@@ -25,7 +25,7 @@ spec:
         fsGroup: 1000
       containers:
         - name: dipper
-          image: ghcr.io/edgeandnode/dipper-service:v0.1.10 # x-release-please-version
+          image: ghcr.io/edgeandnode/dipper-service:v0.1.11 # x-release-please-version
           args:
             - /config/config.json
           ports:
