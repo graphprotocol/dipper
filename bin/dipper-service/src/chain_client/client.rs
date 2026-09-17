@@ -83,10 +83,12 @@ fn is_nonce_error(error: &str) -> bool {
 const MAX_NONCE_RETRIES: u32 = 2;
 
 /// How long one submission may hold `submit_lock` before giving up, derived from the retry
-/// schedule so the cut-off can never pre-empt a retry the config allows: each nonce attempt
-/// is at worst one full walk of the endpoint ring to read the nonce and another to send.
+/// schedule so the cut-off can never pre-empt a retry the config allows: one full walk of
+/// the endpoint ring to read the nonce and another to send. A second nonce attempt is not
+/// budgeted separately: it only follows an endpoint answering with a nonce rejection, and
+/// an endpoint that answers is not one that spends its whole retry schedule hanging.
 fn derive_submit_deadline(pool: &RpcProviderPool) -> Duration {
-    let budget = pool.worst_case_walk() * (2 * MAX_NONCE_RETRIES);
+    let budget = pool.worst_case_walk() * 2;
     // The rest of the worker job's budget stays reserved for what follows the broadcast:
     // the receipt poll and the nonce-gap fill.
     let cap = PROCESS_JOB_TIMEOUT / 5 * 4;
@@ -1324,8 +1326,8 @@ mod tests {
     }
 
     /// The deadline exists to stop one submission starving the queue, not to cut off retries
-    /// the config asks for, so it is derived from the schedule: each nonce attempt walks the
-    /// whole ring twice, once reading the chain's nonce and once broadcasting.
+    /// the config asks for, so it is derived from the schedule: a submission walks the whole
+    /// ring twice, once reading the chain's nonce and once broadcasting.
     #[test]
     fn the_submit_deadline_covers_the_retry_schedule() {
         let client = client_over_retrying(
@@ -1337,8 +1339,48 @@ mod tests {
         );
 
         // Per endpoint: 2 attempts of 5s plus 1s of backoff; 2 endpoints make one walk of
-        // 22s; 2 walks for each of the 2 nonce attempts.
-        assert_eq!(client.inner.submit_deadline, Duration::from_secs(88));
+        // 22s; one walk to read the nonce and one to send.
+        assert_eq!(client.inner.submit_deadline, Duration::from_secs(44));
+    }
+
+    /// The shape a real deployment has, 3 providers at the config defaults (10s timeout,
+    /// 3 retries), must fit under the cap with its whole schedule intact, otherwise every
+    /// production start would log the warning and lose retries the config asked for.
+    #[test]
+    fn three_providers_at_the_defaults_fit_inside_a_worker_job() {
+        let providers = (0..3)
+            .map(|i| {
+                format!("http://rpc{i}.invalid")
+                    .parse()
+                    .expect("provider URL")
+            })
+            .collect();
+        let config = ChainClientConfig {
+            enabled: true,
+            providers,
+            request_timeout: crate::config::default_chain_client_request_timeout(),
+            max_retries: crate::config::default_chain_client_max_retries(),
+            domain_refresh_interval: Duration::from_secs(3600),
+            gas_price_multiplier: 1.2,
+            max_gas_price_gwei: 100,
+            gas_buffer_multiplier: 2.0,
+            gas_floor: 100_000,
+            gas_max_addition: 200_000,
+        };
+        let client = AlloyChainClient::new(
+            &config,
+            1337,
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0x22),
+            &[0x42; 32],
+        )
+        .expect("chain client");
+
+        // Per endpoint: 4 attempts of 10s plus 1+2+4s of backoff; 3 endpoints make one walk
+        // of 141s; two walks come to 282s, inside the 336s the job leaves for a submission.
+        let two_walks = Duration::from_secs(282);
+        assert_eq!(client.inner.submit_deadline, two_walks);
+        assert!(two_walks < PROCESS_JOB_TIMEOUT / 5 * 4);
     }
 
     /// A schedule that wants more time than a worker job has is capped rather than obeyed,

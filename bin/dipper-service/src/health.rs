@@ -14,9 +14,10 @@ use std::{
 use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use tokio::{net::TcpListener, sync::mpsc};
 
-/// Default staleness threshold, twice the [`crate::worker::service::PROCESS_JOB_TIMEOUT`] of 300s
+/// Default staleness threshold, twice the [`crate::worker::service::PROCESS_JOB_TIMEOUT`]
 /// that bounds a single job, so a legitimately slow job never trips the probe.
-pub const DEFAULT_HEALTH_THRESHOLD: Duration = Duration::from_secs(600);
+pub const DEFAULT_HEALTH_THRESHOLD: Duration =
+    Duration::from_secs(2 * crate::worker::service::PROCESS_JOB_TIMEOUT.as_secs());
 
 /// Reference point for every watermark, fixed the first time liveness is touched. Watermarks are
 /// seconds since this instant rather than wall-clock stamps, so an NTP step cannot make a healthy
@@ -183,7 +184,8 @@ mod tests {
     #[test]
     fn default_threshold_exceeds_the_job_timeout() {
         // A job timeout at or above the threshold means a job running to its bound looks wedged,
-        // so k8s restarts a healthy pod. Raising the timeout past 600s must fail here first.
+        // so k8s restarts a healthy pod. The threshold is derived from the timeout, so this
+        // guards a future edit that sets it by hand.
         assert!(
             DEFAULT_HEALTH_THRESHOLD > crate::worker::service::PROCESS_JOB_TIMEOUT,
             "the health threshold must leave room for one full-length job"

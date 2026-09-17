@@ -717,7 +717,7 @@ fn default_chain_client_enabled() -> bool {
     false
 }
 
-fn default_chain_client_request_timeout() -> Duration {
+pub(crate) fn default_chain_client_request_timeout() -> Duration {
     Duration::from_secs(10)
 }
 
@@ -725,7 +725,7 @@ fn default_domain_refresh_interval() -> Duration {
     Duration::from_secs(3600)
 }
 
-fn default_chain_client_max_retries() -> u32 {
+pub(crate) fn default_chain_client_max_retries() -> u32 {
     3
 }
 

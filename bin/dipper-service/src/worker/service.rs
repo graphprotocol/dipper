@@ -41,7 +41,10 @@ const DEFAULT_QUEUE_POLL_PERIOD: Duration = Duration::from_secs(1);
 /// (IISA HTTP, indexer RPC, chain RPC + receipt polling), so the legitimate
 /// worst case is their sum, on the order of a couple of minutes. This timeout
 /// sits comfortably above that and only fires if a dependency accepts the
-/// connection but never responds, defeating the per-call timeouts. Critically,
+/// connection but never responds, defeating the per-call timeouts. It also
+/// bounds how long a chain submission may retry across the RPC providers
+/// (see `derive_submit_deadline`): 4/5 of it must hold two walks of a
+/// 3-provider ring at the default 10s timeout and 3 retries. Critically,
 /// for the whole `process_job` call the job's `JobGuard` holds the row's
 /// `Running` lock (and the pgmq transaction behind it). An unbounded hang
 /// would therefore both wedge the worker loop and pin that row indefinitely.
@@ -50,7 +53,7 @@ const DEFAULT_QUEUE_POLL_PERIOD: Duration = Duration::from_secs(1);
 /// `JobGuard` reschedules the row and releases its lock. Recovery is
 /// idempotent (chain-as-source-of-truth), so re-running a job whose handler
 /// was cancelled mid-flight is safe.
-pub(crate) const PROCESS_JOB_TIMEOUT: Duration = Duration::from_secs(300);
+pub(crate) const PROCESS_JOB_TIMEOUT: Duration = Duration::from_secs(420);
 
 /// Base backoff for a job rescheduled after hitting [`PROCESS_JOB_TIMEOUT`].
 const JOB_TIMEOUT_RETRY_BASE_DELAY: Duration = Duration::from_secs(30);
