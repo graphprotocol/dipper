@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.12](https://github.com/graphprotocol/dipper/compare/v0.1.11...v0.1.12) (2026-09-17)
+
+
+### Fixed
+
+* **ci:** publish container images under the graphprotocol organisation ([#696](https://github.com/graphprotocol/dipper/issues/696)) ([87f7c12](https://github.com/graphprotocol/dipper/commit/87f7c12a11e878fafd8c69c226c6e8d49973e6fc))
+
 ## [0.1.11](https://github.com/graphprotocol/dipper/compare/v0.1.10...v0.1.11) (2026-09-17)
 
 
