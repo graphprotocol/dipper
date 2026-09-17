@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.11](https://github.com/graphprotocol/dipper/compare/v0.1.10...v0.1.11) (2026-09-17)
+
+
+### Fixed
+
+* **worker:** let a chain submission try every RPC provider in one job ([#695](https://github.com/graphprotocol/dipper/issues/695)) ([f40a71f](https://github.com/graphprotocol/dipper/commit/f40a71ff52e78d37ffa57fe19a9d88b28b8ada1d))
+
+
+### Documentation
+
+* rewrite the README around the agreement lifecycle ([#688](https://github.com/graphprotocol/dipper/issues/688)) ([38f86ae](https://github.com/graphprotocol/dipper/commit/38f86ae44b9067877f121fdf7c86e9f03fb316b1))
+
 ## [0.1.10](https://github.com/edgeandnode/dipper/compare/v0.1.9...v0.1.10) (2026-08-03)
 
 
