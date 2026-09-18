@@ -3256,3 +3256,72 @@ async fn count_created_agreements_by_indexer_counts_only_created() {
     );
     assert_eq!(global, 3, "global counts only the 3 Created rows");
 }
+
+#[tokio::test]
+async fn kafka_consumer_offsets_roundtrip_and_upsert() {
+    //* Given
+    let (db, _temp_db) = temp_registry_db().await;
+    let registry = PgRegistry::new(db);
+
+    let topic = "studio.subgraph.indexing.requests";
+
+    //* When / Then - no offset recorded yet
+    let offset = registry
+        .get_kafka_consumer_offset(topic, 0)
+        .await
+        .expect("get offset");
+    assert_eq!(offset, None, "a fresh partition has no recorded offset");
+
+    //* When / Then - first write inserts
+    registry
+        .set_kafka_consumer_offset(topic, 0, 5)
+        .await
+        .expect("set offset");
+    let offset = registry
+        .get_kafka_consumer_offset(topic, 0)
+        .await
+        .expect("get offset");
+    assert_eq!(offset, Some(5));
+
+    //* When / Then - second write updates in place
+    registry
+        .set_kafka_consumer_offset(topic, 0, 42)
+        .await
+        .expect("update offset");
+    let offset = registry
+        .get_kafka_consumer_offset(topic, 0)
+        .await
+        .expect("get offset");
+    assert_eq!(offset, Some(42));
+
+    //* When / Then - partitions and topics are independent keys
+    registry
+        .set_kafka_consumer_offset(topic, 7, 1)
+        .await
+        .expect("set offset on another partition");
+    registry
+        .set_kafka_consumer_offset("another.topic", 0, 9)
+        .await
+        .expect("set offset on another topic");
+    assert_eq!(
+        registry
+            .get_kafka_consumer_offset(topic, 0)
+            .await
+            .expect("get offset"),
+        Some(42)
+    );
+    assert_eq!(
+        registry
+            .get_kafka_consumer_offset(topic, 7)
+            .await
+            .expect("get offset"),
+        Some(1)
+    );
+    assert_eq!(
+        registry
+            .get_kafka_consumer_offset("another.topic", 0)
+            .await
+            .expect("get offset"),
+        Some(9)
+    );
+}

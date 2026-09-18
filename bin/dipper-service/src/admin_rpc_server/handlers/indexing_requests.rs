@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use async_trait::async_trait;
 use dipper_core::{ids::IndexingRequestId, state::FromState};
-use dipper_producer::{events::SubgraphIndexingAgreementEventsProducer, proto};
+use dipper_producer::events::SubgraphIndexingAgreementEventsProducer;
 use dipper_rpc::admin::{
     SignedMessage,
     indexing_requests::{
@@ -17,8 +17,9 @@ use super::error_handling::{handle_list_result, handle_optional_result};
 use crate::{
     registry::{
         IndexingRequest as IndexingRequestRecord, IndexingRequestRegistry,
-        IndexingRequestStatus as IndexingRequestRecordStatus, SetTargetOutcome,
+        IndexingRequestStatus as IndexingRequestRecordStatus,
     },
+    set_indexing_target::{ApplyError, SetIndexingTarget, apply_set_indexing_target},
     signing::eip712::Eip712Signer,
     worker::service::{JobPriority, WorkerQueue},
 };
@@ -109,117 +110,27 @@ where
 
         let num_candidates = num_candidates.unwrap_or(self.max_candidates);
 
-        let outcome = match self
-            .registry
-            .set_indexing_target_candidates(requested_by, deployment_id, chain_id, num_candidates)
-            .await
-        {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                tracing::error!(error=?err, "Failed to set indexing target candidates");
-                return Err(ErrorObject::borrowed(503, "Service unavailable", None));
+        apply_set_indexing_target(
+            &self.registry,
+            &self.worker,
+            &self.subgraph_indexing_agreements_events_emitter,
+            self.signer.chain_id(),
+            SetIndexingTarget {
+                requested_by,
+                deployment_id,
+                deployment_chain_id: chain_id,
+                num_candidates,
+                // Interactive: a caller is waiting on this set-target result.
+                priority: JobPriority::Interactive,
+            },
+        )
+        .await
+        .map_err(|err| match err {
+            ApplyError::Registry(_) => ErrorObject::borrowed(503, "Service unavailable", None),
+            ApplyError::QueueReassess { .. } => {
+                ErrorObject::borrowed(500, "Internal server error", None)
             }
-        };
-
-        // Translate the outcome into the appropriate follow-up worker job and the
-        // wire-level return value.
-        let (id_opt, reassess_count): (Option<IndexingRequestId>, Option<usize>) = match outcome {
-            SetTargetOutcome::Inserted { id } => {
-                tracing::info!(
-                    indexing_request_id = %id,
-                    %requested_by,
-                    %deployment_id,
-                    %chain_id,
-                    num_candidates,
-                    "Inserted new indexing request"
-                );
-
-                // A new request was received: emit the lifecycle event. Only the
-                // `Inserted` outcome is a genuinely new request; `Updated`/`Canceled`
-                // are later transitions in the lifecycle, not "request received".
-                // `the_graph_network` is the protocol network (signer chain id), not
-                // the deployment's data-source `chain_id`.
-                self.subgraph_indexing_agreements_events_emitter
-                    .produce_subgraph_indexing_agreement_request_received(
-                        deployment_id,
-                        self.signer.chain_id(),
-                        proto::SubgraphIndexingAgreementRequestReceived {
-                            agreements_requested: num_candidates as i32,
-                        },
-                    );
-
-                (Some(id), Some(num_candidates))
-            }
-            SetTargetOutcome::Updated {
-                id,
-                new_num_candidates,
-            } => {
-                tracing::info!(
-                    indexing_request_id = %id,
-                    %requested_by,
-                    %deployment_id,
-                    %chain_id,
-                    num_candidates = new_num_candidates,
-                    "Updated num_candidates on open indexing request"
-                );
-                (Some(id), Some(new_num_candidates))
-            }
-            SetTargetOutcome::NoOp { id } => {
-                tracing::debug!(
-                    indexing_request_id = %id,
-                    "Set target candidates is a no-op (count unchanged)"
-                );
-                (Some(id), None)
-            }
-            SetTargetOutcome::Canceled { id } => {
-                tracing::info!(
-                    indexing_request_id = %id,
-                    %requested_by,
-                    %deployment_id,
-                    %chain_id,
-                    "Canceled indexing request (target candidates set to zero)"
-                );
-                (Some(id), Some(0))
-            }
-            SetTargetOutcome::NoOpAlreadyEmpty => {
-                tracing::warn!(
-                    %requested_by,
-                    %deployment_id,
-                    %chain_id,
-                    "set_indexing_target_candidates with num_candidates=0 against a key with no open request \
-                     - nothing to cancel"
-                );
-                (None, None)
-            }
-        };
-
-        // Queue reassessment if the row changed. Reassessment computes the
-        // diff between the IISA target group of size `num_candidates` and the
-        // current active agreements, then grows or shrinks accordingly. With
-        // num_candidates=0 it shrinks to zero, firing the on-chain cancel for
-        // every active agreement on the key.
-        if let (Some(id), Some(count)) = (id_opt, reassess_count)
-            && let Err(err) = self
-                .worker
-                .reassess_indexing_request(
-                    id,
-                    deployment_id,
-                    chain_id,
-                    count,
-                    // Interactive: a caller is waiting on this set-target result.
-                    JobPriority::Interactive,
-                )
-                .await
-        {
-            tracing::error!(
-                indexing_request_id = %id,
-                error = ?err,
-                "Failed to queue task: 'reassess_indexing_request'"
-            );
-            return Err(ErrorObject::borrowed(500, "Internal server error", None));
-        }
-
-        Ok(id_opt)
+        })
     }
 }
 
@@ -267,7 +178,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        registry::Result as RegistryResult,
+        registry::{Result as RegistryResult, SetTargetOutcome},
         test_support::{CapturedEvent, CapturingEventsProducer},
         worker::queue::JobId,
     };
@@ -379,8 +290,7 @@ mod tests {
         }
     }
 
-    /// Build a signed `set_indexing_target_candidates` request using the
-    /// canonical `thegraph_core::signed_message::sign` helper and the admin
+    /// Build a signed `set_indexing_target_candidates` request under the admin
     /// EIP-712 domain, returning both the signer (so its address can be
     /// allowlisted) and the wrapped `SignedMessage`.
     fn signed_request(
@@ -399,10 +309,9 @@ mod tests {
         (signer, inner.into())
     }
 
-    /// Assemble an `RpcServerImpl` whose signer's chain id is
-    /// [`SIGNER_CHAIN_ID`], whose allowlist contains `allowed`, and whose
-    /// registry returns `outcome`. Returns the server and the shared events
-    /// capture for assertions.
+    /// Assemble an `RpcServerImpl` with [`SIGNER_CHAIN_ID`], allowlist
+    /// `allowed`, and a registry returning `outcome`; also returns the shared
+    /// events capture for assertions.
     fn server(
         allowed: Address,
         outcome: SetTargetOutcome,

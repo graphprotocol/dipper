@@ -88,10 +88,30 @@ jobs:
             sudo apt-get install -y postgresql-17
             echo "/usr/lib/postgresql/$(pg_lsclusters | awk 'NR==2 {print $1}')/bin" >> $GITHUB_PATH
 
+      # The Kafka roundtrip and consumer tests skip themselves when
+      # REDPANDA_BROKERS is unset, so the broker must be up before they run.
+      - name: Start Redpanda for Kafka integration tests
+        run: |
+            docker run -d --name redpanda -p 9092:9092 redpandadata/redpanda:v24.2.7 \
+              redpanda start --mode dev-container --smp 1 --memory 1G \
+              --kafka-addr PLAINTEXT://0.0.0.0:9092 \
+              --advertise-kafka-addr PLAINTEXT://localhost:9092
+            for _ in $(seq 1 30); do
+              if docker exec redpanda rpk cluster health 2>/dev/null | grep -q 'Healthy:.*true'; then
+                exit 0
+              fi
+              sleep 1
+            done
+            echo "Redpanda did not become healthy in time" >&2
+            docker logs redpanda >&2
+            exit 1
+
       - name: Integration tests (in-tree)
         uses: LNSD/sops-exec-action@6da1fbca63459d9796097496d5f5e6233555b31a # v1
         env:
           SOPS_AGE_KEY: ${{ secrets.IT_TESTS_AGE_KEY }}
+          REDPANDA_BROKERS: localhost:9092
+          REQUIRE_REDPANDA: '1'
         with:
           env_file: .env
           run: cargo nextest run --all-features -E 'test(~tests::it_)'
@@ -100,6 +120,8 @@ jobs:
         uses: LNSD/sops-exec-action@6da1fbca63459d9796097496d5f5e6233555b31a # v1
         env:
           SOPS_AGE_KEY: ${{ secrets.IT_TESTS_AGE_KEY }}
+          REDPANDA_BROKERS: localhost:9092
+          REQUIRE_REDPANDA: '1'
         with:
           env_file: .env
           run: cargo nextest run --all-features -E 'kind(test)'

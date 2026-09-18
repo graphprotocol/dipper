@@ -798,3 +798,31 @@ impl crate::network::service::chain_listener::ChainListenerStateRegistry for Reg
             .map_err(Into::into)
     }
 }
+
+#[async_trait]
+impl crate::network::service::indexing_request_consumer::KafkaConsumerOffsetRegistry
+    for RegistryProvider
+{
+    async fn get_kafka_consumer_offset(
+        &self,
+        topic: &str,
+        partition_id: i32,
+    ) -> RegistryResult<Option<i64>> {
+        self.inner
+            .get_kafka_consumer_offset(topic, partition_id)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn set_kafka_consumer_offset(
+        &self,
+        topic: &str,
+        partition_id: i32,
+        next_offset: i64,
+    ) -> RegistryResult<()> {
+        self.inner
+            .set_kafka_consumer_offset(topic, partition_id, next_offset)
+            .await
+            .map_err(Into::into)
+    }
+}

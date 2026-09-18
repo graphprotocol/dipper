@@ -1926,6 +1926,61 @@ impl PgRegistry {
         Ok(())
     }
 
+    // =========================================================================
+    // Kafka consumer offset operations
+    // =========================================================================
+
+    /// Get the next offset to fetch for a topic partition.
+    /// Returns `None` if no offset was recorded yet (first run).
+    pub async fn get_kafka_consumer_offset(
+        &self,
+        topic: &str,
+        partition_id: i32,
+    ) -> Result<Option<i64>, Error> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            r#"
+            SELECT next_offset
+            FROM dipper_kafka_consumer_offsets
+            WHERE topic = $1 AND partition_id = $2
+            "#,
+        )
+        .bind(topic)
+        .bind(partition_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|(next_offset,)| next_offset))
+    }
+
+    /// Record the next offset to fetch for a topic partition (upsert). Called
+    /// after a record is fully processed, so a crash between processing and
+    /// this write redelivers the record (at-least-once).
+    pub async fn set_kafka_consumer_offset(
+        &self,
+        topic: &str,
+        partition_id: i32,
+        next_offset: i64,
+    ) -> Result<(), Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO dipper_kafka_consumer_offsets
+                (topic, partition_id, next_offset, updated_at)
+            VALUES ($1, $2, $3, timezone('UTC', now()))
+            ON CONFLICT (topic, partition_id)
+            DO UPDATE SET
+                next_offset = EXCLUDED.next_offset,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(topic)
+        .bind(partition_id)
+        .bind(next_offset)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
     // -- Pending cancellations --
 
     /// Register a new agreement and record a pending cancellation in a single

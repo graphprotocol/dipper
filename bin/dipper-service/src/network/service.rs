@@ -5,5 +5,6 @@ pub mod entity_count_cache;
 pub mod escrow_reconciler;
 pub mod expiration;
 pub mod indexer_urls;
+pub mod indexing_request_consumer;
 pub mod liveness_checker;
 pub mod reassignment;
