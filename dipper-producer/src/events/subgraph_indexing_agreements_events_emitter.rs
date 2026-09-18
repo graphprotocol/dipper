@@ -711,6 +711,7 @@ mod tests {
             sasl_password: None,
             tls_enabled: false,
             tls_ca_cert_path: None,
+            connect_timeout_secs: 60,
         }
     }
 

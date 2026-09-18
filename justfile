@@ -113,7 +113,9 @@ remove-git-hooks:
     # Remove the pre-commit hooks
     pre-commit uninstall --config .github/pre-commit-config.yaml
 
-# Generate job events protobuf bindings (RUSTFLAGS="--cfg gen_event_proto" cargo check)
+# Generate event protobuf bindings (RUSTFLAGS="--cfg gen_event_proto" cargo check)
 [group: 'codegen']
-gen-indexing-agreement-events-proto:
+gen-event-protos:
     RUSTFLAGS="--cfg gen_event_proto" cargo check -p dipper-producer
+
+alias gen-indexing-agreement-events-proto := gen-event-protos

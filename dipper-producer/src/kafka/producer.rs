@@ -1,21 +1,13 @@
 //! Kafka producer for sending dipper events on a configured topic
 
-use std::{
-    path::{Path, PathBuf},
-    sync::{Arc, Once},
-    time::Duration,
-};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use rskafka::{
-    client::{
-        ClientBuilder, Credentials, SaslConfig,
-        partition::{Compression, PartitionClient, UnknownTopicHandling},
-    },
+    client::partition::{Compression, PartitionClient, UnknownTopicHandling},
     record::Record,
 };
-use rustls::ClientConfig;
 
-static RUSTLS_CRYPTO_PROVIDER: Once = Once::new();
+use super::connection::{self, ConnectOptions, ConnectionError};
 
 /// Kafka producer configuration.
 #[derive(Clone, serde::Deserialize)]
@@ -46,6 +38,11 @@ pub struct KafkaConfig {
     /// Path to a PEM-encoded CA certificate file for TLS verification.
     #[serde(default)]
     pub tls_ca_cert_path: Option<PathBuf>,
+    /// Seconds allowed for the initial connect and partition binding (default:
+    /// 60). Load-bearing: the underlying client retries an unreachable broker
+    /// forever, so without this bound `new` would never return.
+    #[serde(default = "super::consumer::default_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
 }
 
 // Manual impl instead of derive: the service logs the whole config with Debug
@@ -64,6 +61,7 @@ impl std::fmt::Debug for KafkaConfig {
             )
             .field("tls_enabled", &self.tls_enabled)
             .field("tls_ca_cert_path", &self.tls_ca_cert_path)
+            .field("connect_timeout_secs", &self.connect_timeout_secs)
             .finish()
     }
 }
@@ -89,28 +87,32 @@ pub struct KafkaProducer {
 impl KafkaProducer {
     const PRODUCE_TIMEOUT: Duration = Duration::from_secs(30);
 
-    /// Creates a new Kafka producer with the given configuration.
+    /// Creates a new Kafka producer with the given configuration. Bounded by
+    /// `connect_timeout_secs`, since the underlying client retries an
+    /// unreachable broker forever.
     pub async fn new(config: &KafkaConfig) -> Result<Self, Error> {
+        tokio::time::timeout(
+            Duration::from_secs(config.connect_timeout_secs),
+            Self::new_inner(config),
+        )
+        .await
+        .map_err(|_| Error::Timeout)?
+    }
+
+    async fn new_inner(config: &KafkaConfig) -> Result<Self, Error> {
         if config.partitions == 0 {
             return Err(Error::InvalidPartitionCount);
         }
 
-        let mut builder = ClientBuilder::new(config.brokers.clone());
-
-        // Configure SASL authentication if mechanism is specified
-        if let Some(mechanism_str) = &config.sasl_mechanism {
-            let mechanism: SaslMechanism = mechanism_str.parse()?;
-            let sasl_config = Self::build_sasl_config(mechanism, config)?;
-            builder = builder.sasl_config(sasl_config);
-        }
-
-        // Configure TLS if enabled
-        if config.tls_enabled {
-            let tls_config = Self::build_tls_config(config.tls_ca_cert_path.as_deref())?;
-            builder = builder.tls_config(tls_config);
-        }
-
-        let client = builder.build().await.map_err(Error::Connection)?;
+        let client = connection::connect(ConnectOptions {
+            brokers: &config.brokers,
+            sasl_mechanism: config.sasl_mechanism.as_deref(),
+            sasl_username: config.sasl_username.as_deref(),
+            sasl_password: config.sasl_password.as_deref(),
+            tls_enabled: config.tls_enabled,
+            tls_ca_cert_path: config.tls_ca_cert_path.as_deref(),
+        })
+        .await?;
         let client = Arc::new(client);
         let mut partition_clients = Vec::with_capacity(config.partitions as usize);
 
@@ -130,68 +132,8 @@ impl KafkaProducer {
         })
     }
 
-    /// Builds SASL configuration from the provided mechanism and credentials.
-    fn build_sasl_config(
-        mechanism: SaslMechanism,
-        config: &KafkaConfig,
-    ) -> Result<SaslConfig, Error> {
-        let username = config
-            .sasl_username
-            .clone()
-            .ok_or(Error::MissingSaslUsername)?;
-        let password = config
-            .sasl_password
-            .clone()
-            .ok_or(Error::MissingSaslPassword)?;
-
-        let credentials = Credentials::new(username, password);
-
-        Ok(match mechanism {
-            SaslMechanism::Plain => SaslConfig::Plain(credentials),
-            SaslMechanism::ScramSha256 => SaslConfig::ScramSha256(credentials),
-            SaslMechanism::ScramSha512 => SaslConfig::ScramSha512(credentials),
-        })
-    }
-
-    /// Builds TLS configuration.
-    ///
-    /// If a custom CA certificate path is provided, the client will trust that CA
-    /// for verifying broker connections. Otherwise, system root certificates are used.
-    fn build_tls_config(ca_cert_path: Option<&Path>) -> Result<Arc<ClientConfig>, Error> {
-        install_rustls_crypto_provider();
-
-        let root_store = match ca_cert_path {
-            Some(path) => {
-                let ca_pem = fs_err::read(path).map_err(|e| Error::TlsCaCert { source: e })?;
-                let mut reader = std::io::BufReader::new(&ca_pem[..]);
-                let certs: Vec<_> = rustls_pemfile::certs(&mut reader)
-                    .collect::<Result<_, _>>()
-                    .map_err(|e| Error::TlsCaCert { source: e })?;
-
-                let mut store = rustls::RootCertStore::empty();
-                for cert in certs {
-                    store.add(cert).map_err(|e| Error::TlsCaCert {
-                        source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
-                    })?;
-                }
-                store
-            }
-            None => rustls::RootCertStore {
-                roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-            },
-        };
-
-        let tls_config = ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-
-        Ok(Arc::new(tls_config))
-    }
-
-    /// Sends an event to Kafka.
-    ///
-    /// Events are partitioned by the partition key (table discriminator) before being written to
-    /// Kafka. The produce attempt times out after 30 seconds.
+    /// Sends an event to Kafka, partitioned by the partition key (table
+    /// discriminator). The produce attempt times out after 30 seconds.
     pub async fn send(&self, partition_key: &str, payload: &[u8]) -> Result<(), Error> {
         let partition = self.partition_for_key(partition_key);
         let partition_client = &self.partition_clients[partition as usize];
@@ -213,12 +155,9 @@ impl KafkaProducer {
         .map(|_| ())
     }
 
-    /// Computes the partition for a given key.
-    ///
-    /// Uses a deterministic FNV-1a hash modulo the partition count so that a given
-    /// key always maps to the same partition across restarts and instances,
-    /// preserving per-key ordering. The partition count is configured via
-    /// `KafkaConfig::partitions`.
+    /// Computes the partition for a key: deterministic FNV-1a hash modulo
+    /// `KafkaConfig::partitions`, so a key maps to the same partition across
+    /// restarts and instances, preserving per-key ordering.
     fn partition_for_key(&self, key: &str) -> i32 {
         // FNV-1a (32-bit): order-dependent and well-distributed, unlike a byte sum.
         const FNV_OFFSET_BASIS: u32 = 0x811c_9dc5;
@@ -231,20 +170,12 @@ impl KafkaProducer {
     }
 }
 
-fn install_rustls_crypto_provider() {
-    RUSTLS_CRYPTO_PROVIDER.call_once(|| {
-        // Necessary for the Kafka client: it builds a Rustls TLS config directly,
-        // so install a provider before `ClientConfig::builder()` tries to infer one.
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    });
-}
-
 /// Errors that can occur when working with the Kafka producer.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// Failed to connect to Kafka brokers
-    #[error("failed to connect to Kafka brokers")]
-    Connection(#[source] rskafka::client::error::Error),
+    /// Failed to establish the broker connection (SASL, TLS, or bootstrap)
+    #[error(transparent)]
+    Connection(#[from] ConnectionError),
 
     /// Failed to get partition client
     #[error("failed to get partition client")]
@@ -261,125 +192,11 @@ pub enum Error {
     /// Partition count must be greater than zero
     #[error("partitions must be greater than zero")]
     InvalidPartitionCount,
-
-    /// Unsupported SASL mechanism
-    #[error("unsupported SASL mechanism '{0}', supported: PLAIN, SCRAM-SHA-256, SCRAM-SHA-512")]
-    UnsupportedSaslMechanism(String),
-
-    /// Missing SASL username
-    #[error("sasl_username is required when sasl_mechanism is set")]
-    MissingSaslUsername,
-
-    /// Missing SASL password
-    #[error("sasl_password is required when sasl_mechanism is set")]
-    MissingSaslPassword,
-
-    /// Failed to load TLS CA certificate
-    #[error("failed to load TLS CA certificate")]
-    TlsCaCert {
-        #[source]
-        source: std::io::Error,
-    },
-}
-
-/// Supported SASL authentication mechanisms.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SaslMechanism {
-    Plain,
-    ScramSha256,
-    ScramSha512,
-}
-
-impl std::str::FromStr for SaslMechanism {
-    type Err = Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_uppercase().as_str() {
-            "PLAIN" => Ok(Self::Plain),
-            "SCRAM-SHA-256" => Ok(Self::ScramSha256),
-            "SCRAM-SHA-512" => Ok(Self::ScramSha512),
-            _ => Err(Error::UnsupportedSaslMechanism(s.to_string())),
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn should_parse_sasl_mechanism_correctly() {
-        // Case-insensitive parsing
-        assert_eq!(
-            "PLAIN".parse::<SaslMechanism>().unwrap(),
-            SaslMechanism::Plain
-        );
-        assert_eq!(
-            "plain".parse::<SaslMechanism>().unwrap(),
-            SaslMechanism::Plain
-        );
-        assert_eq!(
-            "SCRAM-SHA-256".parse::<SaslMechanism>().unwrap(),
-            SaslMechanism::ScramSha256
-        );
-        assert_eq!(
-            "scram-sha-256".parse::<SaslMechanism>().unwrap(),
-            SaslMechanism::ScramSha256
-        );
-        assert_eq!(
-            "SCRAM-SHA-512".parse::<SaslMechanism>().unwrap(),
-            SaslMechanism::ScramSha512
-        );
-
-        // Unsupported mechanism
-        assert!("GSSAPI".parse::<SaslMechanism>().is_err());
-    }
-
-    #[test]
-    fn should_build_sasl_plain_sasl_config() {
-        let config = make_kafka_config(Some("PLAIN"), Some("user".into()), Some("pass".into()));
-        let result = KafkaProducer::build_sasl_config(SaslMechanism::Plain, &config);
-        assert!(matches!(result, Ok(SaslConfig::Plain(_))));
-    }
-
-    #[test]
-    fn should_build_scram_sha_256_sasl_config() {
-        let config = make_kafka_config(
-            Some("SCRAM-SHA-256"),
-            Some("user".into()),
-            Some("pass".into()),
-        );
-        let result = KafkaProducer::build_sasl_config(SaslMechanism::ScramSha256, &config);
-        assert!(matches!(result, Ok(SaslConfig::ScramSha256(_))));
-    }
-
-    #[test]
-    fn should_build_sasl_sha_512_sasl_config() {
-        let config = make_kafka_config(
-            Some("SCRAM-SHA-512"),
-            Some("user".into()),
-            Some("pass".into()),
-        );
-        let result = KafkaProducer::build_sasl_config(SaslMechanism::ScramSha512, &config);
-        assert!(matches!(result, Ok(SaslConfig::ScramSha512(_))));
-    }
-
-    #[test]
-    fn should_throw_err_on_missing_credentials() {
-        // Missing username
-        let config = make_kafka_config(Some("PLAIN"), None, Some("pass".into()));
-        assert!(matches!(
-            KafkaProducer::build_sasl_config(SaslMechanism::Plain, &config),
-            Err(Error::MissingSaslUsername)
-        ));
-
-        // Missing password
-        let config = make_kafka_config(Some("PLAIN"), Some("user".into()), None);
-        assert!(matches!(
-            KafkaProducer::build_sasl_config(SaslMechanism::Plain, &config),
-            Err(Error::MissingSaslPassword)
-        ));
-    }
 
     #[test]
     fn debug_output_redacts_the_sasl_password() {
@@ -422,6 +239,7 @@ mod tests {
             sasl_password: sasl_pass,
             tls_enabled: false,
             tls_ca_cert_path: None,
+            connect_timeout_secs: 60,
         }
     }
 }

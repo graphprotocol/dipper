@@ -1,27 +1,11 @@
-//! Kafka client for subgraph indexing agreement event streaming.
-//!
-//! This module provides a Kafka producer for emitting subgraph indexing agreement lifecycle events
-//! to a kafka topic
-//!
-//! Events are encoded using Protocol Buffers for compact, schema-enforced messages.
-//!
-//! # Example
-//!
-//! ```ignore
-//! use dipper_producer::kafka::{KafkaConfig, KafkaProducer};
-//!
-//! let config = KafkaConfig {
-//!     brokers: vec!["localhost:9092".to_string()],
-//!     topic: "dipper.subgraph.indexing.agreement.events".to_string(),
-//!     partitions: 16,
-//! };
-//!
-//! let producer = KafkaProducer::new(&config).await?;
-//!
-//! // Send an event with partition key and protobuf payload
-//! producer.send("QmT329Bej8AwSLahmgnmi6fdYkj3rorYAcCes45gDv9aJ4", &encoded_event).await?;
-//! ```
+//! Kafka clients for dipper event streaming: a producer for the agreement
+//! lifecycle events the dipper emits and a consumer for the indexing request
+//! events Studio emits. Events are Protocol Buffers encoded.
 
+mod connection;
+mod consumer;
 mod producer;
 
+pub use connection::ConnectionError;
+pub use consumer::{ConsumerError, KafkaConsumer, KafkaConsumerConfig};
 pub use producer::{Error, KafkaConfig, KafkaProducer};

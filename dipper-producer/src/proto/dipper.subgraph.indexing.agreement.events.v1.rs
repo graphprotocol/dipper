@@ -178,7 +178,7 @@ pub struct SubgraphIndexingAgreementTerminated {
     /// the one just terminated.
     /// 0  -> the Subgraph no longer has any active, accepted indexing agreements.
     /// -1 -> the count was unavailable when the event was emitted (e.g. a transient
-    ///       datastore error); treat as unknown, not as zero.
+    ///        datastore error); treat as unknown, not as zero.
     #[prost(int32, tag = "5")]
     pub remaining_accepted_indexing_agreements: i32,
 }

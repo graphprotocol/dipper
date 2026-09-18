@@ -2456,6 +2456,7 @@ dependencies = [
  "rustls",
  "rustls-pemfile 2.2.0",
  "serde",
+ "serde_json",
  "thegraph-core",
  "thiserror 2.0.18",
  "tokio",
