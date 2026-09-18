@@ -951,12 +951,13 @@ fn default_deadline_seconds() -> u64 {
 /// Operators who want filter coverage on additional chains must
 /// add explicit entries to `max_grt_per_30_days` in their config.
 ///
-/// Synced from <https://github.com/graphprotocol/indexer-rs/blob/mb9/dips-signalling-endpoint/crates/config/maximal-config-example.toml#L201-L210>
+/// Synced from <https://github.com/graphprotocol/indexer-rs/blob/main/crates/config/maximal-config-example.toml#L205-L214>
 /// (the rollout-trimmed `[dips.min_grt_per_30_days]` section).
 ///
 /// To refresh: re-read the linked section and copy the value pairs.
-/// Update the `mb9/dips-signalling-endpoint` ref to the merged commit
-/// hash on `main` (or `main-dips`) once the PR lands.
+/// Checked against upstream `main` by `it_min_grt_per_30_days_matches_indexer_rs_upstream`
+/// below (`just test-it`) — that test fails loudly instead of this const
+/// silently going stale.
 const INDEXER_RS_MIN_GRT_PER_30_DAYS: &[(&str, f64)] = &[
     ("arbitrum-one", 450.0),
     ("matic", 300.0),
@@ -1754,6 +1755,68 @@ mod tests {
             let want = *min * PAYMENT_CEILING_MULTIPLIER;
             assert_eq!(map.get(*name), Some(&want), "ceiling for {name}");
         }
+    }
+
+    /// Live counterpart to `test_default_max_grt_per_30_days_const`: fetches
+    /// indexer-rs's current `main` branch instead of trusting our pinned
+    /// copy, so an upstream change to `[dips.min_grt_per_30_days]` fails
+    /// this test instead of silently drifting until someone notices by
+    /// hand. See #620.
+    #[tokio::test]
+    async fn it_min_grt_per_30_days_matches_indexer_rs_upstream() {
+        const UPSTREAM_URL: &str = "https://raw.githubusercontent.com/graphprotocol/indexer-rs/main/crates/config/maximal-config-example.toml";
+        const SECTION_HEADER: &str = "[dips.min_grt_per_30_days]";
+
+        let body = reqwest::get(UPSTREAM_URL)
+            .await
+            .expect("failed to fetch indexer-rs upstream config")
+            .error_for_status()
+            .expect("indexer-rs upstream config returned an error status")
+            .text()
+            .await
+            .expect("failed to read indexer-rs upstream config body");
+
+        // The table is shipped commented-out (it's a per-operator opt-in
+        // example, not a live default), so we parse the `# name = "value"`
+        // lines directly rather than through a TOML parser.
+        let mut upstream: BTreeMap<String, f64> = BTreeMap::new();
+        let mut in_section = false;
+        for line in body.lines() {
+            if line.starts_with(SECTION_HEADER) {
+                in_section = true;
+                continue;
+            }
+            if !in_section {
+                continue;
+            }
+            let Some(entry) = line.strip_prefix('#') else {
+                break;
+            };
+            let Some((name, value)) = entry.trim().split_once('=') else {
+                break;
+            };
+            let Ok(value) = value.trim().trim_matches('"').parse::<f64>() else {
+                break;
+            };
+            upstream.insert(name.trim().to_string(), value);
+        }
+
+        assert!(
+            !upstream.is_empty(),
+            "found no entries under {SECTION_HEADER} in indexer-rs's upstream config; \
+             the section may have moved, been renamed, or changed format"
+        );
+
+        let ours: BTreeMap<String, f64> = INDEXER_RS_MIN_GRT_PER_30_DAYS
+            .iter()
+            .map(|(name, min)| (name.to_string(), *min))
+            .collect();
+
+        assert_eq!(
+            ours, upstream,
+            "INDEXER_RS_MIN_GRT_PER_30_DAYS has drifted from indexer-rs's published \
+             [dips.min_grt_per_30_days] table — update the const in config.rs to match"
+        );
     }
 
     /// Stale `max_initial_tokens` and `max_ongoing_tokens_per_second` keys
