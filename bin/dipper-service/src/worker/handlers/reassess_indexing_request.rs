@@ -645,6 +645,7 @@ where
         if needs_on_chain_cancel {
             match crate::cancel_dispatch::cancel_agreement_on_chain(
                 &ctx.chain_client,
+                &ctx.registry,
                 old_agreement,
                 &ctx.agreement_conf,
             )
@@ -780,8 +781,13 @@ where
 }
 
 /// Compute the EIP-712 terms hash persisted for the protocol-managed cancel
-/// path, reusing the proposal signer's RCA-to-sol conversion and signing-hash so
-/// the value matches the hash dipper signs over.
+/// path, reusing the proposal signer's RCA-to-sol conversion and signing-hash.
+/// In protocol-managed mode dipper signs nothing — this value is only the
+/// cancel identifier the RecurringCollector stored at offer time and checks
+/// against on cancel (see `cancel_dispatch::cancel_agreement_on_chain`,
+/// which recovers it from chain if this column is empty, and confirms
+/// on-chain afterward rather than trusting a mismatch to fail loudly on its
+/// own).
 fn compute_terms_version_hash(
     nonce_uuid: uuid::Uuid,
     terms: &IndexingAgreementTerms,
@@ -1071,6 +1077,15 @@ mod lifecycle_event_tests {
             // Cancel confirmed: agreement is no longer active on-chain.
             Ok(false)
         }
+
+        async fn fetch_agreement_version_hash(
+            &self,
+            _agreement_id: &[u8; 16],
+        ) -> std::result::Result<Option<B256>, ChainClientError> {
+            // These tests always construct agreements with a stored hash, so
+            // recovery is never exercised.
+            unimplemented!("not exercised by reassess handler")
+        }
     }
 
     // ---- Mock: registry (all five traits) -----------------------------------
@@ -1231,6 +1246,13 @@ mod lifecycle_event_tests {
             _tx_hash: &[u8; 32],
         ) -> RegistryResult<()> {
             unimplemented!()
+        }
+        async fn update_terms_version_hash(
+            &self,
+            _id: &IndexingAgreementId,
+            _hash: &[u8; 32],
+        ) -> RegistryResult<()> {
+            unimplemented!("not exercised by reassess handler tests")
         }
         // Cancel path: pre-mark the local row terminal.
         async fn mark_indexing_agreement_as_canceled_by_requester(
@@ -2293,6 +2315,15 @@ mod deadline_clock_tests {
             _agreement_id: &[u8; 16],
         ) -> Result<bool, ChainClientError> {
             Ok(false)
+        }
+
+        async fn fetch_agreement_version_hash(
+            &self,
+            _agreement_id: &[u8; 16],
+        ) -> Result<Option<B256>, ChainClientError> {
+            // These tests always construct agreements with a stored hash, so
+            // recovery is never exercised.
+            unimplemented!("not exercised by reassess handler")
         }
     }
 

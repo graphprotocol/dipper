@@ -895,6 +895,34 @@ impl PgRegistry {
         Ok(())
     }
 
+    /// Backfill a `terms_version_hash` recovered from on-chain state for an
+    /// agreement whose local copy is missing — e.g. a row from before the
+    /// `terms_version_hash` column existed. No status guard: unlike
+    /// `update_offer_tx_hash` (which risks clobbering a live tx hash for an
+    /// agreement that has since moved on), a missing hash never gets a
+    /// legitimate DB-side update to race with, and cancellation from any
+    /// non-terminal status still needs the recovered value.
+    pub async fn update_terms_version_hash(
+        &self,
+        agreement_id: &IndexingAgreementId,
+        hash: &[u8; 32],
+    ) -> Result<(), Error> {
+        sqlx::query(
+            r#"
+            UPDATE dipper_reg_indexing_agreements
+            SET
+                terms_version_hash = $1,
+                updated_at = timezone('UTC', now())
+            WHERE id = $2 AND terms_version_hash IS NULL
+            "#,
+        )
+        .bind(&hash[..])
+        .bind(agreement_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn mark_indexing_agreement_as_canceled_by_requester(
         &self,
         agreement_id: &IndexingAgreementId,

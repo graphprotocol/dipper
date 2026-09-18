@@ -74,43 +74,49 @@ where
     );
 
     // Send the cancellation transaction (mode-aware dispatch).
-    let on_chain_cancel_tx: Option<String> =
-        match cancel_agreement_on_chain(&ctx.chain_client, &agreement, &ctx.agreement_conf).await {
-            Ok(Some(tx_hash)) => {
-                tracing::info!(
-                    agreement_id = %agreement_id,
-                    tx_hash = %tx_hash,
-                    "Successfully submitted on-chain cancellation"
-                );
-                Some(tx_hash.to_string())
-            }
-            Ok(None) => {
-                tracing::info!(
-                    agreement_id = %agreement_id,
-                    "Rejected agreement already canceled on-chain; reconciling local state"
-                );
-                None
-            }
-            Err(err @ ChainClientError::MissingTermsVersionHash { .. }) => {
-                // Permanent: the hash never appears, so retrying can't help. Fail
-                // terminally and leave the live agreement for operator action.
-                tracing::error!(
-                    agreement_id = %agreement_id,
-                    error = %err,
-                    "Cannot cancel rejected agreement: missing terms_version_hash"
-                );
-                return Err(JobError::Fatal(err.into()));
-            }
-            Err(err) => {
-                tracing::warn!(
-                    agreement_id = %agreement_id,
-                    error = %err,
-                    "Failed to cancel agreement on-chain, will retry"
-                );
-                // Retry with backoff - on-chain transactions can fail due to gas issues, nonce, etc.
-                return Err(JobError::Retryable(err.into(), Duration::from_secs(30)));
-            }
-        };
+    let on_chain_cancel_tx: Option<String> = match cancel_agreement_on_chain(
+        &ctx.chain_client,
+        &ctx.registry,
+        &agreement,
+        &ctx.agreement_conf,
+    )
+    .await
+    {
+        Ok(Some(tx_hash)) => {
+            tracing::info!(
+                agreement_id = %agreement_id,
+                tx_hash = %tx_hash,
+                "Successfully submitted on-chain cancellation"
+            );
+            Some(tx_hash.to_string())
+        }
+        Ok(None) => {
+            tracing::info!(
+                agreement_id = %agreement_id,
+                "Rejected agreement already canceled on-chain; reconciling local state"
+            );
+            None
+        }
+        Err(err @ ChainClientError::MissingTermsVersionHash { .. }) => {
+            // Permanent: the hash never appears, so retrying can't help. Fail
+            // terminally and leave the live agreement for operator action.
+            tracing::error!(
+                agreement_id = %agreement_id,
+                error = %err,
+                "Cannot cancel rejected agreement: missing terms_version_hash"
+            );
+            return Err(JobError::Fatal(err.into()));
+        }
+        Err(err) => {
+            tracing::warn!(
+                agreement_id = %agreement_id,
+                error = %err,
+                "Failed to cancel agreement on-chain, will retry"
+            );
+            // Retry with backoff - on-chain transactions can fail due to gas issues, nonce, etc.
+            return Err(JobError::Retryable(err.into(), Duration::from_secs(30)));
+        }
+    };
 
     // When the row was actually flipped to terminal, record the cancel audit so
     // the chain_listener's `terminated` sweep announces it durably. The accept
@@ -361,6 +367,14 @@ mod tests {
             Ok(())
         }
 
+        async fn update_terms_version_hash(
+            &self,
+            _id: &IndexingAgreementId,
+            _hash: &[u8; 32],
+        ) -> crate::registry::Result<()> {
+            Ok(())
+        }
+
         async fn mark_indexing_agreement_as_canceled_by_requester(
             &self,
             id: &IndexingAgreementId,
@@ -494,6 +508,15 @@ mod tests {
             _agreement_id: &[u8; 16],
         ) -> Result<bool, ChainClientError> {
             Ok(false)
+        }
+
+        async fn fetch_agreement_version_hash(
+            &self,
+            _agreement_id: &[u8; 16],
+        ) -> Result<Option<B256>, ChainClientError> {
+            // These tests always construct agreements with a stored hash, so
+            // recovery is never exercised.
+            unimplemented!("not exercised by cancel_rejected_agreement_on_chain tests")
         }
     }
 

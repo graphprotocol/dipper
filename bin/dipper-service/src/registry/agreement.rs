@@ -256,6 +256,17 @@ pub trait AgreementRegistry {
         tx_hash: &[u8; 32],
     ) -> RegistryResult<()>;
 
+    /// Backfill a `terms_version_hash` recovered from on-chain state for an
+    /// agreement whose local copy is missing (e.g. a row from before the
+    /// column existed). Idempotent and safe to call even if a hash is
+    /// already stored — callers only invoke it when the local copy is
+    /// absent, so overwriting is not a concern in practice.
+    async fn update_terms_version_hash(
+        &self,
+        id: &IndexingAgreementId,
+        hash: &[u8; 32],
+    ) -> RegistryResult<()>;
+
     /// Mark an indexing agreement as `CANCELED_BY_REQUESTER`.
     ///
     /// If there is no indexing agreement with the given ID, or if the agreement is not in the

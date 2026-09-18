@@ -587,6 +587,42 @@ impl AlloyChainClient {
             tokio::time::sleep(RECEIPT_POLL_INTERVAL).await;
         }
     }
+
+    /// Read `getAgreementDetails(id, VERSION_CURRENT)` from the
+    /// RecurringCollector. Shared by `agreement_still_active` (checks
+    /// `state`) and `fetch_agreement_version_hash` (checks `versionHash`) so
+    /// there's one call site for the ABI encode/decode.
+    async fn get_agreement_details(
+        &self,
+        agreement_id: &[u8; 16],
+    ) -> Result<IRecurringCollector::AgreementDetails, ChainClientError> {
+        let calldata = IRecurringCollector::getAgreementDetailsCall {
+            agreementId: FixedBytes::<16>::from_slice(agreement_id),
+            index: thegraph_core::alloy::primitives::U256::from(VERSION_CURRENT),
+        }
+        .abi_encode();
+
+        let collector = self.inner.recurring_collector_address;
+        let output = self
+            .inner
+            .rpc_pool
+            .execute("get_agreement_details", |provider| {
+                let calldata = calldata.clone();
+                async move {
+                    let tx = TransactionRequest::default()
+                        .to(collector)
+                        .input(calldata.into());
+                    provider.call(tx).await
+                }
+            })
+            .await?;
+
+        IRecurringCollector::getAgreementDetailsCall::abi_decode_returns(&output).map_err(|err| {
+            ChainClientError::RpcError(anyhow::anyhow!(
+                "undecodable getAgreementDetails from {collector}: {err}"
+            ))
+        })
+    }
 }
 
 #[async_trait]
@@ -712,39 +748,21 @@ impl ChainClient for AlloyChainClient {
         &self,
         agreement_id: &[u8; 16],
     ) -> Result<bool, ChainClientError> {
-        let calldata = IRecurringCollector::getAgreementDetailsCall {
-            agreementId: FixedBytes::<16>::from_slice(agreement_id),
-            index: thegraph_core::alloy::primitives::U256::from(VERSION_CURRENT),
-        }
-        .abi_encode();
-
-        let collector = self.inner.recurring_collector_address;
-        let output = self
-            .inner
-            .rpc_pool
-            .execute("get_agreement_details", |provider| {
-                let calldata = calldata.clone();
-                async move {
-                    let tx = TransactionRequest::default()
-                        .to(collector)
-                        .input(calldata.into());
-                    provider.call(tx).await
-                }
-            })
-            .await?;
-
-        let details = IRecurringCollector::getAgreementDetailsCall::abi_decode_returns(&output)
-            .map_err(|err| {
-                ChainClientError::RpcError(anyhow::anyhow!(
-                    "undecodable getAgreementDetails from {collector}: {err}"
-                ))
-            })?;
+        let details = self.get_agreement_details(agreement_id).await?;
 
         // Live iff the terms are accepted and no cancellation notice exists.
         // A cancel sets NOTICE_GIVEN while ACCEPTED stays set, so checking the
         // notice bit is what tells a still-live agreement from a cancelled one.
         let state = details.state;
         Ok(state & STATE_ACCEPTED != 0 && state & STATE_NOTICE_GIVEN == 0)
+    }
+
+    async fn fetch_agreement_version_hash(
+        &self,
+        agreement_id: &[u8; 16],
+    ) -> Result<Option<B256>, ChainClientError> {
+        let details = self.get_agreement_details(agreement_id).await?;
+        Ok(Some(details.versionHash).filter(|hash| *hash != B256::ZERO))
     }
 
     async fn reconcile_provider(

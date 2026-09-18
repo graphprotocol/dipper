@@ -6,7 +6,7 @@ use thegraph_core::alloy::primitives::B256;
 use crate::{
     chain_client::{ChainClient, ChainClientError},
     config::IndexingAgreementConfig,
-    registry::IndexingAgreement,
+    registry::{AgreementRegistry, IndexingAgreement},
 };
 
 /// Pass both ACTIVE and PENDING; local status lags the chain, so let the
@@ -16,22 +16,59 @@ const SCOPE_ACTIVE: u16 = 1;
 const SCOPE_PENDING: u16 = 2;
 const SCOPE_BOTH: u16 = SCOPE_ACTIVE | SCOPE_PENDING;
 
-/// Cancel an agreement on-chain through the RecurringAgreementManager. Passes
-/// both scope bits so the collector cancels whichever scope the agreement is in,
-/// and treats a missing or short stored hash as `MissingTermsVersionHash`.
-pub async fn cancel_agreement_on_chain<T: ChainClient>(
+/// Resolve the version hash to cancel with: the locally stored one, or — if
+/// missing or malformed (e.g. a pre-migration row with no `terms_version_hash`
+/// column value) — the authoritative one read back from
+/// `getAgreementDetails`. A recovered hash is best-effort persisted to the
+/// registry so future cancels don't need to re-fetch it; a persistence
+/// failure is logged and otherwise ignored, since the recovered hash is
+/// still used for this call regardless.
+async fn resolve_version_hash<T: ChainClient, R: AgreementRegistry>(
     chain_client: &T,
+    registry: &R,
     agreement: &IndexingAgreement,
-    config: &IndexingAgreementConfig,
-) -> Result<Option<B256>, ChainClientError> {
-    let version_hash = agreement
+) -> Result<B256, ChainClientError> {
+    if let Some(hash) = agreement
         .terms_version_hash
         .as_deref()
         .filter(|h| h.len() == 32)
         .map(B256::from_slice)
+    {
+        return Ok(hash);
+    }
+
+    let recovered = chain_client
+        .fetch_agreement_version_hash(agreement.id.as_bytes())
+        .await?
         .ok_or_else(|| ChainClientError::MissingTermsVersionHash {
             agreement_id: agreement.id.to_string(),
         })?;
+
+    if let Err(err) = registry
+        .update_terms_version_hash(&agreement.id, recovered.as_slice().try_into().unwrap())
+        .await
+    {
+        tracing::warn!(
+            agreement_id = %agreement.id,
+            error = %err,
+            "recovered terms_version_hash from chain but failed to persist it; will \
+             re-recover on the next cancel attempt"
+        );
+    }
+    Ok(recovered)
+}
+
+/// Cancel an agreement on-chain through the RecurringAgreementManager. Passes
+/// both scope bits so the collector cancels whichever scope the agreement is in.
+/// If the local `terms_version_hash` is missing, first tries to recover it from
+/// `getAgreementDetails` before giving up with `MissingTermsVersionHash`.
+pub async fn cancel_agreement_on_chain<T: ChainClient, R: AgreementRegistry>(
+    chain_client: &T,
+    registry: &R,
+    agreement: &IndexingAgreement,
+    config: &IndexingAgreementConfig,
+) -> Result<Option<B256>, ChainClientError> {
+    let version_hash = resolve_version_hash(chain_client, registry, agreement).await?;
     // Hazard: the manager's cancel mines successfully even when it does nothing
     // (stale/wrong hash, unknown id, already-terminal). So after a submitted
     // cancel we re-read on-chain and surface CancelNotConfirmed if still active.
@@ -78,9 +115,32 @@ mod tests {
         config::IndexingAgreementConfig,
         registry::{
             IndexingAgreement, IndexingAgreementStatus, IndexingAgreementTerms,
-            IndexingAgreementTermsMetadata,
+            IndexingAgreementTermsMetadata, StubAgreementRegistry,
         },
     };
+
+    /// Panic-by-default registry: fine for every test that never exercises
+    /// the missing-hash recovery path (the only registry call dispatch makes).
+    struct StubRegistry;
+    impl StubAgreementRegistry for StubRegistry {}
+
+    /// Records `update_terms_version_hash` calls for the recovery tests.
+    #[derive(Default)]
+    struct RecordingRegistry {
+        persisted_hashes: Mutex<Vec<(IndexingAgreementId, [u8; 32])>>,
+    }
+
+    #[async_trait]
+    impl StubAgreementRegistry for RecordingRegistry {
+        async fn update_terms_version_hash(
+            &self,
+            id: &IndexingAgreementId,
+            hash: &[u8; 32],
+        ) -> crate::registry::Result<()> {
+            self.persisted_hashes.lock().unwrap().push((*id, *hash));
+            Ok(())
+        }
+    }
 
     /// (collector, agreement_id, version_hash, options) per manager cancel.
     type ManagerCancelArgs = (Address, [u8; 16], B256, u16);
@@ -88,11 +148,15 @@ mod tests {
     /// Records which on-chain cancel ran and with what arguments.
     /// `still_active_after_cancel` is the post-cancel verification read result;
     /// `active_reads` counts how many times that read fired.
+    /// `on_chain_version_hash` is what a `fetch_agreement_version_hash` recovery
+    /// read returns; `version_hash_reads` counts how many times it fired.
     #[derive(Default)]
     struct RecordingChainClient {
         manager_cancels: Mutex<Vec<ManagerCancelArgs>>,
         still_active_after_cancel: bool,
         active_reads: Mutex<u32>,
+        on_chain_version_hash: Option<B256>,
+        version_hash_reads: Mutex<u32>,
     }
 
     #[async_trait]
@@ -141,6 +205,14 @@ mod tests {
         ) -> Result<bool, ChainClientError> {
             *self.active_reads.lock().unwrap() += 1;
             Ok(self.still_active_after_cancel)
+        }
+
+        async fn fetch_agreement_version_hash(
+            &self,
+            _agreement_id: &[u8; 16],
+        ) -> Result<Option<B256>, ChainClientError> {
+            *self.version_hash_reads.lock().unwrap() += 1;
+            Ok(self.on_chain_version_hash)
         }
     }
 
@@ -224,7 +296,7 @@ mod tests {
             Some(vec![7u8; 32]),
         );
 
-        cancel_agreement_on_chain(&client, &ag, &manager_conf(collector))
+        cancel_agreement_on_chain(&client, &StubRegistry, &ag, &manager_conf(collector))
             .await
             .expect("cancel dispatch");
 
@@ -246,7 +318,7 @@ mod tests {
         let client = RecordingChainClient::default();
         let ag = agreement(IndexingAgreementStatus::Rejected, Some(vec![9u8; 32]));
 
-        cancel_agreement_on_chain(&client, &ag, &manager_conf(Address::ZERO))
+        cancel_agreement_on_chain(&client, &StubRegistry, &ag, &manager_conf(Address::ZERO))
             .await
             .expect("cancel dispatch");
 
@@ -263,9 +335,10 @@ mod tests {
         let client = RecordingChainClient::default();
         let ag = agreement(IndexingAgreementStatus::AcceptedOnChain, None);
 
-        let err = cancel_agreement_on_chain(&client, &ag, &manager_conf(Address::ZERO))
-            .await
-            .unwrap_err();
+        let err =
+            cancel_agreement_on_chain(&client, &StubRegistry, &ag, &manager_conf(Address::ZERO))
+                .await
+                .unwrap_err();
 
         assert!(matches!(
             err,
@@ -283,9 +356,10 @@ mod tests {
             Some(vec![1u8; 16]),
         );
 
-        let err = cancel_agreement_on_chain(&client, &ag, &manager_conf(Address::ZERO))
-            .await
-            .unwrap_err();
+        let err =
+            cancel_agreement_on_chain(&client, &StubRegistry, &ag, &manager_conf(Address::ZERO))
+                .await
+                .unwrap_err();
 
         assert!(matches!(
             err,
@@ -308,9 +382,10 @@ mod tests {
             Some(vec![7u8; 32]),
         );
 
-        let err = cancel_agreement_on_chain(&client, &ag, &manager_conf(Address::ZERO))
-            .await
-            .unwrap_err();
+        let err =
+            cancel_agreement_on_chain(&client, &StubRegistry, &ag, &manager_conf(Address::ZERO))
+                .await
+                .unwrap_err();
 
         assert!(matches!(err, ChainClientError::CancelNotConfirmed { .. }));
         assert_eq!(client.manager_cancels.lock().unwrap().len(), 1);
@@ -330,12 +405,73 @@ mod tests {
             Some(vec![7u8; 32]),
         );
 
-        let out = cancel_agreement_on_chain(&client, &ag, &manager_conf(Address::ZERO))
-            .await
-            .expect("cancel confirmed");
+        let out =
+            cancel_agreement_on_chain(&client, &StubRegistry, &ag, &manager_conf(Address::ZERO))
+                .await
+                .expect("cancel confirmed");
 
         assert!(out.is_some());
         assert_eq!(client.manager_cancels.lock().unwrap().len(), 1);
         assert_eq!(*client.active_reads.lock().unwrap(), 1, "verified once");
+    }
+
+    #[tokio::test]
+    async fn manager_cancel_recovers_missing_hash_from_chain_and_persists_it() {
+        // #638 item 3: a row with no local terms_version_hash (e.g. pre-migration)
+        // must not be permanently uncancelable. If the RecurringCollector still
+        // has the hash on record, recover it from there, use it for this cancel,
+        // and best-effort persist it so future cancels don't need to re-fetch.
+        let recovered_hash = B256::from_slice(&[3u8; 32]);
+        let client = RecordingChainClient {
+            on_chain_version_hash: Some(recovered_hash),
+            still_active_after_cancel: false,
+            ..Default::default()
+        };
+        let registry = RecordingRegistry::default();
+        let ag = agreement(IndexingAgreementStatus::AcceptedOnChain, None);
+
+        let out = cancel_agreement_on_chain(&client, &registry, &ag, &manager_conf(Address::ZERO))
+            .await
+            .expect("recovered hash unblocks the cancel");
+
+        assert!(out.is_some());
+        assert_eq!(
+            *client.version_hash_reads.lock().unwrap(),
+            1,
+            "recovery read fired once"
+        );
+        let calls = client.manager_cancels.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].2, recovered_hash, "cancel used the recovered hash");
+
+        let persisted = registry.persisted_hashes.lock().unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0], (ag.id, *recovered_hash));
+    }
+
+    #[tokio::test]
+    async fn manager_cancel_missing_hash_with_nothing_on_chain_is_still_missing_hash_error() {
+        // The contract itself has no versionHash on record either (e.g. the
+        // agreement was never offered) — recovery has nothing to recover, so
+        // this must still surface as MissingTermsVersionHash, not attempt a
+        // cancel with a zero hash.
+        let client = RecordingChainClient {
+            on_chain_version_hash: None,
+            ..Default::default()
+        };
+        let registry = RecordingRegistry::default();
+        let ag = agreement(IndexingAgreementStatus::AcceptedOnChain, None);
+
+        let err = cancel_agreement_on_chain(&client, &registry, &ag, &manager_conf(Address::ZERO))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ChainClientError::MissingTermsVersionHash { .. }
+        ));
+        assert_eq!(*client.version_hash_reads.lock().unwrap(), 1);
+        assert!(client.manager_cancels.lock().unwrap().is_empty());
+        assert!(registry.persisted_hashes.lock().unwrap().is_empty());
     }
 }

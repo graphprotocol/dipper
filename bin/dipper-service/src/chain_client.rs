@@ -119,6 +119,18 @@ pub trait ChainClient {
         agreement_id: &[u8; 16],
     ) -> Result<bool, ChainClientError>;
 
+    /// Read the authoritative `versionHash` the RecurringCollector stored for
+    /// this agreement via `getAgreementDetails(id, VERSION_CURRENT)`. Returns
+    /// `None` if the contract has no hash on record (a zero `versionHash` —
+    /// the agreement was never offered, or the id is unknown), `Some(hash)`
+    /// otherwise. Used to recover a `terms_version_hash` missing locally
+    /// (e.g. a row from before the column existed) instead of leaving the
+    /// agreement permanently uncancelable.
+    async fn fetch_agreement_version_hash(
+        &self,
+        agreement_id: &[u8; 16],
+    ) -> Result<Option<B256>, ChainClientError>;
+
     /// Read the latest block's unix timestamp from the chain. Lets agreement
     /// deadlines be stamped from live chain time when the chain-clock bypass is
     /// on, instead of a cached listener timestamp that can lag a fast chain.
@@ -163,6 +175,13 @@ impl<T: ChainClient + Send + Sync + ?Sized> ChainClient for Arc<T> {
         agreement_id: &[u8; 16],
     ) -> Result<bool, ChainClientError> {
         (**self).agreement_still_active(agreement_id).await
+    }
+
+    async fn fetch_agreement_version_hash(
+        &self,
+        agreement_id: &[u8; 16],
+    ) -> Result<Option<B256>, ChainClientError> {
+        (**self).fetch_agreement_version_hash(agreement_id).await
     }
 
     async fn latest_block_timestamp(&self) -> Result<u64, ChainClientError> {

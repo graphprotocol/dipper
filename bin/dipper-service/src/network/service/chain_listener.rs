@@ -1064,6 +1064,7 @@ where
         let mut on_chain_cancel_tx: Option<String> = None;
         match crate::cancel_dispatch::cancel_agreement_on_chain(
             chain_client,
+            registry,
             &old_agreement,
             config,
         )
@@ -1213,8 +1214,13 @@ async fn sweep_orphan_canceled_agreements<R, T>(
 
     for agreement in orphans {
         let mut on_chain_cancel_tx: Option<String> = None;
-        match crate::cancel_dispatch::cancel_agreement_on_chain(chain_client, &agreement, config)
-            .await
+        match crate::cancel_dispatch::cancel_agreement_on_chain(
+            chain_client,
+            registry,
+            &agreement,
+            config,
+        )
+        .await
         {
             Ok(Some(tx_hash)) => {
                 tracing::info!(
@@ -2070,6 +2076,14 @@ mod tests {
             Ok(())
         }
 
+        async fn update_terms_version_hash(
+            &self,
+            _id: &IndexingAgreementId,
+            _hash: &[u8; 32],
+        ) -> RegistryResult<()> {
+            Ok(())
+        }
+
         async fn mark_indexing_agreement_as_canceled_by_requester(
             &self,
             id: &IndexingAgreementId,
@@ -2473,6 +2487,18 @@ mod tests {
             // Cancel dispatch always reads back after a mined cancel; reporting
             // not-active here means "cancel confirmed", which these tests expect.
             Ok(false)
+        }
+
+        async fn fetch_agreement_version_hash(
+            &self,
+            _agreement_id: &[u8; 16],
+        ) -> Result<
+            Option<thegraph_core::alloy::primitives::B256>,
+            crate::chain_client::ChainClientError,
+        > {
+            // These tests always construct agreements with a stored hash, so
+            // recovery is never exercised.
+            unimplemented!("not exercised by chain_listener tests")
         }
     }
 

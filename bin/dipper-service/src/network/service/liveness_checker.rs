@@ -492,8 +492,13 @@ async fn cancel_and_reassess<R, W, C>(
 {
     // 1. Cancel on-chain (mode-aware dispatch)
     let mut on_chain_cancel_tx: Option<String> = None;
-    match crate::cancel_dispatch::cancel_agreement_on_chain(chain_client, agreement, agreement_conf)
-        .await
+    match crate::cancel_dispatch::cancel_agreement_on_chain(
+        chain_client,
+        registry,
+        agreement,
+        agreement_conf,
+    )
+    .await
     {
         Ok(Some(tx_hash)) => {
             tracing::info!(
@@ -1188,6 +1193,15 @@ mod tests {
             // Cancel dispatch reads back after a mined cancel; reporting
             // not-active means "cancel confirmed", which these tests expect.
             Ok(false)
+        }
+
+        async fn fetch_agreement_version_hash(
+            &self,
+            _agreement_id: &[u8; 16],
+        ) -> Result<Option<B256>, ChainClientError> {
+            // These tests always construct agreements with a stored hash, so
+            // recovery is never exercised.
+            unimplemented!("not exercised by liveness_checker tests")
         }
     }
 

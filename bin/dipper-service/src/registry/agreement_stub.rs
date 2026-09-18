@@ -129,6 +129,14 @@ pub trait StubAgreementRegistry: Send + Sync {
         unimplemented!("update_offer_tx_hash")
     }
 
+    async fn update_terms_version_hash(
+        &self,
+        _id: &IndexingAgreementId,
+        _hash: &[u8; 32],
+    ) -> Result<()> {
+        unimplemented!("update_terms_version_hash")
+    }
+
     async fn mark_indexing_agreement_as_canceled_by_requester(
         &self,
         _id: &IndexingAgreementId,
@@ -414,6 +422,14 @@ impl<T: StubAgreementRegistry> AgreementRegistry for T {
         tx_hash: &[u8; 32],
     ) -> Result<()> {
         StubAgreementRegistry::update_offer_tx_hash(self, id, tx_hash).await
+    }
+
+    async fn update_terms_version_hash(
+        &self,
+        id: &IndexingAgreementId,
+        hash: &[u8; 32],
+    ) -> Result<()> {
+        StubAgreementRegistry::update_terms_version_hash(self, id, hash).await
     }
 
     async fn mark_indexing_agreement_as_canceled_by_requester(

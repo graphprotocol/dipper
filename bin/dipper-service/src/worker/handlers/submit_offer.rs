@@ -271,6 +271,12 @@ mod tests {
         ) -> Result<bool, ChainClientError> {
             unimplemented!()
         }
+        async fn fetch_agreement_version_hash(
+            &self,
+            _agreement_id: &[u8; 16],
+        ) -> Result<Option<B256>, ChainClientError> {
+            unimplemented!()
+        }
         async fn latest_block_timestamp(&self) -> Result<u64, ChainClientError> {
             unimplemented!()
         }
