@@ -8,7 +8,9 @@ use thegraph_core::alloy::primitives::{Address, U256};
 use tokio::{sync::mpsc, time::MissedTickBehavior};
 
 use crate::{
-    chain_client::{ChainClient, ChainClientError, EscrowAccount, ManagerEscrowReader},
+    chain_client::{
+        ChainClient, ChainClientError, EscrowAccount, ManagerEscrowReader, TrackedProviders,
+    },
     config::{EscrowReconcilerConfig, IndexingAgreementConfig},
 };
 
@@ -176,11 +178,16 @@ async fn providers_due<T>(
 where
     T: ChainClient + ManagerEscrowReader,
 {
-    let providers = chain_client.tracked_providers(collector).await?;
+    let TrackedProviders {
+        providers,
+        complete,
+    } = chain_client.tracked_providers(collector).await?;
     let now = chain_client.latest_block_timestamp().await?;
     let (from, to) = schedule.window(now, config.interval);
-    let tracked: HashSet<Address> = providers.iter().copied().collect();
-    schedule.owed.retain(|provider| tracked.contains(provider));
+    if complete {
+        let tracked: HashSet<Address> = providers.iter().copied().collect();
+        schedule.owed.retain(|provider| tracked.contains(provider));
+    }
 
     let mut due = Vec::new();
     let mut rebalances = Vec::new();
@@ -201,7 +208,11 @@ where
             }
         }
     }
-    schedule.covered_until = Some(to);
+    // A short list may have missed a provider whose slot is in this window, so cover it
+    // again next sweep; a provider listed now may then get 1 extra rebalance.
+    if complete {
+        schedule.covered_until = Some(to);
+    }
 
     due.extend(rebalances);
     let deferred = cap(&mut due, config.batch_size);
@@ -346,6 +357,8 @@ mod tests {
         stall: bool,
         /// Never answer the provider list, like a hung RPC endpoint.
         stall_reads: bool,
+        /// Report the provider list as cut short.
+        incomplete: bool,
     }
 
     impl FakeManager {
@@ -367,12 +380,15 @@ mod tests {
         async fn tracked_providers(
             &self,
             _collector: Address,
-        ) -> Result<Vec<Address>, ChainClientError> {
+        ) -> Result<TrackedProviders, ChainClientError> {
             *self.reads.lock().unwrap() += 1;
             if self.stall_reads {
                 std::future::pending::<()>().await;
             }
-            Ok(self.order.clone())
+            Ok(TrackedProviders {
+                providers: self.order.clone(),
+                complete: !self.incomplete,
+            })
         }
 
         async fn escrow_account(
@@ -617,6 +633,62 @@ mod tests {
             .await
             .unwrap();
         assert!(third.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_short_provider_list_keeps_what_a_missing_provider_is_owed() {
+        //* Arrange - `a` is owed a rebalance, then a read of the list stops before it
+        let (a, b) = (Address::repeat_byte(0x11), Address::repeat_byte(0x22));
+        let mut manager = FakeManager::with(vec![(b, settled()), (a, settled())]);
+        let config = no_rebalance();
+        let mut schedule = RebalanceSchedule {
+            covered_until: Some(NOW),
+            owed: HashSet::from([a]),
+        };
+        manager.order = vec![b];
+        manager.incomplete = true;
+        providers_due(&manager, Address::ZERO, &config, &mut schedule)
+            .await
+            .unwrap();
+
+        //* Act - the next read gets the whole list
+        manager.order = vec![b, a];
+        manager.incomplete = false;
+        let due = providers_due(&manager, Address::ZERO, &config, &mut schedule)
+            .await
+            .unwrap();
+
+        //* Assert
+        assert_eq!(due, vec![(a, Reason::Rebalance)]);
+    }
+
+    #[tokio::test]
+    async fn a_short_provider_list_leaves_its_window_for_the_next_sweep() {
+        //* Arrange - every provider's slot falls in this window, but the read misses `a`
+        let (a, b) = (Address::repeat_byte(0x11), Address::repeat_byte(0x22));
+        let mut manager = FakeManager::with(vec![(b, settled()), (a, settled())]);
+        let config = config(Duration::from_secs(600), Duration::from_secs(600), 500);
+        let mut schedule = RebalanceSchedule {
+            covered_until: Some(NOW - 600),
+            owed: HashSet::new(),
+        };
+        manager.order = vec![b];
+        manager.incomplete = true;
+        let short = providers_due(&manager, Address::ZERO, &config, &mut schedule)
+            .await
+            .unwrap();
+        assert_eq!(short, vec![(b, Reason::Rebalance)]);
+        schedule.settle(&[b], &[]);
+
+        //* Act - the next read gets the whole list
+        manager.order = vec![b, a];
+        manager.incomplete = false;
+        let due = providers_due(&manager, Address::ZERO, &config, &mut schedule)
+            .await
+            .unwrap();
+
+        //* Assert - `a` gets its slot, and `b` an extra rebalance
+        assert_eq!(due, vec![(b, Reason::Rebalance), (a, Reason::Rebalance)]);
     }
 
     #[tokio::test]
