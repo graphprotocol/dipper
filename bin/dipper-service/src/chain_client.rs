@@ -195,14 +195,24 @@ pub struct EscrowAccount {
     pub thaw_end_timestamp: U256,
 }
 
+/// The providers the RecurringAgreementManager tracks, as read one entry at a time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackedProviders {
+    pub providers: Vec<Address>,
+    /// False when the list changed or a read failed part way, so some may be missing.
+    pub complete: bool,
+}
+
 /// Reads of the RecurringAgreementManager's escrow records, so the escrow reconciler
 /// sends a transaction only when one would change something. Kept apart from
 /// [`ChainClient`] so only the reconciler and its tests need to provide it.
 #[async_trait]
 pub trait ManagerEscrowReader {
     /// Providers the manager tracks escrow for under `collector`.
-    async fn tracked_providers(&self, collector: Address)
-    -> Result<Vec<Address>, ChainClientError>;
+    async fn tracked_providers(
+        &self,
+        collector: Address,
+    ) -> Result<TrackedProviders, ChainClientError>;
 
     /// The manager's escrow account with `provider` under `collector`.
     async fn escrow_account(
@@ -239,7 +249,7 @@ impl<T: ManagerEscrowReader + Send + Sync + ?Sized> ManagerEscrowReader for Arc<
     async fn tracked_providers(
         &self,
         collector: Address,
-    ) -> Result<Vec<Address>, ChainClientError> {
+    ) -> Result<TrackedProviders, ChainClientError> {
         (**self).tracked_providers(collector).await
     }
 

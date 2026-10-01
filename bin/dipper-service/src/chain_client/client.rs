@@ -31,7 +31,9 @@ use super::{
     rpc_provider::RpcProviderPool,
 };
 use crate::{
-    chain_client::{ChainClient, ChainClientError, EscrowAccount, ManagerEscrowReader},
+    chain_client::{
+        ChainClient, ChainClientError, EscrowAccount, ManagerEscrowReader, TrackedProviders,
+    },
     config::ChainClientConfig,
     worker::service::PROCESS_JOB_TIMEOUT,
 };
@@ -866,7 +868,7 @@ impl ManagerEscrowReader for AlloyChainClient {
     async fn tracked_providers(
         &self,
         collector: Address,
-    ) -> Result<Vec<Address>, ChainClientError> {
+    ) -> Result<TrackedProviders, ChainClientError> {
         let manager = self.inner.recurring_agreement_manager_address;
         let count = self
             .view(
@@ -880,10 +882,11 @@ impl ManagerEscrowReader for AlloyChainClient {
         })?;
 
         // Each read sees the latest block (pruned nodes refuse older state), so the list
-        // can change mid-read: an entry can turn up twice or the list can end early. A
-        // provider missed here is read again next sweep.
+        // can change mid-read: an entry can turn up twice or the list can end early, and
+        // either means another entry may have been missed.
         let mut providers = Vec::new();
         let mut seen = HashSet::new();
+        let mut complete = true;
         for index in 0..count {
             let read = self
                 .view(
@@ -899,6 +902,8 @@ impl ManagerEscrowReader for AlloyChainClient {
                 Ok(provider) => {
                     if seen.insert(provider) {
                         providers.push(provider);
+                    } else {
+                        complete = false;
                     }
                 }
                 Err(err) => {
@@ -908,11 +913,15 @@ impl ManagerEscrowReader for AlloyChainClient {
                         error = %err,
                         "Failed to read a provider from the manager's list; using those read so far"
                     );
+                    complete = false;
                     break;
                 }
             }
         }
-        Ok(providers)
+        Ok(TrackedProviders {
+            providers,
+            complete,
+        })
     }
 
     async fn escrow_account(
@@ -2008,18 +2017,21 @@ mod tests {
     async fn reads_the_providers_and_escrow_the_manager_tracks() {
         let (client, _server) = client_over_manager(ManagerViewsResponder::default()).await;
 
-        let providers = client
+        let tracked = client
             .tracked_providers(Address::repeat_byte(0x11))
             .await
             .expect("providers");
         let account = client
-            .escrow_account(Address::repeat_byte(0x11), providers[0])
+            .escrow_account(Address::repeat_byte(0x11), tracked.providers[0])
             .await
             .expect("escrow account");
 
         assert_eq!(
-            providers,
-            vec![Address::repeat_byte(0x10), Address::repeat_byte(0x11)]
+            tracked,
+            TrackedProviders {
+                providers: vec![Address::repeat_byte(0x10), Address::repeat_byte(0x11)],
+                complete: true,
+            }
         );
         assert_eq!(
             account,
@@ -2093,15 +2105,22 @@ mod tests {
         })
         .await;
 
-        let providers = client
+        let tracked = client
             .tracked_providers(Address::repeat_byte(0x11))
             .await
             .expect("the providers read before the failure");
 
-        assert_eq!(providers, vec![Address::repeat_byte(0x10)]);
+        assert_eq!(
+            tracked,
+            TrackedProviders {
+                providers: vec![Address::repeat_byte(0x10)],
+                complete: false,
+            }
+        );
     }
 
-    /// An entry can move within the list mid-read and turn up twice; list it once.
+    /// An entry can move within the list mid-read and turn up twice; list it once, and
+    /// report the list as incomplete, since the move may have hidden another entry.
     #[tokio::test]
     async fn tracked_providers_lists_a_provider_read_twice_once() {
         let (client, _server) = client_over_manager(ManagerViewsResponder {
@@ -2113,14 +2132,17 @@ mod tests {
         })
         .await;
 
-        let providers = client
+        let tracked = client
             .tracked_providers(Address::repeat_byte(0x11))
             .await
             .expect("providers");
 
         assert_eq!(
-            providers,
-            vec![Address::repeat_byte(0x10), Address::repeat_byte(0x11)]
+            tracked,
+            TrackedProviders {
+                providers: vec![Address::repeat_byte(0x10), Address::repeat_byte(0x11)],
+                complete: false,
+            }
         );
     }
 }
