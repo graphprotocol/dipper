@@ -641,13 +641,17 @@ where
     let mut directly_cancelled = 0u32;
     let mut cancel_failures = 0u32;
     for old_agreement in old_iter {
-        // Skip agreements that haven't been accepted on-chain yet -- there is
-        // nothing on the contract to cancel. The local row goes straight to
-        // CanceledByRequester so the indexer never picks it up.
-        let needs_on_chain_cancel = matches!(
+        // A Created agreement's offer may already be on-chain, where the indexer
+        // can still accept it, so it is cancelled on-chain too: the cancel revokes
+        // a pending offer and does nothing when none was made. Rows without a
+        // stored terms hash can't be cancelled on-chain and are only marked locally.
+        let was_accepted = matches!(
             old_agreement.status,
             crate::registry::IndexingAgreementStatus::AcceptedOnChain
         );
+        let needs_on_chain_cancel = was_accepted
+            || (old_agreement.status == crate::registry::IndexingAgreementStatus::Created
+                && old_agreement.terms_version_hash.is_some());
 
         let mut on_chain_cancel_tx: Option<String> = None;
         if needs_on_chain_cancel {
@@ -711,10 +715,10 @@ where
 
         // Record the cancel audit for the accepted-on-chain agreements dipper just
         // cancelled, so the chain_listener's `terminated` sweep announces them
-        // durably. Never-accepted agreements (`!needs_on_chain_cancel`) were never
-        // live on-chain: they are not sweep-eligible (`accepted_at IS NULL`) and
+        // durably. Never-accepted agreements (`!was_accepted`) were never live
+        // on-chain: they are not sweep-eligible (`accepted_at IS NULL`) and
         // correctly emit nothing.
-        if needs_on_chain_cancel {
+        if was_accepted {
             let manager = ctx.agreement_conf.recurring_agreement_manager().to_string();
             if let Err(err) = ctx
                 .registry
@@ -1043,9 +1047,12 @@ mod lifecycle_event_tests {
 
     // ---- Mock: chain client --------------------------------------------------
 
-    /// Always reports a successful cancel that the post-cancel read confirms.
-    #[derive(Default)]
-    struct MockChainClient;
+    /// Always reports a successful cancel that the post-cancel read confirms, and
+    /// records the id of every agreement it was asked to cancel.
+    #[derive(Default, Clone)]
+    struct MockChainClient {
+        cancelled: Arc<Mutex<Vec<[u8; 16]>>>,
+    }
 
     #[async_trait]
     impl ChainClient for MockChainClient {
@@ -1065,10 +1072,11 @@ mod lifecycle_event_tests {
         async fn cancel_via_manager(
             &self,
             _collector: Address,
-            _agreement_id: &[u8; 16],
+            agreement_id: &[u8; 16],
             _version_hash: B256,
             _options: u16,
         ) -> std::result::Result<Option<B256>, ChainClientError> {
+            self.cancelled.lock().unwrap().push(*agreement_id);
             Ok(Some(B256::repeat_byte(0xcd)))
         }
 
@@ -1573,7 +1581,7 @@ mod lifecycle_event_tests {
                 selected: vec![selected(new_idx)],
             },
             MockQueue::default(),
-            MockChainClient,
+            MockChainClient::default(),
             events.clone(),
             snapshot,
         );
@@ -1626,7 +1634,7 @@ mod lifecycle_event_tests {
                 selected: vec![selected(new_idx)],
             },
             MockQueue::default(),
-            MockChainClient,
+            MockChainClient::default(),
             events.clone(),
             snapshot,
         );
@@ -1673,7 +1681,7 @@ mod lifecycle_event_tests {
                 selected: vec![selected(idx)],
             },
             MockQueue::default(),
-            MockChainClient,
+            MockChainClient::default(),
             events.clone(),
             indexer_urls::Snapshot::new(),
         );
@@ -1709,7 +1717,7 @@ mod lifecycle_event_tests {
                 selected: vec![selected(idx)],
             },
             MockQueue::default(),
-            MockChainClient,
+            MockChainClient::default(),
             events.clone(),
             indexer_urls::Snapshot::new(),
         );
@@ -1734,7 +1742,7 @@ mod lifecycle_event_tests {
             MockRegistry::default(),       // no current agreements, latch false
             MockIisa { selected: vec![] }, // zero available
             MockQueue::default(),
-            MockChainClient,
+            MockChainClient::default(),
             events.clone(),
             indexer_urls::Snapshot::new(),
         );
@@ -1777,7 +1785,7 @@ mod lifecycle_event_tests {
             registry,
             MockIisa { selected: vec![] }, // IISA returns nothing -> coverage drops
             MockQueue::default(),
-            MockChainClient,
+            MockChainClient::default(),
             events.clone(),
             indexer_urls::Snapshot::new(),
         );
@@ -1832,7 +1840,7 @@ mod lifecycle_event_tests {
                 selected: vec![selected(new_idx)],
             },
             queue.clone(),
-            MockChainClient,
+            MockChainClient::default(),
             events.clone(),
             snapshot,
         );
@@ -1871,7 +1879,7 @@ mod lifecycle_event_tests {
         // Both old agreements were never accepted on-chain (Created). One add
         // pairs with the first old agreement; the second, unpaired old agreement
         // reaches the cancel loop but, being never-accepted
-        // (`!needs_on_chain_cancel`), must NOT emit `terminated`. The add still
+        // (`!was_accepted`), must NOT emit `terminated`. The add still
         // emits `proposed`. Net: exactly one event, a `proposed`.
         let new_idx = indexer_id(0x44);
         let old_paired = indexer_id(0x55);
@@ -1896,7 +1904,7 @@ mod lifecycle_event_tests {
                 selected: vec![selected(new_idx)],
             },
             MockQueue::default(),
-            MockChainClient,
+            MockChainClient::default(),
             events.clone(),
             snapshot,
         );
@@ -1910,6 +1918,34 @@ mod lifecycle_event_tests {
             "only Proposed; never-accepted unpaired cancel emits no Terminated: {captured:?}"
         );
         assert!(matches!(captured[0], CapturedEvent::Proposed { .. }));
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_unaccepted_agreement_revokes_its_offer_on_chain() {
+        // A Created agreement's offer can already be on-chain, where the indexer
+        // can still accept it. Cancelling the request must revoke that offer, not
+        // only mark the local row cancelled.
+        let leaving = agreement(indexer_id(0x11), IndexingAgreementStatus::Created);
+        let leaving_id = *leaving.id.as_bytes();
+        let chain_client = MockChainClient::default();
+        let registry = MockRegistry {
+            active_agreements: vec![leaving],
+            accepted_count: 0,
+            chain_state_lookup_fails: false,
+            shortfall_active: std::sync::Mutex::new(false),
+        };
+        let ctx = build_ctx(
+            registry,
+            MockIisa { selected: vec![] },
+            MockQueue::default(),
+            chain_client.clone(),
+            CapturingEventsProducer::new(),
+            indexer_urls::Snapshot::new(),
+        );
+
+        handle(ctx, &test_message(0)).await.expect("handler ok");
+
+        assert_eq!(*chain_client.cancelled.lock().unwrap(), vec![leaving_id]);
     }
 }
 
