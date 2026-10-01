@@ -83,7 +83,13 @@ where
                 _ = timer.tick() => {},
             }
 
-            let due = match providers_due(&chain_client, collector, &config).await {
+            // Reading every provider's escrow takes a few RPC calls each, so let a stop
+            // request cut it short rather than hold up shutdown.
+            let read = tokio::select! {
+                _ = rx_stop.recv() => break,
+                read = providers_due(&chain_client, collector, &config) => read,
+            };
+            let due = match read {
                 Ok(due) => due,
                 Err(err) => {
                     tracing::error!(error = %err, "failed to read the manager's escrow for reconciliation");
@@ -282,6 +288,8 @@ mod tests {
         calls: Arc<Mutex<Vec<Address>>>,
         /// Never finish a reconcile, like one stuck waiting for its receipt.
         stall: bool,
+        /// Never answer the provider list, like a hung RPC endpoint.
+        stall_reads: bool,
     }
 
     impl FakeManager {
@@ -305,6 +313,9 @@ mod tests {
             _collector: Address,
         ) -> Result<Vec<Address>, ChainClientError> {
             *self.reads.lock().unwrap() += 1;
+            if self.stall_reads {
+                std::future::pending::<()>().await;
+            }
             Ok(self.order.clone())
         }
 
@@ -574,6 +585,30 @@ mod tests {
         assert_eq!(manager.calls(), vec![finished]);
 
         handle.stop().await;
+        service.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_interrupts_a_sweep_still_reading_the_manager() {
+        //* Arrange - the sweep starts, then hangs reading the provider list
+        let manager = FakeManager {
+            stall_reads: true,
+            ..Default::default()
+        };
+        let (handle, service) = new(Ctx {
+            chain_client: manager.clone(),
+            config: no_rebalance(),
+            collector: Address::ZERO,
+        });
+        let service = tokio::spawn(service);
+        tokio::time::sleep(Duration::from_secs(601)).await;
+        assert_eq!(*manager.reads.lock().unwrap(), 1, "the sweep is reading");
+
+        //* Act
+        let stopped = tokio::time::timeout(Duration::from_secs(5), handle.stop()).await;
+
+        //* Assert - shutdown gives each service only a few seconds to stop
+        assert!(stopped.is_ok(), "the reconciler ignored the stop");
         service.await.unwrap().unwrap();
     }
 }
