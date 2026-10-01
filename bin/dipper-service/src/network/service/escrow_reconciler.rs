@@ -341,6 +341,7 @@ where
     let checks = limit.min(total);
 
     let mut ended = Vec::new();
+    let mut seen = HashSet::new();
     let mut checked = 0;
     while checked < checks {
         if max_ended.is_some_and(|max| ended.len() >= max) {
@@ -363,6 +364,10 @@ where
                 continue;
             }
         };
+        // The list can shift between reads, so the same agreement can turn up twice.
+        if !seen.insert(id) {
+            continue;
+        }
         match chain_client.max_next_claim(collector, &id).await {
             Ok(claim) if claim.is_zero() => ended.push(id),
             Ok(_) => {}
@@ -1030,6 +1035,27 @@ mod tests {
         .await;
 
         assert_eq!(ended, vec![[0xe1; 16]]);
+    }
+
+    /// The manager's list can shift between reads, so the same agreement can turn up twice.
+    #[tokio::test]
+    async fn an_agreement_read_twice_is_released_once() {
+        let provider = Address::repeat_byte(0x11);
+        let manager = FakeManager::with(vec![(provider, settled())])
+            .tracking(vec![(provider, [0xe0; 16], 0), (provider, [0xe0; 16], 0)]);
+        let mut cursor = 0;
+
+        let ended = ended_agreements(
+            &manager,
+            Address::ZERO,
+            &manager.order,
+            &mut cursor,
+            500,
+            None,
+        )
+        .await;
+
+        assert_eq!(ended, vec![[0xe0; 16]]);
     }
 
     #[tokio::test]
