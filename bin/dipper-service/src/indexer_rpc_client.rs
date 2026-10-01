@@ -143,10 +143,14 @@ impl DipsIndexerClient {
             .map_err(|err| DipsError::ConnectionError(err.into()))?
             .connect_timeout(self.connect_timeout)
             .timeout(self.request_timeout);
-        // An endpoint built from a URL string leaves TLS off, even for https.
+        // An endpoint built from a URL string leaves TLS off, even for https. The
+        // handshake gets its own timeout: neither of the endpoint's timeouts covers it.
         if indexer_url.scheme() == "https" {
+            let tls = ClientTlsConfig::new()
+                .with_enabled_roots()
+                .timeout(self.connect_timeout);
             endpoint = endpoint
-                .tls_config(ClientTlsConfig::new().with_enabled_roots())
+                .tls_config(tls)
                 .map_err(|err| DipsError::ConnectionError(err.into()))?;
         }
         let channel = endpoint.connect_lazy();
@@ -664,6 +668,42 @@ mod tests {
 
         //* Assert - 0x16 opens a TLS handshake record (the ClientHello)
         assert_eq!(bytes, [0x16]);
+    }
+
+    #[tokio::test]
+    async fn test_https_handshake_with_a_silent_indexer_times_out() {
+        //* Arrange - a port that accepts the connection but never answers
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("https://{}/", listener.local_addr().unwrap())).unwrap();
+        let silent = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let mut client = DipsIndexerClient {
+            request_timeout: Duration::from_secs(600),
+            ..signing_test_client(PrivateKeySigner::random())
+        }
+        .get_client(&url)
+        .unwrap();
+        let request = rpc::SubmitAgreementProposalRequest {
+            version: 2,
+            signed_rca: vec![],
+        };
+
+        //* Act
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.submit_agreement_proposal(request),
+        )
+        .await;
+        silent.abort();
+
+        //* Assert - the 1s connect timeout bounds the handshake, not the 600s request timeout
+        assert!(
+            result
+                .expect("the handshake should give up within 10s")
+                .is_err()
+        );
     }
 
     #[tokio::test]
