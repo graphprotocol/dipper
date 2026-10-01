@@ -1,5 +1,5 @@
-//! Keeps the RecurringAgreementManager's escrow tidy. The manager only rebalances a
-//! provider when one of its agreements changes or is collected, so this sweep withdraws
+//! Keeps the RecurringAgreementManager's escrow tidy. The manager isn't told when an
+//! agreement ends without a collection, so this sweep drops ended agreements, withdraws
 //! finished thaws and rebalances each provider periodically, and only where needed.
 
 use std::{collections::HashSet, future::Future, time::Duration};
@@ -66,6 +66,7 @@ where
             interval_secs = config.interval.as_secs(),
             rebalance_interval_secs = config.rebalance_interval.as_secs(),
             batch_size = config.batch_size,
+            agreements_per_sweep = config.agreements_per_sweep,
             collector = %collector,
             "escrow reconciler service started"
         );
@@ -77,6 +78,7 @@ where
         );
         timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut schedule = RebalanceSchedule::default();
+        let mut agreement_cursor: u64 = 0;
 
         loop {
             tokio::select! {
@@ -84,11 +86,47 @@ where
                 _ = timer.tick() => {},
             }
 
-            // Reading every provider's escrow takes a few RPC calls each, so let a stop
-            // request cut it short rather than hold up shutdown.
+            // Each read below takes a few RPC calls per provider or agreement, so let a
+            // stop request cut them short rather than hold up shutdown.
+            let providers = tokio::select! {
+                _ = rx_stop.recv() => break,
+                providers = chain_client.tracked_providers(collector) => providers,
+            };
+            let providers = match providers {
+                Ok(providers) => providers,
+                Err(err) => {
+                    tracing::error!(error = %err, "failed to list the providers the manager tracks");
+                    continue;
+                }
+            };
+
+            let mut ended = tokio::select! {
+                _ = rx_stop.recv() => break,
+                ended = ended_agreements(
+                    &chain_client,
+                    collector,
+                    &providers,
+                    &mut agreement_cursor,
+                    config.agreements_per_sweep,
+                ) => ended,
+            };
+            cap(&mut ended, config.batch_size);
+            if !ended.is_empty() {
+                match release_agreements(&chain_client, &mut rx_stop, collector, ended).await {
+                    Outcome::Stopped => return Ok(()),
+                    Outcome::Done { succeeded, failed } => {
+                        tracing::info!(
+                            released = succeeded.len(),
+                            failed = failed.len(),
+                            "released ended agreements"
+                        );
+                    }
+                }
+            }
+
             let read = tokio::select! {
                 _ = rx_stop.recv() => break,
-                read = providers_due(&chain_client, collector, &config, &mut schedule) => read,
+                read = providers_due(&chain_client, collector, &providers, &config, &mut schedule) => read,
             };
             let due = match read {
                 Ok(due) => due,
@@ -170,13 +208,13 @@ impl RebalanceSchedule {
 async fn providers_due<T>(
     chain_client: &T,
     collector: Address,
+    providers: &[Address],
     config: &EscrowReconcilerConfig,
     schedule: &mut RebalanceSchedule,
 ) -> Result<Vec<(Address, Reason)>, ChainClientError>
 where
     T: ChainClient + ManagerEscrowReader,
 {
-    let providers = chain_client.tracked_providers(collector).await?;
     let now = chain_client.latest_block_timestamp().await?;
     let (from, to) = schedule.window(now, config.interval);
     let tracked: HashSet<Address> = providers.iter().copied().collect();
@@ -184,7 +222,7 @@ where
 
     let mut due = Vec::new();
     let mut rebalances = Vec::new();
-    for provider in providers {
+    for &provider in providers {
         if rebalance_due(provider, from, to, config.rebalance_interval) {
             schedule.owed.insert(provider);
         }
@@ -246,15 +284,132 @@ fn rebalance_due(provider: Address, from: u64, to: u64, rebalance: Duration) -> 
     to.saturating_add(offset) / period != from.saturating_add(offset) / period
 }
 
-/// Result of one sweep over the provider set.
-enum Outcome {
-    /// `rx_stop` fired mid-sweep; the caller should return.
+/// Result of one round of reconciles, over providers or agreements.
+enum Outcome<T> {
+    /// `rx_stop` fired mid-round; the caller should return.
     Stopped,
-    /// The sweep finished; the providers whose reconcile went through or failed.
-    Done {
-        succeeded: Vec<Address>,
-        failed: Vec<Address>,
-    },
+    /// The round finished; the items whose reconcile went through or failed.
+    Done { succeeded: Vec<T>, failed: Vec<T> },
+}
+
+/// Agreements the manager still counts against a provider although the collector says
+/// nothing more can be claimed on them. Checks at most `limit` tracked agreements, from
+/// `cursor` onwards, so a large set is covered over several sweeps; one that can't be
+/// read is left for a later sweep.
+async fn ended_agreements<T>(
+    chain_client: &T,
+    collector: Address,
+    providers: &[Address],
+    cursor: &mut u64,
+    limit: u64,
+) -> Vec<[u8; 16]>
+where
+    T: ManagerEscrowReader,
+{
+    let mut counts = Vec::with_capacity(providers.len());
+    for &provider in providers {
+        match chain_client
+            .tracked_agreement_count(collector, provider)
+            .await
+        {
+            Ok(count) => counts.push((provider, count)),
+            Err(err) => {
+                tracing::warn!(%provider, error = %err, "failed to count provider agreements; skipping it this sweep");
+            }
+        }
+    }
+    let total: u64 = counts.iter().map(|(_, count)| count).sum();
+    if total == 0 || limit == 0 {
+        return Vec::new();
+    }
+
+    let start = *cursor % total;
+    let checks = limit.min(total);
+    *cursor = (start + checks) % total;
+
+    let mut ended = Vec::new();
+    for step in 0..checks {
+        let (provider, index) = locate(&counts, (start + step) % total);
+        let id = match chain_client
+            .tracked_agreement_at(collector, provider, index)
+            .await
+        {
+            Ok(id) => id,
+            Err(err) => {
+                tracing::warn!(%provider, index, error = %err, "failed to read a tracked agreement");
+                continue;
+            }
+        };
+        match chain_client.max_next_claim(collector, &id).await {
+            Ok(claim) if claim.is_zero() => ended.push(id),
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(agreement_id = %hex_id(&id), error = %err, "failed to read an agreement's remaining claim");
+            }
+        }
+    }
+    ended
+}
+
+/// The provider and index for position `pos` when the providers' agreements are laid
+/// end to end. `pos` must be below the sum of the counts.
+fn locate(counts: &[(Address, u64)], mut pos: u64) -> (Address, u64) {
+    for &(provider, count) in counts {
+        if pos < count {
+            return (provider, pos);
+        }
+        pos -= count;
+    }
+    unreachable!("position beyond the agreements counted")
+}
+
+fn hex_id(id: &[u8; 16]) -> String {
+    format!(
+        "0x{}",
+        id.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    )
+}
+
+/// Call `reconcileAgreement` for each ended agreement, so the manager drops it and starts
+/// releasing its escrow. One failure never aborts the rest; a later sweep finds it again.
+async fn release_agreements<T>(
+    chain_client: &T,
+    rx_stop: &mut mpsc::Receiver<()>,
+    collector: Address,
+    agreements: Vec<[u8; 16]>,
+) -> Outcome<[u8; 16]>
+where
+    T: ChainClient,
+{
+    let mut succeeded = Vec::new();
+    let mut failed = Vec::new();
+
+    for id in agreements {
+        let result = tokio::select! {
+            _ = rx_stop.recv() => {
+                tracing::debug!("escrow reconciler stopping mid-release");
+                return Outcome::Stopped;
+            }
+            result = chain_client.reconcile_agreement(collector, &id) => result,
+        };
+
+        match result {
+            Ok(tx_hash) => {
+                succeeded.push(id);
+                tracing::info!(agreement_id = %hex_id(&id), ?tx_hash, "released ended agreement");
+            }
+            Err(err) => {
+                failed.push(id);
+                tracing::warn!(
+                    agreement_id = %hex_id(&id),
+                    error = %err,
+                    "failed to release ended agreement; will retry next sweep"
+                );
+            }
+        }
+    }
+
+    Outcome::Done { succeeded, failed }
 }
 
 /// Call `reconcileProvider` once per distinct provider. One failed tx never aborts
@@ -264,7 +419,7 @@ async fn reconcile_providers<T>(
     rx_stop: &mut mpsc::Receiver<()>,
     collector: Address,
     providers: Vec<(Address, Reason)>,
-) -> Outcome
+) -> Outcome<Address>
 where
     T: ChainClient,
 {
@@ -335,7 +490,7 @@ mod tests {
 
     const NOW: u64 = 1_800_000_000;
 
-    /// A manager with fixed provider escrow, recording every `reconcile_provider` call.
+    /// A manager with fixed provider escrow and agreements, recording every reconcile.
     #[derive(Clone, Default)]
     struct FakeManager {
         escrow: Arc<HashMap<Address, Result<EscrowAccount, String>>>,
@@ -346,6 +501,10 @@ mod tests {
         stall: bool,
         /// Never answer the provider list, like a hung RPC endpoint.
         stall_reads: bool,
+        agreements: Arc<HashMap<Address, Vec<[u8; 16]>>>,
+        /// What the collector says is left to claim; missing means the read fails.
+        claims: Arc<HashMap<[u8; 16], U256>>,
+        released: Arc<Mutex<Vec<[u8; 16]>>>,
     }
 
     impl FakeManager {
@@ -359,6 +518,23 @@ mod tests {
 
         fn calls(&self) -> Vec<Address> {
             self.calls.lock().unwrap().clone()
+        }
+
+        /// The same manager, also tracking `agreements` with these remaining claims.
+        fn tracking(mut self, agreements: Vec<(Address, [u8; 16], u64)>) -> Self {
+            let mut by_provider: HashMap<Address, Vec<[u8; 16]>> = HashMap::new();
+            let mut claims = HashMap::new();
+            for (provider, id, claim) in agreements {
+                by_provider.entry(provider).or_default().push(id);
+                claims.insert(id, U256::from(claim));
+            }
+            self.agreements = Arc::new(by_provider);
+            self.claims = Arc::new(claims);
+            self
+        }
+
+        fn released(&self) -> Vec<[u8; 16]> {
+            self.released.lock().unwrap().clone()
         }
     }
 
@@ -383,6 +559,37 @@ mod tests {
             self.escrow[&provider]
                 .clone()
                 .map_err(|err| ChainClientError::RpcError(anyhow::anyhow!(err)))
+        }
+
+        async fn tracked_agreement_count(
+            &self,
+            _collector: Address,
+            provider: Address,
+        ) -> Result<u64, ChainClientError> {
+            Ok(self
+                .agreements
+                .get(&provider)
+                .map_or(0, |ids| ids.len() as u64))
+        }
+
+        async fn tracked_agreement_at(
+            &self,
+            _collector: Address,
+            provider: Address,
+            index: u64,
+        ) -> Result<[u8; 16], ChainClientError> {
+            Ok(self.agreements[&provider][index as usize])
+        }
+
+        async fn max_next_claim(
+            &self,
+            _collector: Address,
+            agreement_id: &[u8; 16],
+        ) -> Result<U256, ChainClientError> {
+            self.claims
+                .get(agreement_id)
+                .copied()
+                .ok_or_else(|| ChainClientError::RpcError(anyhow::anyhow!("claim read failed")))
         }
     }
 
@@ -424,6 +631,14 @@ mod tests {
         ) -> Result<bool, ChainClientError> {
             unimplemented!()
         }
+        async fn reconcile_agreement(
+            &self,
+            _collector: Address,
+            agreement_id: &[u8; 16],
+        ) -> Result<Option<B256>, ChainClientError> {
+            self.released.lock().unwrap().push(*agreement_id);
+            Ok(Some(B256::ZERO))
+        }
     }
 
     fn thawing_until(thaw_end: u64) -> Result<EscrowAccount, String> {
@@ -448,6 +663,7 @@ mod tests {
             interval,
             batch_size,
             rebalance_interval: rebalance,
+            agreements_per_sweep: 500,
         }
     }
 
@@ -509,6 +725,7 @@ mod tests {
         let due = providers_due(
             &manager,
             Address::ZERO,
+            &manager.order,
             &no_rebalance(),
             &mut RebalanceSchedule::default(),
         )
@@ -530,6 +747,7 @@ mod tests {
         let due = providers_due(
             &manager,
             Address::ZERO,
+            &manager.order,
             &no_rebalance(),
             &mut RebalanceSchedule::default(),
         )
@@ -554,6 +772,7 @@ mod tests {
         let due = providers_due(
             &manager,
             Address::ZERO,
+            &manager.order,
             &every_sweep,
             &mut RebalanceSchedule::default(),
         )
@@ -599,23 +818,41 @@ mod tests {
         let manager = FakeManager::with(vec![(provider, settled())]);
         let config = config(Duration::from_secs(600), Duration::from_secs(600), 500);
         let mut schedule = RebalanceSchedule::default();
-        let first = providers_due(&manager, Address::ZERO, &config, &mut schedule)
-            .await
-            .unwrap();
+        let first = providers_due(
+            &manager,
+            Address::ZERO,
+            &manager.order,
+            &config,
+            &mut schedule,
+        )
+        .await
+        .unwrap();
         assert_eq!(first, vec![(provider, Reason::Rebalance)]);
         schedule.settle(&[], &[provider]);
 
         //* Act - the next sweep covers no new slot, the clock not having moved
-        let second = providers_due(&manager, Address::ZERO, &config, &mut schedule)
-            .await
-            .unwrap();
+        let second = providers_due(
+            &manager,
+            Address::ZERO,
+            &manager.order,
+            &config,
+            &mut schedule,
+        )
+        .await
+        .unwrap();
 
         //* Assert - still owed until a reconcile goes through
         assert_eq!(second, vec![(provider, Reason::Rebalance)]);
         schedule.settle(&[provider], &[]);
-        let third = providers_due(&manager, Address::ZERO, &config, &mut schedule)
-            .await
-            .unwrap();
+        let third = providers_due(
+            &manager,
+            Address::ZERO,
+            &manager.order,
+            &config,
+            &mut schedule,
+        )
+        .await
+        .unwrap();
         assert!(third.is_empty());
     }
 
@@ -717,5 +954,88 @@ mod tests {
         //* Assert - shutdown gives each service only a few seconds to stop
         assert!(stopped.is_ok(), "the reconciler ignored the stop");
         service.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn only_agreements_with_nothing_left_to_claim_are_released() {
+        //* Arrange
+        let provider = Address::repeat_byte(0x11);
+        let manager = FakeManager::with(vec![(provider, settled())]).tracking(vec![
+            (provider, [0xe0; 16], 0),
+            (provider, [0xa1; 16], 18_667),
+        ]);
+        let mut cursor = 0;
+
+        //* Act
+        let ended =
+            ended_agreements(&manager, Address::ZERO, &manager.order, &mut cursor, 500).await;
+
+        //* Assert
+        assert_eq!(ended, vec![[0xe0; 16]]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_claim_read_leaves_the_agreement_for_later() {
+        let provider = Address::repeat_byte(0x11);
+        let mut manager = FakeManager::with(vec![(provider, settled())])
+            .tracking(vec![(provider, [0xe0; 16], 0), (provider, [0xe1; 16], 0)]);
+        Arc::make_mut(&mut manager.claims).remove(&[0xe0; 16]);
+        let mut cursor = 0;
+
+        let ended =
+            ended_agreements(&manager, Address::ZERO, &manager.order, &mut cursor, 500).await;
+
+        assert_eq!(ended, vec![[0xe1; 16]]);
+    }
+
+    #[tokio::test]
+    async fn checks_carry_on_where_the_last_sweep_stopped() {
+        //* Arrange - 5 ended agreements across 2 providers, 2 checked per sweep
+        let (a, b) = (Address::repeat_byte(0x11), Address::repeat_byte(0x22));
+        let manager = FakeManager::with(vec![(a, settled()), (b, settled())]).tracking(vec![
+            (a, [1; 16], 0),
+            (a, [2; 16], 0),
+            (a, [3; 16], 0),
+            (b, [4; 16], 0),
+            (b, [5; 16], 0),
+        ]);
+        let mut cursor = 0;
+
+        //* Act
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            seen.extend(
+                ended_agreements(&manager, Address::ZERO, &manager.order, &mut cursor, 2).await,
+            );
+        }
+
+        //* Assert - every agreement checked once, then the cursor wraps round
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![[1; 16], [1; 16], [2; 16], [3; 16], [4; 16], [5; 16]]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_sweep_releases_ended_agreements() {
+        //* Arrange
+        let provider = Address::repeat_byte(0x11);
+        let manager = FakeManager::with(vec![(provider, settled())])
+            .tracking(vec![(provider, [0xe0; 16], 0), (provider, [0xa1; 16], 5)]);
+        let (handle, service) = new(Ctx {
+            chain_client: manager.clone(),
+            config: no_rebalance(),
+            collector: Address::ZERO,
+        });
+        let service = tokio::spawn(service);
+
+        //* Act
+        tokio::time::sleep(Duration::from_secs(601)).await;
+        handle.stop().await;
+        service.await.unwrap().unwrap();
+
+        //* Assert
+        assert_eq!(manager.released(), vec![[0xe0; 16]]);
     }
 }

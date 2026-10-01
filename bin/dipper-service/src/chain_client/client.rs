@@ -549,6 +549,41 @@ impl AlloyChainClient {
             })
     }
 
+    /// Send a reconcile call to the manager and wait for its receipt, as offers and
+    /// cancels do, so a reverted or dropped reconcile is reported as failed, not done.
+    async fn send_reconcile(
+        &self,
+        calldata: Vec<u8>,
+        log_agreement_id: &[u8; 16],
+    ) -> Result<Option<B256>, ChainClientError> {
+        let SubmittedTx {
+            hash: tx_hash,
+            nonce: dropped_nonce,
+        } = self
+            .build_and_send_call(
+                self.inner.recurring_agreement_manager_address,
+                calldata,
+                log_agreement_id,
+            )
+            .await?;
+
+        match self.wait_for_receipt(tx_hash, RECEIPT_POLL_TIMEOUT).await? {
+            Some(true) => Ok(Some(tx_hash)),
+            Some(false) => Err(ChainClientError::TxReverted { tx_hash }),
+            None => {
+                tracing::warn!(
+                    tx_hash = %tx_hash,
+                    nonce = dropped_nonce,
+                    "Reconcile tx did not mine within receipt-poll window; treating as dropped"
+                );
+                if let Err(err) = self.fill_nonce_gap(dropped_nonce).await {
+                    tracing::warn!(nonce = dropped_nonce, error = %err, "Failed to fill mempool nonce gap");
+                }
+                Err(ChainClientError::TxDropped { tx_hash })
+            }
+        }
+    }
+
     /// Run a read-only contract call and decode its return value.
     async fn view<C: SolCall>(
         &self,
@@ -806,32 +841,28 @@ impl ChainClient for AlloyChainClient {
         );
 
         // No agreement context here; pass a zero id for the shared call's
-        // logging field only. The call target is the manager.
-        let SubmittedTx {
-            hash: tx_hash,
-            nonce: dropped_nonce,
-        } = self
-            .build_and_send_call(manager, calldata, &[0u8; 16])
-            .await?;
+        // logging field only.
+        self.send_reconcile(calldata, &[0u8; 16]).await
+    }
 
-        // Wait for the receipt, as offers and cancels do, so a reverted or dropped
-        // reconcile is reported as failed rather than counted as done.
-        match self.wait_for_receipt(tx_hash, RECEIPT_POLL_TIMEOUT).await? {
-            Some(true) => Ok(Some(tx_hash)),
-            Some(false) => Err(ChainClientError::TxReverted { tx_hash }),
-            None => {
-                tracing::warn!(
-                    provider = %provider,
-                    tx_hash = %tx_hash,
-                    nonce = dropped_nonce,
-                    "Reconcile tx did not mine within receipt-poll window; treating as dropped"
-                );
-                if let Err(err) = self.fill_nonce_gap(dropped_nonce).await {
-                    tracing::warn!(nonce = dropped_nonce, error = %err, "Failed to fill mempool nonce gap");
-                }
-                Err(ChainClientError::TxDropped { tx_hash })
-            }
+    async fn reconcile_agreement(
+        &self,
+        collector: Address,
+        agreement_id: &[u8; 16],
+    ) -> Result<Option<B256>, ChainClientError> {
+        let calldata = IRecurringAgreementManager::reconcileAgreementCall {
+            collector,
+            agreementId: FixedBytes::<16>::from_slice(agreement_id),
         }
+        .abi_encode();
+
+        tracing::info!(
+            agreement_id = %format_args!("0x{}", agreement_id.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+            collector = %collector,
+            "Reconciling agreement escrow via RecurringAgreementManager"
+        );
+
+        self.send_reconcile(calldata, agreement_id).await
     }
 }
 
@@ -901,6 +932,61 @@ impl ManagerEscrowReader for AlloyChainClient {
             tokens_thawing: account.tokensThawing,
             thaw_end_timestamp: account.thawEndTimestamp,
         })
+    }
+
+    async fn tracked_agreement_count(
+        &self,
+        collector: Address,
+        provider: Address,
+    ) -> Result<u64, ChainClientError> {
+        let count = self
+            .view(
+                self.inner.recurring_agreement_manager_address,
+                IRecurringAgreementManager::getAgreementCountCall {
+                    collector,
+                    provider,
+                },
+                "get_agreement_count",
+            )
+            .await?;
+        u64::try_from(count).map_err(|_| {
+            ChainClientError::RpcError(anyhow::anyhow!("implausible agreement count {count}"))
+        })
+    }
+
+    async fn tracked_agreement_at(
+        &self,
+        collector: Address,
+        provider: Address,
+        index: u64,
+    ) -> Result<[u8; 16], ChainClientError> {
+        let id = self
+            .view(
+                self.inner.recurring_agreement_manager_address,
+                IRecurringAgreementManager::getAgreementAtCall {
+                    collector,
+                    provider,
+                    index: U256::from(index),
+                },
+                "get_agreement_at",
+            )
+            .await?;
+        Ok(id.0)
+    }
+
+    async fn max_next_claim(
+        &self,
+        collector: Address,
+        agreement_id: &[u8; 16],
+    ) -> Result<U256, ChainClientError> {
+        self.view(
+            collector,
+            IRecurringCollector::getMaxNextClaimCall {
+                agreementId: FixedBytes::<16>::from_slice(agreement_id),
+            },
+            "get_max_next_claim",
+        )
+        .await
     }
 }
 
@@ -1863,6 +1949,16 @@ mod tests {
                     .expect("getProviderAt args");
                 let provider = Address::repeat_byte(0x10 + u8::try_from(call.index).unwrap());
                 IRecurringAgreementManager::getProviderAtCall::abi_encode_returns(&provider)
+            } else if selector == IRecurringAgreementManager::getAgreementCountCall::SELECTOR {
+                IRecurringAgreementManager::getAgreementCountCall::abi_encode_returns(&U256::from(
+                    1,
+                ))
+            } else if selector == IRecurringAgreementManager::getAgreementAtCall::SELECTOR {
+                IRecurringAgreementManager::getAgreementAtCall::abi_encode_returns(
+                    &FixedBytes::<16>::repeat_byte(0xe0),
+                )
+            } else if selector == IRecurringCollector::getMaxNextClaimCall::SELECTOR {
+                IRecurringCollector::getMaxNextClaimCall::abi_encode_returns(&U256::ZERO)
             } else if selector == IRecurringAgreementManager::getEscrowAccountCall::SELECTOR {
                 IRecurringAgreementManager::getEscrowAccountCall::abi_encode_returns(
                     &IRecurringAgreementManager::EscrowAccount {
@@ -1915,6 +2011,59 @@ mod tests {
                 tokens_thawing: U256::from(40),
                 thaw_end_timestamp: U256::from(1_234),
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn reads_the_agreements_the_manager_tracks() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ManagerViewsResponder::default())
+            .mount(&server)
+            .await;
+        let client = client_over(vec![server.uri().parse().expect("provider URL")]);
+        let (collector, provider) = (Address::repeat_byte(0x11), Address::repeat_byte(0x44));
+
+        let count = client
+            .tracked_agreement_count(collector, provider)
+            .await
+            .expect("count");
+        let id = client
+            .tracked_agreement_at(collector, provider, 0)
+            .await
+            .expect("agreement id");
+        let claim = client.max_next_claim(collector, &id).await.expect("claim");
+
+        assert_eq!((count, id, claim), (1, [0xe0; 16], U256::ZERO));
+    }
+
+    #[tokio::test]
+    async fn reconcile_agreement_reports_a_reverted_transaction() {
+        let (client, _server, _broadcast) = client_whose_tx_mines(false).await;
+
+        let result = client
+            .reconcile_agreement(Address::repeat_byte(0x11), &[0xe0; 16])
+            .await;
+
+        assert!(
+            matches!(result, Err(ChainClientError::TxReverted { .. })),
+            "got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_agreement_returns_the_hash_once_mined() {
+        let (client, _server, broadcast) = client_whose_tx_mines(true).await;
+
+        let tx_hash = client
+            .reconcile_agreement(Address::repeat_byte(0x11), &[0xe0; 16])
+            .await
+            .expect("a mined reconcile succeeds");
+
+        assert_eq!(
+            tx_hash,
+            *broadcast.lock().unwrap(),
+            "the hash of what was broadcast"
         );
     }
 }

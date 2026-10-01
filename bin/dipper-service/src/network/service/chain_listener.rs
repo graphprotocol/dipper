@@ -2465,6 +2465,16 @@ mod tests {
         > {
             Ok(None)
         }
+        async fn reconcile_agreement(
+            &self,
+            _collector: thegraph_core::alloy::primitives::Address,
+            _agreement_id: &[u8; 16],
+        ) -> Result<
+            Option<thegraph_core::alloy::primitives::B256>,
+            crate::chain_client::ChainClientError,
+        > {
+            Ok(None)
+        }
 
         async fn agreement_still_active(
             &self,

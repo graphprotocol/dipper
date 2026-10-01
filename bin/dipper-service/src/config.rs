@@ -402,9 +402,9 @@ impl Default for ExpirationConfig {
     }
 }
 
-/// Escrow reconciler service config. Each sweep reads the escrow of every provider
-/// the RecurringAgreementManager tracks and calls its permissionless
-/// `reconcileProvider` only where that would change something.
+/// Escrow reconciler service config. Each sweep checks what the RecurringAgreementManager
+/// tracks and calls its permissionless `reconcileAgreement` / `reconcileProvider` only
+/// where that would change something.
 #[serde_as]
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -428,6 +428,11 @@ pub struct EscrowReconcilerConfig {
     #[serde_as(as = "serde_with::DurationSeconds<u64>")]
     #[serde(default = "default_escrow_reconciler_rebalance_interval")]
     pub rebalance_interval: Duration,
+
+    /// How many tracked agreements to check for having ended per sweep; each sweep
+    /// carries on from where the last stopped (default: 500).
+    #[serde(default = "default_escrow_reconciler_agreements_per_sweep")]
+    pub agreements_per_sweep: u64,
 }
 
 fn default_escrow_reconciler_enabled() -> bool {
@@ -446,6 +451,10 @@ fn default_escrow_reconciler_rebalance_interval() -> Duration {
     Duration::from_secs(86_400)
 }
 
+fn default_escrow_reconciler_agreements_per_sweep() -> u64 {
+    500
+}
+
 impl Default for EscrowReconcilerConfig {
     fn default() -> Self {
         Self {
@@ -453,6 +462,7 @@ impl Default for EscrowReconcilerConfig {
             interval: default_escrow_reconciler_interval(),
             batch_size: default_escrow_reconciler_batch_size(),
             rebalance_interval: default_escrow_reconciler_rebalance_interval(),
+            agreements_per_sweep: default_escrow_reconciler_agreements_per_sweep(),
         }
     }
 }

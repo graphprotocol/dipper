@@ -35,6 +35,10 @@ sol! {
             view
             returns (AgreementDetails memory);
 
+        /// The most the payer could still owe on the agreement; 0 once it has ended
+        /// and nothing more can be collected.
+        function getMaxNextClaim(bytes16 agreementId) external view returns (uint256);
+
         /// Emitted when `offer()` stores a new or updated RCA offer.
         event OfferStored(
             bytes16 indexed agreementId,
@@ -143,6 +147,15 @@ sol! {
             external
             view
             returns (EscrowAccount memory account);
+
+        /// Number of agreements the manager tracks for `provider` under `collector`.
+        function getAgreementCount(address collector, address provider) external view returns (uint256);
+
+        /// The agreement at `index` among those the manager tracks for `provider`.
+        function getAgreementAt(address collector, address provider, uint256 index)
+            external
+            view
+            returns (bytes16);
 
         /// Emitted when the manager stores a new agreement.
         event AgreementAdded(
