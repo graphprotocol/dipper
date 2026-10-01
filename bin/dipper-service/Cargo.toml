@@ -29,7 +29,7 @@ thegraph-core = { workspace = true, features = ["alloy-signer-local", "serde", "
 thiserror.workspace = true
 time = { workspace = true, features = ["parsing", "formatting"] }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
-tonic = { version = "0.14", default-features = false, features = ["server", "channel"] }
+tonic = { version = "0.14", default-features = false, features = ["server", "channel", "tls-aws-lc", "tls-native-roots"] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 uuid.workspace = true
