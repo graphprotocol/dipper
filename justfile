@@ -14,6 +14,10 @@ fmt-check:
 check *EXTRA_FLAGS:
     cargo clippy {{EXTRA_FLAGS}} -- -D warnings --force-warn deprecated -D dead-code
 
+# Check for unused dependencies (cargo machete)
+check-deps:
+    cargo machete
+
 # Run Rust unit tests
 test-unit *EXTRA_FLAGS:
     cargo test {{EXTRA_FLAGS}} 'tests::' -- --skip 'tests::it_'
