@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.2.0](https://github.com/graphprotocol/dipper/compare/v0.1.12...v0.2.0) (2026-10-01)
+
+
+### ⚠ BREAKING CHANGES
+
+* **cli:** detect the chain from the subgraph manifest ([#699](https://github.com/graphprotocol/dipper/issues/699))
+
+### Added
+
+* **cli:** detect the chain from the subgraph manifest ([#699](https://github.com/graphprotocol/dipper/issues/699)) ([bd61524](https://github.com/graphprotocol/dipper/commit/bd6152480e143a96073b9379619c60962be9aadf))
+
+
+### Fixed
+
+* send agreement proposals to https indexers over TLS ([#698](https://github.com/graphprotocol/dipper/issues/698)) ([2b5f751](https://github.com/graphprotocol/dipper/commit/2b5f7510f83c4452083442055e9ded0eb161a6d2))
+
 ## [0.1.12](https://github.com/graphprotocol/dipper/compare/v0.1.11...v0.1.12) (2026-09-17)
 
 
