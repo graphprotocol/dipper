@@ -15,7 +15,7 @@ use dipper_rpc::indexer::indexer_client::sol::RecurringCollectionAgreement;
 use thegraph_core::alloy::{
     eips::{BlockNumberOrTag, eip2718::Encodable2718},
     network::{EthereumWallet, TransactionBuilder},
-    primitives::{Address, B256, FixedBytes},
+    primitives::{Address, B256, FixedBytes, U256},
     providers::Provider,
     rpc::types::TransactionRequest,
     signers::local::PrivateKeySigner,
@@ -30,7 +30,7 @@ use super::{
     rpc_provider::RpcProviderPool,
 };
 use crate::{
-    chain_client::{ChainClient, ChainClientError},
+    chain_client::{ChainClient, ChainClientError, EscrowAccount, ManagerEscrowReader},
     config::ChainClientConfig,
     worker::service::PROCESS_JOB_TIMEOUT,
 };
@@ -549,6 +549,30 @@ impl AlloyChainClient {
             })
     }
 
+    /// Run a read-only contract call and decode its return value.
+    async fn view<C: SolCall>(
+        &self,
+        to: Address,
+        call: C,
+        operation: &'static str,
+    ) -> Result<C::Return, ChainClientError> {
+        let calldata = call.abi_encode();
+        let output = self
+            .inner
+            .rpc_pool
+            .execute(operation, |provider| {
+                let calldata = calldata.clone();
+                async move {
+                    let tx = TransactionRequest::default().to(to).input(calldata.into());
+                    provider.call(tx).await
+                }
+            })
+            .await?;
+        C::abi_decode_returns(&output).map_err(|err| {
+            ChainClientError::RpcError(anyhow::anyhow!("undecodable {operation} from {to}: {err}"))
+        })
+    }
+
     /// Poll `eth_getTransactionReceipt` until the tx has mined or the timeout elapses.
     /// `Ok(Some(status))` reports the receipt's success flag; `Ok(None)` says the tx never
     /// appeared in time (dropped from the mempool). Transient RPC errors keep polling.
@@ -794,6 +818,64 @@ impl ChainClient for AlloyChainClient {
                 Err(ChainClientError::TxDropped { tx_hash })
             }
         }
+    }
+}
+
+#[async_trait]
+impl ManagerEscrowReader for AlloyChainClient {
+    async fn tracked_providers(
+        &self,
+        collector: Address,
+    ) -> Result<Vec<Address>, ChainClientError> {
+        let manager = self.inner.recurring_agreement_manager_address;
+        let count = self
+            .view(
+                manager,
+                IRecurringAgreementManager::getProviderCountCall { collector },
+                "get_provider_count",
+            )
+            .await?;
+        let count = u64::try_from(count).map_err(|_| {
+            ChainClientError::RpcError(anyhow::anyhow!("implausible provider count {count}"))
+        })?;
+
+        let mut providers = Vec::new();
+        for index in 0..count {
+            let provider = self
+                .view(
+                    manager,
+                    IRecurringAgreementManager::getProviderAtCall {
+                        collector,
+                        index: U256::from(index),
+                    },
+                    "get_provider_at",
+                )
+                .await?;
+            providers.push(provider);
+        }
+        Ok(providers)
+    }
+
+    async fn escrow_account(
+        &self,
+        collector: Address,
+        provider: Address,
+    ) -> Result<EscrowAccount, ChainClientError> {
+        let account = self
+            .view(
+                self.inner.recurring_agreement_manager_address,
+                IRecurringAgreementManager::getEscrowAccountCall {
+                    collector,
+                    provider,
+                },
+                "get_escrow_account",
+            )
+            .await?;
+        Ok(EscrowAccount {
+            balance: account.balance,
+            tokens_thawing: account.tokensThawing,
+            thaw_end_timestamp: account.thawEndTimestamp,
+        })
     }
 }
 
@@ -1716,6 +1798,79 @@ mod tests {
             tx_hash,
             *broadcast.lock().unwrap(),
             "the hash of what was broadcast"
+        );
+    }
+
+    /// Answers the manager's escrow views as a manager tracking 2 providers would.
+    struct ManagerViewsResponder;
+
+    impl Respond for ManagerViewsResponder {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).expect("JSON-RPC request body");
+            assert_eq!(body["method"], "eth_call", "only views are expected");
+            let input = body["params"][0]["input"]
+                .as_str()
+                .or_else(|| body["params"][0]["data"].as_str())
+                .expect("calldata");
+            let data = thegraph_core::alloy::primitives::hex::decode(input).expect("hex");
+            let selector: [u8; 4] = data[..4].try_into().expect("selector");
+
+            let output = if selector == IRecurringAgreementManager::getProviderCountCall::SELECTOR {
+                IRecurringAgreementManager::getProviderCountCall::abi_encode_returns(&U256::from(2))
+            } else if selector == IRecurringAgreementManager::getProviderAtCall::SELECTOR {
+                let call = IRecurringAgreementManager::getProviderAtCall::abi_decode(&data)
+                    .expect("getProviderAt args");
+                let provider = Address::repeat_byte(0x10 + u8::try_from(call.index).unwrap());
+                IRecurringAgreementManager::getProviderAtCall::abi_encode_returns(&provider)
+            } else if selector == IRecurringAgreementManager::getEscrowAccountCall::SELECTOR {
+                IRecurringAgreementManager::getEscrowAccountCall::abi_encode_returns(
+                    &IRecurringAgreementManager::EscrowAccount {
+                        balance: U256::from(100),
+                        tokensThawing: U256::from(40),
+                        thawEndTimestamp: U256::from(1_234),
+                    },
+                )
+            } else {
+                panic!("unexpected call {}", input)
+            };
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": body["id"],
+                "result": format!("0x{}", thegraph_core::alloy::primitives::hex::encode(output)),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn reads_the_providers_and_escrow_the_manager_tracks() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ManagerViewsResponder)
+            .mount(&server)
+            .await;
+        let client = client_over(vec![server.uri().parse().expect("provider URL")]);
+
+        let providers = client
+            .tracked_providers(Address::repeat_byte(0x11))
+            .await
+            .expect("providers");
+        let account = client
+            .escrow_account(Address::repeat_byte(0x11), providers[0])
+            .await
+            .expect("escrow account");
+
+        assert_eq!(
+            providers,
+            vec![Address::repeat_byte(0x10), Address::repeat_byte(0x11)]
+        );
+        assert_eq!(
+            account,
+            EscrowAccount {
+                balance: U256::from(100),
+                tokens_thawing: U256::from(40),
+                thaw_end_timestamp: U256::from(1_234),
+            }
         );
     }
 }

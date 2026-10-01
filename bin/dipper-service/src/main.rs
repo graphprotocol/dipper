@@ -323,7 +323,8 @@ pub async fn main() -> anyhow::Result<()> {
     // Application services
 
     //- The chain client (for on-chain transactions). Required: presence validated above.
-    let chain_client: Arc<dyn chain_client::ChainClient + Send + Sync> = {
+    //  Kept concrete as well, for the escrow reconciler's reads of the manager.
+    let alloy_chain_client = {
         let cfg = conf
             .chain_client
             .as_ref()
@@ -344,6 +345,7 @@ pub async fn main() -> anyhow::Result<()> {
         );
         Arc::new(client)
     };
+    let chain_client: Arc<dyn chain_client::ChainClient + Send + Sync> = alloy_chain_client.clone();
 
     //- Protocol-managed mode requires dipper's signer to hold AGREEMENT_MANAGER_ROLE on
     //  the manager; without it every offer and cancel reverts on-chain. Fail fast at
@@ -556,8 +558,7 @@ pub async fn main() -> anyhow::Result<()> {
     ) {
         let er_conf = conf.escrow_reconciler.clone().unwrap_or_default();
         let ctx = network::service::escrow_reconciler::Ctx {
-            registry: registry.clone(),
-            chain_client: chain_client.clone(),
+            chain_client: alloy_chain_client.clone(),
             config: er_conf,
             collector: escrow_reconciler_agreement_conf.recurring_collector(),
         };

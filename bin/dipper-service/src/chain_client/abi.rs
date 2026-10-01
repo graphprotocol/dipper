@@ -125,6 +125,25 @@ sol! {
             external
             returns (bool tracked);
 
+        /// The manager's escrow account with one provider, as PaymentsEscrow holds it.
+        struct EscrowAccount {
+            uint256 balance;
+            uint256 tokensThawing;
+            uint256 thawEndTimestamp;
+        }
+
+        /// Number of providers the manager tracks escrow for under `collector`.
+        function getProviderCount(address collector) external view returns (uint256);
+
+        /// The provider at `index` in the manager's tracked set for `collector`.
+        function getProviderAt(address collector, uint256 index) external view returns (address);
+
+        /// The manager's escrow account with `provider` under `collector`.
+        function getEscrowAccount(address collector, address provider)
+            external
+            view
+            returns (EscrowAccount memory account);
+
         /// Emitted when the manager stores a new agreement.
         event AgreementAdded(
             bytes16 indexed agreementId,
