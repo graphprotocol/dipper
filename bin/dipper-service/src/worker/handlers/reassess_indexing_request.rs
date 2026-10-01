@@ -1063,6 +1063,13 @@ mod lifecycle_event_tests {
         ) -> std::result::Result<Option<B256>, ChainClientError> {
             Ok(None)
         }
+        async fn reconcile_agreement(
+            &self,
+            _collector: Address,
+            _agreement_id: &[u8; 16],
+        ) -> Result<Option<B256>, ChainClientError> {
+            unimplemented!()
+        }
 
         async fn agreement_still_active(
             &self,
@@ -2286,6 +2293,13 @@ mod deadline_clock_tests {
             _provider: Address,
         ) -> Result<Option<B256>, ChainClientError> {
             Ok(None)
+        }
+        async fn reconcile_agreement(
+            &self,
+            _collector: Address,
+            _agreement_id: &[u8; 16],
+        ) -> Result<Option<B256>, ChainClientError> {
+            unimplemented!()
         }
 
         async fn agreement_still_active(

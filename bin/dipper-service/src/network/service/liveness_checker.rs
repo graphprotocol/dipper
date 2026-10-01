@@ -1180,6 +1180,13 @@ mod tests {
             // Not exercised by liveness_checker tests.
             Ok(None)
         }
+        async fn reconcile_agreement(
+            &self,
+            _collector: Address,
+            _agreement_id: &[u8; 16],
+        ) -> Result<Option<B256>, ChainClientError> {
+            unimplemented!()
+        }
 
         async fn agreement_still_active(
             &self,
