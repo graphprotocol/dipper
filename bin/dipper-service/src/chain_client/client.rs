@@ -2,6 +2,7 @@
 //! alloy for Ethereum interactions.
 
 use std::{
+    collections::HashSet,
     future::Future,
     sync::{
         Arc,
@@ -15,7 +16,7 @@ use dipper_rpc::indexer::indexer_client::sol::RecurringCollectionAgreement;
 use thegraph_core::alloy::{
     eips::{BlockNumberOrTag, eip2718::Encodable2718},
     network::{EthereumWallet, TransactionBuilder},
-    primitives::{Address, B256, FixedBytes},
+    primitives::{Address, B256, FixedBytes, U256},
     providers::Provider,
     rpc::types::TransactionRequest,
     signers::local::PrivateKeySigner,
@@ -30,7 +31,9 @@ use super::{
     rpc_provider::RpcProviderPool,
 };
 use crate::{
-    chain_client::{ChainClient, ChainClientError},
+    chain_client::{
+        ChainClient, ChainClientError, EscrowAccount, ManagerEscrowReader, TrackedProviders,
+    },
     config::ChainClientConfig,
     worker::service::PROCESS_JOB_TIMEOUT,
 };
@@ -549,6 +552,30 @@ impl AlloyChainClient {
             })
     }
 
+    /// Run a read-only contract call and decode its return value.
+    async fn view<C: SolCall>(
+        &self,
+        to: Address,
+        call: C,
+        operation: &'static str,
+    ) -> Result<C::Return, ChainClientError> {
+        let calldata = call.abi_encode();
+        let output = self
+            .inner
+            .rpc_pool
+            .execute(operation, |provider| {
+                let calldata = calldata.clone();
+                async move {
+                    let tx = TransactionRequest::default().to(to).input(calldata.into());
+                    provider.call(tx).await
+                }
+            })
+            .await?;
+        C::abi_decode_returns(&output).map_err(|err| {
+            ChainClientError::RpcError(anyhow::anyhow!("undecodable {operation} from {to}: {err}"))
+        })
+    }
+
     /// Poll `eth_getTransactionReceipt` until the tx has mined or the timeout elapses.
     /// `Ok(Some(status))` reports the receipt's success flag; `Ok(None)` says the tx never
     /// appeared in time (dropped from the mempool). Transient RPC errors keep polling.
@@ -794,6 +821,90 @@ impl ChainClient for AlloyChainClient {
                 Err(ChainClientError::TxDropped { tx_hash })
             }
         }
+    }
+}
+
+#[async_trait]
+impl ManagerEscrowReader for AlloyChainClient {
+    async fn tracked_providers(
+        &self,
+        collector: Address,
+    ) -> Result<TrackedProviders, ChainClientError> {
+        let manager = self.inner.recurring_agreement_manager_address;
+        let count = self
+            .view(
+                manager,
+                IRecurringAgreementManager::getProviderCountCall { collector },
+                "get_provider_count",
+            )
+            .await?;
+        let count = u64::try_from(count).map_err(|_| {
+            ChainClientError::RpcError(anyhow::anyhow!("implausible provider count {count}"))
+        })?;
+
+        // Each read sees the latest block (pruned nodes refuse older state), so the list
+        // can change mid-read: an entry can turn up twice or the list can end early, and
+        // either means another entry may have been missed.
+        let mut providers = Vec::new();
+        let mut seen = HashSet::new();
+        let mut complete = true;
+        for index in 0..count {
+            let read = self
+                .view(
+                    manager,
+                    IRecurringAgreementManager::getProviderAtCall {
+                        collector,
+                        index: U256::from(index),
+                    },
+                    "get_provider_at",
+                )
+                .await;
+            match read {
+                Ok(provider) => {
+                    if seen.insert(provider) {
+                        providers.push(provider);
+                    } else {
+                        complete = false;
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        index,
+                        count,
+                        error = %err,
+                        "Failed to read a provider from the manager's list; using those read so far"
+                    );
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        Ok(TrackedProviders {
+            providers,
+            complete,
+        })
+    }
+
+    async fn escrow_account(
+        &self,
+        collector: Address,
+        provider: Address,
+    ) -> Result<EscrowAccount, ChainClientError> {
+        let account = self
+            .view(
+                self.inner.recurring_agreement_manager_address,
+                IRecurringAgreementManager::getEscrowAccountCall {
+                    collector,
+                    provider,
+                },
+                "get_escrow_account",
+            )
+            .await?;
+        Ok(EscrowAccount {
+            balance: account.balance,
+            tokens_thawing: account.tokensThawing,
+            thaw_end_timestamp: account.thawEndTimestamp,
+        })
     }
 }
 
@@ -1716,6 +1827,165 @@ mod tests {
             tx_hash,
             *broadcast.lock().unwrap(),
             "the hash of what was broadcast"
+        );
+    }
+
+    /// Answers the manager's escrow views as a manager whose provider list is `providers`
+    /// would. A `None` entry reverts, as a read past the end of a list that shrank does.
+    struct ManagerViewsResponder {
+        providers: Vec<Option<Address>>,
+    }
+
+    impl Default for ManagerViewsResponder {
+        /// A manager tracking 2 providers.
+        fn default() -> Self {
+            Self {
+                providers: vec![
+                    Some(Address::repeat_byte(0x10)),
+                    Some(Address::repeat_byte(0x11)),
+                ],
+            }
+        }
+    }
+
+    impl Respond for ManagerViewsResponder {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).expect("JSON-RPC request body");
+            assert_eq!(body["method"], "eth_call", "only views are expected");
+            let input = body["params"][0]["input"]
+                .as_str()
+                .or_else(|| body["params"][0]["data"].as_str())
+                .expect("calldata");
+            let data = thegraph_core::alloy::primitives::hex::decode(input).expect("hex");
+            let selector: [u8; 4] = data[..4].try_into().expect("selector");
+
+            let output = if selector == IRecurringAgreementManager::getProviderCountCall::SELECTOR {
+                IRecurringAgreementManager::getProviderCountCall::abi_encode_returns(&U256::from(
+                    self.providers.len(),
+                ))
+            } else if selector == IRecurringAgreementManager::getProviderAtCall::SELECTOR {
+                let call = IRecurringAgreementManager::getProviderAtCall::abi_decode(&data)
+                    .expect("getProviderAt args");
+                let entry = usize::try_from(call.index)
+                    .ok()
+                    .and_then(|index| self.providers.get(index).copied().flatten());
+                let Some(provider) = entry else {
+                    return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": body["id"],
+                        "error": { "code": 3, "message": "execution reverted" },
+                    }));
+                };
+                IRecurringAgreementManager::getProviderAtCall::abi_encode_returns(&provider)
+            } else if selector == IRecurringAgreementManager::getEscrowAccountCall::SELECTOR {
+                IRecurringAgreementManager::getEscrowAccountCall::abi_encode_returns(
+                    &IRecurringAgreementManager::EscrowAccount {
+                        balance: U256::from(100),
+                        tokensThawing: U256::from(40),
+                        thawEndTimestamp: U256::from(1_234),
+                    },
+                )
+            } else {
+                panic!("unexpected call {}", input)
+            };
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": body["id"],
+                "result": format!("0x{}", thegraph_core::alloy::primitives::hex::encode(output)),
+            }))
+        }
+    }
+
+    async fn client_over_manager(
+        responder: ManagerViewsResponder,
+    ) -> (AlloyChainClient, MockServer) {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(responder)
+            .mount(&server)
+            .await;
+        let client = client_over(vec![server.uri().parse().expect("provider URL")]);
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn reads_the_providers_and_escrow_the_manager_tracks() {
+        let (client, _server) = client_over_manager(ManagerViewsResponder::default()).await;
+
+        let tracked = client
+            .tracked_providers(Address::repeat_byte(0x11))
+            .await
+            .expect("providers");
+        let account = client
+            .escrow_account(Address::repeat_byte(0x11), tracked.providers[0])
+            .await
+            .expect("escrow account");
+
+        assert_eq!(
+            tracked,
+            TrackedProviders {
+                providers: vec![Address::repeat_byte(0x10), Address::repeat_byte(0x11)],
+                complete: true,
+            }
+        );
+        assert_eq!(
+            account,
+            EscrowAccount {
+                balance: U256::from(100),
+                tokens_thawing: U256::from(40),
+                thaw_end_timestamp: U256::from(1_234),
+            }
+        );
+    }
+
+    /// The list can shrink between reading its length and reading an entry, so a failed
+    /// read keeps the providers read before it rather than failing the whole sweep.
+    #[tokio::test]
+    async fn tracked_providers_keeps_what_was_read_before_a_failed_read() {
+        let (client, _server) = client_over_manager(ManagerViewsResponder {
+            providers: vec![Some(Address::repeat_byte(0x10)), None],
+        })
+        .await;
+
+        let tracked = client
+            .tracked_providers(Address::repeat_byte(0x11))
+            .await
+            .expect("the providers read before the failure");
+
+        assert_eq!(
+            tracked,
+            TrackedProviders {
+                providers: vec![Address::repeat_byte(0x10)],
+                complete: false,
+            }
+        );
+    }
+
+    /// An entry can move within the list mid-read and turn up twice; list it once, and
+    /// report the list as incomplete, since the move may have hidden another entry.
+    #[tokio::test]
+    async fn tracked_providers_lists_a_provider_read_twice_once() {
+        let (client, _server) = client_over_manager(ManagerViewsResponder {
+            providers: vec![
+                Some(Address::repeat_byte(0x10)),
+                Some(Address::repeat_byte(0x11)),
+                Some(Address::repeat_byte(0x10)),
+            ],
+        })
+        .await;
+
+        let tracked = client
+            .tracked_providers(Address::repeat_byte(0x11))
+            .await
+            .expect("providers");
+
+        assert_eq!(
+            tracked,
+            TrackedProviders {
+                providers: vec![Address::repeat_byte(0x10), Address::repeat_byte(0x11)],
+                complete: false,
+            }
         );
     }
 }

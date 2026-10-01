@@ -29,7 +29,7 @@ pub use client::AlloyChainClient;
 use dipper_rpc::indexer::indexer_client::sol::RecurringCollectionAgreement;
 pub use eip5267::{fetch_rca_eip712_domain, refresh_rca_eip712_domain};
 pub use manager_role::verify_signer_has_agreement_manager_role;
-use thegraph_core::alloy::primitives::{B256, Bytes};
+use thegraph_core::alloy::primitives::{Address, B256, Bytes, U256};
 
 /// Error type for chain client operations
 #[derive(Debug, thiserror::Error)]
@@ -167,5 +167,58 @@ impl<T: ChainClient + Send + Sync + ?Sized> ChainClient for Arc<T> {
 
     async fn latest_block_timestamp(&self) -> Result<u64, ChainClientError> {
         (**self).latest_block_timestamp().await
+    }
+}
+
+/// The RecurringAgreementManager's escrow account with one provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EscrowAccount {
+    pub balance: U256,
+    pub tokens_thawing: U256,
+    pub thaw_end_timestamp: U256,
+}
+
+/// The providers the RecurringAgreementManager tracks, as read one entry at a time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackedProviders {
+    pub providers: Vec<Address>,
+    /// False when the list changed or a read failed part way, so some may be missing.
+    pub complete: bool,
+}
+
+/// Reads of the RecurringAgreementManager's escrow records, so the escrow reconciler
+/// sends a transaction only when one would change something. Kept apart from
+/// [`ChainClient`] so only the reconciler and its tests need to provide it.
+#[async_trait]
+pub trait ManagerEscrowReader {
+    /// Providers the manager tracks escrow for under `collector`.
+    async fn tracked_providers(
+        &self,
+        collector: Address,
+    ) -> Result<TrackedProviders, ChainClientError>;
+
+    /// The manager's escrow account with `provider` under `collector`.
+    async fn escrow_account(
+        &self,
+        collector: Address,
+        provider: Address,
+    ) -> Result<EscrowAccount, ChainClientError>;
+}
+
+#[async_trait]
+impl<T: ManagerEscrowReader + Send + Sync + ?Sized> ManagerEscrowReader for Arc<T> {
+    async fn tracked_providers(
+        &self,
+        collector: Address,
+    ) -> Result<TrackedProviders, ChainClientError> {
+        (**self).tracked_providers(collector).await
+    }
+
+    async fn escrow_account(
+        &self,
+        collector: Address,
+        provider: Address,
+    ) -> Result<EscrowAccount, ChainClientError> {
+        (**self).escrow_account(collector, provider).await
     }
 }
