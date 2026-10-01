@@ -12,7 +12,7 @@ fmt-check:
 
 # Check Rust code (cargo clippy)
 check *EXTRA_FLAGS:
-    cargo clippy {{EXTRA_FLAGS}} -- -D warnings --force-warn deprecated --force-warn dead-code
+    cargo clippy {{EXTRA_FLAGS}} -- -D warnings --force-warn deprecated -D dead-code
 
 # Run Rust unit tests
 test-unit *EXTRA_FLAGS:
