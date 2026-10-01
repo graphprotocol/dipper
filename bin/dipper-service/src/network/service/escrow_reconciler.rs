@@ -184,7 +184,7 @@ where
                 tracing::info!(
                     %provider,
                     %tx_hash,
-                    "submitted escrow reconciliation for provider"
+                    "reconciled provider escrow"
                 );
             }
             Ok(None) => {

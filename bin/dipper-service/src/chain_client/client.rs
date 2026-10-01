@@ -277,7 +277,7 @@ impl AlloyChainClient {
     }
 
     /// Build, gas-estimate, and send a call to any contract. Shared entry point for the
-    /// manager-routed offer and cancel calls; `log_agreement_id` is only for logging.
+    /// manager-routed offer, cancel and reconcile calls; `log_agreement_id` is only for logging.
     async fn build_and_send_call(
         &self,
         to: Address,
