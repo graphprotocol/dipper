@@ -750,11 +750,15 @@ where
     }
 
     if cancel_failures > 0 {
-        // Two recovery paths cover any agreements left AcceptedOnChain here:
+        // Agreements whose cancel failed keep their status (AcceptedOnChain or
+        // Created), and two recovery paths cover them:
         //
         // - Shrink-to-zero (request now Canceled): the chain_listener's
-        //   `sweep_orphan_canceled_agreements` retries on every sweep tick
-        //   (default ~5 min at fast poll, ~5 h at slow poll).
+        //   `sweep_orphan_canceled_agreements` retries AcceptedOnChain rows on
+        //   every sweep tick (default ~5 min at fast poll, ~5 h at slow poll).
+        //   A Created row is not retried: its offer stays open until its
+        //   deadline, and if the indexer accepts it the listener marks it
+        //   AcceptedOnChain, which brings it into that sweep.
         // - Shrink-not-zero (request still Open with too many agreements):
         //   the periodic reassignment service re-queues reassessment at its
         //   configured cadence (default 24 h).
