@@ -450,18 +450,6 @@ pub trait AgreementRegistry {
         batch_size: i64,
     ) -> RegistryResult<Vec<IndexingAgreement>>;
 
-    /// Distinct service-provider addresses whose protocol-manager escrow may
-    /// need on-chain reconciliation. Empty by default so mocks need not override.
-    async fn get_providers_for_escrow_reconciliation(
-        &self,
-        _limit: i64,
-    ) -> RegistryResult<Vec<Address>>
-    where
-        Self: Sync,
-    {
-        Ok(Vec::new())
-    }
-
     /// Update the sync progress for an agreement.
     ///
     /// Called when the liveness checker observes the block height has changed

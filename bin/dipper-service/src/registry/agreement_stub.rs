@@ -5,10 +5,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use dipper_core::ids::{IndexingAgreementId, IndexingRequestId};
-use thegraph_core::{
-    DeploymentId, IndexerId,
-    alloy::primitives::{Address, ChainId},
-};
+use thegraph_core::{DeploymentId, IndexerId, alloy::primitives::ChainId};
 
 use super::{
     agreement::{
@@ -192,11 +189,6 @@ pub trait StubAgreementRegistry: Send + Sync {
         _batch_size: i64,
     ) -> Result<Vec<IndexingAgreement>> {
         unimplemented!("get_agreements_pending_chain_cancel")
-    }
-
-    // Mirrors the trait's default (empty list).
-    async fn get_providers_for_escrow_reconciliation(&self, _limit: i64) -> Result<Vec<Address>> {
-        Ok(Vec::new())
     }
 
     async fn update_agreement_sync_progress(
@@ -472,10 +464,6 @@ impl<T: StubAgreementRegistry> AgreementRegistry for T {
         batch_size: i64,
     ) -> Result<Vec<IndexingAgreement>> {
         StubAgreementRegistry::get_agreements_pending_chain_cancel(self, batch_size).await
-    }
-
-    async fn get_providers_for_escrow_reconciliation(&self, limit: i64) -> Result<Vec<Address>> {
-        StubAgreementRegistry::get_providers_for_escrow_reconciliation(self, limit).await
     }
 
     async fn update_agreement_sync_progress(
