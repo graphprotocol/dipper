@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use super::{common, result::Result};
 use crate::{
-    chain::{self, ChainOverride, ChainResolver},
+    chain::{ChainOverride, ChainResolver},
     client,
     client::IndexingRequestsRpcClient,
     config::Config,
@@ -142,11 +142,7 @@ pub async fn set_target(conf: Config, matches: &clap::ArgMatches) -> Result<()> 
         (None, Some(id)) => Some(ChainOverride::Id(*id)),
         (None, None) => None,
     };
-    let ipfs_url = matches
-        .get_one::<Url>("ipfs-url")
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("No IPFS URL provided"))?;
-    let request_chain_id = ChainResolver::new(ipfs_url)?
+    let request_chain_id = ChainResolver::new(conf.ipfs_url.clone())?
         .resolve(request_deployment_id, chain_override)
         .await?;
 
@@ -215,10 +211,9 @@ pub(super) fn cmd() -> Command {
                     arg!(--"chain-id" <ID> "Use this numeric chain ID instead of the manifest's network (e.g. 1337 for a local chain)")
                         .value_parser(value_parser!(ChainId))
                         .required(false),
-                    arg!(--"ipfs-url" <URL> "The IPFS API to read the subgraph manifest from")
-                        .env(crate::name_prefixed!("IPFS_URL"))
+                    arg!(--"ipfs-url" <URL> "The IPFS API to read the subgraph manifest from (env DIPS_IPFS_URL, default https://ipfs.thegraph.com)")
                         .value_parser(value_parser!(Url))
-                        .default_value(chain::DEFAULT_IPFS_URL),
+                        .required(false),
                     arg!(--"num-candidates" <N> "Target number of indexers to assign (0 cancels). Defaults to server maximum.")
                         .value_parser(value_parser!(usize))
                         .required(false),
@@ -318,6 +313,25 @@ mod tests {
 
         assert_eq!(matches.get_one::<String>("chain-name"), None);
         assert_eq!(matches.get_one::<ChainId>("chain-id"), None);
+    }
+
+    #[test]
+    fn test_set_target_candidates_reads_the_ipfs_url_from_the_env_file() {
+        //* Arrange
+        let env_file = std::env::temp_dir().join(format!("dipper-cli-{}.env", std::process::id()));
+        std::fs::write(&env_file, "DIPS_IPFS_URL=http://ipfs.env-file.test:5001\n").unwrap();
+        let matches = parse_set_target(&["--env-file", env_file.to_str().unwrap()]).unwrap();
+        let (_, matches) = matches.subcommand().unwrap();
+
+        //* Act
+        let conf = common::load_conf(matches);
+        std::fs::remove_file(&env_file).unwrap();
+
+        //* Assert
+        assert_eq!(
+            conf.unwrap().ipfs_url.as_str(),
+            "http://ipfs.env-file.test:5001/"
+        );
     }
 
     #[test]
