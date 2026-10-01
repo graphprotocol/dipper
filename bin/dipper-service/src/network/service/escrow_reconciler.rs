@@ -100,6 +100,8 @@ where
                 }
             };
 
+            // Releases and provider reconciles share one `batch_size`, releases first.
+            let budget = sweep_budget(config.batch_size);
             let ended = tokio::select! {
                 _ = rx_stop.recv() => break,
                 ended = ended_agreements(
@@ -108,9 +110,10 @@ where
                     &providers,
                     &mut agreement_cursor,
                     config.agreements_per_sweep,
-                    sweep_budget(config.batch_size),
+                    budget,
                 ) => ended,
             };
+            let left = budget.map(|max| max.saturating_sub(ended.len()));
             if !ended.is_empty() {
                 match release_agreements(&chain_client, &mut rx_stop, collector, ended).await {
                     Outcome::Stopped => return Ok(()),
@@ -124,9 +127,16 @@ where
                 }
             }
 
+            if left == Some(0) {
+                tracing::info!(
+                    "escrow reconciliation: releases used this sweep's batch_size; provider reconciles wait for a later sweep"
+                );
+                continue;
+            }
+
             let read = tokio::select! {
                 _ = rx_stop.recv() => break,
-                read = providers_due(&chain_client, collector, &providers, &config, &mut schedule) => read,
+                read = providers_due(&chain_client, collector, &providers, &config, left, &mut schedule) => read,
             };
             let due = match read {
                 Ok(due) => due,
@@ -203,13 +213,14 @@ impl RebalanceSchedule {
 }
 
 /// Providers to reconcile this sweep: those whose thaw has finished first, then those
-/// owed a rebalance, capped at `batch_size` when it is positive. A provider whose escrow
-/// can't be read is skipped this sweep, and keeps any rebalance it is owed.
+/// owed a rebalance, at most `limit` of them. A provider whose escrow can't be read is
+/// skipped this sweep, and keeps any rebalance it is owed.
 async fn providers_due<T>(
     chain_client: &T,
     collector: Address,
     providers: &[Address],
     config: &EscrowReconcilerConfig,
+    limit: Option<usize>,
     schedule: &mut RebalanceSchedule,
 ) -> Result<Vec<(Address, Reason)>, ChainClientError>
 where
@@ -242,7 +253,7 @@ where
     schedule.covered_until = Some(to);
 
     due.extend(rebalances);
-    let deferred = cap(&mut due, config.batch_size);
+    let deferred = cap(&mut due, limit);
     if deferred > 0 {
         tracing::info!(
             deferred,
@@ -257,10 +268,10 @@ fn sweep_budget(batch_size: i64) -> Option<usize> {
     usize::try_from(batch_size).ok().filter(|&limit| limit > 0)
 }
 
-/// Keep at most `batch_size` items when it is positive, returning how many were cut.
-fn cap<T>(items: &mut Vec<T>, batch_size: i64) -> usize {
+/// Keep at most `limit` items, returning how many were cut.
+fn cap<T>(items: &mut Vec<T>, limit: Option<usize>) -> usize {
     let before = items.len();
-    if let Some(limit) = sweep_budget(batch_size) {
+    if let Some(limit) = limit {
         items.truncate(limit);
     }
     before - items.len()
@@ -740,6 +751,7 @@ mod tests {
             Address::ZERO,
             &manager.order,
             &no_rebalance(),
+            None,
             &mut RebalanceSchedule::default(),
         )
         .await
@@ -762,6 +774,7 @@ mod tests {
             Address::ZERO,
             &manager.order,
             &no_rebalance(),
+            None,
             &mut RebalanceSchedule::default(),
         )
         .await
@@ -787,6 +800,7 @@ mod tests {
             Address::ZERO,
             &manager.order,
             &every_sweep,
+            Some(2),
             &mut RebalanceSchedule::default(),
         )
         .await
@@ -836,6 +850,7 @@ mod tests {
             Address::ZERO,
             &manager.order,
             &config,
+            None,
             &mut schedule,
         )
         .await
@@ -849,6 +864,7 @@ mod tests {
             Address::ZERO,
             &manager.order,
             &config,
+            None,
             &mut schedule,
         )
         .await
@@ -862,6 +878,7 @@ mod tests {
             Address::ZERO,
             &manager.order,
             &config,
+            None,
             &mut schedule,
         )
         .await
@@ -1094,5 +1111,42 @@ mod tests {
 
         //* Assert - the second sweep starts at the first agreement the first one left
         assert_eq!(manager.released(), vec![[1; 16], [2; 16], [3; 16], [4; 16]]);
+    }
+
+    /// Runs 1 sweep over 2 providers whose thaws have finished, the first also tracking an
+    /// ended agreement, and returns what was released and which providers were reconciled.
+    async fn one_sweep_with_batch_size(batch_size: i64) -> (Vec<[u8; 16]>, Vec<Address>) {
+        let (a, b) = (Address::repeat_byte(0x11), Address::repeat_byte(0x22));
+        let manager = FakeManager::with(vec![
+            (a, thawing_until(NOW - 1)),
+            (b, thawing_until(NOW - 1)),
+        ])
+        .tracking(vec![(a, [0xe0; 16], 0)]);
+        let (handle, service) = new(Ctx {
+            chain_client: manager.clone(),
+            config: config(Duration::from_secs(600), Duration::ZERO, batch_size),
+            collector: Address::ZERO,
+        });
+        let service = tokio::spawn(service);
+        tokio::time::sleep(Duration::from_secs(601)).await;
+        handle.stop().await;
+        service.await.unwrap().unwrap();
+        (manager.released(), manager.calls())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn releases_and_provider_reconciles_share_one_batch() {
+        let (released, reconciled) = one_sweep_with_batch_size(2).await;
+
+        assert_eq!(released, vec![[0xe0; 16]]);
+        assert_eq!(reconciled, vec![Address::repeat_byte(0x11)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn releases_that_fill_the_batch_leave_providers_for_a_later_sweep() {
+        let (released, reconciled) = one_sweep_with_batch_size(1).await;
+
+        assert_eq!(released, vec![[0xe0; 16]]);
+        assert!(reconciled.is_empty(), "reconciled {reconciled:?}");
     }
 }
