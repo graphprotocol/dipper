@@ -50,6 +50,10 @@ pub struct Message {
     pub deployment_chain_id: ChainId,
 }
 
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "predates this lint; fix when next touched"
+)]
 pub async fn handle<R, T>(
     ctx: Ctx<R, T>,
     Message {

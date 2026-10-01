@@ -239,6 +239,10 @@ impl WarnPacer {
 /// or not, because PostgreSQL only holds them for sessions currently listening.
 /// The 1 second poll bounds that to added latency, never a dropped job, which is
 /// the property worth relying on here.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "predates this lint; fix when next touched"
+)]
 async fn await_next_tick<N: JobNotifications>(
     stop_rx: &mut watch::Receiver<bool>,
     listener: &mut Option<N>,
@@ -368,6 +372,10 @@ impl<N: JobNotifications> Subscription<N> {
 
     /// Re-opens the subscription. A failure here keeps us in poll-only mode,
     /// which processes every job just as reliably, only later.
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "predates this lint; fix when next touched"
+    )]
     async fn resubscribe<Q: Queue<Message, Listener = N>>(&mut self, queue: &Q) {
         match queue.subscribe().await {
             Ok(l) => {
@@ -535,6 +543,10 @@ where
 /// One worker loop: drains jobs until the stop signal fires. Each loop owns its
 /// own queue notification listener because the underlying `LISTEN`/`NOTIFY` is
 /// per-connection and can't be shared across tasks.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "predates this lint; fix when next touched"
+)]
 async fn run_loop<Q, R, C, I, T>(
     state: InnerCtx<R, WorkerQueueHandle<Q>, C, I, T>,
     queue: Q,

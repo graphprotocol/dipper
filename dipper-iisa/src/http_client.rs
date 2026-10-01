@@ -196,6 +196,10 @@ impl HttpIisaClient {
     /// # Arguments
     /// * `endpoint` - Base URL of the IISA service (e.g., "http://iisa-service:8080")
     /// * `config` - Client configuration for timeouts and retries
+    #[expect(
+        clippy::expect_used,
+        reason = "predates this lint; fix when next touched"
+    )]
     pub fn with_config(endpoint: String, config: HttpClientConfig) -> Self {
         let endpoint = if endpoint.ends_with('/') {
             endpoint
@@ -285,6 +289,10 @@ impl HttpIisaClient {
     /// Does not retry on:
     /// - 4xx client errors
     /// - Parse/deserialization errors
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "predates this lint; fix when next touched"
+    )]
     async fn post_with_retry<T: for<'de> Deserialize<'de>>(
         &self,
         url: &str,

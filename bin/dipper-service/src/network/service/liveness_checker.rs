@@ -90,6 +90,10 @@ pub struct Ctx<R, W, C> {
 /// Returns a handle for controlling the service and a future that must be spawned
 /// on a runtime. The service periodically polls indexer status endpoints and cancels
 /// agreements where no indexing progress is observed within the tolerance window.
+#[expect(
+    clippy::too_many_lines,
+    reason = "predates this lint; fix when next touched"
+)]
 pub fn new<R, W, C>(ctx: Ctx<R, W, C>) -> (Handle, impl Future<Output = anyhow::Result<()>>)
 where
     R: AgreementRegistry + IndexingRequestRegistry + PendingCancellationRegistry + Send + Sync,
@@ -337,6 +341,10 @@ fn group_by_indexer_id(
 /// Compute the tolerance duration for a deployment based on active agreement count.
 ///
 /// Returns `min(active_count, max_days)` days as a duration.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "predates this lint; fix when next touched"
+)]
 fn tolerance_duration(
     deployment_id: DeploymentId,
     active_counts: &HashMap<DeploymentId, usize>,
@@ -477,6 +485,11 @@ async fn record_progress<R>(
 /// If the on-chain cancel fails, the DB is not updated and reassessment is not
 /// queued, leaving the agreement in `AcceptedOnChain` for the next cycle to retry.
 #[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::cognitive_complexity,
+    clippy::too_many_lines,
+    reason = "predates this lint; fix when next touched"
+)]
 async fn cancel_and_reassess<R, W, C>(
     agreement: &IndexingAgreement,
     registry: &R,

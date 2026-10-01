@@ -70,6 +70,10 @@ impl<T> JobGuard<'_, T> {
 /// Job actions
 impl<T> JobGuard<'_, T> {
     /// Remove the job from the queue
+    #[expect(
+        clippy::expect_used,
+        reason = "predates this lint; fix when next touched"
+    )]
     pub async fn remove(mut self) -> anyhow::Result<()> {
         self.consumed = true;
         let mut tx = self
@@ -82,6 +86,10 @@ impl<T> JobGuard<'_, T> {
     }
 
     /// Mark the job as failed
+    #[expect(
+        clippy::expect_used,
+        reason = "predates this lint; fix when next touched"
+    )]
     pub async fn mark_as_failed(mut self) -> anyhow::Result<()> {
         self.consumed = true;
         let mut tx = self
@@ -94,6 +102,10 @@ impl<T> JobGuard<'_, T> {
     }
 
     /// Mark the job as failed and reschedule it
+    #[expect(
+        clippy::expect_used,
+        reason = "predates this lint; fix when next touched"
+    )]
     pub async fn mark_as_failed_and_reschedule(
         mut self,
         schedule: time::OffsetDateTime,
@@ -111,6 +123,10 @@ impl<T> JobGuard<'_, T> {
     /// Re-queue the job for a later time without counting an attempt. Used for
     /// deferral (e.g. a contended lock) where retrying is normal and must not
     /// push the job toward its max-attempt ceiling.
+    #[expect(
+        clippy::expect_used,
+        reason = "predates this lint; fix when next touched"
+    )]
     pub async fn reschedule(mut self, schedule: time::OffsetDateTime) -> anyhow::Result<()> {
         self.consumed = true;
         let mut tx = self

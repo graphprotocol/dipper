@@ -17,6 +17,10 @@ pub const DEFAULT_MAX_CONNECTIONS: u32 = 32;
 const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Connect to the database
+#[expect(
+    clippy::expect_used,
+    reason = "predates this lint; fix when next touched"
+)]
 pub async fn connect(conf: &DbConfig) -> anyhow::Result<Pool<Postgres>> {
     let mut conn_options: PgConnectOptions = conf.url.as_str().parse().expect("Invalid DB URL");
     conn_options = conn_options

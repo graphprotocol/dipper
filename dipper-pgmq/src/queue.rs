@@ -79,6 +79,10 @@ impl PgQueue {
     }
 
     /// Pulls a job from the queue
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "predates this lint; fix when next touched"
+    )]
     pub async fn pop<T>(&self) -> anyhow::Result<Option<JobGuard<'_, T>>>
     where
         T: for<'de> serde::Deserialize<'de> + Send + Unpin + 'static,

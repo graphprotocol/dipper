@@ -143,6 +143,10 @@ pub struct ChainListenerState {
 /// Returns a handle for controlling the service and a future that must be spawned
 /// on a runtime. The service polls the subgraph for agreement state snapshots
 /// and reconciles them against the local DB.
+#[expect(
+    clippy::too_many_lines,
+    reason = "predates this lint; fix when next touched"
+)]
 pub fn new<R, W, E, T>(ctx: Ctx<R, W, E, T>) -> (Handle, impl Future<Output = anyhow::Result<()>>)
 where
     R: AgreementRegistry + ChainListenerStateRegistry + PendingCancellationRegistry + Send + Sync,
@@ -414,6 +418,12 @@ struct DrainOutcome {
 /// signals the subgraph fetch itself failed so the outer loop skips the
 /// heartbeat block.
 #[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::cast_possible_wrap,
+    clippy::cognitive_complexity,
+    clippy::too_many_lines,
+    reason = "predates this lint; fix when next touched"
+)]
 async fn drain_once<R, W, E, T>(
     cursor: &mut Cursor,
     last_persisted_timestamp: &mut Option<u64>,
@@ -793,6 +803,10 @@ fn apply_chain_ts_drift_cap(
 /// no DB write is needed. Caller pre-fetches the agreement (in batch for
 /// the chain_listener loop, single-row for tests) and passes `None`
 /// when the snapshot is for an agreement we don't track locally.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "predates this lint; fix when next touched"
+)]
 async fn prepare_reconciliation<R, W>(
     snapshot: &AgreementStateSnapshot,
     agreement: Option<IndexingAgreement>,
@@ -921,6 +935,10 @@ where
 
 /// Log the transition that landed and, on fresh accepts, fan out the
 /// linked pending cancellations.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "predates this lint; fix when next touched"
+)]
 async fn finalize_reconciliation<R, T>(
     prep: &PreparedReconciliation,
     outcome: crate::registry::ReconciliationOutcome,
@@ -1023,6 +1041,11 @@ where
 /// then flips the dipper DB row to `CanceledByRequester`. Each pending row is
 /// deleted individually after both steps succeed; transient failures retain
 /// the record so the next reconcile pass can retry.
+#[expect(
+    clippy::cognitive_complexity,
+    clippy::too_many_lines,
+    reason = "predates this lint; fix when next touched"
+)]
 async fn execute_pending_cancellations<R, T>(
     agreement_id: &IndexingAgreementId,
     registry: &R,
@@ -1180,6 +1203,10 @@ where
 /// (the `Ok(None)` revert path handles already-canceled agreements), and the
 /// DB transition is gated on chain success, so this is safe to run on every
 /// sweep without coordination with reassessment.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "predates this lint; fix when next touched"
+)]
 async fn sweep_orphan_canceled_agreements<R, T>(
     registry: &R,
     chain_client: &T,
@@ -1410,6 +1437,11 @@ where
 /// `accepted_at IS NOT NULL`, so a never-accepted agreement that was only ever
 /// cancelled locally never produces a `terminated` -- there was nothing live
 /// on-chain to terminate.
+#[expect(
+    clippy::cast_sign_loss,
+    clippy::cognitive_complexity,
+    reason = "predates this lint; fix when next touched"
+)]
 async fn sweep_pending_terminated_events<R>(
     registry: &R,
     config: &crate::config::IndexingAgreementConfig,
@@ -1505,6 +1537,10 @@ where
 /// NOT gated on current status: an agreement accepted and then cancelled in a
 /// single snapshot is already terminal yet must still emit its `accepted` (which
 /// is why this sweep runs before the terminated sweep).
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "predates this lint; fix when next touched"
+)]
 async fn sweep_pending_accepted_events<R>(
     registry: &R,
     events_emitter: &dyn SubgraphIndexingAgreementEventsProducer,
@@ -1574,6 +1610,10 @@ where
 /// a late on-chain accept) means a row that was prematurely marked `Expired` is
 /// no longer selected once recovered -- so a premature `expired` never
 /// contradicts a subsequent `accepted`.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "predates this lint; fix when next touched"
+)]
 async fn sweep_pending_expired_events<R>(
     registry: &R,
     events_emitter: &dyn SubgraphIndexingAgreementEventsProducer,
@@ -1652,6 +1692,10 @@ where
 ///
 /// Per-orphan failures are logged and swallowed so one stuck cancellation
 /// cannot block the rest of the sweep.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "predates this lint; fix when next touched"
+)]
 async fn sweep_executable_pending_cancellations<R, T>(
     registry: &R,
     chain_client: &T,
@@ -2233,6 +2277,11 @@ mod tests {
             Ok(vec![])
         }
 
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "predates this lint; fix when next touched"
+        )]
         async fn get_agreements_pending_chain_cancel(
             &self,
             batch_size: i64,
@@ -2359,6 +2408,11 @@ mod tests {
             Ok(())
         }
 
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "predates this lint; fix when next touched"
+        )]
         async fn list_executable_pending_cancellations(
             &self,
             limit: i64,

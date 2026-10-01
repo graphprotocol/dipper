@@ -33,6 +33,10 @@ pub struct Message {
 /// This is called when an indexer rejected the proposal off-chain but then accepted
 /// on-chain anyway. We cancel the agreement via `cancelIndexingAgreementByPayer` to
 /// ensure the indexer doesn't receive payment for work we didn't want.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "predates this lint; fix when next touched"
+)]
 pub async fn handle<R, T>(ctx: Ctx<R, T>, Message { agreement_id }: &Message) -> JobResult<()>
 where
     R: AgreementRegistry + Sync,

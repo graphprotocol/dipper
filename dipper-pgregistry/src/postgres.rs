@@ -115,6 +115,10 @@ pub struct PendingTerminatedEvent {
 }
 
 impl sqlx::FromRow<'_, sqlx::postgres::PgRow> for PendingTerminatedEvent {
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "predates this lint; fix when next touched"
+    )]
     fn from_row(row: &sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
         use sqlx::Row as _;
         let agreement_id = row.try_get("id")?;
@@ -158,6 +162,10 @@ pub struct PendingAcceptedEvent {
 }
 
 impl sqlx::FromRow<'_, sqlx::postgres::PgRow> for PendingAcceptedEvent {
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "predates this lint; fix when next touched"
+    )]
     fn from_row(row: &sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
         use sqlx::Row as _;
         let agreement_id = row.try_get("id")?;
@@ -196,6 +204,10 @@ pub struct PendingExpiredEvent {
 }
 
 impl sqlx::FromRow<'_, sqlx::postgres::PgRow> for PendingExpiredEvent {
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "predates this lint; fix when next touched"
+    )]
     fn from_row(row: &sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
         use sqlx::Row as _;
         let agreement_id = row.try_get("id")?;
@@ -1009,6 +1021,11 @@ impl PgRegistry {
     ///
     /// Caller contract: input ids must be unique. Duplicates would leave
     /// stale outcome flags from the first iteration; debug_asserted.
+    #[expect(
+        clippy::expect_used,
+        clippy::too_many_lines,
+        reason = "predates this lint; fix when next touched"
+    )]
     pub async fn apply_reconciliation_batch(
         &self,
         items: &[ReconciliationItem],
@@ -1294,6 +1311,10 @@ impl PgRegistry {
     /// normal accept transition never records it. Persisting it here (from the
     /// observed snapshot) marks the row as genuinely accepted so its eventual
     /// `terminated` is sweep-eligible. `COALESCE` keeps any existing value.
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "predates this lint; fix when next touched"
+    )]
     pub async fn record_accepted_audit(
         &self,
         agreement_id: &IndexingAgreementId,
@@ -1320,6 +1341,10 @@ impl PgRegistry {
     /// emission sweep can populate the `terminated` event's tx/by/at fields.
     /// `COALESCE` keeps any value already observed on-chain. Best-effort
     /// enrichment: the event still emits (with fallbacks) if never recorded.
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "predates this lint; fix when next touched"
+    )]
     pub async fn record_cancel_audit(
         &self,
         agreement_id: &IndexingAgreementId,
@@ -1419,6 +1444,10 @@ impl PgRegistry {
     /// Get `Created` agreements whose RCA deadline has passed.
     ///
     /// Compares `terms.deadline` against `chain_timestamp` (block time).
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "predates this lint; fix when next touched"
+    )]
     pub async fn get_expired_created_agreements(
         &self,
         batch_size: i64,
@@ -1640,6 +1669,10 @@ impl PgRegistry {
     ///
     /// Called when the liveness checker observes the block height has changed
     /// (either advancing or resetting due to a resync).
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "predates this lint; fix when next touched"
+    )]
     pub async fn update_agreement_sync_progress(
         &self,
         agreement_id: &IndexingAgreementId,
@@ -1669,6 +1702,11 @@ impl PgRegistry {
     /// Returns a map of deployment ID to count of `Created` or `AcceptedOnChain`
     /// agreements. Used by the liveness checker to determine the tolerance threshold
     /// for each deployment.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "predates this lint; fix when next touched"
+    )]
     pub async fn count_active_agreements_by_deployment(
         &self,
     ) -> Result<HashMap<DeploymentId, usize>, Error> {
@@ -1694,6 +1732,10 @@ impl PgRegistry {
     /// Count `Created` (in-flight, not yet accepted) agreements per indexer,
     /// returning the per-indexer map and global total in one round-trip. Offer
     /// pacing reads both to gauge spare acceptance capacity before creating more.
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "predates this lint; fix when next touched"
+    )]
     pub async fn count_created_agreements_by_indexer(
         &self,
     ) -> Result<(HashMap<IndexerId, u64>, u64), Error> {
@@ -1863,6 +1905,11 @@ impl PgRegistry {
 
     /// Get the chain listener state for a given chain ID.
     /// Returns `None` if no state exists for the chain (first run).
+    #[expect(
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss,
+        reason = "predates this lint; fix when next touched"
+    )]
     pub async fn get_chain_listener_state(
         &self,
         chain_id: u64,
@@ -1896,6 +1943,10 @@ impl PgRegistry {
     /// Creates the record if it doesn't exist (upsert). `last_processed_id`
     /// is the keyset's `id` discriminator at `last_processed_block`; `None`
     /// means the cursor sits at a block boundary.
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "predates this lint; fix when next touched"
+    )]
     pub async fn update_chain_listener_state(
         &self,
         chain_id: u64,
@@ -2137,6 +2188,10 @@ async fn batch_update_status_from(
 /// over `batch_update_status_from` for the single-row case.
 /// Persist the accepted-transition audit payload for a single row. `COALESCE`
 /// keeps any already-stored value rather than clobbering it with `NULL`.
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "predates this lint; fix when next touched"
+)]
 async fn persist_accept_audit(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     id: &IndexingAgreementId,
@@ -2163,6 +2218,10 @@ async fn persist_accept_audit(
 
 /// Persist the cancel-transition audit payload for a single row. `COALESCE`
 /// keeps any already-stored value rather than clobbering it with `NULL`.
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "predates this lint; fix when next touched"
+)]
 async fn persist_cancel_audit(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     id: &IndexingAgreementId,

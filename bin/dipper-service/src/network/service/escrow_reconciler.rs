@@ -143,6 +143,10 @@ enum Outcome {
 /// Call `reconcileProvider` once per distinct provider. One failed tx never
 /// aborts the sweep — the next provider runs and the failed one retries next
 /// tick (reconcile is idempotent). One tx per provider; `batch_size` bounds it.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "predates this lint; fix when next touched"
+)]
 async fn reconcile_providers<T>(
     chain_client: &T,
     rx_stop: &mut mpsc::Receiver<()>,

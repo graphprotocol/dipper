@@ -90,6 +90,10 @@ impl KafkaProducer {
     const PRODUCE_TIMEOUT: Duration = Duration::from_secs(30);
 
     /// Creates a new Kafka producer with the given configuration.
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "predates this lint; fix when next touched"
+    )]
     pub async fn new(config: &KafkaConfig) -> Result<Self, Error> {
         if config.partitions == 0 {
             return Err(Error::InvalidPartitionCount);
@@ -192,6 +196,10 @@ impl KafkaProducer {
     ///
     /// Events are partitioned by the partition key (table discriminator) before being written to
     /// Kafka. The produce attempt times out after 30 seconds.
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "predates this lint; fix when next touched"
+    )]
     pub async fn send(&self, partition_key: &str, payload: &[u8]) -> Result<(), Error> {
         let partition = self.partition_for_key(partition_key);
         let partition_client = &self.partition_clients[partition as usize];
@@ -219,6 +227,10 @@ impl KafkaProducer {
     /// key always maps to the same partition across restarts and instances,
     /// preserving per-key ordering. The partition count is configured via
     /// `KafkaConfig::partitions`.
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "predates this lint; fix when next touched"
+    )]
     fn partition_for_key(&self, key: &str) -> i32 {
         // FNV-1a (32-bit): order-dependent and well-distributed, unlike a byte sum.
         const FNV_OFFSET_BASIS: u32 = 0x811c_9dc5;

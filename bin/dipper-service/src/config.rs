@@ -1365,6 +1365,10 @@ impl EventStreamingConfig {
     }
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "predates this lint; fix when next touched"
+)]
 pub fn default_event_queue_capacity() -> NonZeroUsize {
     NonZeroUsize::new(1024).expect("default event queue capacity is non-zero")
 }

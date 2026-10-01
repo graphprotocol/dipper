@@ -17,6 +17,10 @@ use crate::{
 };
 
 /// The `indexings` command implementation
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "predates this lint; fix when next touched"
+)]
 pub(super) async fn run(matches: &clap::ArgMatches) -> Result<()> {
     match matches.subcommand() {
         Some(("list", matches)) => {
@@ -180,6 +184,10 @@ pub async fn set_target(conf: Config, matches: &clap::ArgMatches) -> Result<()> 
 }
 
 /// Create the `indexings` DIPs indexing requests admin command
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "predates this lint; fix when next touched"
+)]
 pub(super) fn cmd() -> Command {
     command!("indexings")
         .about("Manage indexings")

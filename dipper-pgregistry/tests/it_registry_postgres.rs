@@ -24,6 +24,10 @@ use uuid::uuid;
 ///
 /// This function creates a temporary database and runs the migrations.
 /// It returns the database connection pool and the temporary database guard.
+#[expect(
+    clippy::expect_used,
+    reason = "predates this lint; fix when next touched"
+)]
 async fn temp_registry_db() -> (Pool<Postgres>, PgTempDB) {
     let temp_db = PgTempDB::new();
     let db = Pool::connect(&temp_db.connection_uri())
@@ -3126,6 +3130,10 @@ async fn apply_reconciliation_batch_paired_rolls_back_on_unmatched_cancel() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "predates this lint; fix when next touched"
+)]
 async fn count_created_agreements_by_indexer_counts_only_created() {
     //* Given
     let (db, _temp_db) = temp_registry_db().await;

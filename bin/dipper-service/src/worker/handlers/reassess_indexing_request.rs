@@ -97,6 +97,14 @@ pub struct Message {
     pub num_candidates: usize,
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cognitive_complexity,
+    clippy::expect_used,
+    clippy::too_many_lines,
+    reason = "predates this lint; fix when next touched"
+)]
 pub async fn handle<R, W, I, T>(
     ctx: Ctx<R, W, I, T>,
     Message {
@@ -782,6 +790,10 @@ where
 /// Compute the EIP-712 terms hash persisted for the protocol-managed cancel
 /// path, reusing the proposal signer's RCA-to-sol conversion and signing-hash so
 /// the value matches the hash dipper signs over.
+#[expect(
+    clippy::expect_used,
+    reason = "predates this lint; fix when next touched"
+)]
 fn compute_terms_version_hash(
     nonce_uuid: uuid::Uuid,
     terms: &IndexingAgreementTerms,
@@ -800,6 +812,10 @@ fn compute_terms_version_hash(
 /// Pick the clock denominating `terms.deadline`/`terms.ends_at`: wall clock when
 /// `bypass` is false; otherwise chain time — live chain head, else the listener's
 /// persisted timestamp, else wall clock, warning on each demotion; registry errors retry.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "predates this lint; fix when next touched"
+)]
 async fn resolve_deadline_clock<R, C>(
     bypass: bool,
     chain_listener_chain_id: Option<u64>,

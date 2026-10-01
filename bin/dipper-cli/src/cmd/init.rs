@@ -148,6 +148,10 @@ fn write_config(server_url: &Url, signing_key: &str, output_path: &Path) -> Resu
 }
 
 /// Create the `init` DIPs CLI configuration bootstrap command
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "predates this lint; fix when next touched"
+)]
 pub(super) fn cmd() -> Command {
     command!("init")
         .about("Bootstrap the DIPs Admin CLI configuration file")

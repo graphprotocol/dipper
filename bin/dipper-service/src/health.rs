@@ -48,6 +48,10 @@ impl ProgressTicker {
 }
 
 /// Seconds elapsed since [`PROCESS_START`]. Monotonic, so it never jumps with the system clock.
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "predates this lint; fix when next touched"
+)]
 fn elapsed_secs() -> i64 {
     PROCESS_START.elapsed().as_secs() as i64
 }
@@ -62,6 +66,10 @@ impl Liveness {
 
     /// Registers a worker loop and returns its ticker, seeded to now so a
     /// freshly spawned loop is considered live (startup grace).
+    #[expect(
+        clippy::expect_used,
+        reason = "predates this lint; fix when next touched"
+    )]
     pub fn register(&self) -> ProgressTicker {
         let slot = Arc::new(AtomicI64::new(elapsed_secs()));
         self.slots
@@ -74,6 +82,11 @@ impl Liveness {
     /// Whether every registered loop made progress within `threshold` of `now_elapsed_secs`, where
     /// both are seconds since [`PROCESS_START`]. A single stale loop makes the whole worker
     /// unhealthy. Pure in its inputs so it is unit testable without waiting on real time.
+    #[expect(
+        clippy::cast_possible_wrap,
+        clippy::expect_used,
+        reason = "predates this lint; fix when next touched"
+    )]
     fn is_healthy_at(&self, now_elapsed_secs: i64, threshold: Duration) -> bool {
         let slots = self.slots.lock().expect("liveness mutex poisoned");
         // With no loops registered yet (startup) there is nothing stale to report.
