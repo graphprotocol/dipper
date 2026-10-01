@@ -14,6 +14,9 @@ pub const DEFAULT_IPFS_URL: &str = "https://ipfs.thegraph.com";
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long to wait on a lookup that only serves to check an override.
+const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// A chain chosen on the command line instead of the one in the manifest.
 #[derive(Debug, Clone)]
 pub enum ChainOverride {
@@ -28,6 +31,7 @@ pub struct ChainResolver {
     http: reqwest::Client,
     ipfs_api: Url,
     registry_url: String,
+    check_timeout: Duration,
 }
 
 impl ChainResolver {
@@ -49,6 +53,7 @@ impl ChainResolver {
             http,
             ipfs_api,
             registry_url,
+            check_timeout: CHECK_TIMEOUT,
         })
     }
 
@@ -59,8 +64,21 @@ impl ChainResolver {
         deployment: &DeploymentId,
         chain: Option<ChainOverride>,
     ) -> anyhow::Result<ChainId> {
-        let (manifest, registry) =
-            tokio::join!(self.fetch_manifest(deployment), self.fetch_registry());
+        // With an override, the manifest only feeds a warning, and so does the registry
+        // for a numeric ID, so an IPFS or registry outage shouldn't hold up the request.
+        let manifest_timeout = if chain.is_some() {
+            self.check_timeout
+        } else {
+            HTTP_TIMEOUT
+        };
+        let registry_timeout = match chain {
+            Some(ChainOverride::Id(_)) => self.check_timeout,
+            _ => HTTP_TIMEOUT,
+        };
+        let (manifest, registry) = tokio::join!(
+            self.fetch_manifest(deployment, manifest_timeout),
+            self.fetch_registry(registry_timeout)
+        );
         let manifest_network = manifest.and_then(|manifest| network_from_manifest(&manifest));
         let (chain_id, notice) = choose_chain_id(chain, manifest_network, registry)?;
         if let Some(notice) = notice {
@@ -69,7 +87,11 @@ impl ChainResolver {
         Ok(chain_id)
     }
 
-    async fn fetch_manifest(&self, deployment: &DeploymentId) -> anyhow::Result<String> {
+    async fn fetch_manifest(
+        &self,
+        deployment: &DeploymentId,
+        timeout: Duration,
+    ) -> anyhow::Result<String> {
         let mut url = self.ipfs_api.clone();
         url.query_pairs_mut()
             .append_pair("arg", &deployment.to_string());
@@ -77,6 +99,7 @@ impl ChainResolver {
         let response = self
             .http
             .post(url)
+            .timeout(timeout)
             .send()
             .await
             .and_then(reqwest::Response::error_for_status)
@@ -92,10 +115,11 @@ impl ChainResolver {
             .context("failed to read the subgraph manifest body")
     }
 
-    async fn fetch_registry(&self) -> anyhow::Result<NetworksRegistry> {
+    async fn fetch_registry(&self, timeout: Duration) -> anyhow::Result<NetworksRegistry> {
         let response = self
             .http
             .get(&self.registry_url)
+            .timeout(timeout)
             .send()
             .await
             .and_then(reqwest::Response::error_for_status)
@@ -396,6 +420,42 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_with_a_chain_id_does_not_wait_long_on_ipfs() {
+        //* Arrange - IPFS and the registry both take 30s to answer
+        let server = MockServer::start().await;
+        let slow = |body: String| {
+            ResponseTemplate::new(200)
+                .set_body_string(body)
+                .set_delay(Duration::from_secs(30))
+        };
+        Mock::given(method("POST"))
+            .respond_with(slow(manifest("mainnet")))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(slow(REGISTRY_JSON.to_string()))
+            .mount(&server)
+            .await;
+        let mut resolver = ChainResolver::with_registry_url(
+            Url::parse(&server.uri()).unwrap(),
+            format!("{}/registry.json", server.uri()),
+        )
+        .unwrap();
+        resolver.check_timeout = Duration::from_millis(200);
+
+        //* Act
+        let resolved = tokio::time::timeout(
+            Duration::from_secs(5),
+            resolver.resolve(&DEPLOYMENT.parse().unwrap(), Some(ChainOverride::Id(1337))),
+        )
+        .await;
+
+        //* Assert
+        let chain_id = resolved.expect("the check should give up long before 5s");
+        assert_eq!(chain_id.unwrap(), 1337);
     }
 
     #[tokio::test]
