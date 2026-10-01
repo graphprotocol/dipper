@@ -171,7 +171,8 @@ pub async fn set_target(conf: Config, matches: &clap::ArgMatches) -> Result<()> 
     match res {
         Some(id) => println!("{}", id),
         None => println!(
-            "no-op: no open indexing request exists for deployment '{request_deployment_id}' on chain {request_chain_id}"
+            "no-op: no open indexing request exists for deployment '{request_deployment_id}' on chain {request_chain_id}; \
+             if one was made on another chain, `indexings status {request_deployment_id}` shows it, then pass its --chain-id"
         ),
     }
 
