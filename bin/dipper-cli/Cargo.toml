@@ -11,12 +11,17 @@ dipper-core = { version = "0.1.0", path = "../../dipper-core" }
 dipper-rpc = { version = "0.1.0", path = "../../dipper-rpc", features = ["admin-rpc"] }
 dotenvy = "0.15.7"
 figment = { version = "0.10.19", features = ["env"] }
+# Without its fetch feature: that pulls in OpenSSL, which the CLI image does not ship.
+graph-networks-registry = { version = "0.7", default-features = false }
 indoc = "2.0"
 jsonrpsee = { workspace = true, features = ["http-client"] }
+# rustls with built-in root certificates: the CLI image has no OpenSSL or CA bundle.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true
 serde_with.workspace = true
 serde-envfile = { version = "0.3.0", features = ["preserve_order"] }
+serde_yaml = "0.9"
 snmalloc-rs = "0.3.6"
 thegraph-core = { workspace = true, features = ["alloy-signer-local", "signed-message"] }
 thiserror.workspace = true
@@ -25,3 +30,6 @@ tracing.workspace = true
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 url.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+wiremock.workspace = true

@@ -2359,12 +2359,15 @@ dependencies = [
  "dipper-rpc",
  "dotenvy",
  "figment",
+ "graph-networks-registry 0.7.0",
  "indoc",
  "jsonrpsee",
+ "reqwest 0.12.28",
  "serde",
  "serde-envfile",
  "serde_json",
  "serde_with",
+ "serde_yaml",
  "snmalloc-rs",
  "thegraph-core",
  "thiserror 2.0.18",
@@ -2373,6 +2376,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

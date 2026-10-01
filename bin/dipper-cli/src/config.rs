@@ -15,4 +15,15 @@ pub struct Config {
     /// The signing key to use for authentication
     #[serde_as(as = "HiddenSecretKeyAsHexStr")]
     pub signing_key: Hidden<SecretKey>,
+    /// The IPFS API subgraph manifests are read from
+    #[debug(with = std::fmt::Display::fmt)]
+    #[serde_as(as = "DisplayFromStr")]
+    #[serde(default = "default_ipfs_url")]
+    pub ipfs_url: Url,
+}
+
+fn default_ipfs_url() -> Url {
+    crate::chain::DEFAULT_IPFS_URL
+        .parse()
+        .expect("the default IPFS URL is valid")
 }
