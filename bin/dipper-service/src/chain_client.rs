@@ -121,8 +121,8 @@ pub trait ChainClient {
     ) -> Result<Option<B256>, ChainClientError>;
 
     /// Read whether the agreement is still live on-chain (terms accepted and no
-    /// cancellation notice given) via the RecurringCollector's
-    /// `getAgreementDetails(id, VERSION_CURRENT)`.
+    /// cancellation notice given, or an offer still waiting to be accepted) via
+    /// the RecurringCollector's `getAgreementDetails(id, VERSION_CURRENT)`.
     async fn agreement_still_active(
         &self,
         agreement_id: &[u8; 16],

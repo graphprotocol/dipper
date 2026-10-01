@@ -57,11 +57,23 @@ const RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// pre-acceptance) terms. `getAgreementDetails(id, 0)` reports their state.
 const VERSION_CURRENT: u64 = 0;
 
-/// `AgreementDetails.state` flags from `IAgreementCollector.sol` (ACCEPTED=2,
-/// NOTICE_GIVEN=4). `getAgreementDetails` keeps ACCEPTED set on a canceled
-/// agreement and ORs in NOTICE_GIVEN, so a cancel must clear it, not just lack it.
+/// `AgreementDetails.state` flags from `IAgreementCollector.sol` (REGISTERED=1,
+/// ACCEPTED=2, NOTICE_GIVEN=4). `getAgreementDetails` keeps ACCEPTED set on a
+/// canceled agreement and ORs in NOTICE_GIVEN, so a cancel must clear it, not
+/// just lack it. REGISTERED without ACCEPTED is an offer still waiting.
+const STATE_REGISTERED: u16 = 1;
 const STATE_ACCEPTED: u16 = 2;
 const STATE_NOTICE_GIVEN: u16 = 4;
+
+/// Live iff the terms are accepted and no cancellation notice exists, or an
+/// offer is still stored for the indexer to accept. A cancel sets NOTICE_GIVEN
+/// while ACCEPTED stays set, so the notice bit tells a live agreement from a
+/// cancelled one; a revoked offer reads as an empty state.
+fn still_live(state: u16) -> bool {
+    let accepted = state & STATE_ACCEPTED != 0;
+    let pending_offer = state & STATE_REGISTERED != 0 && !accepted;
+    pending_offer || (accepted && state & STATE_NOTICE_GIVEN == 0)
+}
 
 /// Error patterns that indicate a nonce-related issue.
 ///
@@ -805,11 +817,7 @@ impl ChainClient for AlloyChainClient {
                 ))
             })?;
 
-        // Live iff the terms are accepted and no cancellation notice exists.
-        // A cancel sets NOTICE_GIVEN while ACCEPTED stays set, so checking the
-        // notice bit is what tells a still-live agreement from a cancelled one.
-        let state = details.state;
-        Ok(state & STATE_ACCEPTED != 0 && state & STATE_NOTICE_GIVEN == 0)
+        Ok(still_live(details.state))
     }
 
     async fn reconcile_provider(
@@ -1008,6 +1016,25 @@ mod tests {
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate, matchers::method};
 
     use super::*;
+
+    /// A cancel must leave nothing the indexer can still be paid through: neither
+    /// an accepted agreement without a cancellation notice, nor an offer still
+    /// stored and waiting to be accepted. The collector reports a revoked offer,
+    /// or an id it never saw, as an empty state.
+    #[test]
+    fn still_live_covers_accepted_agreements_and_pending_offers() {
+        const SETTLED: u16 = 8;
+        const BY_PAYER: u16 = 16;
+        assert!(still_live(STATE_REGISTERED | STATE_ACCEPTED));
+        assert!(
+            still_live(STATE_REGISTERED),
+            "a pending offer can still be accepted"
+        );
+        assert!(!still_live(
+            STATE_REGISTERED | STATE_ACCEPTED | STATE_NOTICE_GIVEN | BY_PAYER | SETTLED
+        ));
+        assert!(!still_live(0), "revoked or never offered");
+    }
 
     /// Answers a send with a fixed transaction hash, echoing the request id so alloy's
     /// transport accepts the response. Any other call is a mistake in the test rather than
