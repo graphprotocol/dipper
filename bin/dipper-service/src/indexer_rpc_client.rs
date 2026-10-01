@@ -143,11 +143,12 @@ impl DipsIndexerClient {
             .map_err(|err| DipsError::ConnectionError(err.into()))?
             .connect_timeout(self.connect_timeout)
             .timeout(self.request_timeout);
-        // An endpoint built from a URL string leaves TLS off, even for https. The
-        // handshake gets its own timeout: neither of the endpoint's timeouts covers it.
+        // An endpoint built from a URL string leaves TLS off, even for https. Built-in
+        // roots avoid rereading the system store on every attempt, and the handshake
+        // needs its own timeout: neither of the endpoint's timeouts covers it.
         if indexer_url.scheme() == "https" {
             let tls = ClientTlsConfig::new()
-                .with_enabled_roots()
+                .with_webpki_roots()
                 .timeout(self.connect_timeout);
             endpoint = endpoint
                 .tls_config(tls)
