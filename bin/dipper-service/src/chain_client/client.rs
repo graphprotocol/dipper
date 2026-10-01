@@ -552,10 +552,12 @@ impl AlloyChainClient {
 
     /// Send a reconcile call to the manager and wait for its receipt, as offers and
     /// cancels do, so a reverted or dropped reconcile is reported as failed, not done.
+    /// `subject` names what is being reconciled, for the logs.
     async fn send_reconcile(
         &self,
         calldata: Vec<u8>,
         log_agreement_id: &[u8; 16],
+        subject: &str,
     ) -> Result<Option<B256>, ChainClientError> {
         let SubmittedTx {
             hash: tx_hash,
@@ -573,6 +575,7 @@ impl AlloyChainClient {
             Some(false) => Err(ChainClientError::TxReverted { tx_hash }),
             None => {
                 tracing::warn!(
+                    reconciling = subject,
                     tx_hash = %tx_hash,
                     nonce = dropped_nonce,
                     "Reconcile tx did not mine within receipt-poll window; treating as dropped"
@@ -829,7 +832,8 @@ impl ChainClient for AlloyChainClient {
 
         // No agreement context here; pass a zero id for the shared call's
         // logging field only.
-        self.send_reconcile(calldata, &[0u8; 16]).await
+        self.send_reconcile(calldata, &[0u8; 16], &format!("provider {provider}"))
+            .await
     }
 
     async fn reconcile_agreement(
@@ -849,7 +853,11 @@ impl ChainClient for AlloyChainClient {
             "Reconciling agreement escrow via RecurringAgreementManager"
         );
 
-        self.send_reconcile(calldata, agreement_id).await
+        let subject = format!(
+            "agreement 0x{}",
+            thegraph_core::alloy::primitives::hex::encode(agreement_id)
+        );
+        self.send_reconcile(calldata, agreement_id, &subject).await
     }
 }
 

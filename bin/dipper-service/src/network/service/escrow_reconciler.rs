@@ -257,7 +257,7 @@ where
     if deferred > 0 {
         tracing::info!(
             deferred,
-            "escrow reconciliation reached batch_size; the rest wait for the next sweep"
+            "escrow reconciliation reached batch_size; the rest wait for a later sweep"
         );
     }
     Ok(due)
@@ -432,7 +432,7 @@ where
                 tracing::warn!(
                     agreement_id = %hex_id(&id),
                     error = %err,
-                    "failed to release ended agreement; will retry next sweep"
+                    "failed to release ended agreement; a later sweep will try again"
                 );
             }
         }
@@ -442,7 +442,7 @@ where
 }
 
 /// Call `reconcileProvider` once per distinct provider. One failed tx never aborts
-/// the sweep: the next provider runs and the failed one is picked up again next sweep.
+/// the sweep: the next provider runs and the failed one is picked up by a later sweep.
 async fn reconcile_providers<T>(
     chain_client: &T,
     rx_stop: &mut mpsc::Receiver<()>,
@@ -496,7 +496,7 @@ where
                     %provider,
                     ?reason,
                     error = %err,
-                    "failed to reconcile provider escrow; will retry next sweep"
+                    "failed to reconcile provider escrow; a later sweep will try again"
                 );
             }
         }
