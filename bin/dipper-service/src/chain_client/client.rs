@@ -1605,9 +1605,11 @@ mod tests {
     }
 
     /// Answers every call a manager transaction makes, through to a receipt that mined
-    /// with the given status.
+    /// with the given status. Only the hash of the bytes actually broadcast has a receipt,
+    /// so a client polling for any other hash never sees one.
     struct MinedResponder {
         succeeded: bool,
+        broadcast: Arc<std::sync::Mutex<Option<B256>>>,
     }
 
     impl Respond for MinedResponder {
@@ -1620,6 +1622,11 @@ mod tests {
                 "eth_maxPriorityFeePerGas" => serde_json::json!("0x1"),
                 "eth_getTransactionCount" => serde_json::json!("0x0"),
                 "eth_sendRawTransaction" => {
+                    let raw = body["params"][0].as_str().expect("raw tx");
+                    let bytes = thegraph_core::alloy::primitives::hex::decode(raw).expect("hex");
+                    *self.broadcast.lock().unwrap() =
+                        Some(thegraph_core::alloy::primitives::keccak256(bytes));
+                    // A made-up hash, so a client trusting the endpoint's answer is caught.
                     serde_json::json!(format!("{:#x}", B256::repeat_byte(0xab)))
                 }
                 "eth_getBlockByNumber" => serde_json::json!({
@@ -1632,8 +1639,16 @@ mod tests {
                     "nonce": "0x0000000000000000", "baseFeePerGas": "0x1",
                     "uncles": [], "transactions": [],
                 }),
+                "eth_getTransactionReceipt"
+                    if body["params"][0].as_str()
+                        != (*self.broadcast.lock().unwrap())
+                            .map(|h| format!("{h:#x}"))
+                            .as_deref() =>
+                {
+                    serde_json::Value::Null
+                }
                 "eth_getTransactionReceipt" => serde_json::json!({
-                    "transactionHash": format!("{:#x}", B256::repeat_byte(0xab)),
+                    "transactionHash": body["params"][0],
                     "transactionIndex": "0x0", "blockHash": zero, "blockNumber": "0x1",
                     "from": format!("{:#x}", Address::ZERO),
                     "to": format!("{:#x}", Address::repeat_byte(0x22)),
@@ -1652,21 +1667,31 @@ mod tests {
         }
     }
 
-    async fn client_whose_tx_mines(succeeded: bool) -> (AlloyChainClient, MockServer) {
+    async fn client_whose_tx_mines(
+        succeeded: bool,
+    ) -> (
+        AlloyChainClient,
+        MockServer,
+        Arc<std::sync::Mutex<Option<B256>>>,
+    ) {
+        let broadcast = Arc::new(std::sync::Mutex::new(None));
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .respond_with(MinedResponder { succeeded })
+            .respond_with(MinedResponder {
+                succeeded,
+                broadcast: broadcast.clone(),
+            })
             .mount(&server)
             .await;
         let client = client_over(vec![server.uri().parse().expect("provider URL")]);
-        (client, server)
+        (client, server, broadcast)
     }
 
     /// A reconcile that reverted on-chain must not be reported as done: the reconciler
     /// counts and logs what this returns, and a reverted call reclaimed nothing.
     #[tokio::test]
     async fn reconcile_provider_reports_a_reverted_transaction() {
-        let (client, _server) = client_whose_tx_mines(false).await;
+        let (client, _server, _broadcast) = client_whose_tx_mines(false).await;
 
         let result = client
             .reconcile_provider(Address::repeat_byte(0x11), Address::repeat_byte(0x44))
@@ -1680,13 +1705,17 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_provider_returns_the_hash_once_mined() {
-        let (client, _server) = client_whose_tx_mines(true).await;
+        let (client, _server, broadcast) = client_whose_tx_mines(true).await;
 
         let tx_hash = client
             .reconcile_provider(Address::repeat_byte(0x11), Address::repeat_byte(0x44))
             .await
             .expect("a mined reconcile succeeds");
 
-        assert!(tx_hash.is_some());
+        assert_eq!(
+            tx_hash,
+            *broadcast.lock().unwrap(),
+            "the hash of what was broadcast"
+        );
     }
 }
