@@ -104,7 +104,7 @@ pub trait ChainClient {
 
     /// Reconcile a provider's escrow via the RecurringAgreementManager
     /// (`AgreementManager` mode) by calling `reconcileProvider(collector,
-    /// provider)`. Permissionless and idempotent; `Ok(Some(tx_hash))` on submit.
+    /// provider)`. Permissionless and idempotent; `Ok(Some(tx_hash))` once mined.
     async fn reconcile_provider(
         &self,
         collector: thegraph_core::alloy::primitives::Address,

@@ -769,10 +769,31 @@ impl ChainClient for AlloyChainClient {
 
         // No agreement context here; pass a zero id for the shared call's
         // logging field only. The call target is the manager.
-        let tx = self
+        let SubmittedTx {
+            hash: tx_hash,
+            nonce: dropped_nonce,
+        } = self
             .build_and_send_call(manager, calldata, &[0u8; 16])
             .await?;
-        Ok(Some(tx.hash))
+
+        // Wait for the receipt, as offers and cancels do, so a reverted or dropped
+        // reconcile is reported as failed rather than counted as done.
+        match self.wait_for_receipt(tx_hash, RECEIPT_POLL_TIMEOUT).await? {
+            Some(true) => Ok(Some(tx_hash)),
+            Some(false) => Err(ChainClientError::TxReverted { tx_hash }),
+            None => {
+                tracing::warn!(
+                    provider = %provider,
+                    tx_hash = %tx_hash,
+                    nonce = dropped_nonce,
+                    "Reconcile tx did not mine within receipt-poll window; treating as dropped"
+                );
+                if let Err(err) = self.fill_nonce_gap(dropped_nonce).await {
+                    tracing::warn!(nonce = dropped_nonce, error = %err, "Failed to fill mempool nonce gap");
+                }
+                Err(ChainClientError::TxDropped { tx_hash })
+            }
+        }
     }
 }
 
@@ -1581,5 +1602,91 @@ mod tests {
             .await
             .expect("a further submission succeeds");
         assert_eq!(next.nonce, 6, "a successful broadcast spends its slot");
+    }
+
+    /// Answers every call a manager transaction makes, through to a receipt that mined
+    /// with the given status.
+    struct MinedResponder {
+        succeeded: bool,
+    }
+
+    impl Respond for MinedResponder {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).expect("JSON-RPC request body");
+            let zero = format!("{:#x}", B256::ZERO);
+            let result = match body["method"].as_str().unwrap_or_default() {
+                "eth_estimateGas" => serde_json::json!("0x30000"),
+                "eth_maxPriorityFeePerGas" => serde_json::json!("0x1"),
+                "eth_getTransactionCount" => serde_json::json!("0x0"),
+                "eth_sendRawTransaction" => {
+                    serde_json::json!(format!("{:#x}", B256::repeat_byte(0xab)))
+                }
+                "eth_getBlockByNumber" => serde_json::json!({
+                    "hash": zero, "parentHash": zero, "sha3Uncles": zero,
+                    "miner": format!("{:#x}", Address::ZERO), "stateRoot": zero,
+                    "transactionsRoot": zero, "receiptsRoot": zero,
+                    "logsBloom": format!("0x{}", "00".repeat(256)), "difficulty": "0x0",
+                    "number": "0x1", "gasLimit": "0x1c9c380", "gasUsed": "0x0",
+                    "timestamp": "0x1", "extraData": "0x", "mixHash": zero,
+                    "nonce": "0x0000000000000000", "baseFeePerGas": "0x1",
+                    "uncles": [], "transactions": [],
+                }),
+                "eth_getTransactionReceipt" => serde_json::json!({
+                    "transactionHash": format!("{:#x}", B256::repeat_byte(0xab)),
+                    "transactionIndex": "0x0", "blockHash": zero, "blockNumber": "0x1",
+                    "from": format!("{:#x}", Address::ZERO),
+                    "to": format!("{:#x}", Address::repeat_byte(0x22)),
+                    "cumulativeGasUsed": "0x30000", "gasUsed": "0x30000",
+                    "effectiveGasPrice": "0x2", "contractAddress": null, "logs": [],
+                    "logsBloom": format!("0x{}", "00".repeat(256)), "type": "0x2",
+                    "status": if self.succeeded { "0x1" } else { "0x0" },
+                }),
+                other => panic!("unexpected method {other}"),
+            };
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": body["id"],
+                "result": result,
+            }))
+        }
+    }
+
+    async fn client_whose_tx_mines(succeeded: bool) -> (AlloyChainClient, MockServer) {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(MinedResponder { succeeded })
+            .mount(&server)
+            .await;
+        let client = client_over(vec![server.uri().parse().expect("provider URL")]);
+        (client, server)
+    }
+
+    /// A reconcile that reverted on-chain must not be reported as done: the reconciler
+    /// counts and logs what this returns, and a reverted call reclaimed nothing.
+    #[tokio::test]
+    async fn reconcile_provider_reports_a_reverted_transaction() {
+        let (client, _server) = client_whose_tx_mines(false).await;
+
+        let result = client
+            .reconcile_provider(Address::repeat_byte(0x11), Address::repeat_byte(0x44))
+            .await;
+
+        assert!(
+            matches!(result, Err(ChainClientError::TxReverted { .. })),
+            "got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_provider_returns_the_hash_once_mined() {
+        let (client, _server) = client_whose_tx_mines(true).await;
+
+        let tx_hash = client
+            .reconcile_provider(Address::repeat_byte(0x11), Address::repeat_byte(0x44))
+            .await
+            .expect("a mined reconcile succeeds");
+
+        assert!(tx_hash.is_some());
     }
 }
