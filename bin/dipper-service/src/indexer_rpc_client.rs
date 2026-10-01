@@ -30,6 +30,7 @@ use thegraph_core::alloy::{
     signers::{SignerSync, local::PrivateKeySigner},
     sol_types::{Eip712Domain, SolValue},
 };
+use tonic::transport::ClientTlsConfig;
 use url::Url;
 
 use crate::{config::IndexerClientConfig, registry::IndexingAgreementTerms};
@@ -138,12 +139,22 @@ impl DipsIndexerClient {
         &self,
         indexer_url: &Url,
     ) -> Result<rpc::IndexerDipsServiceClient<tonic::transport::Channel>, DipsError> {
-        let indexer_url = indexer_url.as_str();
-        let channel = tonic::transport::Endpoint::from_str(indexer_url)
+        let mut endpoint = tonic::transport::Endpoint::from_str(indexer_url.as_str())
             .map_err(|err| DipsError::ConnectionError(err.into()))?
             .connect_timeout(self.connect_timeout)
-            .timeout(self.request_timeout)
-            .connect_lazy();
+            .timeout(self.request_timeout);
+        // An endpoint built from a URL string leaves TLS off, even for https. Built-in
+        // roots avoid rereading the system store on every attempt, and the handshake
+        // needs its own timeout: neither of the endpoint's timeouts covers it.
+        if indexer_url.scheme() == "https" {
+            let tls = ClientTlsConfig::new()
+                .with_webpki_roots()
+                .timeout(self.connect_timeout);
+            endpoint = endpoint
+                .tls_config(tls)
+                .map_err(|err| DipsError::ConnectionError(err.into()))?;
+        }
+        let channel = endpoint.connect_lazy();
         let client = rpc::IndexerDipsServiceClient::new(channel);
         Ok(client)
     }
@@ -616,5 +627,92 @@ mod tests {
         assert_eq!(calculate_retry_delay(6), Duration::from_secs(30)); // Would be 64s, capped
         assert_eq!(calculate_retry_delay(10), Duration::from_secs(30));
         assert_eq!(calculate_retry_delay(100), Duration::from_secs(30));
+    }
+
+    /// Send a proposal to a local port under the given URL scheme and return the
+    /// first `n` bytes the client writes there. Nothing answers, so the proposal
+    /// itself fails; only what the client opens the connection with matters.
+    async fn first_bytes_of_a_proposal(scheme: &str, n: usize) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("{scheme}://{}/", listener.local_addr().unwrap())).unwrap();
+        let mut client = signing_test_client(PrivateKeySigner::random())
+            .get_client(&url)
+            .expect("the client should build");
+        let request = rpc::SubmitAgreementProposalRequest {
+            version: 2,
+            signed_rca: vec![],
+        };
+        let proposal = tokio::spawn(async move { client.submit_agreement_proposal(request).await });
+
+        let read = async {
+            let (mut socket, _) = listener.accept().await.expect("the client should connect");
+            let mut bytes = vec![0u8; n];
+            socket
+                .read_exact(&mut bytes)
+                .await
+                .expect("the client should write to the connection");
+            bytes
+        };
+        let bytes = tokio::time::timeout(Duration::from_secs(5), read)
+            .await
+            .expect("the client should reach the port within 5s");
+        proposal.abort();
+        bytes
+    }
+
+    #[tokio::test]
+    async fn test_https_indexer_is_reached_over_tls() {
+        //* Act
+        let bytes = first_bytes_of_a_proposal("https", 1).await;
+
+        //* Assert - 0x16 opens a TLS handshake record (the ClientHello)
+        assert_eq!(bytes, [0x16]);
+    }
+
+    #[tokio::test]
+    async fn test_https_handshake_with_a_silent_indexer_times_out() {
+        //* Arrange - a port that accepts the connection but never answers
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("https://{}/", listener.local_addr().unwrap())).unwrap();
+        let silent = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let mut client = DipsIndexerClient {
+            request_timeout: Duration::from_secs(600),
+            ..signing_test_client(PrivateKeySigner::random())
+        }
+        .get_client(&url)
+        .unwrap();
+        let request = rpc::SubmitAgreementProposalRequest {
+            version: 2,
+            signed_rca: vec![],
+        };
+
+        //* Act
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.submit_agreement_proposal(request),
+        )
+        .await;
+        silent.abort();
+
+        //* Assert - the 1s connect timeout bounds the handshake, not the 600s request timeout
+        assert!(
+            result
+                .expect("the handshake should give up within 10s")
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_indexer_is_reached_without_tls() {
+        //* Act
+        let bytes = first_bytes_of_a_proposal("http", 3).await;
+
+        //* Assert - plaintext gRPC opens with the HTTP/2 preface, "PRI * HTTP/2.0"
+        assert_eq!(bytes, b"PRI");
     }
 }
