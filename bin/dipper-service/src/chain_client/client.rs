@@ -2,6 +2,7 @@
 //! alloy for Ethereum interactions.
 
 use std::{
+    collections::HashSet,
     future::Future,
     sync::{
         Arc,
@@ -13,7 +14,7 @@ use std::{
 use async_trait::async_trait;
 use dipper_rpc::indexer::indexer_client::sol::RecurringCollectionAgreement;
 use thegraph_core::alloy::{
-    eips::{BlockId, BlockNumberOrTag, eip2718::Encodable2718},
+    eips::{BlockNumberOrTag, eip2718::Encodable2718},
     network::{EthereumWallet, TransactionBuilder},
     primitives::{Address, B256, FixedBytes, U256},
     providers::Provider,
@@ -591,17 +592,6 @@ impl AlloyChainClient {
         call: C,
         operation: &'static str,
     ) -> Result<C::Return, ChainClientError> {
-        self.view_at(to, call, operation, None).await
-    }
-
-    /// [`Self::view`] at a given block, so several reads see one consistent state.
-    async fn view_at<C: SolCall>(
-        &self,
-        to: Address,
-        call: C,
-        operation: &'static str,
-        block: Option<u64>,
-    ) -> Result<C::Return, ChainClientError> {
         let calldata = call.abi_encode();
         let output = self
             .inner
@@ -610,10 +600,7 @@ impl AlloyChainClient {
                 let calldata = calldata.clone();
                 async move {
                     let tx = TransactionRequest::default().to(to).input(calldata.into());
-                    match block {
-                        Some(number) => provider.call(tx).block(BlockId::number(number)).await,
-                        None => provider.call(tx).await,
-                    }
+                    provider.call(tx).await
                 }
             })
             .await?;
@@ -873,41 +860,49 @@ impl ManagerEscrowReader for AlloyChainClient {
         collector: Address,
     ) -> Result<Vec<Address>, ChainClientError> {
         let manager = self.inner.recurring_agreement_manager_address;
-        // Read the whole list at one block: the set can lose a member between reads,
-        // which would shift later entries or put an index past the end.
-        let block = self
-            .inner
-            .rpc_pool
-            .execute("get_block_number", |provider| async move {
-                provider.get_block_number().await
-            })
-            .await?;
         let count = self
-            .view_at(
+            .view(
                 manager,
                 IRecurringAgreementManager::getProviderCountCall { collector },
                 "get_provider_count",
-                Some(block),
             )
             .await?;
         let count = u64::try_from(count).map_err(|_| {
             ChainClientError::RpcError(anyhow::anyhow!("implausible provider count {count}"))
         })?;
 
+        // Each read sees the latest block (pruned nodes refuse older state), so the list
+        // can change mid-read: an entry can turn up twice or the list can end early. A
+        // provider missed here is read again next sweep.
         let mut providers = Vec::new();
+        let mut seen = HashSet::new();
         for index in 0..count {
-            let provider = self
-                .view_at(
+            let read = self
+                .view(
                     manager,
                     IRecurringAgreementManager::getProviderAtCall {
                         collector,
                         index: U256::from(index),
                     },
                     "get_provider_at",
-                    Some(block),
                 )
-                .await?;
-            providers.push(provider);
+                .await;
+            match read {
+                Ok(provider) => {
+                    if seen.insert(provider) {
+                        providers.push(provider);
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        index,
+                        count,
+                        error = %err,
+                        "Failed to read a provider from the manager's list; using those read so far"
+                    );
+                    break;
+                }
+            }
         }
         Ok(providers)
     }
@@ -1912,22 +1907,28 @@ mod tests {
         );
     }
 
-    /// Answers the manager's escrow views as a manager tracking 2 providers would, at
-    /// block 100, recording the block each provider-list read asked for.
-    #[derive(Default)]
+    /// Answers the manager's escrow views as a manager whose provider list is `providers`
+    /// would. A `None` entry reverts, as a read past the end of a list that shrank does.
     struct ManagerViewsResponder {
-        list_blocks: Arc<std::sync::Mutex<Vec<String>>>,
+        providers: Vec<Option<Address>>,
+    }
+
+    impl Default for ManagerViewsResponder {
+        /// A manager tracking 2 providers.
+        fn default() -> Self {
+            Self {
+                providers: vec![
+                    Some(Address::repeat_byte(0x10)),
+                    Some(Address::repeat_byte(0x11)),
+                ],
+            }
+        }
     }
 
     impl Respond for ManagerViewsResponder {
         fn respond(&self, request: &Request) -> ResponseTemplate {
             let body: serde_json::Value =
                 serde_json::from_slice(&request.body).expect("JSON-RPC request body");
-            if body["method"] == "eth_blockNumber" {
-                return ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "jsonrpc": "2.0", "id": body["id"], "result": "0x64",
-                }));
-            }
             assert_eq!(body["method"], "eth_call", "only views are expected");
             let input = body["params"][0]["input"]
                 .as_str()
@@ -1935,19 +1936,24 @@ mod tests {
                 .expect("calldata");
             let data = thegraph_core::alloy::primitives::hex::decode(input).expect("hex");
             let selector: [u8; 4] = data[..4].try_into().expect("selector");
-            if selector == IRecurringAgreementManager::getProviderCountCall::SELECTOR
-                || selector == IRecurringAgreementManager::getProviderAtCall::SELECTOR
-            {
-                let block = body["params"][1].as_str().unwrap_or("latest").to_string();
-                self.list_blocks.lock().unwrap().push(block);
-            }
 
             let output = if selector == IRecurringAgreementManager::getProviderCountCall::SELECTOR {
-                IRecurringAgreementManager::getProviderCountCall::abi_encode_returns(&U256::from(2))
+                IRecurringAgreementManager::getProviderCountCall::abi_encode_returns(&U256::from(
+                    self.providers.len(),
+                ))
             } else if selector == IRecurringAgreementManager::getProviderAtCall::SELECTOR {
                 let call = IRecurringAgreementManager::getProviderAtCall::abi_decode(&data)
                     .expect("getProviderAt args");
-                let provider = Address::repeat_byte(0x10 + u8::try_from(call.index).unwrap());
+                let entry = usize::try_from(call.index)
+                    .ok()
+                    .and_then(|index| self.providers.get(index).copied().flatten());
+                let Some(provider) = entry else {
+                    return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": body["id"],
+                        "error": { "code": 3, "message": "execution reverted" },
+                    }));
+                };
                 IRecurringAgreementManager::getProviderAtCall::abi_encode_returns(&provider)
             } else if selector == IRecurringAgreementManager::getAgreementCountCall::SELECTOR {
                 IRecurringAgreementManager::getAgreementCountCall::abi_encode_returns(&U256::from(
@@ -1978,16 +1984,21 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn reads_the_providers_and_escrow_the_manager_tracks() {
-        let responder = ManagerViewsResponder::default();
-        let list_blocks = responder.list_blocks.clone();
+    async fn client_over_manager(
+        responder: ManagerViewsResponder,
+    ) -> (AlloyChainClient, MockServer) {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(responder)
             .mount(&server)
             .await;
         let client = client_over(vec![server.uri().parse().expect("provider URL")]);
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn reads_the_providers_and_escrow_the_manager_tracks() {
+        let (client, _server) = client_over_manager(ManagerViewsResponder::default()).await;
 
         let providers = client
             .tracked_providers(Address::repeat_byte(0x11))
@@ -2002,8 +2013,6 @@ mod tests {
             providers,
             vec![Address::repeat_byte(0x10), Address::repeat_byte(0x11)]
         );
-        // One block for the whole list, so a provider dropped mid-read can't shift it.
-        assert_eq!(*list_blocks.lock().unwrap(), vec!["0x64"; 3]);
         assert_eq!(
             account,
             EscrowAccount {
@@ -2064,6 +2073,46 @@ mod tests {
             tx_hash,
             *broadcast.lock().unwrap(),
             "the hash of what was broadcast"
+        );
+    }
+
+    /// The list can shrink between reading its length and reading an entry, so a failed
+    /// read keeps the providers read before it rather than failing the whole sweep.
+    #[tokio::test]
+    async fn tracked_providers_keeps_what_was_read_before_a_failed_read() {
+        let (client, _server) = client_over_manager(ManagerViewsResponder {
+            providers: vec![Some(Address::repeat_byte(0x10)), None],
+        })
+        .await;
+
+        let providers = client
+            .tracked_providers(Address::repeat_byte(0x11))
+            .await
+            .expect("the providers read before the failure");
+
+        assert_eq!(providers, vec![Address::repeat_byte(0x10)]);
+    }
+
+    /// An entry can move within the list mid-read and turn up twice; list it once.
+    #[tokio::test]
+    async fn tracked_providers_lists_a_provider_read_twice_once() {
+        let (client, _server) = client_over_manager(ManagerViewsResponder {
+            providers: vec![
+                Some(Address::repeat_byte(0x10)),
+                Some(Address::repeat_byte(0x11)),
+                Some(Address::repeat_byte(0x10)),
+            ],
+        })
+        .await;
+
+        let providers = client
+            .tracked_providers(Address::repeat_byte(0x11))
+            .await
+            .expect("providers");
+
+        assert_eq!(
+            providers,
+            vec![Address::repeat_byte(0x10), Address::repeat_byte(0x11)]
         );
     }
 }
