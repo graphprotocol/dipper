@@ -63,7 +63,7 @@ pub enum ChainClientError {
     ///
     /// In practice the tx was evicted from the mempool — typically a same-sender
     /// tx claimed the nonce with a higher fee. Callers re-sync the nonce and
-    /// resubmit; there is no idempotency guard, so a replay re-sends the offer.
+    /// resubmit; there is no idempotency guard, so a replay re-sends the call.
     #[error("tx {tx_hash} did not mine within the receipt-poll window")]
     TxDropped { tx_hash: B256 },
 
@@ -104,7 +104,7 @@ pub trait ChainClient {
 
     /// Reconcile a provider's escrow via the RecurringAgreementManager
     /// (`AgreementManager` mode) by calling `reconcileProvider(collector,
-    /// provider)`. Permissionless and idempotent; `Ok(Some(tx_hash))` on submit.
+    /// provider)`. Permissionless and idempotent; `Ok(Some(tx_hash))` once mined.
     async fn reconcile_provider(
         &self,
         collector: thegraph_core::alloy::primitives::Address,

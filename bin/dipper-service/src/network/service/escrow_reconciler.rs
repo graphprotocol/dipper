@@ -168,13 +168,23 @@ where
             continue;
         }
 
-        match chain_client.reconcile_provider(collector, provider).await {
+        // A reconcile can wait seconds for its receipt; abandoning it on stop is safe
+        // because reconciling is idempotent and the next run picks the provider up again.
+        let result = tokio::select! {
+            _ = rx_stop.recv() => {
+                tracing::debug!("escrow reconciler stopping mid-reconcile");
+                return Outcome::Stopped;
+            }
+            result = chain_client.reconcile_provider(collector, provider) => result,
+        };
+
+        match result {
             Ok(Some(tx_hash)) => {
                 ok += 1;
                 tracing::info!(
                     %provider,
                     %tx_hash,
-                    "submitted escrow reconciliation for provider"
+                    "reconciled provider escrow"
                 );
             }
             Ok(None) => {
@@ -210,6 +220,8 @@ mod tests {
     #[derive(Clone, Default)]
     struct RecordingChainClient {
         calls: Arc<Mutex<Vec<Address>>>,
+        /// Never finish a reconcile, like one stuck waiting for its receipt.
+        stall: bool,
     }
 
     #[async_trait]
@@ -243,6 +255,9 @@ mod tests {
             provider: Address,
         ) -> Result<Option<B256>, ChainClientError> {
             self.calls.lock().unwrap().push(provider);
+            if self.stall {
+                std::future::pending::<()>().await;
+            }
             Ok(Some(B256::ZERO))
         }
         async fn agreement_still_active(
@@ -401,6 +416,35 @@ mod tests {
             dup_count, 1,
             "duplicate provider must be reconciled once per sweep"
         );
+    }
+
+    #[tokio::test]
+    async fn a_stop_interrupts_a_reconcile_waiting_on_its_receipt() {
+        //* Arrange
+        let chain = RecordingChainClient {
+            stall: true,
+            ..Default::default()
+        };
+        let (tx_stop, mut rx_stop) = mpsc::channel(1);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            tx_stop.send(()).await.unwrap();
+        });
+
+        //* Act - the stop arrives while the reconcile is in flight
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            reconcile_providers(
+                &chain,
+                &mut rx_stop,
+                Address::ZERO,
+                vec![Address::repeat_byte(0x11)],
+            ),
+        )
+        .await;
+
+        //* Assert - shutdown gives each service only a few seconds to stop
+        assert!(matches!(outcome, Ok(Outcome::Stopped)));
     }
 
     #[tokio::test]
