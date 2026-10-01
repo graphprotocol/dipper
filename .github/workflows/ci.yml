@@ -38,7 +38,7 @@ jobs:
         with:
           sweep-cache: true
 
-      - run: cargo clippy -- -D warnings --force-warn deprecated -D dead-code
+      - run: cargo clippy --all-targets -- -D warnings --force-warn deprecated -D dead-code
 
   unused-deps:
     runs-on: ubuntu-latest
