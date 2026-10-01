@@ -100,7 +100,7 @@ where
                 }
             };
 
-            let mut ended = tokio::select! {
+            let ended = tokio::select! {
                 _ = rx_stop.recv() => break,
                 ended = ended_agreements(
                     &chain_client,
@@ -108,9 +108,9 @@ where
                     &providers,
                     &mut agreement_cursor,
                     config.agreements_per_sweep,
+                    sweep_budget(config.batch_size),
                 ) => ended,
             };
-            cap(&mut ended, config.batch_size);
             if !ended.is_empty() {
                 match release_agreements(&chain_client, &mut rx_stop, collector, ended).await {
                     Outcome::Stopped => return Ok(()),
@@ -252,12 +252,15 @@ where
     Ok(due)
 }
 
+/// The most transactions a sweep may send: `batch_size` when it is positive, else no limit.
+fn sweep_budget(batch_size: i64) -> Option<usize> {
+    usize::try_from(batch_size).ok().filter(|&limit| limit > 0)
+}
+
 /// Keep at most `batch_size` items when it is positive, returning how many were cut.
 fn cap<T>(items: &mut Vec<T>, batch_size: i64) -> usize {
     let before = items.len();
-    if let Ok(limit) = usize::try_from(batch_size)
-        && limit > 0
-    {
+    if let Some(limit) = sweep_budget(batch_size) {
         items.truncate(limit);
     }
     before - items.len()
@@ -293,15 +296,15 @@ enum Outcome<T> {
 }
 
 /// Agreements the manager still counts against a provider although the collector says
-/// nothing more can be claimed on them. Checks at most `limit` tracked agreements, from
-/// `cursor` onwards, so a large set is covered over several sweeps; one that can't be
-/// read is left for a later sweep.
+/// nothing more can be claimed on them. Checks up to `limit` agreements from `cursor`,
+/// stopping once `max_ended` are found; the rest, and any unreadable, wait for later sweeps.
 async fn ended_agreements<T>(
     chain_client: &T,
     collector: Address,
     providers: &[Address],
     cursor: &mut u64,
     limit: u64,
+    max_ended: Option<usize>,
 ) -> Vec<[u8; 16]>
 where
     T: ManagerEscrowReader,
@@ -325,11 +328,20 @@ where
 
     let start = *cursor % total;
     let checks = limit.min(total);
-    *cursor = (start + checks) % total;
 
     let mut ended = Vec::new();
-    for step in 0..checks {
-        let (provider, index) = locate(&counts, (start + step) % total);
+    let mut checked = 0;
+    while checked < checks {
+        if max_ended.is_some_and(|max| ended.len() >= max) {
+            tracing::info!(
+                checked,
+                found = ended.len(),
+                "found as many ended agreements as this sweep can release; the rest are checked later"
+            );
+            break;
+        }
+        let (provider, index) = locate(&counts, (start + checked) % total);
+        checked += 1;
         let id = match chain_client
             .tracked_agreement_at(collector, provider, index)
             .await
@@ -348,6 +360,7 @@ where
             }
         }
     }
+    *cursor = (start + checked) % total;
     ended
 }
 
@@ -967,8 +980,15 @@ mod tests {
         let mut cursor = 0;
 
         //* Act
-        let ended =
-            ended_agreements(&manager, Address::ZERO, &manager.order, &mut cursor, 500).await;
+        let ended = ended_agreements(
+            &manager,
+            Address::ZERO,
+            &manager.order,
+            &mut cursor,
+            500,
+            None,
+        )
+        .await;
 
         //* Assert
         assert_eq!(ended, vec![[0xe0; 16]]);
@@ -982,8 +1002,15 @@ mod tests {
         Arc::make_mut(&mut manager.claims).remove(&[0xe0; 16]);
         let mut cursor = 0;
 
-        let ended =
-            ended_agreements(&manager, Address::ZERO, &manager.order, &mut cursor, 500).await;
+        let ended = ended_agreements(
+            &manager,
+            Address::ZERO,
+            &manager.order,
+            &mut cursor,
+            500,
+            None,
+        )
+        .await;
 
         assert_eq!(ended, vec![[0xe1; 16]]);
     }
@@ -1005,7 +1032,15 @@ mod tests {
         let mut seen = Vec::new();
         for _ in 0..3 {
             seen.extend(
-                ended_agreements(&manager, Address::ZERO, &manager.order, &mut cursor, 2).await,
+                ended_agreements(
+                    &manager,
+                    Address::ZERO,
+                    &manager.order,
+                    &mut cursor,
+                    2,
+                    None,
+                )
+                .await,
             );
         }
 
@@ -1037,5 +1072,27 @@ mod tests {
 
         //* Assert
         assert_eq!(manager.released(), vec![[0xe0; 16]]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ended_agreements_past_the_batch_are_checked_by_the_next_sweep() {
+        //* Arrange - 5 ended agreements, and room to release 2 per sweep
+        let provider = Address::repeat_byte(0x11);
+        let manager = FakeManager::with(vec![(provider, settled())])
+            .tracking((1..=5).map(|n| (provider, [n; 16], 0)).collect());
+        let (handle, service) = new(Ctx {
+            chain_client: manager.clone(),
+            config: config(Duration::from_secs(600), Duration::ZERO, 2),
+            collector: Address::ZERO,
+        });
+        let service = tokio::spawn(service);
+
+        //* Act - 2 sweeps
+        tokio::time::sleep(Duration::from_secs(1_201)).await;
+        handle.stop().await;
+        service.await.unwrap().unwrap();
+
+        //* Assert - the second sweep starts at the first agreement the first one left
+        assert_eq!(manager.released(), vec![[1; 16], [2; 16], [3; 16], [4; 16]]);
     }
 }
