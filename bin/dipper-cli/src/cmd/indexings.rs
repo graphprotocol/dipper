@@ -4,10 +4,17 @@ use clap::{Command, arg, command, value_parser};
 use dipper_core::ids::IndexingRequestId;
 use dipper_rpc::admin::indexing_requests::SetIndexingTargetCandidates;
 use thegraph_core::{DeploymentId, SubgraphId, alloy::primitives::ChainId, signed_message};
+use url::Url;
 use uuid::Uuid;
 
 use super::{common, result::Result};
-use crate::{client, client::IndexingRequestsRpcClient, config::Config, signer};
+use crate::{
+    chain::{self, ChainOverride, ChainResolver},
+    client,
+    client::IndexingRequestsRpcClient,
+    config::Config,
+    signer,
+};
 
 /// The `indexings` command implementation
 pub(super) async fn run(matches: &clap::ArgMatches) -> Result<()> {
@@ -107,11 +114,9 @@ pub async fn status(conf: Config, matches: &clap::ArgMatches) -> Result<()> {
     }
 }
 
-/// The `indexings set-target-candidates` command.
-///
-/// Idempotent upsert keyed on `(requester, deployment, chain)`. Run with
-/// `--num-candidates N` to request N indexers; run with `--num-candidates 0`
-/// to cancel an existing assignment.
+/// The `indexings set-target-candidates` command: an idempotent upsert keyed on
+/// `(requester, deployment, chain)`, where `--num-candidates 0` cancels. The chain
+/// comes from the deployment's manifest unless `--chain-name` or `--chain-id` is given.
 pub async fn set_target(conf: Config, matches: &clap::ArgMatches) -> Result<()> {
     let rpc_client = client::new(&conf.server_url);
     let signer = signer::new_private_key_eip712_signer(&conf.signing_key);
@@ -129,9 +134,21 @@ pub async fn set_target(conf: Config, matches: &clap::ArgMatches) -> Result<()> 
         None => unreachable!("No ID provided"),
     };
 
-    let request_chain_id = matches
-        .get_one::<ChainId>("CHAIN_ID")
-        .ok_or_else(|| anyhow::anyhow!("No chain ID provided"))?;
+    let chain_override = match (
+        matches.get_one::<String>("chain-name"),
+        matches.get_one::<ChainId>("chain-id"),
+    ) {
+        (Some(name), _) => Some(ChainOverride::Name(name.clone())),
+        (None, Some(id)) => Some(ChainOverride::Id(*id)),
+        (None, None) => None,
+    };
+    let ipfs_url = matches
+        .get_one::<Url>("ipfs-url")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("No IPFS URL provided"))?;
+    let request_chain_id = ChainResolver::new(ipfs_url)?
+        .resolve(request_deployment_id, chain_override)
+        .await?;
 
     let num_candidates = matches.get_one::<usize>("num-candidates").copied();
 
@@ -140,7 +157,7 @@ pub async fn set_target(conf: Config, matches: &clap::ArgMatches) -> Result<()> 
         &signer_eip712_domain,
         SetIndexingTargetCandidates {
             deployment_id: *request_deployment_id,
-            chain_id: *request_chain_id,
+            chain_id: request_chain_id,
             num_candidates,
         },
     )
@@ -192,9 +209,16 @@ pub(super) fn cmd() -> Command {
                 .args([
                     arg!(<SUBGRAPH> "The indexing request's Subgraph (or Deployment) ID")
                         .value_parser(value_parser!(SubgraphIdOrDeploymentId)),
-                    arg!(<CHAIN_ID> "The ID of the chain indexed by the subgraph")
+                    arg!(--"chain-name" <NETWORK> "Use this network instead of the one in the subgraph manifest (e.g. arbitrum-sepolia)")
+                        .required(false)
+                        .conflicts_with("chain-id"),
+                    arg!(--"chain-id" <ID> "Use this numeric chain ID instead of the manifest's network (e.g. 1337 for a local chain)")
                         .value_parser(value_parser!(ChainId))
-                        .required(true),
+                        .required(false),
+                    arg!(--"ipfs-url" <URL> "The IPFS API to read the subgraph manifest from")
+                        .env(crate::name_prefixed!("IPFS_URL"))
+                        .value_parser(value_parser!(Url))
+                        .default_value(chain::DEFAULT_IPFS_URL),
                     arg!(--"num-candidates" <N> "Target number of indexers to assign (0 cancels). Defaults to server maximum.")
                         .value_parser(value_parser!(usize))
                         .required(false),
@@ -266,5 +290,45 @@ impl FromStr for IndexingRequestSelector {
         }
 
         Err(anyhow::anyhow!("Invalid indexing request selector: {val}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parse `indexings set-target-candidates <deployment>` followed by `args`.
+    fn parse_set_target(args: &[&str]) -> std::result::Result<clap::ArgMatches, clap::Error> {
+        let base = [
+            "indexings",
+            "--server-url",
+            "http://localhost:9000",
+            "--signing-key",
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            "set-target-candidates",
+            "QmQ5w3LqJdBGZvHNYTWq7np2B1qbBQMpHP77ZKQPzGVTrg",
+        ];
+        cmd().try_get_matches_from(base.into_iter().chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn test_set_target_candidates_needs_no_chain() {
+        let matches = parse_set_target(&[]).unwrap();
+        let (_, matches) = matches.subcommand().unwrap();
+
+        assert_eq!(matches.get_one::<String>("chain-name"), None);
+        assert_eq!(matches.get_one::<ChainId>("chain-id"), None);
+    }
+
+    #[test]
+    fn test_set_target_candidates_rejects_both_chain_flags() {
+        let err = parse_set_target(&["--chain-name", "mainnet", "--chain-id", "1"]).unwrap_err();
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn test_set_target_candidates_rejects_the_old_positional_chain_id() {
+        assert!(parse_set_target(&["1"]).is_err());
     }
 }
