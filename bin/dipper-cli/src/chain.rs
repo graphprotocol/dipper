@@ -152,7 +152,12 @@ fn choose_chain_id(
                  pass --chain-name or --chain-id"
             )
         })?;
-        let chain_id = chain_id_for_network(&registry?, &network)?;
+        // The CLI prints only the outermost message, so the cause goes into it.
+        let chain_id = registry
+            .and_then(|registry| chain_id_for_network(&registry, &network))
+            .map_err(|err| {
+                anyhow!("could not look up the chain ID of {network} ({err:#}); pass --chain-id")
+            })?;
         let notice =
             format!("Using chain {network} (chain ID {chain_id}) from the subgraph manifest");
         return Ok((chain_id, Some(notice)));
@@ -218,9 +223,9 @@ fn network_from_manifest(manifest: &str) -> anyhow::Result<String> {
 
 /// The EVM chain ID for a network name or alias in the networks registry.
 fn chain_id_for_network(registry: &NetworksRegistry, network: &str) -> anyhow::Result<ChainId> {
-    let entry = registry.get_network_by_graph_id(network).ok_or_else(|| {
-        anyhow!("network '{network}' is not in the networks registry; pass --chain-id")
-    })?;
+    let entry = registry
+        .get_network_by_graph_id(network)
+        .ok_or_else(|| anyhow!("network '{network}' is not in the networks registry"))?;
     entry
         .caip2_id
         .strip_prefix("eip155:")
@@ -359,6 +364,35 @@ mod tests {
             err.contains("IPFS is down") && err.contains("--chain-id"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn test_choose_chain_id_explains_a_registry_failure_without_an_override() {
+        let err = choose_chain_id(
+            None,
+            Ok("arbitrum-sepolia".to_string()),
+            Err(anyhow!("registry is down")),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("registry is down") && err.contains("--chain-id"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_choose_chain_id_does_not_suggest_a_chain_id_that_was_given() {
+        let (_, notice) = choose_chain_id(
+            Some(ChainOverride::Id(1337)),
+            Ok("hardhat".to_string()),
+            registry(),
+        )
+        .unwrap();
+
+        let notice = notice.unwrap();
+        assert!(!notice.contains("pass --chain-id"), "{notice}");
     }
 
     #[test]
