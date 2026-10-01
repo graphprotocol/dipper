@@ -2,7 +2,7 @@
 //! provider when one of its agreements changes or is collected, so this sweep withdraws
 //! finished thaws and rebalances each provider periodically, and only where needed.
 
-use std::{future::Future, time::Duration};
+use std::{collections::HashSet, future::Future, time::Duration};
 
 use thegraph_core::alloy::primitives::{Address, U256};
 use tokio::{sync::mpsc, time::MissedTickBehavior};
@@ -76,6 +76,7 @@ where
             config.interval,
         );
         timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut schedule = RebalanceSchedule::default();
 
         loop {
             tokio::select! {
@@ -87,7 +88,7 @@ where
             // request cut it short rather than hold up shutdown.
             let read = tokio::select! {
                 _ = rx_stop.recv() => break,
-                read = providers_due(&chain_client, collector, &config) => read,
+                read = providers_due(&chain_client, collector, &config, &mut schedule) => read,
             };
             let due = match read {
                 Ok(due) => due,
@@ -104,12 +105,13 @@ where
 
             match reconcile_providers(&chain_client, &mut rx_stop, collector, due).await {
                 Outcome::Stopped => return Ok(()),
-                Outcome::Done { ok, failed } => {
+                Outcome::Done { succeeded, failed } => {
                     tracing::info!(
-                        reconciled = ok,
-                        failed,
+                        reconciled = succeeded.len(),
+                        failed = failed.len(),
                         "escrow reconciliation sweep completed"
                     );
+                    schedule.settle(&succeeded, &failed);
                 }
             }
         }
@@ -130,28 +132,67 @@ enum Reason {
     Rebalance,
 }
 
+/// Which providers are owed a rebalance. Each sweep hands out the slots in the chain
+/// time since the previous one, so a late or failed sweep doesn't skip any, and a
+/// rebalance that couldn't be sent stays owed until one goes through.
+#[derive(Debug, Default)]
+struct RebalanceSchedule {
+    /// Chain time up to which rebalance slots have been handed out.
+    covered_until: Option<u64>,
+    /// Providers whose rebalance came due but hasn't gone through yet.
+    owed: HashSet<Address>,
+}
+
+impl RebalanceSchedule {
+    /// The chain-time window this sweep hands out slots for. The first sweep looks back
+    /// one `interval`; a head older than the last one seen (a lagging RPC endpoint)
+    /// covers nothing new.
+    fn window(&self, now: u64, interval: Duration) -> (u64, u64) {
+        let from = self
+            .covered_until
+            .unwrap_or_else(|| now.saturating_sub(interval.as_secs()));
+        (from, now.max(from))
+    }
+
+    /// Record a sweep's reconciles: each one rebalances the provider in full, so a
+    /// success settles what it owed, and a failure leaves it owed.
+    fn settle(&mut self, succeeded: &[Address], failed: &[Address]) {
+        for provider in succeeded {
+            self.owed.remove(provider);
+        }
+        self.owed.extend(failed.iter().copied());
+    }
+}
+
 /// Providers to reconcile this sweep: those whose thaw has finished first, then those
-/// due a rebalance, capped at `batch_size` when it is positive. A provider whose escrow
-/// can't be read is skipped until the next sweep rather than failing the rest.
+/// owed a rebalance, capped at `batch_size` when it is positive. A provider whose escrow
+/// can't be read is skipped this sweep, and keeps any rebalance it is owed.
 async fn providers_due<T>(
     chain_client: &T,
     collector: Address,
     config: &EscrowReconcilerConfig,
+    schedule: &mut RebalanceSchedule,
 ) -> Result<Vec<(Address, Reason)>, ChainClientError>
 where
     T: ChainClient + ManagerEscrowReader,
 {
     let providers = chain_client.tracked_providers(collector).await?;
     let now = chain_client.latest_block_timestamp().await?;
+    let (from, to) = schedule.window(now, config.interval);
+    let tracked: HashSet<Address> = providers.iter().copied().collect();
+    schedule.owed.retain(|provider| tracked.contains(provider));
 
     let mut due = Vec::new();
     let mut rebalances = Vec::new();
     for provider in providers {
+        if rebalance_due(provider, from, to, config.rebalance_interval) {
+            schedule.owed.insert(provider);
+        }
         match chain_client.escrow_account(collector, provider).await {
             Ok(account) if thaw_finished(&account, now) => {
                 due.push((provider, Reason::ThawFinished));
             }
-            Ok(_) if rebalance_due(provider, now, config.interval, config.rebalance_interval) => {
+            Ok(_) if schedule.owed.contains(&provider) => {
                 rebalances.push((provider, Reason::Rebalance));
             }
             Ok(_) => {}
@@ -160,14 +201,28 @@ where
             }
         }
     }
-    due.extend(rebalances);
+    schedule.covered_until = Some(to);
 
-    if let Ok(limit) = usize::try_from(config.batch_size)
-        && limit > 0
-    {
-        due.truncate(limit);
+    due.extend(rebalances);
+    let deferred = cap(&mut due, config.batch_size);
+    if deferred > 0 {
+        tracing::info!(
+            deferred,
+            "escrow reconciliation reached batch_size; the rest wait for the next sweep"
+        );
     }
     Ok(due)
+}
+
+/// Keep at most `batch_size` items when it is positive, returning how many were cut.
+fn cap<T>(items: &mut Vec<T>, batch_size: i64) -> usize {
+    let before = items.len();
+    if let Ok(limit) = usize::try_from(batch_size)
+        && limit > 0
+    {
+        items.truncate(limit);
+    }
+    before - items.len()
 }
 
 /// Whether a thaw has finished, so `reconcileProvider` would withdraw it. Mirrors the
@@ -176,29 +231,30 @@ fn thaw_finished(account: &EscrowAccount, now: u64) -> bool {
     account.tokens_thawing > U256::ZERO && account.thaw_end_timestamp < U256::from(now)
 }
 
-/// Whether a rebalance for `provider` falls in this sweep. Each provider gets its own
-/// offset into `rebalance` so the transactions spread out, and the slot follows chain
-/// time rather than process memory, so a restart doesn't trigger a round of them.
-fn rebalance_due(provider: Address, now: u64, sweep: Duration, rebalance: Duration) -> bool {
+/// Whether `provider`'s once-per-`rebalance` slot falls in the chain-time window
+/// `(from, to]`. Each provider gets its own offset into the interval, so the
+/// transactions spread out rather than landing in one sweep.
+fn rebalance_due(provider: Address, from: u64, to: u64, rebalance: Duration) -> bool {
     let period = rebalance.as_secs();
-    if period == 0 {
+    if period == 0 || to <= from {
         return false;
     }
     let mut first_bytes = [0u8; 8];
     first_bytes.copy_from_slice(&provider.as_slice()[..8]);
     let offset = u64::from_be_bytes(first_bytes) % period;
 
-    let this_sweep = now.saturating_add(offset) / period;
-    let last_sweep = now.saturating_sub(sweep.as_secs()).saturating_add(offset) / period;
-    this_sweep != last_sweep
+    to.saturating_add(offset) / period != from.saturating_add(offset) / period
 }
 
 /// Result of one sweep over the provider set.
 enum Outcome {
     /// `rx_stop` fired mid-sweep; the caller should return.
     Stopped,
-    /// The sweep finished; `ok`/`failed` count per-provider tx outcomes.
-    Done { ok: u64, failed: u64 },
+    /// The sweep finished; the providers whose reconcile went through or failed.
+    Done {
+        succeeded: Vec<Address>,
+        failed: Vec<Address>,
+    },
 }
 
 /// Call `reconcileProvider` once per distinct provider. One failed tx never aborts
@@ -212,9 +268,9 @@ async fn reconcile_providers<T>(
 where
     T: ChainClient,
 {
-    let mut seen = std::collections::HashSet::new();
-    let mut ok: u64 = 0;
-    let mut failed: u64 = 0;
+    let mut seen = HashSet::new();
+    let mut succeeded = Vec::new();
+    let mut failed = Vec::new();
 
     for (provider, reason) in providers {
         if rx_stop.try_recv().is_ok() {
@@ -238,7 +294,7 @@ where
 
         match result {
             Ok(Some(tx_hash)) => {
-                ok += 1;
+                succeeded.push(provider);
                 tracing::info!(
                     %provider,
                     ?reason,
@@ -247,11 +303,11 @@ where
                 );
             }
             Ok(None) => {
-                ok += 1;
+                succeeded.push(provider);
                 tracing::debug!(%provider, ?reason, "escrow reconciliation was a no-op for provider");
             }
             Err(err) => {
-                failed += 1;
+                failed.push(provider);
                 tracing::warn!(
                     %provider,
                     ?reason,
@@ -262,7 +318,7 @@ where
         }
     }
 
-    Outcome::Done { ok, failed }
+    Outcome::Done { succeeded, failed }
 }
 
 #[cfg(test)]
@@ -450,9 +506,14 @@ mod tests {
         ]);
 
         //* Act
-        let due = providers_due(&manager, Address::ZERO, &no_rebalance())
-            .await
-            .unwrap();
+        let due = providers_due(
+            &manager,
+            Address::ZERO,
+            &no_rebalance(),
+            &mut RebalanceSchedule::default(),
+        )
+        .await
+        .unwrap();
 
         //* Assert
         assert_eq!(due, vec![(finished, Reason::ThawFinished)]);
@@ -466,9 +527,14 @@ mod tests {
             (finished, thawing_until(NOW - 1)),
         ]);
 
-        let due = providers_due(&manager, Address::ZERO, &no_rebalance())
-            .await
-            .unwrap();
+        let due = providers_due(
+            &manager,
+            Address::ZERO,
+            &no_rebalance(),
+            &mut RebalanceSchedule::default(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(due, vec![(finished, Reason::ThawFinished)]);
     }
@@ -485,9 +551,14 @@ mod tests {
         let every_sweep = config(Duration::from_secs(600), Duration::from_secs(60), 2);
 
         //* Act
-        let due = providers_due(&manager, Address::ZERO, &every_sweep)
-            .await
-            .unwrap();
+        let due = providers_due(
+            &manager,
+            Address::ZERO,
+            &every_sweep,
+            &mut RebalanceSchedule::default(),
+        )
+        .await
+        .unwrap();
 
         //* Assert
         assert_eq!(due.len(), 2);
@@ -496,22 +567,56 @@ mod tests {
     }
 
     #[test]
-    fn each_provider_is_rebalanced_once_per_interval() {
-        let sweep = Duration::from_secs(600);
+    fn each_provider_is_rebalanced_once_per_interval_however_sweeps_are_spaced() {
         let day = Duration::from_secs(86_400);
+        // Sweeps late, early and skipped, as a slow RPC or a busy worker would leave them.
+        let gaps = [600, 1_300, 45, 2_000, 600, 7_200, 600, 30];
 
         for provider in [Address::repeat_byte(0x01), Address::repeat_byte(0xfe)] {
-            let sweeps_in_three_days = (0..3 * 144u64)
-                .filter(|i| rebalance_due(provider, NOW + i * 600, sweep, day))
-                .count();
-            assert_eq!(sweeps_in_three_days, 3, "provider {provider}");
+            let (mut from, mut slots) = (NOW, 0);
+            for gap in gaps.iter().cycle() {
+                let to = from + gap;
+                if to > NOW + 3 * 86_400 {
+                    break;
+                }
+                slots += usize::from(rebalance_due(provider, from, to, day));
+                from = to;
+            }
+            assert_eq!(slots, 3, "provider {provider}");
         }
         assert!(!rebalance_due(
             Address::repeat_byte(0x01),
             NOW,
-            sweep,
+            NOW + 86_400,
             Duration::ZERO
         ));
+    }
+
+    #[tokio::test]
+    async fn a_rebalance_that_failed_is_sent_again_next_sweep() {
+        //* Arrange - a rebalance falls due in the first sweep and its transaction fails
+        let provider = Address::repeat_byte(0x11);
+        let manager = FakeManager::with(vec![(provider, settled())]);
+        let config = config(Duration::from_secs(600), Duration::from_secs(600), 500);
+        let mut schedule = RebalanceSchedule::default();
+        let first = providers_due(&manager, Address::ZERO, &config, &mut schedule)
+            .await
+            .unwrap();
+        assert_eq!(first, vec![(provider, Reason::Rebalance)]);
+        schedule.settle(&[], &[provider]);
+
+        //* Act - the next sweep covers no new slot, the clock not having moved
+        let second = providers_due(&manager, Address::ZERO, &config, &mut schedule)
+            .await
+            .unwrap();
+
+        //* Assert - still owed until a reconcile goes through
+        assert_eq!(second, vec![(provider, Reason::Rebalance)]);
+        schedule.settle(&[provider], &[]);
+        let third = providers_due(&manager, Address::ZERO, &config, &mut schedule)
+            .await
+            .unwrap();
+        assert!(third.is_empty());
     }
 
     #[tokio::test]
@@ -532,7 +637,9 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(outcome, Outcome::Done { ok: 2, failed: 0 }));
+        assert!(
+            matches!(&outcome, Outcome::Done { succeeded, failed } if succeeded.len() == 2 && failed.is_empty())
+        );
         assert_eq!(manager.calls().iter().filter(|c| **c == dup).count(), 1);
     }
 
