@@ -928,11 +928,63 @@ where
             tracing::debug!(
                 agreement_id = %agreement.id,
                 status = %agreement.status,
-                "Agreement already canceled, ignoring snapshot"
+                "Agreement already canceled, recording any accept dipper missed"
             );
+            record_accept_and_cancel_from_chain(snapshot, &agreement, registry).await;
         }
         Ok(None)
     }
+}
+
+/// How long after an offer's deadline dipper's cancel can still have raced an
+/// accept the listener hadn't caught up with.
+const LISTENER_LAG_SLACK_SECS: i64 = 3_600;
+
+/// Record the accept and cancel of an agreement dipper had already marked
+/// cancelled that went live on-chain first, so its accepted and terminated
+/// events go out. Cancel first: the terminated sweep waits only for the accept.
+/// Existing values win, so an agreement dipper already recorded is unchanged.
+async fn record_accept_and_cancel_from_chain<R: AgreementRegistry + Sync>(
+    snapshot: &AgreementStateSnapshot,
+    agreement: &IndexingAgreement,
+    registry: &R,
+) {
+    if snapshot.accepted_at == 0 || !cancelled_while_offer_open(agreement) {
+        return;
+    }
+    let canceled_by = snapshot.canceled_by.to_string();
+    let recorded = match registry
+        .record_cancel_audit(
+            &agreement.id,
+            snapshot.canceled_at,
+            &canceled_by,
+            Some(&snapshot.canceled_tx),
+        )
+        .await
+    {
+        Ok(()) => {
+            registry
+                .record_accepted_audit(&agreement.id, snapshot.accepted_at, &snapshot.accepted_tx)
+                .await
+        }
+        Err(err) => Err(err),
+    };
+    if let Err(err) = recorded {
+        tracing::warn!(
+            agreement_id = %agreement.id,
+            error = %err,
+            "failed to record the on-chain accept and cancel of a cancelled agreement; \
+             its events go out only if the listener reads this agreement again"
+        );
+    }
+}
+
+/// Whether dipper cancelled the agreement while its offer could still be accepted,
+/// so an accept on-chain may have slipped past it. One accepted before lifecycle
+/// events existed was cancelled long after its deadline and is never announced.
+fn cancelled_while_offer_open(agreement: &IndexingAgreement) -> bool {
+    let deadline = i64::try_from(agreement.terms.deadline).unwrap_or(i64::MAX);
+    agreement.updated_at.unix_timestamp() <= deadline.saturating_add(LISTENER_LAG_SLACK_SECS)
 }
 
 /// Safety net for an agreement dipper cancelled whose offer the indexer accepted
@@ -1183,10 +1235,11 @@ where
         );
 
         // Record the cancel audit so `sweep_pending_terminated_events` can emit
-        // the `terminated` durably. Crucially, the sweep only emits for rows that
-        // were genuinely accepted on-chain (`accepted_at IS NOT NULL`): a
-        // proposed-but-never-accepted replacement records audit here but is never
-        // swept, so it produces no spurious `terminated`.
+        // the `terminated` durably. Only for an accepted agreement: one that never
+        // was gets the chain's own cancel data if the indexer accepts it after all.
+        if old_agreement.status != IndexingAgreementStatus::AcceptedOnChain {
+            continue;
+        }
         let manager = config.recurring_agreement_manager().to_string();
         if let Err(err) = registry
             .record_cancel_audit(
@@ -1902,6 +1955,10 @@ mod tests {
         /// Ids passed to `record_cancel_audit` -- the signal a cancel path drives
         /// the terminated event (the sweep emits from this audit).
         recorded_cancel_audit: Vec<IndexingAgreementId>,
+        /// Every audit write in order, as ("cancel" | "accept", id).
+        audit_writes: Vec<(&'static str, IndexingAgreementId)>,
+        /// When true, `record_cancel_audit` fails.
+        fail_cancel_audit: bool,
         pending_cancellations: std::collections::HashMap<
             IndexingAgreementId,
             Vec<crate::registry::PendingCancellation>,
@@ -1968,6 +2025,14 @@ mod tests {
             self.state.lock().unwrap().canceled_request_ids.insert(id);
         }
 
+        /// Set when the offer could last be accepted, as seconds from now.
+        fn set_agreement_deadline_from_now(&self, agreement_id: IndexingAgreementId, secs: i64) {
+            if let Some(a) = self.state.lock().unwrap().agreements.get_mut(&agreement_id) {
+                let deadline = OffsetDateTime::now_utc().unix_timestamp() + secs;
+                a.terms.deadline = u64::try_from(deadline).unwrap();
+            }
+        }
+
         fn set_agreement_request_id(
             &self,
             agreement_id: IndexingAgreementId,
@@ -2000,6 +2065,10 @@ mod tests {
                 .unwrap()
                 .marked_canceled_by_indexer
                 .contains(id)
+        }
+
+        fn audit_writes(&self) -> Vec<(&'static str, IndexingAgreementId)> {
+            self.state.lock().unwrap().audit_writes.clone()
         }
 
         fn was_cancel_audit_recorded(&self, id: &IndexingAgreementId) -> bool {
@@ -2164,11 +2233,26 @@ mod tests {
             _canceled_by: &str,
             _canceled_tx: Option<&str>,
         ) -> RegistryResult<()> {
+            let mut state = self.state.lock().unwrap();
+            if state.fail_cancel_audit {
+                return Err(crate::registry::Error::NoRecordsUpdated);
+            }
+            state.recorded_cancel_audit.push(*agreement_id);
+            state.audit_writes.push(("cancel", *agreement_id));
+            Ok(())
+        }
+
+        async fn record_accepted_audit(
+            &self,
+            agreement_id: &IndexingAgreementId,
+            _accepted_at: u64,
+            _accepted_tx: &str,
+        ) -> RegistryResult<()> {
             self.state
                 .lock()
                 .unwrap()
-                .recorded_cancel_audit
-                .push(*agreement_id);
+                .audit_writes
+                .push(("accept", *agreement_id));
             Ok(())
         }
 
@@ -2969,6 +3053,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_reconcile_records_accept_and_cancel_of_cancelled_agreement_that_went_live() {
+        // Dipper had marked the agreement cancelled, but it was accepted on-chain
+        // before being ended there. Recording both lets the accepted and terminated
+        // events go out; the cancel goes first because the terminated sweep only
+        // waits for the accept.
+        let registry = MockRegistry::new();
+        let chain_client = MockChainClient::default();
+        let worker_queue = MockWorkerQueue::default();
+        let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+        registry.add_agreement(agreement_id, IndexingAgreementStatus::CanceledByRequester);
+        // Dipper cancelled it while its offer could still be accepted.
+        registry.set_agreement_deadline_from_now(agreement_id, 600);
+
+        let snapshot = make_snapshot(agreement_id, AgreementState::CanceledByPayer, Address::ZERO);
+        let result = reconcile_agreement(
+            &snapshot,
+            &registry,
+            &worker_queue,
+            &chain_client,
+            test_agreement_conf().as_ref(),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(
+            registry.audit_writes(),
+            vec![("cancel", agreement_id), ("accept", agreement_id)]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_records_no_accept_when_the_cancel_record_fails() {
+        // An accept recorded without its cancel would let the terminated event go
+        // out with fallback cancel fields.
+        let registry = MockRegistry::new();
+        let chain_client = MockChainClient::default();
+        let worker_queue = MockWorkerQueue::default();
+        let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+        registry.add_agreement(agreement_id, IndexingAgreementStatus::CanceledByRequester);
+        registry.set_agreement_deadline_from_now(agreement_id, 600);
+        registry.state.lock().unwrap().fail_cancel_audit = true;
+
+        let snapshot = make_snapshot(agreement_id, AgreementState::CanceledByPayer, Address::ZERO);
+        let result = reconcile_agreement(
+            &snapshot,
+            &registry,
+            &worker_queue,
+            &chain_client,
+            test_agreement_conf().as_ref(),
+        )
+        .await;
+
+        assert!(result.is_ok(), "a failed record must not fail the snapshot");
+        assert!(registry.audit_writes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_does_not_announce_an_agreement_accepted_before_events_existed() {
+        // Agreements accepted before lifecycle events existed have no recorded
+        // accept and are never announced. Dipper cancelled this one long after its
+        // offer's deadline, so it can't be an accept dipper missed.
+        let registry = MockRegistry::new();
+        let chain_client = MockChainClient::default();
+        let worker_queue = MockWorkerQueue::default();
+        let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+        registry.add_agreement(agreement_id, IndexingAgreementStatus::CanceledByRequester);
+        registry.set_agreement_deadline_from_now(agreement_id, -2 * 86_400);
+
+        let snapshot = make_snapshot(agreement_id, AgreementState::CanceledByPayer, Address::ZERO);
+        let result = reconcile_agreement(
+            &snapshot,
+            &registry,
+            &worker_queue,
+            &chain_client,
+            test_agreement_conf().as_ref(),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert!(registry.audit_writes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_records_nothing_for_cancelled_agreement_never_accepted() {
+        // A withdrawn offer was never accepted, so there is nothing to announce.
+        let registry = MockRegistry::new();
+        let chain_client = MockChainClient::default();
+        let worker_queue = MockWorkerQueue::default();
+        let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+        registry.add_agreement(agreement_id, IndexingAgreementStatus::CanceledByRequester);
+
+        let mut snapshot =
+            make_snapshot(agreement_id, AgreementState::CanceledByPayer, Address::ZERO);
+        snapshot.accepted_at = 0;
+        let result = reconcile_agreement(
+            &snapshot,
+            &registry,
+            &worker_queue,
+            &chain_client,
+            test_agreement_conf().as_ref(),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert!(registry.audit_writes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_records_nothing_while_cancelled_agreement_is_still_live() {
+        // Recording the accept now would let the terminated event go out before the
+        // agreement has actually ended on-chain.
+        let registry = MockRegistry::new();
+        let chain_client = MockChainClient::default();
+        let worker_queue = MockWorkerQueue::default();
+        let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+        registry.add_agreement(agreement_id, IndexingAgreementStatus::CanceledByRequester);
+
+        let snapshot = make_snapshot(agreement_id, AgreementState::Accepted, Address::ZERO);
+        let result = reconcile_agreement(
+            &snapshot,
+            &registry,
+            &worker_queue,
+            &chain_client,
+            test_agreement_conf().as_ref(),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert!(registry.audit_writes().is_empty());
+    }
+
+    #[tokio::test]
     async fn test_reconcile_ignores_already_canceled() {
         let registry = MockRegistry::new();
         let chain_client = MockChainClient::default();
@@ -3142,6 +3358,33 @@ mod tests {
             registry.was_cancel_audit_recorded(&old_id),
             "cancel audit recorded so the sweep can emit `terminated`"
         );
+    }
+
+    #[tokio::test]
+    async fn test_pending_cancellations_records_no_audit_for_a_never_accepted_agreement() {
+        // A cancel record on an agreement that was never accepted would later win
+        // over the chain's own, if the indexer accepted it after all and it was
+        // then ended: the terminated event would report an end before the accept.
+        let registry = MockRegistry::new();
+        let chain_client = MockChainClient::default();
+        let new_id = IndexingAgreementId::from_bytes(rand::random());
+        let old_id = IndexingAgreementId::from_bytes(rand::random());
+
+        registry.add_agreement(new_id, IndexingAgreementStatus::AcceptedOnChain);
+        registry.add_agreement(old_id, IndexingAgreementStatus::Created);
+        registry.add_pending_cancellation(new_id, old_id);
+
+        let result = execute_pending_cancellations(
+            &new_id,
+            &registry,
+            &chain_client,
+            test_agreement_conf().as_ref(),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert!(registry.was_marked_canceled_by_requester(&old_id));
+        assert!(!registry.was_cancel_audit_recorded(&old_id));
     }
 
     #[tokio::test]
