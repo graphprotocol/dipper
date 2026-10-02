@@ -1235,10 +1235,11 @@ where
         );
 
         // Record the cancel audit so `sweep_pending_terminated_events` can emit
-        // the `terminated` durably. Crucially, the sweep only emits for rows that
-        // were genuinely accepted on-chain (`accepted_at IS NOT NULL`): a
-        // proposed-but-never-accepted replacement records audit here but is never
-        // swept, so it produces no spurious `terminated`.
+        // the `terminated` durably. Only for an accepted agreement: one that never
+        // was gets the chain's own cancel data if the indexer accepts it after all.
+        if old_agreement.status != IndexingAgreementStatus::AcceptedOnChain {
+            continue;
+        }
         let manager = config.recurring_agreement_manager().to_string();
         if let Err(err) = registry
             .record_cancel_audit(
@@ -3326,6 +3327,33 @@ mod tests {
             registry.was_cancel_audit_recorded(&old_id),
             "cancel audit recorded so the sweep can emit `terminated`"
         );
+    }
+
+    #[tokio::test]
+    async fn test_pending_cancellations_records_no_audit_for_a_never_accepted_agreement() {
+        // A cancel record on an agreement that was never accepted would later win
+        // over the chain's own, if the indexer accepted it after all and it was
+        // then ended: the terminated event would report an end before the accept.
+        let registry = MockRegistry::new();
+        let chain_client = MockChainClient::default();
+        let new_id = IndexingAgreementId::from_bytes(rand::random());
+        let old_id = IndexingAgreementId::from_bytes(rand::random());
+
+        registry.add_agreement(new_id, IndexingAgreementStatus::AcceptedOnChain);
+        registry.add_agreement(old_id, IndexingAgreementStatus::Created);
+        registry.add_pending_cancellation(new_id, old_id);
+
+        let result = execute_pending_cancellations(
+            &new_id,
+            &registry,
+            &chain_client,
+            test_agreement_conf().as_ref(),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert!(registry.was_marked_canceled_by_requester(&old_id));
+        assert!(!registry.was_cancel_audit_recorded(&old_id));
     }
 
     #[tokio::test]
