@@ -77,7 +77,7 @@ where
     // can't decide to cancel this agreement in between. Its cancel then either
     // comes after this offer (a later nonce from the same wallet) and withdraws
     // it, or finished first and the check below sees the agreement cancelled.
-    let Ok(_reassess_guard) = ctx.reassess_lock.try_read() else {
+    let Some(_reassess_guard) = ctx.reassess_lock.offer() else {
         return Err(JobError::Deferred(Duration::from_secs(1)));
     };
 
@@ -265,7 +265,7 @@ mod tests {
             _rca: &dipper_rpc::indexer::indexer_client::sol::RecurringCollectionAgreement,
         ) -> Result<Option<B256>, ChainClientError> {
             *self.reassessment_could_start_mid_send.lock().unwrap() =
-                Some(self.reassess_lock.try_write().is_ok());
+                Some(self.reassess_lock.reassessment_could_start_now());
             self.offer_result
                 .lock()
                 .unwrap()
@@ -397,7 +397,7 @@ mod tests {
         let agreement = make_test_agreement();
         let message = make_message(agreement.id);
         let lock = ReassessLock::default();
-        let _reassessment = lock.clone().try_write_owned().expect("lock is free");
+        let _reassessment = lock.reassessment().await.expect("lock is free");
         let ctx = ctx_with_lock(agreement, None, lock);
 
         //* Act
@@ -430,7 +430,7 @@ mod tests {
             "a reassessment must not be able to start while the offer is sent"
         );
         assert!(
-            lock.try_write().is_ok(),
+            lock.reassessment_could_start_now(),
             "the job must release the lock when it ends"
         );
     }
@@ -441,7 +441,7 @@ mod tests {
         let agreement = make_test_agreement();
         let message = make_message(agreement.id);
         let lock = ReassessLock::default();
-        let _other_offer = lock.clone().try_read_owned().expect("lock is free");
+        let _other_offer = lock.offer().expect("lock is free");
         let ctx = ctx_with_lock(agreement, Some(Ok(Some(B256::repeat_byte(0xab)))), lock);
 
         //* Act

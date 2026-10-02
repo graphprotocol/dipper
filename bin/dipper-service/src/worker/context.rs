@@ -4,8 +4,9 @@ use dipper_core::state::FromState;
 use dipper_producer::events::SubgraphIndexingAgreementEventsProducer;
 use graph_networks_registry::NetworksRegistry;
 use thegraph_core::alloy::primitives::ChainId;
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::Notify;
 
+pub use super::reassess_lock::ReassessLock;
 use super::{
     handlers::{
         CancelRejectedAgreementOnChainCtx, ReassessIndexingRequestCtx,
@@ -18,14 +19,6 @@ use crate::{
     network::{provider::NetworkProviderService, service::entity_count_cache::EntityCountCache},
     signing::eip712::Eip712Signer,
 };
-
-/// A single process-wide async read/write lock. A reassessment takes it
-/// exclusively, so only one runs at a time across every worker loop and two
-/// loops can't diff the same baseline and both create agreements. The offer
-/// job takes it shared, so offers still run alongside each other but never
-/// while a reassessment is deciding what to cancel. In-process only (dipper is
-/// single-replica).
-pub type ReassessLock = Arc<RwLock<()>>;
 
 /// Generates a `FromState<InnerCtx<...>>` impl mapping InnerCtx fields onto a
 /// handler context type. Syntax: `impl_from_state!(Target<generics> { mappings })`,

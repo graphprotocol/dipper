@@ -128,12 +128,10 @@ where
 {
     // Only one reassessment runs globally at a time; if another loop holds the
     // lock this pass would diff the same baseline, so defer ~1s rather than park
-    // this loop. An offer being submitted holds it shared, so this also waits for
-    // in-flight offers to land before deciding what to cancel. Deferral isn't a
-    // failure: no backoff, no attempt count.
-    let _reassess_guard = match ctx.reassess_lock.try_write() {
-        Ok(guard) => guard,
-        Err(_) => return Err(JobError::Deferred(Duration::from_secs(1))),
+    // this loop. Offers in flight are waited out first so none lands after a
+    // cancel decided here. Deferral isn't a failure: no backoff, no attempt count.
+    let Some(_reassess_guard) = ctx.reassess_lock.reassessment().await else {
+        return Err(JobError::Deferred(Duration::from_secs(1)));
     };
 
     // Get current active agreements for this indexing request. Fetched once here
@@ -1501,7 +1499,7 @@ mod lifecycle_event_tests {
             chain_listener_notify: Arc::new(tokio::sync::Notify::new()),
             bypass_chain_clock_defenses: false,
             chain_listener_chain_id: None,
-            reassess_lock: Arc::new(tokio::sync::RwLock::new(())),
+            reassess_lock: crate::worker::ReassessLock::default(),
             unresponsive_breaker: Arc::new(crate::worker::UnresponsiveBreaker::new()),
             dips_accepting_cache: crate::worker::DipsAcceptingCache::new(
                 std::time::Duration::from_secs(300),
@@ -1927,7 +1925,7 @@ mod lifecycle_event_tests {
         assert!(matches!(captured[0], CapturedEvent::Proposed { .. }));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn waits_while_an_offer_is_being_sent() {
         // An offer job holds the lock shared from its status check until its offer
         // lands. Deciding what to cancel now could slip a cancel in front of that
@@ -1940,11 +1938,7 @@ mod lifecycle_event_tests {
             CapturingEventsProducer::new(),
             indexer_urls::Snapshot::new(),
         );
-        let _offer = ctx
-            .reassess_lock
-            .clone()
-            .try_read_owned()
-            .expect("lock is free");
+        let _offer = ctx.reassess_lock.offer().expect("lock is free");
 
         let result = handle(ctx, &test_message(0)).await;
 
