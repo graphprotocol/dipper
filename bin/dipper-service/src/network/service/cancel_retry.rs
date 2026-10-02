@@ -32,17 +32,20 @@ const SETTLE_MINUTES: i32 = 2;
 /// agreement ended, before the retry marks it ended without those details.
 const LISTENER_GRACE: time::Duration = time::Duration::HOUR;
 
-/// Retry the cancel of agreements still `Cancelling`. `chain_now`, in chain seconds,
-/// decides when an offer that was never accepted no longer can be.
+/// Retry the cancel of agreements still `Cancelling`. The chain's own latest block time
+/// decides when an offer that was never accepted no longer can be, so a subgraph that has
+/// fallen behind doesn't hold that up.
 pub async fn retry_cancelling_agreements<R, T>(
     registry: &R,
     chain_client: &T,
     config: &IndexingAgreementConfig,
-    chain_now: u64,
 ) where
     R: AgreementRegistry + Sync,
     T: ChainClient,
 {
+    let Some(chain_now) = chain_time(chain_client).await else {
+        return;
+    };
     let cancelling = match registry
         .get_cancelling_agreements(BATCH_SIZE, MAX_CANCEL_ATTEMPTS, SETTLE_MINUTES)
         .await
@@ -63,6 +66,19 @@ pub async fn retry_cancelling_agreements<R, T>(
             break;
         }
         retry_cancel(registry, chain_client, config, row, chain_now).await;
+    }
+}
+
+async fn chain_time<T: ChainClient>(chain_client: &T) -> Option<u64> {
+    match chain_client.latest_block_timestamp().await {
+        Ok(chain_now) => Some(chain_now),
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "Failed to read the chain's time; cancels are retried next sweep"
+            );
+            None
+        }
     }
 }
 
@@ -322,7 +338,7 @@ fn failed_attempts(err: &ChainClientError) -> u32 {
 mod tests {
     use std::sync::{
         Mutex,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     };
 
     use async_trait::async_trait;
@@ -411,6 +427,8 @@ mod tests {
         send_fails: bool,
         mined_cancel_reverts: bool,
         cancel_has_no_effect: bool,
+        clock_fails: bool,
+        now: AtomicU64,
         ended_by_indexer: bool,
         who_read_fails: bool,
         cancels_sent: AtomicU32,
@@ -478,7 +496,10 @@ mod tests {
             Ok(self.ended_by_indexer)
         }
         async fn latest_block_timestamp(&self) -> Result<u64, ChainClientError> {
-            unimplemented!()
+            if self.clock_fails {
+                return Err(ChainClientError::RpcError(anyhow::anyhow!("rpc down")));
+            }
+            Ok(self.now.load(Ordering::SeqCst))
         }
     }
 
@@ -503,7 +524,22 @@ mod tests {
 
     async fn retry(registry: &MockRegistry, chain: &MockChain, chain_now: u64) {
         let config = IndexingAgreementConfig::for_tests();
-        retry_cancelling_agreements(registry, chain, &config, chain_now).await;
+        chain.now.store(chain_now, Ordering::SeqCst);
+        retry_cancelling_agreements(registry, chain, &config).await;
+    }
+
+    #[tokio::test]
+    async fn waits_for_the_next_sweep_when_the_chain_time_cannot_be_read() {
+        let registry = registry_with_one(true);
+        let chain = MockChain {
+            clock_fails: true,
+            ..live_chain()
+        };
+
+        retry(&registry, &chain, 0).await;
+
+        assert_eq!(chain.cancels_sent.load(Ordering::SeqCst), 0);
+        assert_eq!(registry.checks.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

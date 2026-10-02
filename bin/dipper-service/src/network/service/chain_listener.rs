@@ -301,13 +301,10 @@ where
             // finishing a cancel needs only the chain.
             if last_cancel_retry.is_none_or(|at| at.elapsed() >= CANCEL_RETRY_INTERVAL) {
                 last_cancel_retry = Some(Instant::now());
-                let chain_now =
-                    last_persisted_timestamp.unwrap_or_else(dipper_core::time::now_secs);
                 super::cancel_retry::retry_cancelling_agreements(
                     &registry,
                     &chain_client,
                     &agreement_conf,
-                    chain_now,
                 )
                 .await;
             }
