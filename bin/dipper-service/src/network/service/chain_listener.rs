@@ -974,7 +974,7 @@ async fn record_accept_and_cancel_from_chain<R: AgreementRegistry + Sync>(
             agreement_id = %agreement.id,
             error = %err,
             "failed to record the on-chain accept and cancel of a cancelled agreement; \
-             its accepted and terminated events wait for the next snapshot"
+             its events go out only if the listener reads this agreement again"
         );
     }
 }
@@ -1957,6 +1957,8 @@ mod tests {
         recorded_cancel_audit: Vec<IndexingAgreementId>,
         /// Every audit write in order, as ("cancel" | "accept", id).
         audit_writes: Vec<(&'static str, IndexingAgreementId)>,
+        /// When true, `record_cancel_audit` fails.
+        fail_cancel_audit: bool,
         pending_cancellations: std::collections::HashMap<
             IndexingAgreementId,
             Vec<crate::registry::PendingCancellation>,
@@ -2232,6 +2234,9 @@ mod tests {
             _canceled_tx: Option<&str>,
         ) -> RegistryResult<()> {
             let mut state = self.state.lock().unwrap();
+            if state.fail_cancel_audit {
+                return Err(crate::registry::Error::NoRecordsUpdated);
+            }
             state.recorded_cancel_audit.push(*agreement_id);
             state.audit_writes.push(("cancel", *agreement_id));
             Ok(())
@@ -3076,6 +3081,32 @@ mod tests {
             registry.audit_writes(),
             vec![("cancel", agreement_id), ("accept", agreement_id)]
         );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_records_no_accept_when_the_cancel_record_fails() {
+        // An accept recorded without its cancel would let the terminated event go
+        // out with fallback cancel fields.
+        let registry = MockRegistry::new();
+        let chain_client = MockChainClient::default();
+        let worker_queue = MockWorkerQueue::default();
+        let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+        registry.add_agreement(agreement_id, IndexingAgreementStatus::CanceledByRequester);
+        registry.set_agreement_deadline_from_now(agreement_id, 600);
+        registry.state.lock().unwrap().fail_cancel_audit = true;
+
+        let snapshot = make_snapshot(agreement_id, AgreementState::CanceledByPayer, Address::ZERO);
+        let result = reconcile_agreement(
+            &snapshot,
+            &registry,
+            &worker_queue,
+            &chain_client,
+            test_agreement_conf().as_ref(),
+        )
+        .await;
+
+        assert!(result.is_ok(), "a failed record must not fail the snapshot");
+        assert!(registry.audit_writes().is_empty());
     }
 
     #[tokio::test]

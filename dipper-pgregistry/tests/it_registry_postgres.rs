@@ -2932,6 +2932,86 @@ async fn apply_reconciliation_batch_handles_all_four_item_shapes() {
 }
 
 #[tokio::test]
+async fn recording_a_missed_accept_announces_the_agreement_once() {
+    // The chain listener records the accept and cancel of an agreement dipper had
+    // already cancelled locally, on every read of its cancelled snapshot. The first
+    // values must stick and, once announced, a later read must not announce again.
+    let (db, _temp_db) = temp_registry_db().await;
+    run_fixture(
+        &db,
+        include_str!("fixtures/0003_multi_indexer_agreements.sql"),
+    )
+    .await
+    .expect("Failed to run fixture");
+    let registry = PgRegistry::new(db);
+    let id = IndexingAgreementId::from_bytes([0xbb, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    registry
+        .mark_indexing_agreement_as_canceled_by_requester(&id)
+        .await
+        .expect("dipper cancels it locally");
+
+    for (at, by) in [(1_700_000_002, "0xchain"), (1_800_000_000, "0xlater")] {
+        registry
+            .record_cancel_audit(&id, at, by, Some("0xcxltx"))
+            .await
+            .expect("cancel record");
+        registry
+            .record_accepted_audit(&id, at - 1, "0xacc")
+            .await
+            .expect("accept record");
+    }
+
+    let accepted = registry
+        .get_agreements_pending_accepted_emission(100)
+        .await
+        .expect("accepted query");
+    let accepted: Vec<_> = accepted.iter().filter(|p| p.agreement_id == id).collect();
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(accepted[0].accepted_at, 1_700_000_001);
+    let terminated = registry
+        .get_agreements_pending_terminated_emission(100)
+        .await
+        .expect("terminated query");
+    let terminated: Vec<_> = terminated.iter().filter(|p| p.agreement_id == id).collect();
+    assert_eq!(terminated.len(), 1);
+    assert_eq!(terminated[0].canceled_at, Some(1_700_000_002));
+    assert_eq!(terminated[0].canceled_by.as_deref(), Some("0xchain"));
+
+    registry
+        .mark_accepted_event_emitted(&id)
+        .await
+        .expect("mark accepted");
+    registry
+        .mark_terminated_event_emitted(&id)
+        .await
+        .expect("mark terminated");
+    registry
+        .record_cancel_audit(&id, 1_900_000_000, "0xagain", Some("0xcxltx"))
+        .await
+        .expect("cancel record");
+    registry
+        .record_accepted_audit(&id, 1_899_999_999, "0xacc")
+        .await
+        .expect("accept record");
+    assert!(
+        !registry
+            .get_agreements_pending_accepted_emission(100)
+            .await
+            .expect("accepted query")
+            .iter()
+            .any(|p| p.agreement_id == id)
+    );
+    assert!(
+        !registry
+            .get_agreements_pending_terminated_emission(100)
+            .await
+            .expect("terminated query")
+            .iter()
+            .any(|p| p.agreement_id == id)
+    );
+}
+
+#[tokio::test]
 async fn pending_emission_queries_cover_the_paired_accept_then_cancel() {
     // Regression guard: an agreement accepted and then cancelled in a single
     // snapshot (paired accept+cancel -- dipper was behind) ends up terminal, but
