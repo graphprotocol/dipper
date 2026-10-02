@@ -1034,13 +1034,15 @@ async fn queue_cancel_if_cancelled_but_accepted<W: WorkerQueue>(
 
 /// An agreement dipper is cancelling stays `Cancelling` when the chain shows it accepted,
 /// so its accept is recorded here; its end is then announced, along with the accept,
-/// once the cancel lands. Existing values win.
+/// once the cancel lands. A withdrawn offer reads as cancelled with no accept time.
 async fn record_accept_of_cancelling<R: AgreementRegistry + Sync>(
     snapshot: &AgreementStateSnapshot,
     agreement: &IndexingAgreement,
     registry: &R,
 ) {
-    if agreement.status != IndexingAgreementStatus::Cancelling || !snapshot.state.reached_accepted()
+    if agreement.status != IndexingAgreementStatus::Cancelling
+        || !snapshot.state.reached_accepted()
+        || snapshot.accepted_at == 0
     {
         return;
     }
@@ -2772,6 +2774,38 @@ mod tests {
         assert!(!registry.was_marked_accepted_on_chain(&agreement_id));
         assert_eq!(registry.audit_writes(), vec![("accept", agreement_id)]);
         assert!(!worker_queue.was_cancellation_queued(&agreement_id));
+    }
+
+    #[tokio::test]
+    async fn reconcile_records_no_accept_for_a_withdrawn_offer() {
+        // The subgraph reports a withdrawn offer as cancelled by the payer with no accept
+        // time; recording it would announce an agreement that was never live.
+        let registry = MockRegistry::new();
+        let chain_client = MockChainClient::default();
+        let worker_queue = MockWorkerQueue::default();
+        let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+        registry.add_agreement(agreement_id, IndexingAgreementStatus::Cancelling);
+        let mut snapshot =
+            make_snapshot(agreement_id, AgreementState::CanceledByPayer, Address::ZERO);
+        snapshot.accepted_at = 0;
+
+        reconcile_agreement(
+            &snapshot,
+            &registry,
+            &worker_queue,
+            &chain_client,
+            test_agreement_conf().as_ref(),
+        )
+        .await
+        .expect("reconcile ok");
+
+        assert!(registry.was_marked_canceled_by_requester(&agreement_id));
+        assert!(
+            registry
+                .audit_writes()
+                .iter()
+                .all(|(kind, _)| *kind != "accept")
+        );
     }
 
     #[tokio::test]
