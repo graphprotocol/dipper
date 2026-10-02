@@ -74,8 +74,9 @@ async fn retry_cancel<R, T>(
     }
 }
 
-/// Mark the agreement `CanceledByRequester` once it can't go live again: it was accepted
-/// and has ended, or nobody accepted its offer before the deadline to.
+/// Mark the agreement `CanceledByRequester` once it can't go live again: this sweep's cancel
+/// ended it, or nobody accepted its offer before the deadline to. One accepted that ended
+/// otherwise is left to the chain listener, which reads who ended it and when.
 async fn confirm_if_over<R: AgreementRegistry + Sync>(
     registry: &R,
     config: &IndexingAgreementConfig,
@@ -84,7 +85,12 @@ async fn confirm_if_over<R: AgreementRegistry + Sync>(
     chain_now: u64,
 ) {
     let agreement = &row.agreement;
-    if !row.accepted_on_chain && chain_now <= agreement.terms.deadline {
+    let can_confirm = if row.accepted_on_chain {
+        tx_hash.is_some()
+    } else {
+        chain_now > agreement.terms.deadline
+    };
+    if !can_confirm {
         return;
     }
     if let Err(err) = registry
@@ -106,8 +112,7 @@ async fn confirm_if_over<R: AgreementRegistry + Sync>(
         reason = "cancel_confirmed_on_chain",
         "agreement state transition"
     );
-    // Without a transaction of its own, the chain listener records the cancel it reads.
-    if row.accepted_on_chain && tx_hash.is_some() {
+    if row.accepted_on_chain {
         record_cancel(registry, agreement, tx_hash, config).await;
     }
 }
@@ -337,15 +342,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn marks_an_accepted_agreement_that_already_ended_without_a_record_of_its_own() {
-        // The chain listener records the cancel it reads from the chain.
+    async fn leaves_an_accepted_agreement_that_already_ended_to_the_listener() {
+        // The indexer may have ended it, or an earlier cancel whose result went unread;
+        // the chain listener reads which, and records when and in which transaction.
         let registry = registry_with_one(true);
         let chain = MockChain::default();
 
         retry(&registry, &chain, 0).await;
 
         assert_eq!(chain.cancels_sent.load(Ordering::SeqCst), 0);
-        assert_eq!(registry.marked_cancelled.lock().unwrap().len(), 1);
+        assert!(registry.marked_cancelled.lock().unwrap().is_empty());
         assert!(registry.audits.lock().unwrap().is_empty());
     }
 
