@@ -67,7 +67,8 @@ async fn retry_cancel<R, T>(
                 error = %err,
                 "Failed to read a cancelling agreement on-chain, will retry"
             );
-            (None, None)
+            // Unread, it may still be live, so it can't be confirmed ended.
+            return note_check(registry, row, None).await;
         }
         LiveCancel::NotLive => (None, None),
         LiveCancel::Ended(tx_hash) => {
@@ -414,6 +415,22 @@ mod tests {
 
         assert_eq!(registry.checks.load(Ordering::SeqCst), 1);
         assert_eq!(registry.attempts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn never_confirms_an_agreement_it_could_not_read() {
+        // Past its deadline but unread, it may be live: an accept the listener hasn't
+        // recorded, or one from before accepts were recorded.
+        let registry = registry_with_one(false);
+        let chain = MockChain {
+            read_fails: true,
+            ..live_chain()
+        };
+
+        retry(&registry, &chain, DEADLINE + 1).await;
+
+        assert!(registry.marked_cancelled.lock().unwrap().is_empty());
+        assert_eq!(registry.checks.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
