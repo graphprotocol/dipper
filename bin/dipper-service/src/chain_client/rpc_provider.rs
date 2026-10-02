@@ -56,6 +56,10 @@ fn describe_failure(url: &Url, error: &TransportError) -> String {
 /// Error text that indicates a transient failure worth retrying, used only for faults
 /// that arrive as prose rather than as a status code or JSON-RPC error object.
 const RETRYABLE_ERROR_PATTERNS: &[&str] = &[
+    BEHIND_A_SEEN_BLOCK,
+    // A node behind the rest of its provider's fleet, asked for a block it hasn't reached.
+    "header not found",
+    "unknown block",
     "connection refused",
     "connection reset",
     "connection closed",
@@ -67,6 +71,10 @@ const RETRYABLE_ERROR_PATTERNS: &[&str] = &[
     "bad gateway",
     "temporary internal error",
 ];
+
+/// How a read refused by an endpoint behind a block dipper has already seen describes it. It
+/// is retried, since an endpoint a block or so behind catches up within a second or two.
+pub(super) const BEHIND_A_SEEN_BLOCK: &str = "behind a block already seen";
 
 /// Type alias for the provider with default fillers.
 pub type HttpProvider = FillProvider<
@@ -631,6 +639,14 @@ mod tests {
             RpcProviderPool::is_retryable(&err),
             "the fault behind the outage should be retryable however it is reported"
         );
+    }
+
+    #[test]
+    fn a_node_that_has_not_reached_a_block_yet_is_retryable() {
+        let payload = serde_json::from_str(r#"{"code":-32000,"message":"header not found"}"#)
+            .expect("JSON-RPC error payload");
+        let err: TransportError = RpcError::ErrorResp(payload);
+        assert!(RpcProviderPool::is_retryable(&err));
     }
 
     #[test]

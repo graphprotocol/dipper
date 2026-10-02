@@ -301,13 +301,10 @@ where
             // finishing a cancel needs only the chain.
             if last_cancel_retry.is_none_or(|at| at.elapsed() >= CANCEL_RETRY_INTERVAL) {
                 last_cancel_retry = Some(Instant::now());
-                let chain_now =
-                    last_persisted_timestamp.unwrap_or_else(dipper_core::time::now_secs);
                 super::cancel_retry::retry_cancelling_agreements(
                     &registry,
                     &chain_client,
                     &agreement_conf,
-                    chain_now,
                 )
                 .await;
             }
@@ -901,10 +898,13 @@ where
     // Both transitions are applied atomically downstream so the
     // Accept-then-Cancel-in-one-snapshot path can't leak an intermediate
     // AcceptedOnChain to concurrent readers.
+    // A withdrawn offer reads as cancelled with no accept time: it never went live.
+    let withdrawn_offer = snapshot.state.is_canceled() && snapshot.accepted_at == 0;
     let apply_accept = matches!(
         agreement.status,
         IndexingAgreementStatus::Created | IndexingAgreementStatus::Expired,
-    ) && snapshot.state.reached_accepted();
+    ) && snapshot.state.reached_accepted()
+        && !withdrawn_offer;
 
     let already_terminal_cancel = matches!(
         agreement.status,
@@ -2822,6 +2822,47 @@ mod tests {
                 .iter()
                 .all(|(kind, _)| *kind != "accept")
         );
+    }
+
+    #[tokio::test]
+    async fn reconcile_does_not_accept_an_offer_withdrawn_before_anyone_accepted_it() {
+        // Announcing it would send accepted and terminated events for an agreement that
+        // was never live; an expired one stays expired.
+        for status in [
+            IndexingAgreementStatus::Created,
+            IndexingAgreementStatus::Expired,
+        ] {
+            let registry = MockRegistry::new();
+            let chain_client = MockChainClient::default();
+            let worker_queue = MockWorkerQueue::default();
+            let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+            registry.add_agreement(agreement_id, status);
+            let mut snapshot =
+                make_snapshot(agreement_id, AgreementState::CanceledByPayer, Address::ZERO);
+            snapshot.accepted_at = 0;
+
+            reconcile_agreement(
+                &snapshot,
+                &registry,
+                &worker_queue,
+                &chain_client,
+                test_agreement_conf().as_ref(),
+            )
+            .await
+            .expect("reconcile ok");
+
+            assert!(!registry.was_marked_accepted_on_chain(&agreement_id));
+            assert_eq!(
+                registry.was_marked_canceled_by_requester(&agreement_id),
+                status == IndexingAgreementStatus::Created
+            );
+            assert!(
+                registry
+                    .audit_writes()
+                    .iter()
+                    .all(|(kind, _)| *kind != "accept")
+            );
+        }
     }
 
     #[tokio::test]
