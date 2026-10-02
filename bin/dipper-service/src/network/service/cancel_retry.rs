@@ -143,11 +143,7 @@ async fn note_check<R: AgreementRegistry + Sync>(
     if let Some(err) = failure
         && failed_attempts == 0
     {
-        tracing::warn!(
-            agreement_id = %agreement.id,
-            error = %err,
-            "Failed to send the cancel of an agreement, will retry"
-        );
+        log_uncounted_failure(agreement, err);
     }
     match registry
         .record_cancel_check(&agreement.id, failed_attempts)
@@ -163,6 +159,24 @@ async fn note_check<R: AgreementRegistry + Sync>(
             error = %err,
             "Failed to record a check of a cancelling agreement"
         ),
+    }
+}
+
+/// A revert before sending is logged as an ERROR: a paused or misconfigured manager makes
+/// every cancel revert, so it is retried rather than counted against the agreement.
+fn log_uncounted_failure(agreement: &IndexingAgreement, err: &ChainClientError) {
+    if matches!(err, ChainClientError::ContractRevert { .. }) {
+        tracing::error!(
+            agreement_id = %agreement.id,
+            error = %err,
+            "Cancel of an agreement reverted before it was sent, will retry"
+        );
+    } else {
+        tracing::warn!(
+            agreement_id = %agreement.id,
+            error = %err,
+            "Cancel of an agreement failed or could not be confirmed, will retry"
+        );
     }
 }
 
@@ -187,12 +201,12 @@ fn log_failed_cancel(agreement: &IndexingAgreement, attempts: u32, err: &ChainCl
     );
 }
 
-/// How many of an agreement's cancel attempts a failure uses up. Only a cancel mined without
-/// ending it counts, and one that can never be sent uses them all. An unreachable chain or a
-/// misconfigured or paused manager isn't the agreement's doing, so it is retried freely.
+/// How many of an agreement's cancel attempts a failure uses up. A cancel mined without
+/// ending it, or reverted, counts, and one that can never be sent uses them all. An
+/// unreachable chain or a revert before sending is retried freely.
 fn failed_attempts(err: &ChainClientError) -> u32 {
     match err {
-        ChainClientError::CancelNotConfirmed { .. } => 1,
+        ChainClientError::CancelNotConfirmed { .. } | ChainClientError::TxReverted { .. } => 1,
         ChainClientError::MissingTermsVersionHash { .. } => MAX_CANCEL_ATTEMPTS,
         _ => 0,
     }
@@ -273,6 +287,7 @@ mod tests {
         live: AtomicBool,
         read_fails: bool,
         send_fails: bool,
+        mined_cancel_reverts: bool,
         cancel_has_no_effect: bool,
         cancels_sent: AtomicU32,
     }
@@ -294,6 +309,11 @@ mod tests {
         ) -> Result<Option<B256>, ChainClientError> {
             if self.send_fails {
                 return Err(ChainClientError::RpcError(anyhow::anyhow!("rpc down")));
+            }
+            if self.mined_cancel_reverts {
+                return Err(ChainClientError::TxReverted {
+                    tx_hash: B256::repeat_byte(0xee),
+                });
             }
             self.cancels_sent.fetch_add(1, Ordering::SeqCst);
             if !self.cancel_has_no_effect {
@@ -469,6 +489,20 @@ mod tests {
             MAX_CANCEL_ATTEMPTS
         );
         assert_eq!(chain.cancels_sent.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn counts_a_cancel_that_is_mined_and_reverts() {
+        // Each one costs gas, so it can't be retried without limit.
+        let registry = registry_with_one(true);
+        let chain = MockChain {
+            mined_cancel_reverts: true,
+            ..live_chain()
+        };
+
+        retry(&registry, &chain, 0).await;
+
+        assert_eq!(registry.attempts.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
