@@ -1232,6 +1232,13 @@ where
         );
         return Ok(true);
     };
+    if old_agreement.status == IndexingAgreementStatus::Expired {
+        match expired_but_live(chain_client, &old_agreement).await {
+            Some(true) => {}
+            Some(false) => return Ok(true),
+            None => return Ok(false),
+        }
+    }
     let started =
         crate::cancel_dispatch::start_cancel(registry, chain_client, &old_agreement, config).await;
     Ok(note_replaced_cancel(
@@ -1239,6 +1246,29 @@ where
         &old_agreement,
         started,
     ))
+}
+
+/// Whether an agreement marked `Expired` is live on-chain after all, accepted unseen by a
+/// lagging listener; `None`, logged, when the chain can't be read. One that really expired
+/// stays `Expired`.
+async fn expired_but_live<T: ChainClient>(
+    chain_client: &T,
+    agreement: &IndexingAgreement,
+) -> Option<bool> {
+    match chain_client
+        .agreement_still_active(agreement.id.as_bytes())
+        .await
+    {
+        Ok(live) => Some(live),
+        Err(err) => {
+            tracing::warn!(
+                old_agreement_id = %agreement.id,
+                error = %err,
+                "Failed to read whether a replaced expired agreement is live, retaining pending row"
+            );
+            None
+        }
+    }
 }
 
 /// Log how cancelling a replaced agreement started; false when it couldn't be marked.
@@ -2539,6 +2569,8 @@ mod tests {
         registry: Option<MockRegistry>,
         marked_at_cancel: Arc<Mutex<Vec<bool>>>,
         fail_cancels: bool,
+        /// When set, every agreement reads as live until a cancel is sent for it.
+        live_until_cancelled: bool,
     }
 
     impl MockChainClient {
@@ -2625,11 +2657,11 @@ mod tests {
 
         async fn agreement_still_active(
             &self,
-            _agreement_id: &[u8; 16],
+            agreement_id: &[u8; 16],
         ) -> Result<bool, crate::chain_client::ChainClientError> {
             // Cancel dispatch always reads back after a mined cancel; reporting
             // not-active here means "cancel confirmed", which these tests expect.
-            Ok(false)
+            Ok(self.live_until_cancelled && !self.cancels.lock().unwrap().contains(agreement_id))
         }
     }
 
@@ -3519,10 +3551,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_pending_cancellations_cancel_an_agreement_marked_expired() {
-        // A lagging listener can mark an agreement expired that was in fact accepted.
-        let marked = marked_at_pending_cancel(IndexingAgreementStatus::Expired).await;
-        assert_eq!(marked, vec![true]);
+    async fn test_pending_cancellations_cancel_an_expired_agreement_only_if_live() {
+        // A lagging listener can mark an agreement expired that was in fact accepted; one
+        // that really expired keeps its status, and no needless cancel is sent.
+        for live in [true, false] {
+            let registry = MockRegistry::new();
+            let chain_client = MockChainClient {
+                live_until_cancelled: live,
+                ..MockChainClient::default()
+            };
+            let new_id = IndexingAgreementId::from_bytes(rand::random());
+            let old_id = IndexingAgreementId::from_bytes(rand::random());
+            registry.add_agreement(new_id, IndexingAgreementStatus::AcceptedOnChain);
+            registry.add_agreement(old_id, IndexingAgreementStatus::Expired);
+            registry.add_pending_cancellation(new_id, old_id);
+
+            let result = execute_pending_cancellations(
+                &new_id,
+                &registry,
+                &chain_client,
+                test_agreement_conf().as_ref(),
+            )
+            .await;
+
+            assert!(result.is_ok(), "got {result:?}");
+            assert_eq!(registry.was_marked_cancelling(&old_id), live);
+            assert_eq!(chain_client.was_on_chain_cancel_attempted(&old_id), live);
+            assert!(registry.was_pending_cancellation_deleted(&new_id, &old_id));
+        }
     }
 
     #[tokio::test]
