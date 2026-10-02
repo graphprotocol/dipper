@@ -3487,6 +3487,14 @@ async fn a_cancelling_agreement_stays_live_and_unannounced_until_it_ends() {
         "agreements being cancelled don't keep the listener polling fast; their retry \
          runs on its own timer"
     );
+    let fee_rates = registry
+        .get_agreement_fee_rates()
+        .await
+        .expect("fee rates query");
+    assert!(
+        fee_rates.iter().any(|(id, ..)| *id == cancelling),
+        "its fees still count until the cancel lands"
+    );
     let terminated = registry
         .get_agreements_pending_terminated_emission(100)
         .await

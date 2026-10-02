@@ -1947,8 +1947,8 @@ impl PgRegistry {
     /// Returns (agreement_id, indexer_id, deployment_id, base_rate_wei,
     /// entity_rate_wei) per active agreement for optimistic fee estimation.
     ///
-    /// Queries all `Created` or `AcceptedOnChain` agreements and extracts
-    /// both rate fields from the terms metadata.
+    /// Queries all `Created`, `AcceptedOnChain` or `Cancelling` agreements, the last
+    /// still paid until their cancel lands, and extracts both rate fields from the terms.
     pub async fn get_agreement_fee_rates(
         &self,
     ) -> Result<Vec<(IndexingAgreementId, IndexerId, DeploymentId, f64, f64)>, Error> {
@@ -1960,11 +1960,12 @@ impl PgRegistry {
             r#"
                 SELECT id, indexer_id, terms
                 FROM dipper_reg_indexing_agreements
-                WHERE status IN ($1, $2)
+                WHERE status IN ($1, $2, $3)
                 "#,
         )
         .bind(IndexingAgreementStatus::Created)
         .bind(IndexingAgreementStatus::AcceptedOnChain)
+        .bind(IndexingAgreementStatus::Cancelling)
         .fetch_all(&self.pool)
         .await?;
 
