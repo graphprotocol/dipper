@@ -1,6 +1,6 @@
-//! Cancel on-chain, via the RecurringAgreementManager, an agreement dipper doesn't
-//! want that is still live: one the indexer rejected off-chain, or one dipper had already
-//! cancelled. The chain listener queues it, and a reassessment does when its own cancel fails.
+//! Cancel on-chain, via the RecurringAgreementManager, an agreement dipper doesn't want
+//! that was accepted anyway: one the indexer rejected off-chain, or one dipper had already
+//! cancelled. The chain listener queues it.
 
 use std::{
     collections::HashSet,
@@ -11,7 +11,7 @@ use std::{
 use dipper_core::ids::IndexingAgreementId;
 
 use crate::{
-    cancel_dispatch::cancel_agreement_on_chain,
+    cancel_dispatch::{LiveCancel, cancel_agreement_on_chain, cancel_if_live},
     chain_client::{ChainClient, ChainClientError},
     config::IndexingAgreementConfig,
     registry::{AgreementRegistry, IndexingAgreement, IndexingAgreementStatus},
@@ -148,7 +148,7 @@ where
 }
 
 /// Agreements a job in this process is cancelling right now. The listener can
-/// queue one twice before the chain shows it ended, and two jobs at once would
+/// queue one twice before the chain shows it ended, and 2 jobs at once would
 /// both cancel it and both alert.
 static CANCELLING: LazyLock<Mutex<HashSet<IndexingAgreementId>>> = LazyLock::new(Mutex::default);
 
@@ -173,9 +173,9 @@ impl Drop for Cancelling {
     }
 }
 
-/// Cancel on-chain an agreement dipper had already cancelled that is still live: accepted
-/// anyway, or an offer a failed cancel left open. The row is already terminal. The chain is
-/// read first, so a stale snapshot of one dipper has since ended raises no alert.
+/// Cancel on-chain an agreement dipper had already cancelled that the indexer accepted
+/// anyway; the row is already terminal. The chain is read first, so a stale snapshot of
+/// one dipper has since ended raises no alert.
 async fn cancel_live_agreement_dipper_cancelled<R, T>(
     ctx: &Ctx<R, T>,
     agreement: &IndexingAgreement,
@@ -190,25 +190,32 @@ where
         );
         return Ok(());
     };
-    if !live_on_chain(&ctx.chain_client, agreement).await? {
-        tracing::info!(
-            agreement_id = %agreement.id,
-            "Cancelled agreement is no longer live on-chain; nothing to cancel"
-        );
-        return Ok(());
-    }
-
-    match cancel_agreement_on_chain(&ctx.chain_client, agreement, &ctx.agreement_conf).await {
-        Ok(tx_hash) => {
+    match cancel_if_live(&ctx.chain_client, agreement, &ctx.agreement_conf).await {
+        LiveCancel::NotLive => {
+            tracing::info!(
+                agreement_id = %agreement.id,
+                "Cancelled agreement is no longer live on-chain; nothing to cancel"
+            );
+            Ok(())
+        }
+        LiveCancel::ReadFailed(err) => {
+            tracing::warn!(
+                agreement_id = %agreement.id,
+                error = %err,
+                "Failed to read whether a cancelled agreement is live on-chain, will retry"
+            );
+            Err(JobError::Retryable(err.into(), Duration::from_secs(30)))
+        }
+        LiveCancel::Ended(tx_hash) => {
             let tx = tx_hash.map_or_else(|| "none".to_owned(), |hash| hash.to_string());
             log_caught_live_agreement(agreement, "cancelled", &tx);
             Ok(())
         }
-        Err(err @ ChainClientError::MissingTermsVersionHash { .. }) => {
+        LiveCancel::CancelFailed(err @ ChainClientError::MissingTermsVersionHash { .. }) => {
             log_caught_live_agreement(agreement, "cancel_impossible", &err.to_string());
             Err(JobError::Fatal(err.into()))
         }
-        Err(err) => {
+        LiveCancel::CancelFailed(err) => {
             log_caught_live_agreement(agreement, "cancel_failed", &err.to_string());
             Err(JobError::Retryable(err.into(), Duration::from_secs(30)))
         }
@@ -228,24 +235,6 @@ fn log_caught_live_agreement(agreement: &IndexingAgreement, outcome: &str, detai
         detail,
         "Agreement dipper had cancelled is live on-chain"
     );
-}
-
-/// Read the chain for whether the agreement is still live; a failed read retries.
-async fn live_on_chain<T: ChainClient>(
-    chain_client: &T,
-    agreement: &IndexingAgreement,
-) -> JobResult<bool> {
-    chain_client
-        .agreement_still_active(agreement.id.as_bytes())
-        .await
-        .map_err(|err| {
-            tracing::warn!(
-                agreement_id = %agreement.id,
-                error = %err,
-                "Failed to read whether a cancelled agreement is live on-chain, will retry"
-            );
-            JobError::Retryable(err.into(), Duration::from_secs(30))
-        })
 }
 
 /// Flip the row to CanceledByRequester once the chain shows it cancelled. A failure
@@ -474,6 +463,30 @@ mod tests {
             Ok(())
         }
 
+        async fn mark_indexing_agreement_as_cancelling(
+            &self,
+            _id: &IndexingAgreementId,
+        ) -> crate::registry::Result<()> {
+            Ok(())
+        }
+
+        async fn get_cancelling_agreements(
+            &self,
+            _batch_size: i64,
+            _max_attempts: u32,
+            _min_age_minutes: i32,
+        ) -> crate::registry::Result<Vec<crate::registry::CancellingAgreement>> {
+            Ok(Vec::new())
+        }
+
+        async fn record_cancel_check(
+            &self,
+            _id: &IndexingAgreementId,
+            failed_attempts: u32,
+        ) -> crate::registry::Result<u32> {
+            Ok(failed_attempts)
+        }
+
         async fn apply_reconciliation(
             &self,
             _id: &IndexingAgreementId,
@@ -629,29 +642,7 @@ mod tests {
     }
 
     fn test_agreement_conf() -> Arc<IndexingAgreementConfig> {
-        Arc::new(IndexingAgreementConfig {
-            data_service: Address::ZERO,
-            recurring_collector: Address::ZERO,
-            recurring_agreement_manager: Address::ZERO,
-            max_agreement_grt_per_30_days: 0.0,
-            max_seconds_per_collection: 0,
-            min_seconds_per_collection: 0,
-            duration_seconds: 0,
-            deadline_seconds: 0,
-            max_grt_per_30_days: std::collections::BTreeMap::new(),
-            max_grt_per_billion_entities_per_30_days: 0.0,
-            declined_indexer_lookback_days: 0,
-            price_rejection_lookback_days: 0,
-            transient_rejection_lookback_minutes: 0,
-            uncertain_rejection_lookback_days: 0,
-            unresponsive_indexer_lookback_days: 0,
-            mass_unresponsive_trip_fraction: 0.5,
-            mass_unresponsive_reset_fraction: 0.25,
-            dips_accepting_snapshot_max_age_hours: 48,
-            dips_accepting_cache_ttl_seconds: 300,
-            max_in_flight_offers_per_indexer: None,
-            max_in_flight_offers_total: None,
-        })
+        Arc::new(IndexingAgreementConfig::for_tests())
     }
 
     fn test_deployment_id() -> DeploymentId {
@@ -848,7 +839,7 @@ mod tests {
     #[tokio::test]
     async fn a_second_job_for_the_same_agreement_leaves_it_to_the_first() {
         // The listener can queue an agreement twice before the chain shows it
-        // ended; two jobs at once would both cancel it and both alert.
+        // ended; 2 jobs at once would both cancel it and both alert.
         let agreement = make_agreement(IndexingAgreementStatus::CanceledByRequester);
         let agreement_id = agreement.id;
         let chain = MockChainClient::live();

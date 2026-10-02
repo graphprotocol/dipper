@@ -259,12 +259,36 @@ pub trait AgreementRegistry {
     /// Mark an indexing agreement as `CANCELED_BY_REQUESTER`.
     ///
     /// If there is no indexing agreement with the given ID, or if the agreement is not in the
-    /// `CREATED` or `ACCEPTED_ON_CHAIN` state, this method returns a
+    /// `CREATED`, `ACCEPTED_ON_CHAIN`, `REJECTED` or `CANCELLING` state, this method returns a
     /// [`NoRecordUpdated`](Error::NoRecordsUpdated) error.
     async fn mark_indexing_agreement_as_canceled_by_requester(
         &self,
         id: &IndexingAgreementId,
     ) -> RegistryResult<()>;
+
+    /// Mark a `CREATED`, `ACCEPTED_ON_CHAIN`, `REJECTED` or `EXPIRED` agreement `CANCELLING`,
+    /// before its cancel is sent; [`NoRecordUpdated`](Error::NoRecordsUpdated) otherwise.
+    async fn mark_indexing_agreement_as_cancelling(
+        &self,
+        id: &IndexingAgreementId,
+    ) -> RegistryResult<()>;
+
+    /// `CANCELLING` agreements marked over `min_age_minutes` ago whose cancel has failed
+    /// fewer than `max_attempts` times, those checked longest ago first.
+    async fn get_cancelling_agreements(
+        &self,
+        batch_size: i64,
+        max_attempts: u32,
+        min_age_minutes: i32,
+    ) -> RegistryResult<Vec<CancellingAgreement>>;
+
+    /// Record a check of a `CANCELLING` agreement that left it cancelling, adding
+    /// `failed_attempts` to its failed cancels and returning the new count.
+    async fn record_cancel_check(
+        &self,
+        id: &IndexingAgreementId,
+        failed_attempts: u32,
+    ) -> RegistryResult<u32>;
 
     /// Apply a reconciliation-driven state transition atomically.
     ///
@@ -522,6 +546,25 @@ pub struct AgreementFeeRate {
     pub tokens_per_entity_per_second: f64,
 }
 
+/// An agreement dipper is still cancelling on-chain.
+#[derive(Debug, Clone)]
+pub struct CancellingAgreement {
+    pub agreement: IndexingAgreement,
+    /// Whether dipper saw it accepted on-chain, so its end is announced.
+    pub accepted_on_chain: bool,
+}
+
+impl TryFrom<dipper_pgregistry::CancellingAgreement> for CancellingAgreement {
+    type Error = anyhow::Error;
+
+    fn try_from(value: dipper_pgregistry::CancellingAgreement) -> Result<Self, Self::Error> {
+        Ok(Self {
+            agreement: value.agreement.try_into()?,
+            accepted_on_chain: value.accepted_on_chain,
+        })
+    }
+}
+
 /// An Indexing Agreement represents the contract between the DIPs Gateway (Dipper) and the indexer
 /// to index the data.
 ///
@@ -689,6 +732,11 @@ pub enum Status {
     ///
     /// This is a terminal state.
     AbandonedByIndexer,
+
+    /// Dipper decided to end the agreement and is cancelling it on-chain, where it may
+    /// still be live. It becomes `CanceledByRequester`, announced as ended, only once
+    /// the chain confirms the end.
+    Cancelling,
 }
 
 impl std::fmt::Display for Status {
@@ -702,6 +750,7 @@ impl std::fmt::Display for Status {
             Status::AcceptedOnChain => "ACCEPTED_ON_CHAIN",
             Status::Rejected => "REJECTED",
             Status::AbandonedByIndexer => "ABANDONED_BY_INDEXER",
+            Status::Cancelling => "CANCELLING",
         };
         f.write_str(status)
     }
@@ -733,6 +782,7 @@ impl TryFrom<dipper_pgregistry::IndexingAgreement> for IndexingAgreement {
                 dipper_pgregistry::IndexingAgreementStatus::AbandonedByIndexer => {
                     Status::AbandonedByIndexer
                 }
+                dipper_pgregistry::IndexingAgreementStatus::Cancelling => Status::Cancelling,
                 _ => {
                     return Err(anyhow::anyhow!("Invalid status: {:?}", value.status));
                 }

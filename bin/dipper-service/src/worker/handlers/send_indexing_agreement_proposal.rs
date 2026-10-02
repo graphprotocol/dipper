@@ -522,6 +522,30 @@ mod tests {
             Ok(())
         }
 
+        async fn mark_indexing_agreement_as_cancelling(
+            &self,
+            _id: &IndexingAgreementId,
+        ) -> crate::registry::Result<()> {
+            Ok(())
+        }
+
+        async fn get_cancelling_agreements(
+            &self,
+            _batch_size: i64,
+            _max_attempts: u32,
+            _min_age_minutes: i32,
+        ) -> crate::registry::Result<Vec<crate::registry::CancellingAgreement>> {
+            Ok(Vec::new())
+        }
+
+        async fn record_cancel_check(
+            &self,
+            _id: &IndexingAgreementId,
+            failed_attempts: u32,
+        ) -> crate::registry::Result<u32> {
+            Ok(failed_attempts)
+        }
+
         async fn apply_reconciliation(
             &self,
             _id: &IndexingAgreementId,

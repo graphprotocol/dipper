@@ -23,7 +23,7 @@ use thegraph_core::{DeploymentId, alloy::primitives::ChainId};
 use url::Url;
 
 use crate::{
-    cancel_dispatch::cancel_agreement_on_chain,
+    cancel_dispatch::{LiveCancel, cancel_if_live},
     chain_client::{ChainClient, ChainClientError, decode_revert_reason},
     config::IndexingAgreementConfig,
     indexer_rpc_client::into_sol_rca,
@@ -213,9 +213,7 @@ async fn next_step<R: AgreementRegistry>(
             NextStep::Skip
         }
         Some(a) if a.status == IndexingAgreementStatus::Created => NextStep::Offer(a),
-        Some(a) if a.status == IndexingAgreementStatus::CanceledByRequester => {
-            NextStep::Withdraw(a)
-        }
+        Some(a) if dipper_cancelled(a.status) => NextStep::Withdraw(a),
         Some(a) => {
             tracing::warn!(
                 agreement_id = %agreement_id,
@@ -234,16 +232,9 @@ async fn withdraw_offer_if_stored<R, T: ChainClient>(
     ctx: &Ctx<R, T>,
     agreement: &IndexingAgreement,
 ) -> JobResult<()> {
-    let stored = ctx
-        .chain_client
-        .agreement_still_active(agreement.id.as_bytes())
-        .await
-        .map_err(|err| retry_withdraw(agreement, err))?;
-    if !stored {
-        return Ok(());
-    }
-    match cancel_agreement_on_chain(&ctx.chain_client, agreement, &ctx.agreement_conf).await {
-        Ok(tx_hash) => {
+    match cancel_if_live(&ctx.chain_client, agreement, &ctx.agreement_conf).await {
+        LiveCancel::NotLive => Ok(()),
+        LiveCancel::Ended(tx_hash) => {
             tracing::info!(
                 agreement_id = %agreement.id,
                 tx_hash = ?tx_hash,
@@ -251,7 +242,7 @@ async fn withdraw_offer_if_stored<R, T: ChainClient>(
             );
             Ok(())
         }
-        Err(err @ ChainClientError::MissingTermsVersionHash { .. }) => {
+        LiveCancel::CancelFailed(err @ ChainClientError::MissingTermsVersionHash { .. }) => {
             tracing::error!(
                 agreement_id = %agreement.id,
                 error = %err,
@@ -259,7 +250,9 @@ async fn withdraw_offer_if_stored<R, T: ChainClient>(
             );
             Err(JobError::Fatal(err.into()))
         }
-        Err(err) => Err(retry_withdraw(agreement, err)),
+        LiveCancel::ReadFailed(err) | LiveCancel::CancelFailed(err) => {
+            Err(retry_withdraw(agreement, err))
+        }
     }
 }
 
@@ -272,22 +265,30 @@ fn retry_withdraw(agreement: &IndexingAgreement, err: ChainClientError) -> JobEr
     JobError::Retryable(err.into(), TRANSIENT_RETRY_BASE)
 }
 
-/// The agreement, if it was cancelled after this job's status check.
+/// Whether dipper has cancelled the agreement, or started to.
+fn dipper_cancelled(status: IndexingAgreementStatus) -> bool {
+    matches!(
+        status,
+        IndexingAgreementStatus::Cancelling | IndexingAgreementStatus::CanceledByRequester
+    )
+}
+
+/// The agreement, if it was cancelled after this job's status check. After a failed read
+/// the job still finishes: retrying would send the offer again, and the chain listener's
+/// cancel retry withdraws the offer of an agreement left cancelling.
 async fn cancelled_meanwhile<R: AgreementRegistry>(
     registry: &R,
     agreement_id: &IndexingAgreementId,
 ) -> Option<IndexingAgreement> {
     match registry.get_indexing_agreement_by_id(agreement_id).await {
-        Ok(Some(agreement)) if agreement.status == IndexingAgreementStatus::CanceledByRequester => {
-            Some(agreement)
-        }
+        Ok(Some(agreement)) if dipper_cancelled(agreement.status) => Some(agreement),
         Ok(_) => None,
         Err(err) => {
             tracing::warn!(
                 agreement_id = %agreement_id,
                 error = %err,
-                "Failed to re-read agreement after its offer landed; a cancel made meanwhile \
-                 would leave the offer open until its deadline"
+                "Failed to re-read agreement after its offer landed; the cancel retry \
+                 withdraws the offer if it was cancelled"
             );
             None
         }
@@ -298,7 +299,7 @@ async fn cancelled_meanwhile<R: AgreementRegistry>(
 mod tests {
     use std::sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     };
 
     use async_trait::async_trait;
@@ -321,6 +322,9 @@ mod tests {
 
     struct MockRegistry {
         agreement: SharedAgreement,
+        /// When set, every read after the first fails.
+        later_reads_fail: bool,
+        reads: AtomicU32,
     }
 
     #[async_trait]
@@ -329,6 +333,9 @@ mod tests {
             &self,
             _id: &IndexingAgreementId,
         ) -> crate::registry::Result<Option<IndexingAgreement>> {
+            if self.reads.fetch_add(1, Ordering::SeqCst) > 0 && self.later_reads_fail {
+                return Err(crate::registry::Error::NoRecordsUpdated);
+            }
             Ok(self.agreement.lock().unwrap().clone())
         }
         async fn update_offer_tx_hash(
@@ -364,7 +371,7 @@ mod tests {
             if let Some(agreement) = &self.cancel_mid_send
                 && let Some(row) = agreement.lock().unwrap().as_mut()
             {
-                row.status = IndexingAgreementStatus::CanceledByRequester;
+                row.status = IndexingAgreementStatus::Cancelling;
             }
             let result = self
                 .offer_result
@@ -489,6 +496,8 @@ mod tests {
         Ctx {
             registry: MockRegistry {
                 agreement: Arc::new(Mutex::new(Some(agreement))),
+                later_reads_fail: false,
+                reads: AtomicU32::new(0),
             },
             chain_client: MockChainClient {
                 offer_result: Mutex::new(offer_result),
@@ -502,29 +511,7 @@ mod tests {
     }
 
     fn test_agreement_conf() -> crate::config::IndexingAgreementConfig {
-        crate::config::IndexingAgreementConfig {
-            data_service: Address::ZERO,
-            recurring_collector: Address::ZERO,
-            recurring_agreement_manager: Address::ZERO,
-            max_agreement_grt_per_30_days: 0.0,
-            max_seconds_per_collection: 0,
-            min_seconds_per_collection: 0,
-            duration_seconds: 0,
-            deadline_seconds: 0,
-            max_grt_per_30_days: std::collections::BTreeMap::new(),
-            max_grt_per_billion_entities_per_30_days: 0.0,
-            declined_indexer_lookback_days: 0,
-            price_rejection_lookback_days: 0,
-            transient_rejection_lookback_minutes: 0,
-            uncertain_rejection_lookback_days: 0,
-            unresponsive_indexer_lookback_days: 0,
-            mass_unresponsive_trip_fraction: 0.5,
-            mass_unresponsive_reset_fraction: 0.25,
-            dips_accepting_snapshot_max_age_hours: 48,
-            dips_accepting_cache_ttl_seconds: 300,
-            max_in_flight_offers_per_indexer: None,
-            max_in_flight_offers_total: None,
-        }
+        crate::config::IndexingAgreementConfig::for_tests()
     }
 
     #[tokio::test]
@@ -545,6 +532,21 @@ mod tests {
         //* Assert
         assert!(result.is_ok(), "got {result:?}");
         assert_eq!(*cancelled.lock().unwrap(), vec![*agreement_id.as_bytes()]);
+    }
+
+    #[tokio::test]
+    async fn finishes_without_resending_when_it_cannot_recheck_the_agreement() {
+        //* Arrange - a retry would send the offer again; the mock panics on a second send
+        let agreement = make_test_agreement();
+        let message = make_message(agreement.id);
+        let mut ctx = ctx_with_offer_result(agreement, Ok(Some(B256::repeat_byte(0xab))));
+        ctx.registry.later_reads_fail = true;
+
+        //* Act
+        let result = handle(ctx, &message).await;
+
+        //* Assert
+        assert!(result.is_ok(), "got {result:?}");
     }
 
     #[tokio::test]
@@ -583,23 +585,28 @@ mod tests {
 
     #[tokio::test]
     async fn withdraws_a_stored_offer_of_an_agreement_already_cancelled() {
-        //* Arrange - an earlier attempt sent the offer, then the agreement was
-        // cancelled before this retry; no offer result, so a send would panic
-        let mut agreement = make_test_agreement();
-        agreement.status = IndexingAgreementStatus::CanceledByRequester;
-        agreement.terms_version_hash = Some(vec![7u8; 32]);
-        let agreement_id = agreement.id;
-        let message = make_message(agreement_id);
-        let ctx = ctx_with(agreement, None);
-        ctx.chain_client.on_chain.store(true, Ordering::SeqCst);
-        let cancelled = ctx.chain_client.cancelled.clone();
+        for status in [
+            IndexingAgreementStatus::Cancelling,
+            IndexingAgreementStatus::CanceledByRequester,
+        ] {
+            //* Arrange - an earlier attempt sent the offer, then the agreement was
+            // cancelled before this retry; no offer result, so a send would panic
+            let mut agreement = make_test_agreement();
+            agreement.status = status;
+            agreement.terms_version_hash = Some(vec![7u8; 32]);
+            let agreement_id = agreement.id;
+            let message = make_message(agreement_id);
+            let ctx = ctx_with(agreement, None);
+            ctx.chain_client.on_chain.store(true, Ordering::SeqCst);
+            let cancelled = ctx.chain_client.cancelled.clone();
 
-        //* Act
-        let result = handle(ctx, &message).await;
+            //* Act
+            let result = handle(ctx, &message).await;
 
-        //* Assert
-        assert!(result.is_ok(), "got {result:?}");
-        assert_eq!(*cancelled.lock().unwrap(), vec![*agreement_id.as_bytes()]);
+            //* Assert
+            assert!(result.is_ok(), "got {result:?}");
+            assert_eq!(*cancelled.lock().unwrap(), vec![*agreement_id.as_bytes()]);
+        }
     }
 
     #[tokio::test]
