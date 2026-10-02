@@ -3372,7 +3372,7 @@ async fn cancelling_agreements_are_listed_until_their_cancel_fails_too_often() {
     .execute(&db)
     .await
     .expect("Failed to update deadline");
-    let registry = PgRegistry::new(db);
+    let registry = PgRegistry::new(db.clone());
     let accepted =
         IndexingAgreementId::from_bytes([0xaa, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
     let ended =
@@ -3431,6 +3431,7 @@ async fn cancelling_agreements_are_listed_until_their_cancel_fails_too_often() {
         ]
     );
 
+    assert_eq!(registry.record_cancel_check(&created, 0).await.unwrap(), 0);
     assert_eq!(registry.record_cancel_check(&accepted, 0).await.unwrap(), 0);
     let listed = registry
         .get_cancelling_agreements(100, 2, 0)
@@ -3441,6 +3442,25 @@ async fn cancelling_agreements_are_listed_until_their_cancel_fails_too_often() {
         ids,
         vec![accepted, created],
         "one accepted on-chain may be paying its indexer, so it goes first"
+    );
+
+    sqlx::query(
+        "UPDATE dipper_reg_indexing_agreements \
+         SET cancel_checked_at = cancel_checked_at - INTERVAL '2 hours' WHERE id = $1",
+    )
+    .bind(created)
+    .execute(&db)
+    .await
+    .expect("Failed to age the check");
+    let listed = registry
+        .get_cancelling_agreements(100, 2, 0)
+        .await
+        .expect("cancelling query");
+    let ids: Vec<_> = listed.iter().map(|row| row.agreement.id).collect();
+    assert_eq!(
+        ids,
+        vec![created, accepted],
+        "an offer unchecked for over an hour isn't held back for ever"
     );
 
     assert_eq!(registry.record_cancel_check(&created, 1).await.unwrap(), 1);

@@ -972,8 +972,9 @@ impl PgRegistry {
     }
 
     /// `Cancelling` agreements marked over `min_age_minutes` ago whose cancel has failed
-    /// fewer than `max_attempts` times. Those that may be paying an indexer come first (accepted,
-    /// or past the offer deadline, which only an accepted one outlives), then those checked longest ago.
+    /// fewer than `max_attempts` times, those checked longest ago first. One that may be paying
+    /// an indexer (accepted, or past the offer deadline, which only an accepted one outlives)
+    /// counts as checked an hour earlier, so it goes first without holding the rest back.
     pub async fn get_cancelling_agreements(
         &self,
         batch_size: i64,
@@ -1003,9 +1004,12 @@ impl PgRegistry {
               AND cancel_attempts < $2
               AND updated_at < timezone('UTC', now()) - make_interval(mins => $4)
             ORDER BY
-                (accepted_at IS NOT NULL
-                    OR CAST(terms->>'deadline' AS bigint) < EXTRACT(EPOCH FROM now())) DESC,
-                cancel_checked_at ASC NULLS FIRST,
+                cancel_checked_at - CASE
+                    WHEN accepted_at IS NOT NULL
+                        OR CAST(terms->>'deadline' AS bigint) < EXTRACT(EPOCH FROM now())
+                    THEN INTERVAL '1 hour'
+                    ELSE INTERVAL '0 seconds'
+                END ASC NULLS FIRST,
                 updated_at ASC
             LIMIT $3
             "#,
