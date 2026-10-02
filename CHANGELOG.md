@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.2](https://github.com/graphprotocol/dipper/compare/v0.2.1...v0.2.2) (2026-10-02)
+
+
+### Changed
+
+* **lint:** hold new code to stricter clippy lints ([#706](https://github.com/graphprotocol/dipper/issues/706)) ([0f2ca41](https://github.com/graphprotocol/dipper/commit/0f2ca418aeac561f0699d298300e6bdeb979488e))
+
 ## [0.2.1](https://github.com/graphprotocol/dipper/compare/v0.2.0...v0.2.1) (2026-10-01)
 
 
