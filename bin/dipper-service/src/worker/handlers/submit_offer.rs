@@ -176,7 +176,7 @@ where
 
     // Every cancel of an unaccepted agreement marks it before it is sent, so a cancel
     // that went out ahead of this offer, and found nothing to withdraw, shows here.
-    if let Some(agreement) = cancelled_meanwhile(&ctx.registry, agreement_id).await {
+    if let Some(agreement) = cancelled_meanwhile(&ctx.registry, agreement_id).await? {
         return withdraw_offer_if_stored(&ctx, &agreement).await;
     }
 
@@ -273,22 +273,22 @@ fn dipper_cancelled(status: IndexingAgreementStatus) -> bool {
     )
 }
 
-/// The agreement, if it was cancelled after this job's status check.
+/// The agreement, if it was cancelled after this job's status check. A failed read
+/// retries the job, whose status check then withdraws the offer of a cancelled one.
 async fn cancelled_meanwhile<R: AgreementRegistry>(
     registry: &R,
     agreement_id: &IndexingAgreementId,
-) -> Option<IndexingAgreement> {
+) -> JobResult<Option<IndexingAgreement>> {
     match registry.get_indexing_agreement_by_id(agreement_id).await {
-        Ok(Some(agreement)) if dipper_cancelled(agreement.status) => Some(agreement),
-        Ok(_) => None,
+        Ok(Some(agreement)) if dipper_cancelled(agreement.status) => Ok(Some(agreement)),
+        Ok(_) => Ok(None),
         Err(err) => {
             tracing::warn!(
                 agreement_id = %agreement_id,
                 error = %err,
-                "Failed to re-read agreement after its offer landed; a cancel made meanwhile \
-                 would leave the offer open until its deadline"
+                "Failed to re-read agreement after its offer landed, will retry"
             );
-            None
+            Err(JobError::Retryable(err.into(), TRANSIENT_RETRY_BASE))
         }
     }
 }
@@ -297,7 +297,7 @@ async fn cancelled_meanwhile<R: AgreementRegistry>(
 mod tests {
     use std::sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     };
 
     use async_trait::async_trait;
@@ -320,6 +320,9 @@ mod tests {
 
     struct MockRegistry {
         agreement: SharedAgreement,
+        /// When set, every read after the first fails.
+        later_reads_fail: bool,
+        reads: AtomicU32,
     }
 
     #[async_trait]
@@ -328,6 +331,9 @@ mod tests {
             &self,
             _id: &IndexingAgreementId,
         ) -> crate::registry::Result<Option<IndexingAgreement>> {
+            if self.reads.fetch_add(1, Ordering::SeqCst) > 0 && self.later_reads_fail {
+                return Err(crate::registry::Error::NoRecordsUpdated);
+            }
             Ok(self.agreement.lock().unwrap().clone())
         }
         async fn update_offer_tx_hash(
@@ -488,6 +494,8 @@ mod tests {
         Ctx {
             registry: MockRegistry {
                 agreement: Arc::new(Mutex::new(Some(agreement))),
+                later_reads_fail: false,
+                reads: AtomicU32::new(0),
             },
             chain_client: MockChainClient {
                 offer_result: Mutex::new(offer_result),
@@ -544,6 +552,25 @@ mod tests {
         //* Assert
         assert!(result.is_ok(), "got {result:?}");
         assert_eq!(*cancelled.lock().unwrap(), vec![*agreement_id.as_bytes()]);
+    }
+
+    #[tokio::test]
+    async fn retries_when_it_cannot_check_the_agreement_after_its_offer_lands() {
+        //* Arrange - finishing here would leave the offer open had the agreement
+        // been cancelled while it was sent
+        let agreement = make_test_agreement();
+        let message = make_message(agreement.id);
+        let mut ctx = ctx_with_offer_result(agreement, Ok(Some(B256::repeat_byte(0xab))));
+        ctx.registry.later_reads_fail = true;
+
+        //* Act
+        let result = handle(ctx, &message).await;
+
+        //* Assert
+        assert!(
+            matches!(result, Err(JobError::Retryable(..))),
+            "got {result:?}"
+        );
     }
 
     #[tokio::test]
