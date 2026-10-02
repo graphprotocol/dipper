@@ -58,21 +58,23 @@ const RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const VERSION_CURRENT: u64 = 0;
 
 /// `AgreementDetails.state` flags from `IAgreementCollector.sol` (REGISTERED=1,
-/// ACCEPTED=2, NOTICE_GIVEN=4, BY_PROVIDER=32). `getAgreementDetails` keeps ACCEPTED set on
-/// a canceled agreement and ORs in NOTICE_GIVEN, so a cancel must clear it, not just lack
-/// it. REGISTERED without ACCEPTED is an offer still waiting. BY_PROVIDER: the indexer cancelled.
+/// ACCEPTED=2, NOTICE_GIVEN=4, SETTLED=8, BY_PROVIDER=32). `getAgreementDetails` keeps
+/// ACCEPTED set on a canceled agreement and ORs in NOTICE_GIVEN, so a cancel must clear it,
+/// not just lack it. SETTLED: nothing left to claim. BY_PROVIDER: the indexer cancelled.
 const STATE_REGISTERED: u16 = 1;
 const STATE_ACCEPTED: u16 = 2;
 const STATE_NOTICE_GIVEN: u16 = 4;
+const STATE_SETTLED: u16 = 8;
 const STATE_BY_PROVIDER: u16 = 32;
 
 /// Live iff the terms are accepted and no cancellation notice exists, or an
 /// offer is still stored for the indexer to accept. A cancel sets NOTICE_GIVEN
 /// while ACCEPTED stays set, so the notice bit tells a live agreement from a
-/// cancelled one; a revoked offer reads as an empty state.
+/// cancelled one; a revoked offer reads as an empty state. An offer past its
+/// deadline stays stored but is SETTLED, since it can no longer be accepted.
 fn still_live(state: u16) -> bool {
     let accepted = state & STATE_ACCEPTED != 0;
-    let pending_offer = state & STATE_REGISTERED != 0 && !accepted;
+    let pending_offer = state & STATE_REGISTERED != 0 && !accepted && state & STATE_SETTLED == 0;
     pending_offer || (accepted && state & STATE_NOTICE_GIVEN == 0)
 }
 
@@ -1016,15 +1018,22 @@ mod tests {
     /// or an id it never saw, as an empty state.
     #[test]
     fn still_live_covers_accepted_agreements_and_pending_offers() {
-        const SETTLED: u16 = 8;
         const BY_PAYER: u16 = 16;
         assert!(still_live(STATE_REGISTERED | STATE_ACCEPTED));
         assert!(
             still_live(STATE_REGISTERED),
             "a pending offer can still be accepted"
         );
+        assert!(
+            !still_live(STATE_REGISTERED | STATE_SETTLED),
+            "an offer past its deadline can't be"
+        );
+        assert!(
+            still_live(STATE_REGISTERED | STATE_ACCEPTED | STATE_SETTLED),
+            "an accepted agreement just collected from is still live"
+        );
         assert!(!still_live(
-            STATE_REGISTERED | STATE_ACCEPTED | STATE_NOTICE_GIVEN | BY_PAYER | SETTLED
+            STATE_REGISTERED | STATE_ACCEPTED | STATE_NOTICE_GIVEN | BY_PAYER | STATE_SETTLED
         ));
         assert!(!still_live(0), "revoked or never offered");
     }
