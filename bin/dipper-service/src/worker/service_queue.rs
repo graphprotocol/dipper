@@ -12,6 +12,11 @@ use super::{
     queue::{JobId, JobPriority, Queue},
 };
 
+/// Retries for the job that cancels on-chain an agreement dipper doesn't want but
+/// that went live anyway: about 40 minutes of attempts at its 30 s backoff base,
+/// since giving up leaves the indexer paid.
+const CANCEL_ON_CHAIN_MAX_RETRIES: u32 = 10;
+
 #[async_trait]
 pub trait WorkerQueue {
     async fn send_indexing_agreement_proposal(
@@ -130,11 +135,12 @@ where
         priority: JobPriority,
     ) -> anyhow::Result<JobId> {
         self.queue
-            .push(
+            .push_with_max_retries(
                 Message::CancelRejectedAgreementOnChain(CancelRejectedAgreementOnChain {
                     agreement_id,
                 }),
                 priority,
+                CANCEL_ON_CHAIN_MAX_RETRIES,
             )
             .await
     }
@@ -246,10 +252,10 @@ mod tests {
         assert_eq!(*queue.queue.pushes.lock().unwrap(), vec![Some(4)]);
     }
 
-    /// Only the offer submission has a deadline to spend its retries against,
-    /// so every other job keeps the queue-wide budget.
+    /// A proposal has no deadline of its own to spend retries against, so it
+    /// keeps the queue-wide budget.
     #[tokio::test]
-    async fn other_jobs_keep_the_queue_default_retry_budget() {
+    async fn a_proposal_keeps_the_queue_default_retry_budget() {
         //* Arrange
         let queue = handle(4);
 
@@ -265,6 +271,19 @@ mod tests {
             )
             .await
             .unwrap();
+
+        //* Assert
+        assert_eq!(*queue.queue.pushes.lock().unwrap(), vec![None]);
+    }
+
+    /// Giving up on cancelling a live agreement dipper doesn't want leaves the
+    /// indexer paid, so that job keeps trying well past the queue default.
+    #[tokio::test]
+    async fn an_on_chain_cancel_carries_its_longer_retry_budget() {
+        //* Arrange
+        let queue = handle(4);
+
+        //* Act
         queue
             .cancel_rejected_agreement_on_chain(
                 IndexingAgreementId::from_bytes([0; 16]),
@@ -274,6 +293,9 @@ mod tests {
             .unwrap();
 
         //* Assert
-        assert_eq!(*queue.queue.pushes.lock().unwrap(), vec![None, None]);
+        assert_eq!(
+            *queue.queue.pushes.lock().unwrap(),
+            vec![Some(CANCEL_ON_CHAIN_MAX_RETRIES)]
+        );
     }
 }
