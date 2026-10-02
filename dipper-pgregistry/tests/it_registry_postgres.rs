@@ -3473,7 +3473,26 @@ async fn cancelling_agreements_are_listed_until_their_cancel_fails_too_often() {
     assert_eq!(
         ids,
         vec![accepted],
-        "one that failed too often is left alone"
+        "one that failed too often waits an hour between checks"
+    );
+
+    sqlx::query(
+        "UPDATE dipper_reg_indexing_agreements \
+         SET cancel_checked_at = cancel_checked_at - INTERVAL '2 hours' WHERE id = $1",
+    )
+    .bind(created)
+    .execute(&db)
+    .await
+    .expect("Failed to age the check");
+    let listed = registry
+        .get_cancelling_agreements(100, 2, 0)
+        .await
+        .expect("cancelling query");
+    let given_up = listed.iter().find(|row| row.agreement.id == created);
+    assert_eq!(
+        given_up.map(|row| row.cancel_attempts),
+        Some(2),
+        "and is checked again after it"
     );
 
     let not_cancelling = registry

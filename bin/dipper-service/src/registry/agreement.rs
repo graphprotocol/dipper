@@ -281,8 +281,8 @@ pub trait AgreementRegistry {
         id: &IndexingAgreementId,
     ) -> RegistryResult<()>;
 
-    /// `CANCELLING` agreements marked over `min_age_minutes` ago whose cancel has failed
-    /// fewer than `max_attempts` times, those checked longest ago first. One that may be paying
+    /// `CANCELLING` agreements marked over `min_age_minutes` ago, those checked longest ago
+    /// first; one whose cancel has failed `max_attempts` times only once an hour. One that may be paying
     /// an indexer (accepted, or past the offer deadline, which only an accepted one outlives)
     /// counts as checked an hour earlier, so it goes first without holding the rest back.
     async fn get_cancelling_agreements(
@@ -562,6 +562,8 @@ pub struct CancellingAgreement {
     pub agreement: IndexingAgreement,
     /// Whether dipper saw it accepted on-chain, so its end is announced.
     pub accepted_on_chain: bool,
+    /// Cancels that failed in a way retrying may not fix.
+    pub cancel_attempts: u32,
 }
 
 impl TryFrom<dipper_pgregistry::CancellingAgreement> for CancellingAgreement {
@@ -571,6 +573,7 @@ impl TryFrom<dipper_pgregistry::CancellingAgreement> for CancellingAgreement {
         Ok(Self {
             agreement: value.agreement.try_into()?,
             accepted_on_chain: value.accepted_on_chain,
+            cancel_attempts: value.cancel_attempts,
         })
     }
 }

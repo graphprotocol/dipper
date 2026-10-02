@@ -12,8 +12,8 @@ use crate::{
     registry::{AgreementRegistry, CancelKind, CancellingAgreement, IndexingAgreement},
 };
 
-/// Retried cancels mined without ending an agreement before dipper stops retrying it and
-/// leaves it to an operator. Other failures don't count (see `failed_attempts`).
+/// Failed cancels before dipper stops sending them and alerts an operator; it still reads the
+/// agreement hourly and closes it once it ends. Outages don't count (see `failed_attempts`).
 pub const MAX_CANCEL_ATTEMPTS: u32 = 10;
 
 /// Agreements a sweep takes on, those that may be paying an indexer first; the time budget
@@ -93,7 +93,10 @@ async fn retry_cancel<R, T>(
     T: ChainClient,
 {
     let agreement_id = row.agreement.id;
-    let (tx_hash, failure) = match cancel_if_live(chain_client, &row.agreement, config).await {
+    let Some(outcome) = cancel_unless_given_up(chain_client, config, row).await else {
+        return note_check(registry, row, None).await;
+    };
+    let (tx_hash, failure) = match outcome {
         LiveCancel::ReadFailed(err) => {
             tracing::warn!(
                 %agreement_id,
@@ -120,6 +123,26 @@ async fn retry_cancel<R, T>(
         return;
     }
     note_check(registry, row, failure.as_ref()).await;
+}
+
+/// Cancel the agreement if the chain shows it live. One dipper gave up on is only read, so it
+/// is still closed once it ends without paying for more cancels; `None` if it is still live.
+async fn cancel_unless_given_up<T: ChainClient>(
+    chain_client: &T,
+    config: &IndexingAgreementConfig,
+    row: &CancellingAgreement,
+) -> Option<LiveCancel> {
+    if row.cancel_attempts < MAX_CANCEL_ATTEMPTS {
+        return Some(cancel_if_live(chain_client, &row.agreement, config).await);
+    }
+    match chain_client
+        .agreement_still_active(row.agreement.id.as_bytes())
+        .await
+    {
+        Ok(true) => None,
+        Ok(false) => Some(LiveCancel::NotLive),
+        Err(err) => Some(LiveCancel::ReadFailed(err)),
+    }
 }
 
 /// Mark the agreement `CanceledByRequester` once it can't go live again: this sweep's cancel
@@ -286,7 +309,8 @@ fn log_failed_cancel(agreement: &IndexingAgreement, attempts: u32, err: &ChainCl
         indexing_request_id = %agreement.indexing_request_id,
         attempts,
         error = %err,
-        "Gave up cancelling an agreement on-chain; it may still be live"
+        "Gave up cancelling an agreement on-chain; it may still be live. Dipper checks it hourly \
+         and closes it once it ends; set its cancel_attempts to 0 to send cancels again"
     );
 }
 
@@ -486,6 +510,7 @@ mod tests {
             cancelling: vec![CancellingAgreement {
                 agreement: cancelling,
                 accepted_on_chain,
+                cancel_attempts: 0,
             }],
             ..MockRegistry::default()
         }
@@ -732,6 +757,31 @@ mod tests {
         retry(&registry, &chain, 0).await;
 
         assert_eq!(registry.attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn only_reads_an_agreement_it_gave_up_cancelling() {
+        let mut registry = registry_with_one(true);
+        registry.cancelling[0].cancel_attempts = MAX_CANCEL_ATTEMPTS;
+        let chain = live_chain();
+
+        retry(&registry, &chain, 0).await;
+
+        assert_eq!(chain.cancels_sent.load(Ordering::SeqCst), 0);
+        assert_eq!(registry.checks.load(Ordering::SeqCst), 1);
+        assert!(registry.marked_cancelled.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn closes_an_agreement_it_gave_up_cancelling_once_it_ends() {
+        // Otherwise it stays cancelling, its indexer kept out of selection, for ever.
+        let mut registry = registry_with_one(false);
+        registry.cancelling[0].cancel_attempts = MAX_CANCEL_ATTEMPTS;
+        let chain = MockChain::default();
+
+        retry(&registry, &chain, DEADLINE + 1).await;
+
+        assert_eq!(registry.marked_cancelled.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
