@@ -9,9 +9,9 @@ use thegraph_core::{DeploymentId, IndexerId, alloy::primitives::ChainId};
 
 use super::{
     agreement::{
-        AgreementFeeRate, AgreementRegistry, CancelKind, IndexingAgreement, NewAgreementParams,
-        PendingAcceptedEvent, PendingExpiredEvent, PendingTerminatedEvent, ReconciliationItem,
-        ReconciliationOutcome,
+        AgreementFeeRate, AgreementRegistry, CancelKind, CancellingAgreement, IndexingAgreement,
+        NewAgreementParams, PendingAcceptedEvent, PendingExpiredEvent, PendingTerminatedEvent,
+        ReconciliationItem, ReconciliationOutcome,
     },
     result::Result,
 };
@@ -131,6 +131,22 @@ pub trait StubAgreementRegistry: Send + Sync {
         _id: &IndexingAgreementId,
     ) -> Result<()> {
         unimplemented!("mark_indexing_agreement_as_canceled_by_requester")
+    }
+
+    async fn mark_indexing_agreement_as_cancelling(&self, _id: &IndexingAgreementId) -> Result<()> {
+        unimplemented!("mark_indexing_agreement_as_cancelling")
+    }
+
+    async fn get_cancelling_agreements(
+        &self,
+        _batch_size: i64,
+        _max_attempts: u32,
+    ) -> Result<Vec<CancellingAgreement>> {
+        Ok(Vec::new())
+    }
+
+    async fn record_cancel_attempt(&self, _id: &IndexingAgreementId) -> Result<u32> {
+        Ok(1)
     }
 
     async fn apply_reconciliation(
@@ -413,6 +429,22 @@ impl<T: StubAgreementRegistry> AgreementRegistry for T {
         id: &IndexingAgreementId,
     ) -> Result<()> {
         StubAgreementRegistry::mark_indexing_agreement_as_canceled_by_requester(self, id).await
+    }
+
+    async fn mark_indexing_agreement_as_cancelling(&self, id: &IndexingAgreementId) -> Result<()> {
+        StubAgreementRegistry::mark_indexing_agreement_as_cancelling(self, id).await
+    }
+
+    async fn get_cancelling_agreements(
+        &self,
+        batch_size: i64,
+        max_attempts: u32,
+    ) -> Result<Vec<CancellingAgreement>> {
+        StubAgreementRegistry::get_cancelling_agreements(self, batch_size, max_attempts).await
+    }
+
+    async fn record_cancel_attempt(&self, id: &IndexingAgreementId) -> Result<u32> {
+        StubAgreementRegistry::record_cancel_attempt(self, id).await
     }
 
     async fn apply_reconciliation(

@@ -83,6 +83,9 @@ const SWEEP_BATCH_SIZE: i64 = 1000;
 /// crash-recovery; the steady-state fan-out fires from finalize on a
 /// fresh accept, so per-poll execution is wasted DB work.
 const SWEEP_POLLS: u64 = 60;
+/// How often agreements still being cancelled get their cancel retried: about every
+/// 5 min at the fast rate, which the listener keeps while any are left.
+const CANCEL_RETRY_POLLS: u64 = 10;
 
 /// Handle for controlling the chain listener service lifecycle
 #[derive(Clone)]
@@ -228,6 +231,7 @@ where
         // Starts at SWEEP_POLLS so the first poll runs the sweep,
         // recovering any pre-startup orphans.
         let mut polls_since_sweep: u64 = SWEEP_POLLS;
+        let mut polls_since_cancel_retry: u64 = CANCEL_RETRY_POLLS;
         // Pause the event sweeps after a Kafka send failure, backing off from one
         // poll interval up to the idle interval, so a hung broker cannot stall the
         // poll loop on every iteration.
@@ -291,6 +295,22 @@ where
                     "Applying failure backoff"
                 );
                 tokio::time::sleep(backoff).await;
+            }
+
+            // Ahead of the drain, which ends the poll early while the subgraph is down:
+            // finishing a cancel needs only the chain.
+            polls_since_cancel_retry += 1;
+            if polls_since_cancel_retry >= CANCEL_RETRY_POLLS {
+                let chain_now =
+                    last_persisted_timestamp.unwrap_or_else(dipper_core::time::now_secs);
+                super::cancel_retry::retry_cancelling_agreements(
+                    &registry,
+                    &chain_client,
+                    &agreement_conf,
+                    chain_now,
+                )
+                .await;
+                polls_since_cancel_retry = 0;
             }
 
             let outcome = match drain_once(
@@ -877,6 +897,7 @@ where
     }
 
     queue_cancel_if_cancelled_but_accepted(snapshot, &agreement, worker_queue).await?;
+    record_accept_of_cancelling(snapshot, &agreement, registry).await;
 
     // Both transitions are applied atomically downstream so the
     // Accept-then-Cancel-in-one-snapshot path can't leak an intermediate
@@ -1012,6 +1033,30 @@ async fn queue_cancel_if_cancelled_but_accepted<W: WorkerQueue>(
     Ok(())
 }
 
+/// An agreement dipper is cancelling stays `Cancelling` when the chain shows it accepted,
+/// so its accept is recorded here; its end is then announced, along with the accept,
+/// once the cancel lands. Existing values win.
+async fn record_accept_of_cancelling<R: AgreementRegistry + Sync>(
+    snapshot: &AgreementStateSnapshot,
+    agreement: &IndexingAgreement,
+    registry: &R,
+) {
+    if agreement.status != IndexingAgreementStatus::Cancelling || !snapshot.state.reached_accepted()
+    {
+        return;
+    }
+    if let Err(err) = registry
+        .record_accepted_audit(&agreement.id, snapshot.accepted_at, &snapshot.accepted_tx)
+        .await
+    {
+        tracing::warn!(
+            agreement_id = %agreement.id,
+            error = %err,
+            "failed to record the on-chain accept of an agreement being cancelled"
+        );
+    }
+}
+
 /// Log the transition that landed and, on fresh accepts, fan out the
 /// linked pending cancellations.
 #[expect(
@@ -1115,16 +1160,9 @@ where
 /// Execute pending cancellations linked to a newly-accepted agreement.
 ///
 /// Called from the Created -> AcceptedOnChain and Expired -> AcceptedOnChain
-/// transitions. For each pending cancellation, fires
-/// `cancelIndexingAgreementByPayer` against the RecurringCollector contract and
-/// flips the dipper DB row to `CanceledByRequester`, an unaccepted one first. Each pending row is
-/// deleted individually after both steps succeed; transient failures retain
-/// the record so the next reconcile pass can retry.
-#[expect(
-    clippy::cognitive_complexity,
-    clippy::too_many_lines,
-    reason = "predates this lint; fix when next touched"
-)]
+/// transitions. Each replaced agreement is marked `Cancelling` and its on-chain cancel
+/// sent once; the cancel retry in this listener finishes any that don't end at once.
+/// A pending row is deleted once its agreement is marked; a failed mark keeps it for retry.
 async fn execute_pending_cancellations<R, T>(
     agreement_id: &IndexingAgreementId,
     registry: &R,
@@ -1139,146 +1177,23 @@ where
         .get_pending_cancellations_by_new_agreement(*agreement_id)
         .await?;
 
-    if pending.is_empty() {
-        return Ok(());
-    }
-
     let mut transient_failures: u32 = 0;
-
     for cancellation in &pending {
-        let old_agreement = match registry
-            .get_indexing_agreement_by_id(&cancellation.old_agreement_id)
-            .await?
-        {
-            None => {
-                tracing::warn!(
-                    old_agreement_id = %cancellation.old_agreement_id,
-                    "Pending cancellation references non-existent agreement, cleaning up"
-                );
-                registry
-                    .delete_pending_cancellation(*agreement_id, cancellation.old_agreement_id)
-                    .await?;
-                continue;
-            }
-            Some(a) => a,
-        };
-
-        // An unaccepted one is marked first. An offer for it still in flight then
-        // lands before this cancel, which withdraws it, or sees the mark and withdraws itself.
-        let unaccepted = old_agreement.status == IndexingAgreementStatus::Created;
-        if unaccepted {
-            match registry
-                .mark_indexing_agreement_as_canceled_by_requester(&cancellation.old_agreement_id)
-                .await
-            {
-                Ok(()) | Err(crate::registry::Error::NoRecordsUpdated) => {}
-                Err(err) => {
-                    tracing::error!(
-                        old_agreement_id = %cancellation.old_agreement_id,
-                        error = %err,
-                        "Failed to mark replaced agreement cancelled before its on-chain cancel, \
-                         retaining pending row"
-                    );
-                    transient_failures += 1;
-                    continue;
-                }
-            }
-        }
-
-        let mut on_chain_cancel_tx: Option<String> = None;
-        match crate::cancel_dispatch::cancel_agreement_on_chain(
+        let old_agreement_id = cancellation.old_agreement_id;
+        if start_replaced_cancel(
+            agreement_id,
+            &old_agreement_id,
+            registry,
             chain_client,
-            &old_agreement,
             config,
         )
-        .await
+        .await?
         {
-            Ok(Some(tx_hash)) => {
-                tracing::info!(
-                    new_agreement_id = %agreement_id,
-                    old_agreement_id = %cancellation.old_agreement_id,
-                    %tx_hash,
-                    "Submitted on-chain cancellation for replaced agreement"
-                );
-                on_chain_cancel_tx = Some(tx_hash.to_string());
-            }
-            Ok(None) => {
-                tracing::info!(
-                    new_agreement_id = %agreement_id,
-                    old_agreement_id = %cancellation.old_agreement_id,
-                    "Agreement already canceled on-chain; proceeding with local cleanup"
-                );
-            }
-            Err(err) => {
-                tracing::warn!(
-                    old_agreement_id = %cancellation.old_agreement_id,
-                    error = %err,
-                    "On-chain cancel failed, retaining pending cancellation for retry"
-                );
-                transient_failures += 1;
-                continue;
-            }
-        }
-
-        if !unaccepted {
-            match registry
-                .mark_indexing_agreement_as_canceled_by_requester(&cancellation.old_agreement_id)
-                .await
-            {
-                Ok(()) => {}
-                Err(crate::registry::Error::NoRecordsUpdated) => {
-                    tracing::debug!(
-                        old_agreement_id = %cancellation.old_agreement_id,
-                        "Old agreement already in terminal state, skipping local cancel flip"
-                    );
-                    registry
-                        .delete_pending_cancellation(*agreement_id, cancellation.old_agreement_id)
-                        .await?;
-                    continue;
-                }
-                Err(err) => {
-                    tracing::error!(
-                        old_agreement_id = %cancellation.old_agreement_id,
-                        error = %err,
-                        "On-chain cancel succeeded but DB update failed, retaining pending row"
-                    );
-                    transient_failures += 1;
-                    continue;
-                }
-            }
-        }
-
-        registry
-            .delete_pending_cancellation(*agreement_id, cancellation.old_agreement_id)
-            .await?;
-
-        tracing::info!(
-            new_agreement_id = %agreement_id,
-            old_agreement_id = %cancellation.old_agreement_id,
-            "Canceled old agreement on-chain and in dipper DB after replacement confirmed"
-        );
-
-        // Record the cancel audit so `sweep_pending_terminated_events` can emit
-        // the `terminated` durably. Only for an accepted agreement: one that never
-        // was gets the chain's own cancel data if the indexer accepts it after all.
-        if old_agreement.status != IndexingAgreementStatus::AcceptedOnChain {
-            continue;
-        }
-        let manager = config.recurring_agreement_manager().to_string();
-        if let Err(err) = registry
-            .record_cancel_audit(
-                &cancellation.old_agreement_id,
-                dipper_core::time::now_secs(),
-                &manager,
-                on_chain_cancel_tx.as_deref(),
-            )
-            .await
-        {
-            tracing::warn!(
-                old_agreement_id = %cancellation.old_agreement_id,
-                error = %err,
-                "failed to record cancel audit; terminated event may emit with fallback fields"
-            );
+            registry
+                .delete_pending_cancellation(*agreement_id, old_agreement_id)
+                .await?;
+        } else {
+            transient_failures += 1;
         }
     }
 
@@ -1291,6 +1206,70 @@ where
     }
 
     Ok(())
+}
+
+/// Start cancelling an agreement its accepted replacement supersedes. Returns whether its
+/// pending cancellation is done with: marked, already ended, or gone.
+async fn start_replaced_cancel<R, T>(
+    new_agreement_id: &IndexingAgreementId,
+    old_agreement_id: &IndexingAgreementId,
+    registry: &R,
+    chain_client: &T,
+    config: &crate::config::IndexingAgreementConfig,
+) -> anyhow::Result<bool>
+where
+    R: AgreementRegistry + Sync,
+    T: ChainClient,
+{
+    let Some(old_agreement) = registry
+        .get_indexing_agreement_by_id(old_agreement_id)
+        .await?
+    else {
+        tracing::warn!(
+            %old_agreement_id,
+            "Pending cancellation references non-existent agreement, cleaning up"
+        );
+        return Ok(true);
+    };
+    let started =
+        crate::cancel_dispatch::start_cancel(registry, chain_client, &old_agreement, config).await;
+    Ok(note_replaced_cancel(
+        new_agreement_id,
+        &old_agreement,
+        started,
+    ))
+}
+
+/// Log how cancelling a replaced agreement started; false when it couldn't be marked.
+fn note_replaced_cancel(
+    new_agreement_id: &IndexingAgreementId,
+    old_agreement: &IndexingAgreement,
+    started: crate::registry::Result<crate::cancel_dispatch::CancelStarted>,
+) -> bool {
+    let old_agreement_id = old_agreement.id;
+    match started {
+        Ok(started) => tracing::info!(
+            %new_agreement_id,
+            %old_agreement_id,
+            old_status = %old_agreement.status,
+            ?started,
+            reason = "replacement_accepted",
+            "Cancelling replaced agreement"
+        ),
+        Err(crate::registry::Error::NoRecordsUpdated) => tracing::debug!(
+            %old_agreement_id,
+            "Replaced agreement already ended or being cancelled"
+        ),
+        Err(err) => {
+            tracing::error!(
+                %old_agreement_id,
+                error = %err,
+                "Failed to mark replaced agreement cancelling, retaining pending row"
+            );
+            return false;
+        }
+    }
+    true
 }
 
 /// Retry on-chain cancels for agreements orphaned by a failed shrink-to-zero.
@@ -1975,6 +1954,7 @@ mod tests {
         agreements: std::collections::HashMap<IndexingAgreementId, IndexingAgreement>,
         marked_accepted_on_chain: Vec<IndexingAgreementId>,
         marked_canceled_by_requester: Vec<IndexingAgreementId>,
+        marked_cancelling: Vec<IndexingAgreementId>,
         marked_canceled_by_indexer: Vec<IndexingAgreementId>,
         /// Ids passed to `record_cancel_audit` -- the signal a cancel path drives
         /// the terminated event (the sweep emits from this audit).
@@ -2073,6 +2053,10 @@ mod tests {
                 .unwrap()
                 .marked_accepted_on_chain
                 .contains(id)
+        }
+
+        fn was_marked_cancelling(&self, id: &IndexingAgreementId) -> bool {
+            self.state.lock().unwrap().marked_cancelling.contains(id)
         }
 
         fn was_marked_canceled_by_requester(&self, id: &IndexingAgreementId) -> bool {
@@ -2250,6 +2234,22 @@ mod tests {
             Ok(())
         }
 
+        async fn mark_indexing_agreement_as_cancelling(
+            &self,
+            id: &IndexingAgreementId,
+        ) -> RegistryResult<()> {
+            let mut state = self.state.lock().unwrap();
+            if state.fail_cancel_for.contains(id) {
+                return Err(crate::registry::Error::BackendError(
+                    dipper_pgregistry::Error::DbError(sqlx::Error::Protocol(
+                        "simulated transient failure".into(),
+                    )),
+                ));
+            }
+            state.marked_cancelling.push(*id);
+            Ok(())
+        }
+
         async fn record_cancel_audit(
             &self,
             agreement_id: &IndexingAgreementId,
@@ -2322,12 +2322,16 @@ mod tests {
                     Some(
                         IndexingAgreementStatus::Created
                             | IndexingAgreementStatus::AcceptedOnChain
-                            | IndexingAgreementStatus::Rejected,
+                            | IndexingAgreementStatus::Rejected
+                            | IndexingAgreementStatus::Cancelling,
                     ),
                 ),
                 Some(crate::registry::CancelKind::ByIndexer) => matches!(
                     effective_status_for_cancel,
-                    Some(IndexingAgreementStatus::AcceptedOnChain),
+                    Some(
+                        IndexingAgreementStatus::AcceptedOnChain
+                            | IndexingAgreementStatus::Cancelling,
+                    ),
                 ),
                 None => false,
             };
@@ -2594,6 +2598,7 @@ mod tests {
         /// When set, each cancel records whether its agreement was already marked.
         registry: Option<MockRegistry>,
         marked_at_cancel: Arc<Mutex<Vec<bool>>>,
+        fail_cancels: bool,
     }
 
     impl MockChainClient {
@@ -2638,12 +2643,17 @@ mod tests {
             Option<thegraph_core::alloy::primitives::B256>,
             crate::chain_client::ChainClientError,
         > {
+            if self.fail_cancels {
+                return Err(crate::chain_client::ChainClientError::RpcError(
+                    anyhow::anyhow!("rpc down"),
+                ));
+            }
             // Record manager-routed cancels through the same recorder so the
             // existing assertions hold.
             self.cancels.lock().unwrap().push(*agreement_id);
             if let Some(registry) = &self.registry {
                 let id = IndexingAgreementId::from_bytes(*agreement_id);
-                let was_marked = registry.was_marked_canceled_by_requester(&id);
+                let was_marked = registry.was_marked_cancelling(&id);
                 self.marked_at_cancel.lock().unwrap().push(was_marked);
             }
             // A manager-routed cancel has no "already canceled" result: the
@@ -2754,6 +2764,65 @@ mod tests {
         assert!(result.is_ok());
         assert!(registry.was_marked_accepted_on_chain(&agreement_id));
         assert!(!worker_queue.was_cancellation_queued(&agreement_id));
+    }
+
+    #[tokio::test]
+    async fn reconcile_records_the_accept_of_an_agreement_being_cancelled() {
+        // It stays cancelling, and the recorded accept lets its end be announced.
+        let registry = MockRegistry::new();
+        let chain_client = MockChainClient::default();
+        let worker_queue = MockWorkerQueue::default();
+        let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+        registry.add_agreement(agreement_id, IndexingAgreementStatus::Cancelling);
+
+        let snapshot = make_snapshot(agreement_id, AgreementState::Accepted, Address::ZERO);
+        reconcile_agreement(
+            &snapshot,
+            &registry,
+            &worker_queue,
+            &chain_client,
+            test_agreement_conf().as_ref(),
+        )
+        .await
+        .expect("reconcile ok");
+
+        assert!(!registry.was_marked_accepted_on_chain(&agreement_id));
+        assert_eq!(registry.audit_writes(), vec![("accept", agreement_id)]);
+        assert!(!worker_queue.was_cancellation_queued(&agreement_id));
+    }
+
+    #[tokio::test]
+    async fn reconcile_marks_an_agreement_being_cancelled_once_the_chain_shows_it_ended() {
+        for (state, ended_by_dipper) in [
+            (AgreementState::CanceledByPayer, true),
+            (AgreementState::CanceledByServiceProvider, false),
+        ] {
+            let registry = MockRegistry::new();
+            let chain_client = MockChainClient::default();
+            let worker_queue = MockWorkerQueue::default();
+            let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+            registry.add_agreement(agreement_id, IndexingAgreementStatus::Cancelling);
+
+            let snapshot = make_snapshot(agreement_id, state, Address::ZERO);
+            reconcile_agreement(
+                &snapshot,
+                &registry,
+                &worker_queue,
+                &chain_client,
+                test_agreement_conf().as_ref(),
+            )
+            .await
+            .expect("reconcile ok");
+
+            assert_eq!(
+                registry.was_marked_canceled_by_requester(&agreement_id),
+                ended_by_dipper
+            );
+            assert_eq!(
+                registry.was_marked_canceled_by_indexer(&agreement_id),
+                !ended_by_dipper
+            );
+        }
     }
 
     #[tokio::test]
@@ -3393,10 +3462,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_pending_cancellations_records_no_audit_for_a_never_accepted_agreement() {
-        // A cancel record on an agreement that was never accepted would later win
-        // over the chain's own, if the indexer accepted it after all and it was
-        // then ended: the terminated event would report an end before the accept.
+    async fn test_pending_cancellations_leave_a_never_accepted_agreement_cancelling() {
+        // Its offer could still land and be accepted until the deadline, so the cancel
+        // retry finishes it then. No cancel is recorded: one would win over the chain's
+        // own if the indexer accepted it after all, reporting an end before the accept.
         let registry = MockRegistry::new();
         let chain_client = MockChainClient::default();
         let new_id = IndexingAgreementId::from_bytes(rand::random());
@@ -3415,12 +3484,13 @@ mod tests {
         .await;
 
         assert!(result.is_ok());
-        assert!(registry.was_marked_canceled_by_requester(&old_id));
+        assert!(registry.was_marked_cancelling(&old_id));
+        assert!(!registry.was_marked_canceled_by_requester(&old_id));
         assert!(!registry.was_cancel_audit_recorded(&old_id));
     }
 
     /// Runs the pending cancellation of one old agreement in `status`, returning
-    /// whether it was already marked cancelled when its on-chain cancel went out.
+    /// whether it was already marked cancelling when its on-chain cancel went out.
     async fn marked_at_pending_cancel(status: IndexingAgreementStatus) -> Vec<bool> {
         let registry = MockRegistry::new();
         let chain_client = MockChainClient {
@@ -3442,7 +3512,6 @@ mod tests {
         .await;
 
         assert!(result.is_ok(), "got {result:?}");
-        assert!(registry.was_marked_canceled_by_requester(&old_id));
         assert!(registry.was_pending_cancellation_deleted(&new_id, &old_id));
         chain_client.marked_at_cancel.lock().unwrap().clone()
     }
@@ -3456,9 +3525,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_pending_cancellations_mark_an_accepted_agreement_after_its_cancel() {
+    async fn test_pending_cancellations_mark_an_accepted_agreement_before_its_cancel() {
+        // A failed cancel then leaves it cancelling, which the cancel retry picks up.
         let marked = marked_at_pending_cancel(IndexingAgreementStatus::AcceptedOnChain).await;
-        assert_eq!(marked, vec![false]);
+        assert_eq!(marked, vec![true]);
+    }
+
+    #[tokio::test]
+    async fn test_pending_cancellations_leave_a_failed_cancel_to_the_cancel_retry() {
+        // Retried from here, a cancel that never works was resent on every sweep with no
+        // limit, for as long as the replacement stayed accepted. The cancel retry limits it.
+        let registry = MockRegistry::new();
+        let chain_client = MockChainClient {
+            fail_cancels: true,
+            ..MockChainClient::default()
+        };
+        let new_id = IndexingAgreementId::from_bytes(rand::random());
+        let old_id = IndexingAgreementId::from_bytes(rand::random());
+        registry.add_agreement(new_id, IndexingAgreementStatus::AcceptedOnChain);
+        registry.add_agreement(old_id, IndexingAgreementStatus::AcceptedOnChain);
+        registry.add_pending_cancellation(new_id, old_id);
+
+        let result = execute_pending_cancellations(
+            &new_id,
+            &registry,
+            &chain_client,
+            test_agreement_conf().as_ref(),
+        )
+        .await;
+
+        assert!(result.is_ok(), "got {result:?}");
+        assert!(registry.was_marked_cancelling(&old_id));
+        assert!(!registry.was_marked_canceled_by_requester(&old_id));
+        assert!(!registry.was_cancel_audit_recorded(&old_id));
+        assert!(registry.was_pending_cancellation_deleted(&new_id, &old_id));
     }
 
     #[tokio::test]
@@ -3481,9 +3581,10 @@ mod tests {
         )
         .await;
 
-        // The chain cancel failed, the row is NOT marked canceled, and no cancel
-        // audit is recorded (so the sweep emits nothing).
+        // The row couldn't be marked, so no cancel went out, nothing is recorded (the
+        // sweep emits nothing), and the pending row stays for a retry.
         assert!(result.is_err());
+        assert!(!chain_client.was_on_chain_cancel_attempted(&old_fail));
         assert!(!registry.was_marked_canceled_by_requester(&old_fail));
         assert!(!registry.was_cancel_audit_recorded(&old_fail));
     }

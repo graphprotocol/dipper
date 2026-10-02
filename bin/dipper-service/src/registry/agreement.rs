@@ -259,12 +259,35 @@ pub trait AgreementRegistry {
     /// Mark an indexing agreement as `CANCELED_BY_REQUESTER`.
     ///
     /// If there is no indexing agreement with the given ID, or if the agreement is not in the
-    /// `CREATED` or `ACCEPTED_ON_CHAIN` state, this method returns a
+    /// `CREATED`, `ACCEPTED_ON_CHAIN`, `REJECTED` or `CANCELLING` state, this method returns a
     /// [`NoRecordUpdated`](Error::NoRecordsUpdated) error.
     async fn mark_indexing_agreement_as_canceled_by_requester(
         &self,
         id: &IndexingAgreementId,
     ) -> RegistryResult<()>;
+
+    /// Mark a `CREATED`, `ACCEPTED_ON_CHAIN` or `REJECTED` agreement `CANCELLING`, before its
+    /// on-chain cancel is sent; [`NoRecordUpdated`](Error::NoRecordsUpdated) otherwise.
+    async fn mark_indexing_agreement_as_cancelling(
+        &self,
+        id: &IndexingAgreementId,
+    ) -> RegistryResult<()>;
+
+    /// `CANCELLING` agreements whose cancel has failed fewer than `max_attempts` times,
+    /// longest waiting first. Default returns empty so mocks need not override.
+    async fn get_cancelling_agreements(
+        &self,
+        _batch_size: i64,
+        _max_attempts: u32,
+    ) -> RegistryResult<Vec<CancellingAgreement>> {
+        Ok(Vec::new())
+    }
+
+    /// Count a cancel that went out without ending a `CANCELLING` agreement, returning
+    /// the new count. Default returns 1 so mocks need not override.
+    async fn record_cancel_attempt(&self, _id: &IndexingAgreementId) -> RegistryResult<u32> {
+        Ok(1)
+    }
 
     /// Apply a reconciliation-driven state transition atomically.
     ///
@@ -477,7 +500,7 @@ pub trait AgreementRegistry {
         &self,
     ) -> RegistryResult<(std::collections::HashMap<IndexerId, u64>, u64)>;
 
-    /// Whether any agreement is in `Created` or `AcceptedOnChain` status.
+    /// Whether any agreement is in `Created`, `AcceptedOnChain` or `Cancelling` status.
     ///
     /// Used by the chain listener's adaptive-interval check on every poll;
     /// the default impl falls back to `count_active_agreements_by_deployment`
@@ -520,6 +543,25 @@ pub struct AgreementFeeRate {
     pub tokens_per_second: f64,
     /// Entity rate in wei GRT per entity per second.
     pub tokens_per_entity_per_second: f64,
+}
+
+/// An agreement dipper is still cancelling on-chain.
+#[derive(Debug, Clone)]
+pub struct CancellingAgreement {
+    pub agreement: IndexingAgreement,
+    /// Whether dipper saw it accepted on-chain, so its end is announced.
+    pub accepted_on_chain: bool,
+}
+
+impl TryFrom<dipper_pgregistry::CancellingAgreement> for CancellingAgreement {
+    type Error = anyhow::Error;
+
+    fn try_from(value: dipper_pgregistry::CancellingAgreement) -> Result<Self, Self::Error> {
+        Ok(Self {
+            agreement: value.agreement.try_into()?,
+            accepted_on_chain: value.accepted_on_chain,
+        })
+    }
 }
 
 /// An Indexing Agreement represents the contract between the DIPs Gateway (Dipper) and the indexer
@@ -689,6 +731,11 @@ pub enum Status {
     ///
     /// This is a terminal state.
     AbandonedByIndexer,
+
+    /// Dipper decided to end the agreement and is cancelling it on-chain, where it may
+    /// still be live. It becomes `CanceledByRequester`, announced as ended, only once
+    /// the chain confirms the end.
+    Cancelling,
 }
 
 impl std::fmt::Display for Status {
@@ -702,6 +749,7 @@ impl std::fmt::Display for Status {
             Status::AcceptedOnChain => "ACCEPTED_ON_CHAIN",
             Status::Rejected => "REJECTED",
             Status::AbandonedByIndexer => "ABANDONED_BY_INDEXER",
+            Status::Cancelling => "CANCELLING",
         };
         f.write_str(status)
     }
@@ -733,6 +781,7 @@ impl TryFrom<dipper_pgregistry::IndexingAgreement> for IndexingAgreement {
                 dipper_pgregistry::IndexingAgreementStatus::AbandonedByIndexer => {
                     Status::AbandonedByIndexer
                 }
+                dipper_pgregistry::IndexingAgreementStatus::Cancelling => Status::Cancelling,
                 _ => {
                     return Err(anyhow::anyhow!("Invalid status: {:?}", value.status));
                 }

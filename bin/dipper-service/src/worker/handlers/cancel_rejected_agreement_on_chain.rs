@@ -474,6 +474,13 @@ mod tests {
             Ok(())
         }
 
+        async fn mark_indexing_agreement_as_cancelling(
+            &self,
+            _id: &IndexingAgreementId,
+        ) -> crate::registry::Result<()> {
+            Ok(())
+        }
+
         async fn apply_reconciliation(
             &self,
             _id: &IndexingAgreementId,

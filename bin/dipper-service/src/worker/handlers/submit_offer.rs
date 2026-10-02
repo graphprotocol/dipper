@@ -213,9 +213,7 @@ async fn next_step<R: AgreementRegistry>(
             NextStep::Skip
         }
         Some(a) if a.status == IndexingAgreementStatus::Created => NextStep::Offer(a),
-        Some(a) if a.status == IndexingAgreementStatus::CanceledByRequester => {
-            NextStep::Withdraw(a)
-        }
+        Some(a) if dipper_cancelled(a.status) => NextStep::Withdraw(a),
         Some(a) => {
             tracing::warn!(
                 agreement_id = %agreement_id,
@@ -272,15 +270,21 @@ fn retry_withdraw(agreement: &IndexingAgreement, err: ChainClientError) -> JobEr
     JobError::Retryable(err.into(), TRANSIENT_RETRY_BASE)
 }
 
+/// Whether dipper has cancelled the agreement, or started to.
+fn dipper_cancelled(status: IndexingAgreementStatus) -> bool {
+    matches!(
+        status,
+        IndexingAgreementStatus::Cancelling | IndexingAgreementStatus::CanceledByRequester
+    )
+}
+
 /// The agreement, if it was cancelled after this job's status check.
 async fn cancelled_meanwhile<R: AgreementRegistry>(
     registry: &R,
     agreement_id: &IndexingAgreementId,
 ) -> Option<IndexingAgreement> {
     match registry.get_indexing_agreement_by_id(agreement_id).await {
-        Ok(Some(agreement)) if agreement.status == IndexingAgreementStatus::CanceledByRequester => {
-            Some(agreement)
-        }
+        Ok(Some(agreement)) if dipper_cancelled(agreement.status) => Some(agreement),
         Ok(_) => None,
         Err(err) => {
             tracing::warn!(
@@ -364,7 +368,7 @@ mod tests {
             if let Some(agreement) = &self.cancel_mid_send
                 && let Some(row) = agreement.lock().unwrap().as_mut()
             {
-                row.status = IndexingAgreementStatus::CanceledByRequester;
+                row.status = IndexingAgreementStatus::Cancelling;
             }
             let result = self
                 .offer_result
@@ -583,23 +587,28 @@ mod tests {
 
     #[tokio::test]
     async fn withdraws_a_stored_offer_of_an_agreement_already_cancelled() {
-        //* Arrange - an earlier attempt sent the offer, then the agreement was
-        // cancelled before this retry; no offer result, so a send would panic
-        let mut agreement = make_test_agreement();
-        agreement.status = IndexingAgreementStatus::CanceledByRequester;
-        agreement.terms_version_hash = Some(vec![7u8; 32]);
-        let agreement_id = agreement.id;
-        let message = make_message(agreement_id);
-        let ctx = ctx_with(agreement, None);
-        ctx.chain_client.on_chain.store(true, Ordering::SeqCst);
-        let cancelled = ctx.chain_client.cancelled.clone();
+        for status in [
+            IndexingAgreementStatus::Cancelling,
+            IndexingAgreementStatus::CanceledByRequester,
+        ] {
+            //* Arrange - an earlier attempt sent the offer, then the agreement was
+            // cancelled before this retry; no offer result, so a send would panic
+            let mut agreement = make_test_agreement();
+            agreement.status = status;
+            agreement.terms_version_hash = Some(vec![7u8; 32]);
+            let agreement_id = agreement.id;
+            let message = make_message(agreement_id);
+            let ctx = ctx_with(agreement, None);
+            ctx.chain_client.on_chain.store(true, Ordering::SeqCst);
+            let cancelled = ctx.chain_client.cancelled.clone();
 
-        //* Act
-        let result = handle(ctx, &message).await;
+            //* Act
+            let result = handle(ctx, &message).await;
 
-        //* Assert
-        assert!(result.is_ok(), "got {result:?}");
-        assert_eq!(*cancelled.lock().unwrap(), vec![*agreement_id.as_bytes()]);
+            //* Assert
+            assert!(result.is_ok(), "got {result:?}");
+            assert_eq!(*cancelled.lock().unwrap(), vec![*agreement_id.as_bytes()]);
+        }
     }
 
     #[tokio::test]
