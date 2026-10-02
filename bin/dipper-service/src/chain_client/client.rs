@@ -14,14 +14,14 @@ use std::{
 use async_trait::async_trait;
 use dipper_rpc::indexer::indexer_client::sol::RecurringCollectionAgreement;
 use thegraph_core::alloy::{
-    eips::{BlockNumberOrTag, eip2718::Encodable2718},
+    eips::{BlockId, BlockNumberOrTag, eip2718::Encodable2718},
     network::{EthereumWallet, TransactionBuilder},
     primitives::{Address, B256, FixedBytes, U256},
     providers::Provider,
     rpc::types::TransactionRequest,
     signers::local::PrivateKeySigner,
     sol_types::{SolCall, SolValue},
-    transports::TransportError,
+    transports::{TransportError, TransportErrorKind},
 };
 use tokio::sync::Mutex;
 
@@ -240,6 +240,9 @@ struct AlloyChainClientInner {
     submit_lock: Mutex<()>,
     /// How long one submission may hold `submit_lock`; see `derive_submit_deadline`.
     submit_deadline: Duration,
+    /// The newest block dipper has seen, from reads and receipts. An agreement's state is
+    /// never read from an endpoint behind it, so a lagging endpoint can't undo what dipper saw.
+    seen_block: AtomicU64,
 }
 
 impl AlloyChainClient {
@@ -290,6 +293,7 @@ impl AlloyChainClient {
                 nonce: AtomicU64::new(NONCE_UNINITIALIZED),
                 submit_lock: Mutex::new(()),
                 submit_deadline,
+                seen_block: AtomicU64::new(0),
             }),
         })
     }
@@ -613,9 +617,49 @@ impl AlloyChainClient {
         };
         let collector = self.inner.recurring_collector_address;
         Ok(self
-            .view(collector, call, "get_agreement_details")
+            .view_at_seen_block(collector, call, "get_agreement_details")
             .await?
             .state)
+    }
+
+    /// Run a read-only contract call at the endpoint's latest block, refusing an endpoint
+    /// whose latest block is older than one dipper has already seen; the pool moves on to
+    /// the next endpoint instead.
+    async fn view_at_seen_block<C: SolCall>(
+        &self,
+        to: Address,
+        call: C,
+        operation: &'static str,
+    ) -> Result<C::Return, ChainClientError> {
+        let calldata = call.abi_encode();
+        let seen = self.inner.seen_block.load(Ordering::Relaxed);
+        let (head, output) = self
+            .inner
+            .rpc_pool
+            .execute(operation, |provider| {
+                let calldata = calldata.clone();
+                async move {
+                    let head = provider.get_block_number().await?;
+                    if head < seen {
+                        return Err(TransportErrorKind::custom_str(&format!(
+                            "endpoint is at block {head}, behind block {seen} already seen"
+                        )));
+                    }
+                    let tx = TransactionRequest::default().to(to).input(calldata.into());
+                    let output = provider.call(tx).block(BlockId::number(head)).await?;
+                    Ok((head, output))
+                }
+            })
+            .await?;
+        self.note_block(head);
+        C::abi_decode_returns(&output).map_err(|err| {
+            ChainClientError::RpcError(anyhow::anyhow!("undecodable {operation} from {to}: {err}"))
+        })
+    }
+
+    /// Remember a block dipper has seen, so later reads are never older.
+    fn note_block(&self, block: u64) {
+        self.inner.seen_block.fetch_max(block, Ordering::Relaxed);
     }
 
     /// Run a read-only contract call and decode its return value.
@@ -661,7 +705,12 @@ impl AlloyChainClient {
                 .await;
 
             match receipt {
-                Ok(Some(r)) => return Ok(Some(r.status())),
+                Ok(Some(r)) => {
+                    if let Some(block) = r.block_number {
+                        self.note_block(block);
+                    }
+                    return Ok(Some(r.status()));
+                }
                 Ok(None) => {} // not mined yet
                 Err(e) => {
                     // Transient RPC error: log and keep polling. If it persists, the outer
@@ -695,6 +744,7 @@ impl ChainClient for AlloyChainClient {
             .ok_or_else(|| {
                 ChainClientError::RpcError(anyhow::anyhow!("no latest block returned"))
             })?;
+        self.note_block(block.header.number);
         Ok(block.header.timestamp)
     }
 
@@ -2028,6 +2078,91 @@ mod tests {
                 "result": format!("0x{}", thegraph_core::alloy::primitives::hex::encode(output)),
             }))
         }
+    }
+
+    /// Answers as an endpoint whose latest block is `head`, reporting `state` for any
+    /// agreement read at that block.
+    struct AgreementStateResponder {
+        head: u64,
+        state: u16,
+    }
+
+    impl Respond for AgreementStateResponder {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).expect("JSON-RPC request body");
+            let result = match body["method"].as_str().unwrap_or_default() {
+                "eth_blockNumber" => format!("{:#x}", self.head),
+                "eth_call" => {
+                    assert_eq!(
+                        body["params"][1],
+                        format!("{:#x}", self.head),
+                        "read at the endpoint's latest block"
+                    );
+                    let details = IRecurringCollector::AgreementDetails {
+                        agreementId: FixedBytes::<16>::ZERO,
+                        payer: Address::ZERO,
+                        dataService: Address::ZERO,
+                        serviceProvider: Address::ZERO,
+                        versionHash: B256::ZERO,
+                        state: self.state,
+                    };
+                    let output =
+                        IRecurringCollector::getAgreementDetailsCall::abi_encode_returns(&details);
+                    format!(
+                        "0x{}",
+                        thegraph_core::alloy::primitives::hex::encode(output)
+                    )
+                }
+                other => panic!("unexpected call {other}"),
+            };
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": body["id"],
+                "result": result,
+            }))
+        }
+    }
+
+    async fn server_at_block(head: u64, state: u16) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(AgreementStateResponder { head, state })
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn never_reads_an_agreement_from_an_endpoint_behind_a_block_already_seen() {
+        // The lagging endpoint still shows the offer it hasn't seen accepted and cancelled.
+        let lagging = server_at_block(90, STATE_REGISTERED).await;
+        let current =
+            server_at_block(100, STATE_REGISTERED | STATE_ACCEPTED | STATE_NOTICE_GIVEN).await;
+        let client = client_over(vec![
+            lagging.uri().parse().expect("provider URL"),
+            current.uri().parse().expect("provider URL"),
+        ]);
+        client.note_block(95);
+
+        let live = client
+            .agreement_still_active(&[0xab; 16])
+            .await
+            .expect("read");
+
+        assert!(!live, "read from the endpoint that has reached block 95");
+        assert_eq!(client.inner.seen_block.load(Ordering::Relaxed), 100);
+    }
+
+    #[tokio::test]
+    async fn fails_a_read_rather_than_answer_from_endpoints_all_behind() {
+        let lagging = server_at_block(90, STATE_REGISTERED).await;
+        let client = client_over(vec![lagging.uri().parse().expect("provider URL")]);
+        client.note_block(95);
+
+        let read = client.agreement_still_active(&[0xab; 16]).await;
+
+        assert!(read.is_err(), "got {read:?}");
     }
 
     async fn client_over_manager(
