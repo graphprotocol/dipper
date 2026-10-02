@@ -1042,6 +1042,7 @@ async fn record_accept_of_cancelling<R: AgreementRegistry + Sync>(
     if agreement.status != IndexingAgreementStatus::Cancelling
         || !snapshot.state.reached_accepted()
         || snapshot.accepted_at == 0
+        || !created_after_events_started(agreement)
     {
         return;
     }
@@ -2728,6 +2729,29 @@ mod tests {
         assert!(!registry.was_marked_accepted_on_chain(&agreement_id));
         assert_eq!(registry.audit_writes(), vec![("accept", agreement_id)]);
         assert!(!worker_queue.was_cancellation_queued(&agreement_id));
+    }
+
+    #[tokio::test]
+    async fn reconcile_records_no_accept_of_an_agreement_from_before_events_existed() {
+        let registry = MockRegistry::new();
+        let chain_client = MockChainClient::default();
+        let worker_queue = MockWorkerQueue::default();
+        let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+        registry.add_agreement(agreement_id, IndexingAgreementStatus::Cancelling);
+        registry.set_agreement_created_at(agreement_id, LIFECYCLE_EVENTS_START - 1);
+
+        let snapshot = make_snapshot(agreement_id, AgreementState::Accepted, Address::ZERO);
+        reconcile_agreement(
+            &snapshot,
+            &registry,
+            &worker_queue,
+            &chain_client,
+            test_agreement_conf().as_ref(),
+        )
+        .await
+        .expect("reconcile ok");
+
+        assert!(registry.audit_writes().is_empty());
     }
 
     #[tokio::test]
