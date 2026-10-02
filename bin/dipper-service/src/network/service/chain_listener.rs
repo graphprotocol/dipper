@@ -1272,24 +1272,9 @@ fn note_replaced_cancel(
     true
 }
 
-/// Retry on-chain cancels for agreements orphaned by a failed shrink-to-zero.
-///
-/// When a `set_indexing_target_candidates(num_candidates = 0)` call flips the
-/// request row to `Canceled`, reassessment fires `cancelIndexingAgreementByPayer`
-/// for every agreement under it. A transient chain-client error during that
-/// fan-out leaves the request row `Canceled` and at least one agreement still
-/// `AcceptedOnChain` — the local intent and on-chain state disagree, and the
-/// admin RPC has nothing left to trigger.
-///
-/// This sweep runs periodically on the chain_listener tick and re-fires the
-/// on-chain cancel for each such orphan. The chain-side cancel is idempotent
-/// (the `Ok(None)` revert path handles already-canceled agreements), and the
-/// DB transition is gated on chain success, so this is safe to run on every
-/// sweep without coordination with reassessment.
-#[expect(
-    clippy::cognitive_complexity,
-    reason = "predates this lint; fix when next touched"
-)]
+/// Start cancelling agreements orphaned by a failed shrink-to-zero: still `AcceptedOnChain`
+/// although their request is `Canceled`, because reassessment couldn't mark them. Each starts
+/// like any other cancel, so the cancel retry finishes it with the same limit.
 async fn sweep_orphan_canceled_agreements<R, T>(
     registry: &R,
     chain_client: &T,
@@ -1312,76 +1297,29 @@ async fn sweep_orphan_canceled_agreements<R, T>(
         }
     };
 
-    if orphans.is_empty() {
-        return;
-    }
-
-    tracing::debug!(
-        count = orphans.len(),
-        "Sweeping orphan agreements whose parent request is Canceled"
-    );
-
     for agreement in orphans {
-        let mut on_chain_cancel_tx: Option<String> = None;
-        match crate::cancel_dispatch::cancel_agreement_on_chain(chain_client, &agreement, config)
-            .await
-        {
-            Ok(Some(tx_hash)) => {
-                tracing::info!(
-                    agreement_id = %agreement.id,
-                    %tx_hash,
-                    "Submitted on-chain cancel for orphan agreement"
-                );
-                on_chain_cancel_tx = Some(tx_hash.to_string());
-            }
-            Ok(None) => {
-                tracing::info!(
-                    agreement_id = %agreement.id,
-                    "Orphan agreement already canceled on-chain; cleaning up local state"
-                );
-            }
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    agreement_id = %agreement.id,
-                    "Failed to cancel orphan agreement on-chain; will retry next sweep"
-                );
-                continue;
-            }
-        }
+        let started =
+            crate::cancel_dispatch::start_cancel(registry, chain_client, &agreement, config).await;
+        log_orphan_cancel(&agreement, started);
+    }
+}
 
-        if let Err(err) = registry
-            .mark_indexing_agreement_as_canceled_by_requester(&agreement.id)
-            .await
-        {
-            tracing::error!(
-                error = %err,
-                agreement_id = %agreement.id,
-                "Failed to mark orphan agreement as canceled in local DB"
-            );
-            continue;
-        }
-
-        // Orphan (previously accepted) agreement canceled on-chain by dipper.
-        // Record the cancel audit; `sweep_pending_terminated_events` emits the
-        // `terminated` durably (the row is `AcceptedOnChain` -> terminal, so it is
-        // sweep-eligible).
-        let manager = config.recurring_agreement_manager().to_string();
-        if let Err(err) = registry
-            .record_cancel_audit(
-                &agreement.id,
-                dipper_core::time::now_secs(),
-                &manager,
-                on_chain_cancel_tx.as_deref(),
-            )
-            .await
-        {
-            tracing::warn!(
-                agreement_id = %agreement.id,
-                error = %err,
-                "failed to record cancel audit; terminated event may emit with fallback fields"
-            );
-        }
+fn log_orphan_cancel(
+    agreement: &IndexingAgreement,
+    started: crate::registry::Result<crate::cancel_dispatch::CancelStarted>,
+) {
+    match started {
+        Ok(started) => tracing::info!(
+            agreement_id = %agreement.id,
+            ?started,
+            reason = "request_canceled",
+            "Cancelling orphan agreement"
+        ),
+        Err(err) => tracing::warn!(
+            error = %err,
+            agreement_id = %agreement.id,
+            "Failed to mark orphan agreement cancelling; will retry next sweep"
+        ),
     }
 }
 
@@ -4476,6 +4414,27 @@ mod tests {
             registry.was_marked_canceled_by_requester(&agreement_id),
             "sweep should have marked the agreement CanceledByRequester"
         );
+    }
+
+    #[tokio::test]
+    async fn test_orphan_sweep_leaves_a_failed_cancel_to_the_cancel_retry() {
+        // Retried by this sweep, a cancel that never works was resent with no limit.
+        let registry = MockRegistry::new();
+        let chain_client = MockChainClient {
+            fail_cancels: true,
+            ..MockChainClient::default()
+        };
+        let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+        let request_id = IndexingRequestId::new();
+        registry.add_agreement(agreement_id, IndexingAgreementStatus::AcceptedOnChain);
+        registry.set_agreement_request_id(agreement_id, request_id);
+        registry.mark_request_canceled(request_id);
+
+        sweep_orphan_canceled_agreements(&registry, &chain_client, test_agreement_conf().as_ref())
+            .await;
+
+        assert!(registry.was_marked_cancelling(&agreement_id));
+        assert!(!registry.was_marked_canceled_by_requester(&agreement_id));
     }
 
     #[tokio::test]
