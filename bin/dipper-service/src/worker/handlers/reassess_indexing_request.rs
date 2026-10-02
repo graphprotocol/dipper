@@ -69,9 +69,9 @@ pub struct Ctx<R, W, I, T> {
     /// is true. `None` disables the bypass path even if the flag is set
     /// (handler falls back to wall clock with a warning).
     pub chain_listener_chain_id: Option<u64>,
-    /// Global reassess lock, taken exclusively: only one reassessment runs at a
-    /// time across all worker loops, and none while an offer is being submitted
-    /// (see `crate::worker::context::ReassessLock`).
+    /// Global reassess lock: only one reassessment runs at a time across all
+    /// worker loops, and its cancels of unaccepted agreements wait for offers in
+    /// flight (see `crate::worker::context::ReassessLock`).
     pub reassess_lock: crate::worker::context::ReassessLock,
     /// Mass-unresponsive circuit breaker (see its module).
     pub unresponsive_breaker: Arc<UnresponsiveBreaker>,
@@ -175,13 +175,6 @@ where
         );
         return Err(JobError::Deferred(pacing_defer_delay(indexing_request_id)));
     }
-
-    // Offers in flight are waited out before anything is decided, so none lands
-    // after a cancel sent below. Kept after the saturation check: a pass that
-    // would only defer shouldn't hold up new offers while it waits.
-    let Some(_reassess_guard) = reassessment.wait_for_offers().await else {
-        return Err(JobError::Deferred(Duration::from_secs(1)));
-    };
 
     // Gather load balancing context for IISA, including chain/ceiling info
     let (mut context, unresponsive) = gather_selection_context(
@@ -647,7 +640,24 @@ where
     // transient chain-client failure does the right thing.
     let mut directly_cancelled = 0u32;
     let mut cancel_failures = 0u32;
-    for old_agreement in old_iter {
+    // A cancel of an agreement whose offer may be in flight waits for that offer
+    // to land, so the cancel follows it on-chain and withdraws it. Only these
+    // cancels hold new offers back; the rest of the pass doesn't.
+    let unpaired: Vec<_> = old_iter.collect();
+    let offers_held_back = if unpaired.iter().any(|a| offer_may_be_in_flight(a)) {
+        reassessment.hold_back_offers().await
+    } else {
+        None
+    };
+    for old_agreement in unpaired {
+        if offer_may_be_in_flight(old_agreement) && offers_held_back.is_none() {
+            tracing::warn!(
+                agreement_id = %old_agreement.id,
+                "Offers in flight did not land; will retry this cancel on next reassessment"
+            );
+            cancel_failures += 1;
+            continue;
+        }
         // A Created agreement's offer may already be on-chain, where the indexer
         // can still accept it, so it is cancelled on-chain too: the cancel revokes
         // a pending offer and does nothing when none was made. Rows without a
@@ -1063,6 +1073,9 @@ mod lifecycle_event_tests {
     #[derive(Default, Clone)]
     struct MockChainClient {
         cancelled: Arc<Mutex<Vec<[u8; 16]>>>,
+        /// When set, each cancel records whether new offers were held back.
+        reassess_lock: Option<crate::worker::ReassessLock>,
+        offers_held_back_at_cancel: Arc<Mutex<Vec<bool>>>,
     }
 
     #[async_trait]
@@ -1088,6 +1101,12 @@ mod lifecycle_event_tests {
             _options: u16,
         ) -> std::result::Result<Option<B256>, ChainClientError> {
             self.cancelled.lock().unwrap().push(*agreement_id);
+            if let Some(lock) = &self.reassess_lock {
+                self.offers_held_back_at_cancel
+                    .lock()
+                    .unwrap()
+                    .push(lock.offer().is_none());
+            }
             Ok(Some(B256::repeat_byte(0xcd)))
         }
 
@@ -1959,31 +1978,86 @@ mod lifecycle_event_tests {
         assert_eq!(started.elapsed(), std::time::Duration::ZERO);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn waits_while_an_offer_is_being_sent() {
-        // An offer job holds the lock shared from its status check until its offer
-        // lands. Deciding what to cancel now could slip a cancel in front of that
-        // offer, which would then land after it and stay open.
-        let ctx = build_ctx(
-            MockRegistry::default(),
+    /// Ctx whose only active agreement, in `status`, leaves the target group,
+    /// with the chain mock recording whether offers were held back at each cancel.
+    fn ctx_cancelling_one(
+        status: IndexingAgreementStatus,
+    ) -> (
+        Ctx<MockRegistry, MockQueue, MockIisa, MockChainClient>,
+        IndexingAgreement,
+    ) {
+        let leaving = agreement(indexer_id(0x11), status);
+        let mut ctx = build_ctx(
+            MockRegistry {
+                active_agreements: vec![leaving.clone()],
+                ..MockRegistry::default()
+            },
             MockIisa { selected: vec![] },
             MockQueue::default(),
             MockChainClient::default(),
             CapturingEventsProducer::new(),
             indexer_urls::Snapshot::new(),
         );
-        let _offer = ctx.reassess_lock.offer().expect("lock is free");
+        ctx.chain_client.reassess_lock = Some(ctx.reassess_lock.clone());
+        (ctx, leaving)
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_unaccepted_agreement_holds_back_new_offers() {
+        // Its offer may be in flight: a cancel sent ahead of it would find nothing
+        // to withdraw, and the offer would land after it and stay open.
+        let (ctx, leaving) = ctx_cancelling_one(IndexingAgreementStatus::Created);
+        let chain = ctx.chain_client.clone();
 
         let result = handle(ctx, &test_message(0)).await;
 
-        assert!(
-            matches!(
-                result,
-                Err(crate::worker::result::JobError::Deferred(delay))
-                    if delay == std::time::Duration::from_secs(1)
-            ),
-            "got {result:?}"
+        assert!(result.is_ok(), "got {result:?}");
+        assert_eq!(
+            *chain.cancelled.lock().unwrap(),
+            vec![*leaving.id.as_bytes()]
         );
+        assert_eq!(
+            *chain.offers_held_back_at_cancel.lock().unwrap(),
+            vec![true]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_only_accepted_agreements_leaves_offers_running() {
+        // An accepted agreement has no offer in flight, so nothing to wait for.
+        let (ctx, leaving) = ctx_cancelling_one(IndexingAgreementStatus::AcceptedOnChain);
+        let chain = ctx.chain_client.clone();
+        let _offer = ctx.reassess_lock.offer().expect("lock is free");
+
+        let started = tokio::time::Instant::now();
+        let result = handle(ctx, &test_message(0)).await;
+
+        assert!(result.is_ok(), "got {result:?}");
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+        assert_eq!(
+            *chain.cancelled.lock().unwrap(),
+            vec![*leaving.id.as_bytes()]
+        );
+        assert_eq!(
+            *chain.offers_held_back_at_cancel.lock().unwrap(),
+            vec![false]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn skips_cancelling_an_unaccepted_agreement_while_an_offer_will_not_land() {
+        // After 30 s it gives up on that cancel rather than send it ahead of the
+        // offer, leaving it for the next reassessment.
+        let (ctx, _leaving) = ctx_cancelling_one(IndexingAgreementStatus::Created);
+        let chain = ctx.chain_client.clone();
+        let _stuck_offer = ctx.reassess_lock.offer().expect("lock is free");
+
+        let started = tokio::time::Instant::now();
+        let result = handle(ctx, &test_message(0)).await;
+
+        assert!(result.is_ok(), "got {result:?}");
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(30));
+        assert!(chain.cancelled.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2013,6 +2087,13 @@ mod lifecycle_event_tests {
 
         assert_eq!(*chain_client.cancelled.lock().unwrap(), vec![leaving_id]);
     }
+}
+
+/// Whether an offer for this agreement could still be on its way on-chain: it
+/// isn't accepted yet and has the terms hash an on-chain cancel needs.
+fn offer_may_be_in_flight(agreement: &crate::registry::IndexingAgreement) -> bool {
+    agreement.status == crate::registry::IndexingAgreementStatus::Created
+        && agreement.terms_version_hash.is_some()
 }
 
 /// Olds reserved from cancellation: one per add-cancel pairing lost to a
