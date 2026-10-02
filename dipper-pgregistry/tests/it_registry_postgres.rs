@@ -3483,8 +3483,9 @@ async fn a_cancelling_agreement_stays_live_and_unannounced_until_it_ends() {
         .expect("cancel record");
 
     assert!(
-        registry.exists_active_agreements().await.unwrap(),
-        "the listener keeps polling fast while agreements are being cancelled"
+        !registry.exists_active_agreements().await.unwrap(),
+        "agreements being cancelled don't keep the listener polling fast; their retry \
+         runs on its own timer"
     );
     let terminated = registry
         .get_agreements_pending_terminated_emission(100)
@@ -3505,7 +3506,6 @@ async fn a_cancelling_agreement_stays_live_and_unannounced_until_it_ends() {
         .await
         .expect("dipper's cancel confirmed");
 
-    assert!(!registry.exists_active_agreements().await.unwrap());
     let terminated = registry
         .get_agreements_pending_terminated_emission(100)
         .await

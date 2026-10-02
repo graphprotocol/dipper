@@ -83,9 +83,9 @@ const SWEEP_BATCH_SIZE: i64 = 1000;
 /// crash-recovery; the steady-state fan-out fires from finalize on a
 /// fresh accept, so per-poll execution is wasted DB work.
 const SWEEP_POLLS: u64 = 60;
-/// How often agreements still being cancelled get their cancel retried: about every
-/// 5 min at the fast rate, which the listener keeps while any are left.
-const CANCEL_RETRY_POLLS: u64 = 10;
+/// How often agreements still being cancelled get their cancel retried, whichever rate the
+/// listener polls at: just under the slow poll interval, so every slow poll retries.
+const CANCEL_RETRY_INTERVAL: Duration = Duration::from_secs(290);
 
 /// Handle for controlling the chain listener service lifecycle
 #[derive(Clone)]
@@ -231,7 +231,7 @@ where
         // Starts at SWEEP_POLLS so the first poll runs the sweep,
         // recovering any pre-startup orphans.
         let mut polls_since_sweep: u64 = SWEEP_POLLS;
-        let mut polls_since_cancel_retry: u64 = CANCEL_RETRY_POLLS;
+        let mut last_cancel_retry: Option<Instant> = None;
         // Pause the event sweeps after a Kafka send failure, backing off from one
         // poll interval up to the idle interval, so a hung broker cannot stall the
         // poll loop on every iteration.
@@ -299,8 +299,8 @@ where
 
             // Ahead of the drain, which ends the poll early while the subgraph is down:
             // finishing a cancel needs only the chain.
-            polls_since_cancel_retry += 1;
-            if polls_since_cancel_retry >= CANCEL_RETRY_POLLS {
+            if last_cancel_retry.is_none_or(|at| at.elapsed() >= CANCEL_RETRY_INTERVAL) {
+                last_cancel_retry = Some(Instant::now());
                 let chain_now =
                     last_persisted_timestamp.unwrap_or_else(dipper_core::time::now_secs);
                 super::cancel_retry::retry_cancelling_agreements(
@@ -310,7 +310,6 @@ where
                     chain_now,
                 )
                 .await;
-                polls_since_cancel_retry = 0;
             }
 
             let outcome = match drain_once(

@@ -507,7 +507,7 @@ pub trait AgreementRegistry {
         &self,
     ) -> RegistryResult<(std::collections::HashMap<IndexerId, u64>, u64)>;
 
-    /// Whether any agreement is in `Created`, `AcceptedOnChain` or `Cancelling` status.
+    /// Whether any agreement is in `Created` or `AcceptedOnChain` status.
     ///
     /// Used by the chain listener's adaptive-interval check on every poll;
     /// the default impl falls back to `count_active_agreements_by_deployment`

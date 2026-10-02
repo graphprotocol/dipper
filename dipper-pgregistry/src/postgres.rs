@@ -1852,7 +1852,7 @@ impl PgRegistry {
         Ok((per_indexer, global))
     }
 
-    /// Whether any agreement is in `Created`, `AcceptedOnChain` or `Cancelling` status.
+    /// Whether any agreement is in `Created` or `AcceptedOnChain` status.
     ///
     /// Cheap `EXISTS` probe used by the chain listener's adaptive-interval
     /// gate every poll; the per-deployment `count_active_agreements_by_deployment`
@@ -1863,14 +1863,13 @@ impl PgRegistry {
             SELECT EXISTS (
                 SELECT 1
                 FROM dipper_reg_indexing_agreements
-                WHERE status IN ($1, $2, $3)
+                WHERE status IN ($1, $2)
                 LIMIT 1
             )
             "#,
         )
         .bind(IndexingAgreementStatus::Created)
         .bind(IndexingAgreementStatus::AcceptedOnChain)
-        .bind(IndexingAgreementStatus::Cancelling)
         .fetch_one(&self.pool)
         .await?;
         Ok(exists)
