@@ -193,19 +193,15 @@ pub struct CancellingAgreement {
     pub agreement: IndexingAgreement,
     /// Whether dipper saw it accepted on-chain, so its end is announced.
     pub accepted_on_chain: bool,
-    /// Cancels that failed in a way retrying may not fix.
-    pub cancel_attempts: u32,
 }
 
 impl sqlx::FromRow<'_, sqlx::postgres::PgRow> for CancellingAgreement {
     fn from_row(row: &sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
         use sqlx::Row as _;
         let accepted_at: Option<i64> = row.try_get("accepted_at")?;
-        let cancel_attempts: i32 = row.try_get("cancel_attempts")?;
         Ok(Self {
             agreement: IndexingAgreement::from_row(row)?,
             accepted_on_chain: accepted_at.is_some(),
-            cancel_attempts: u32::try_from(cancel_attempts).unwrap_or_default(),
         })
     }
 }
@@ -1031,8 +1027,7 @@ impl PgRegistry {
                 last_progress_at,
                 rejection_reason,
                 terms_version_hash,
-                accepted_at,
-                cancel_attempts
+                accepted_at
             FROM dipper_reg_indexing_agreements
             WHERE status = $1
               AND (

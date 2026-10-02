@@ -562,8 +562,6 @@ pub struct CancellingAgreement {
     pub agreement: IndexingAgreement,
     /// Whether dipper saw it accepted on-chain, so its end is announced.
     pub accepted_on_chain: bool,
-    /// Cancels that failed in a way retrying may not fix.
-    pub cancel_attempts: u32,
 }
 
 impl TryFrom<dipper_pgregistry::CancellingAgreement> for CancellingAgreement {
@@ -573,7 +571,6 @@ impl TryFrom<dipper_pgregistry::CancellingAgreement> for CancellingAgreement {
         Ok(Self {
             agreement: value.agreement.try_into()?,
             accepted_on_chain: value.accepted_on_chain,
-            cancel_attempts: value.cancel_attempts,
         })
     }
 }
