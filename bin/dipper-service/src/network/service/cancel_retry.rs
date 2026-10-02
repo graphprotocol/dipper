@@ -15,9 +15,12 @@ use crate::{
 /// leaves it to an operator. Other failures don't count (see `failed_attempts`).
 pub const MAX_CANCEL_ATTEMPTS: u32 = 10;
 
-/// Agreements checked per sweep, those checked longest ago first. Each can wait up to
-/// 15 s for a cancel to be mined, holding up the chain listener meanwhile.
+/// Agreements checked per sweep, those checked longest ago first.
 const BATCH_SIZE: i64 = 10;
+
+/// Time a sweep may take before leaving the rest to the next one: it holds up the chain
+/// listener while it runs, and each cancel can wait up to 15 s to be mined.
+const SWEEP_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Minutes an agreement stays out of the retry after it is marked, so the cancel sent
 /// when it was marked can be mined first instead of being sent again.
@@ -48,7 +51,15 @@ pub async fn retry_cancelling_agreements<R, T>(
             return;
         }
     };
-    for row in &cancelling {
+    let started = std::time::Instant::now();
+    for (done, row) in cancelling.iter().enumerate() {
+        if started.elapsed() >= SWEEP_BUDGET {
+            tracing::info!(
+                left = cancelling.len() - done,
+                "Cancel retry ran out of time; the rest wait for the next sweep"
+            );
+            break;
+        }
         retry_cancel(registry, chain_client, config, row, chain_now).await;
     }
 }
