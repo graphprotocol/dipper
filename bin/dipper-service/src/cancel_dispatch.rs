@@ -1,17 +1,21 @@
 //! On-chain cancel dispatch. Every cancel goes through
 //! [`cancel_agreement_on_chain`] so the manager-routed path lives in one place.
 
+use dipper_core::time::now_secs;
 use thegraph_core::alloy::primitives::B256;
 
 use crate::{
     chain_client::{ChainClient, ChainClientError},
     config::IndexingAgreementConfig,
-    registry::IndexingAgreement,
+    registry::{
+        AgreementRegistry, IndexingAgreement, IndexingAgreementStatus, Result as RegistryResult,
+    },
 };
 
 /// Pass both ACTIVE and PENDING; local status lags the chain, so let the
-/// collector no-op the absent scope. Never SCOPE_SIGNED (=4): acceptance is
-/// offer-based and dipper never retracts a pending offer, so it isn't needed.
+/// collector no-op the absent scope. PENDING revokes an offer not yet accepted.
+/// Never SCOPE_SIGNED (=4): acceptance is offer-based, so revoking the stored
+/// offer is enough.
 const SCOPE_ACTIVE: u16 = 1;
 const SCOPE_PENDING: u16 = 2;
 const SCOPE_BOTH: u16 = SCOPE_ACTIVE | SCOPE_PENDING;
@@ -58,8 +62,198 @@ pub async fn cancel_agreement_on_chain<T: ChainClient>(
     Ok(outcome)
 }
 
+/// What [`start_cancel`] left an agreement as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelStarted {
+    /// It was accepted and its cancel landed: now `CanceledByRequester`.
+    Ended,
+    /// Still `Cancelling`; the chain listener finishes it once it can't go live.
+    Cancelling,
+}
+
+/// Start ending an agreement that may be live on-chain. It is marked `Cancelling` first, so an
+/// offer for it still in flight withdraws itself on landing, then cancelled only if the chain
+/// shows it live. Fails, sending nothing, when the mark can't be written.
+pub async fn start_cancel<R, T>(
+    registry: &R,
+    chain_client: &T,
+    agreement: &IndexingAgreement,
+    config: &IndexingAgreementConfig,
+) -> RegistryResult<CancelStarted>
+where
+    R: AgreementRegistry + Sync,
+    T: ChainClient,
+{
+    registry
+        .mark_indexing_agreement_as_cancelling(&agreement.id)
+        .await?;
+    let tx_hash = match cancel_if_live(chain_client, agreement, config).await {
+        LiveCancel::Ended(tx_hash) => tx_hash,
+        LiveCancel::NotLive => return Ok(CancelStarted::Cancelling),
+        LiveCancel::ReadFailed(err) | LiveCancel::CancelFailed(err) => {
+            tracing::warn!(
+                agreement_id = %agreement.id,
+                error = %err,
+                "On-chain cancel failed; the chain listener retries it"
+            );
+            return Ok(CancelStarted::Cancelling);
+        }
+    };
+    tracing::info!(
+        agreement_id = %agreement.id,
+        tx_hash = ?tx_hash,
+        "Submitted on-chain cancellation"
+    );
+    // An offer never accepted could still land and be accepted until its deadline.
+    if agreement.status != IndexingAgreementStatus::AcceptedOnChain {
+        return Ok(CancelStarted::Cancelling);
+    }
+    Ok(
+        if confirm_cancelled(registry, agreement, tx_hash, config).await {
+            CancelStarted::Ended
+        } else {
+            CancelStarted::Cancelling
+        },
+    )
+}
+
+/// Mark an agreement the chain shows dipper ended `CanceledByRequester`, recording the cancel
+/// when its transaction is known, so the `terminated` sweep announces it. False, logged, when
+/// the mark fails; it stays `Cancelling` for the cancel retry.
+pub async fn confirm_cancelled<R: AgreementRegistry + Sync>(
+    registry: &R,
+    agreement: &IndexingAgreement,
+    tx_hash: Option<B256>,
+    config: &IndexingAgreementConfig,
+) -> bool {
+    if let Err(err) = registry
+        .mark_indexing_agreement_as_canceled_by_requester(&agreement.id)
+        .await
+    {
+        tracing::warn!(
+            agreement_id = %agreement.id,
+            error = %err,
+            "Failed to mark an ended agreement cancelled; the cancel retry tries again"
+        );
+        return false;
+    }
+    tracing::info!(
+        agreement_id = %agreement.id,
+        indexing_request_id = %agreement.indexing_request_id,
+        old_status = "CANCELLING",
+        new_status = "CANCELED_BY_REQUESTER",
+        reason = "cancel_confirmed_on_chain",
+        "agreement state transition"
+    );
+    if tx_hash.is_some() {
+        record_cancel(registry, agreement, tx_hash, config).await;
+    }
+    true
+}
+
+/// Record dipper's own cancel of an accepted agreement, so the `terminated` sweep
+/// announces it.
+async fn record_cancel<R: AgreementRegistry + Sync>(
+    registry: &R,
+    agreement: &IndexingAgreement,
+    tx_hash: Option<B256>,
+    config: &IndexingAgreementConfig,
+) {
+    let manager = config.recurring_agreement_manager().to_string();
+    let tx = tx_hash.map(|hash| hash.to_string());
+    if let Err(err) = registry
+        .record_cancel_audit(&agreement.id, now_secs(), &manager, tx.as_deref())
+        .await
+    {
+        tracing::warn!(
+            agreement_id = %agreement.id,
+            error = %err,
+            "failed to record cancel audit; terminated event may emit with fallback fields"
+        );
+    }
+}
+
+/// Move an agreement dipper had already rejected or cancelled back into `Cancelling` when the
+/// chain shows it live after all, so the cancel retry ends it. The chain is read first, so a
+/// subgraph report from before dipper's cancel landed reopens nothing; an unreadable chain
+/// reopens it anyway, as the retry reads again before sending. True if it was reopened.
+pub async fn reopen_if_live<R, T>(
+    registry: &R,
+    chain_client: &T,
+    agreement: &IndexingAgreement,
+) -> RegistryResult<bool>
+where
+    R: AgreementRegistry + Sync,
+    T: ChainClient,
+{
+    match chain_client
+        .agreement_still_active(agreement.id.as_bytes())
+        .await
+    {
+        Ok(false) => return Ok(false),
+        Ok(true) => {}
+        Err(err) => tracing::warn!(
+            agreement_id = %agreement.id,
+            error = %err,
+            "Failed to read an ended agreement reported live; the cancel retry checks it"
+        ),
+    }
+    match registry
+        .reopen_indexing_agreement_cancel(&agreement.id)
+        .await
+    {
+        Ok(()) => {}
+        Err(crate::registry::Error::NoRecordsUpdated) => return Ok(false),
+        Err(err) => return Err(err),
+    }
+    tracing::warn!(
+        agreement_id = %agreement.id,
+        indexer_id = %agreement.indexer.id,
+        indexing_request_id = %agreement.indexing_request_id,
+        old_status = %agreement.status,
+        new_status = "CANCELLING",
+        reason = "live_on_chain_after_end",
+        "agreement state transition"
+    );
+    Ok(true)
+}
+
+/// What [`cancel_if_live`] found and did.
+#[derive(Debug)]
+pub enum LiveCancel {
+    /// The chain showed nothing live, so no cancel was sent.
+    NotLive,
+    /// A cancel went out and the chain confirmed the agreement ended.
+    Ended(Option<B256>),
+    /// The chain could not be read, so nothing was sent.
+    ReadFailed(ChainClientError),
+    /// The cancel failed or did not end the agreement.
+    CancelFailed(ChainClientError),
+}
+
+/// Cancel an agreement on-chain only if the chain shows it live: a pending offer, or
+/// accepted and not yet ended. Reading first saves a wasted transaction, since a cancel
+/// of an agreement that already ended still mines.
+pub async fn cancel_if_live<T: ChainClient>(
+    chain_client: &T,
+    agreement: &IndexingAgreement,
+    config: &IndexingAgreementConfig,
+) -> LiveCancel {
+    match chain_client
+        .agreement_still_active(agreement.id.as_bytes())
+        .await
+    {
+        Err(err) => LiveCancel::ReadFailed(err),
+        Ok(false) => LiveCancel::NotLive,
+        Ok(true) => match cancel_agreement_on_chain(chain_client, agreement, config).await {
+            Ok(tx_hash) => LiveCancel::Ended(tx_hash),
+            Err(err) => LiveCancel::CancelFailed(err),
+        },
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Mutex;
 
     use async_trait::async_trait;
@@ -149,35 +343,26 @@ mod tests {
             *self.active_reads.lock().unwrap() += 1;
             Ok(self.still_active_after_cancel)
         }
+        async fn agreement_ended_by_indexer(
+            &self,
+            _agreement_id: &[u8; 16],
+        ) -> Result<bool, ChainClientError> {
+            Ok(false)
+        }
     }
 
     fn manager_conf(collector: Address) -> IndexingAgreementConfig {
         IndexingAgreementConfig {
-            data_service: Address::ZERO,
             recurring_collector: collector,
             recurring_agreement_manager: Address::repeat_byte(0x33),
-            max_agreement_grt_per_30_days: 0.0,
-            max_seconds_per_collection: 0,
-            min_seconds_per_collection: 0,
-            duration_seconds: 0,
-            deadline_seconds: 0,
-            max_grt_per_30_days: std::collections::BTreeMap::new(),
-            max_grt_per_billion_entities_per_30_days: 0.0,
-            declined_indexer_lookback_days: 0,
-            price_rejection_lookback_days: 0,
-            transient_rejection_lookback_minutes: 0,
-            uncertain_rejection_lookback_days: 0,
-            unresponsive_indexer_lookback_days: 0,
-            mass_unresponsive_trip_fraction: 0.5,
-            mass_unresponsive_reset_fraction: 0.25,
-            dips_accepting_snapshot_max_age_hours: 48,
-            dips_accepting_cache_ttl_seconds: 300,
-            max_in_flight_offers_per_indexer: None,
-            max_in_flight_offers_total: None,
+            ..IndexingAgreementConfig::for_tests()
         }
     }
 
-    fn agreement(status: IndexingAgreementStatus, hash: Option<Vec<u8>>) -> IndexingAgreement {
+    pub(crate) fn agreement(
+        status: IndexingAgreementStatus,
+        hash: Option<Vec<u8>>,
+    ) -> IndexingAgreement {
         let deployment_id: DeploymentId = "QmTXzATwNfgGVukV1fX2T6xw9f6LAYRVWpsdXyRWzUR2H9"
             .parse()
             .unwrap();

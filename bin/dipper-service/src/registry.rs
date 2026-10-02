@@ -23,8 +23,8 @@ pub use self::agreement_stub::StubAgreementRegistry;
 use self::result::Result as RegistryResult;
 pub use self::{
     agreement::{
-        AgreementFeeRate, AgreementRegistry, CancelKind, IndexingAgreement, NewAgreementParams,
-        ReconciliationAudit, ReconciliationItem, ReconciliationOutcome,
+        AgreementFeeRate, AgreementRegistry, CancelKind, CancellingAgreement, IndexingAgreement,
+        NewAgreementParams, ReconciliationAudit, ReconciliationItem, ReconciliationOutcome,
         Status as IndexingAgreementStatus, Terms as IndexingAgreementTerms,
         TermsMetadata as IndexingAgreementTermsMetadata,
     },
@@ -387,6 +387,53 @@ impl AgreementRegistry for RegistryProvider {
     ) -> RegistryResult<()> {
         self.inner
             .mark_indexing_agreement_as_canceled_by_requester(id)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn mark_indexing_agreement_as_cancelling(
+        &self,
+        id: &IndexingAgreementId,
+    ) -> RegistryResult<()> {
+        self.inner
+            .mark_indexing_agreement_as_cancelling(id)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn reopen_indexing_agreement_cancel(
+        &self,
+        id: &IndexingAgreementId,
+    ) -> RegistryResult<()> {
+        self.inner
+            .reopen_indexing_agreement_cancel(id)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn get_cancelling_agreements(
+        &self,
+        batch_size: i64,
+        max_attempts: u32,
+        min_age_minutes: i32,
+    ) -> RegistryResult<Vec<CancellingAgreement>> {
+        Ok(self
+            .inner
+            .get_cancelling_agreements(batch_size, max_attempts, min_age_minutes)
+            .await?
+            .into_iter()
+            .map(CancellingAgreement::try_from)
+            .filter_map(filter_map_with_logging)
+            .collect())
+    }
+
+    async fn record_cancel_check(
+        &self,
+        id: &IndexingAgreementId,
+        failed_attempts: u32,
+    ) -> RegistryResult<u32> {
+        self.inner
+            .record_cancel_check(id, failed_attempts)
             .await
             .map_err(Into::into)
     }

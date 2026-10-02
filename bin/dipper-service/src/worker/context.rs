@@ -234,10 +234,10 @@ impl_from_state!(SendIndexingAgreementProposalCtx<R, W, C> {
 impl_from_state!(CancelRejectedAgreementOnChainCtx<R, T> {
     registry,
     chain_client,
-    agreement_conf,
 });
 
 impl_from_state!(SubmitOfferCtx<R, T> {
     registry,
     chain_client,
+    agreement_conf,
 });

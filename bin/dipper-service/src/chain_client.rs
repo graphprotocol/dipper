@@ -121,9 +121,16 @@ pub trait ChainClient {
     ) -> Result<Option<B256>, ChainClientError>;
 
     /// Read whether the agreement is still live on-chain (terms accepted and no
-    /// cancellation notice given) via the RecurringCollector's
-    /// `getAgreementDetails(id, VERSION_CURRENT)`.
+    /// cancellation notice given, or an offer still waiting to be accepted) via
+    /// the RecurringCollector's `getAgreementDetails(id, VERSION_CURRENT)`.
     async fn agreement_still_active(
+        &self,
+        agreement_id: &[u8; 16],
+    ) -> Result<bool, ChainClientError>;
+
+    /// Read whether the indexer ended the agreement on-chain, which `getAgreementDetails`
+    /// reports with its BY_PROVIDER flag. False for one still live or ended by dipper.
+    async fn agreement_ended_by_indexer(
         &self,
         agreement_id: &[u8; 16],
     ) -> Result<bool, ChainClientError>;
@@ -180,6 +187,13 @@ impl<T: ChainClient + Send + Sync + ?Sized> ChainClient for Arc<T> {
         agreement_id: &[u8; 16],
     ) -> Result<bool, ChainClientError> {
         (**self).agreement_still_active(agreement_id).await
+    }
+
+    async fn agreement_ended_by_indexer(
+        &self,
+        agreement_id: &[u8; 16],
+    ) -> Result<bool, ChainClientError> {
+        (**self).agreement_ended_by_indexer(agreement_id).await
     }
 
     async fn latest_block_timestamp(&self) -> Result<u64, ChainClientError> {

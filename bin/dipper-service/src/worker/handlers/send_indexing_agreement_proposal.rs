@@ -415,7 +415,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl AgreementRegistry for MockRegistry {
+    impl crate::registry::StubAgreementRegistry for MockRegistry {
         async fn get_indexing_agreement_by_id(
             &self,
             _id: &IndexingAgreementId,
@@ -516,6 +516,13 @@ mod tests {
         }
 
         async fn mark_indexing_agreement_as_canceled_by_requester(
+            &self,
+            _id: &IndexingAgreementId,
+        ) -> crate::registry::Result<()> {
+            Ok(())
+        }
+
+        async fn mark_indexing_agreement_as_cancelling(
             &self,
             _id: &IndexingAgreementId,
         ) -> crate::registry::Result<()> {
@@ -726,14 +733,6 @@ mod tests {
                 chain_id,
                 num_candidates,
             ));
-            Ok(JobId::default())
-        }
-
-        async fn cancel_rejected_agreement_on_chain(
-            &self,
-            _agreement_id: IndexingAgreementId,
-            _priority: JobPriority,
-        ) -> anyhow::Result<JobId> {
             Ok(JobId::default())
         }
 

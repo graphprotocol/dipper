@@ -187,6 +187,39 @@ impl sqlx::FromRow<'_, sqlx::postgres::PgRow> for PendingAcceptedEvent {
     }
 }
 
+/// An agreement dipper is still cancelling on-chain.
+#[derive(Debug, Clone)]
+pub struct CancellingAgreement {
+    pub agreement: IndexingAgreement,
+    /// Whether dipper saw it accepted on-chain, so its end is announced.
+    pub accepted_on_chain: bool,
+}
+
+impl sqlx::FromRow<'_, sqlx::postgres::PgRow> for CancellingAgreement {
+    fn from_row(row: &sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
+        use sqlx::Row as _;
+        let accepted_at: Option<i64> = row.try_get("accepted_at")?;
+        Ok(Self {
+            agreement: IndexingAgreement::from_row(row)?,
+            accepted_on_chain: accepted_at.is_some(),
+        })
+    }
+}
+
+/// Statuses an on-chain cancel by dipper ends.
+const CANCEL_BY_REQUESTER_FROM: &[IndexingAgreementStatus] = &[
+    IndexingAgreementStatus::Created,
+    IndexingAgreementStatus::AcceptedOnChain,
+    IndexingAgreementStatus::Rejected,
+    IndexingAgreementStatus::Cancelling,
+];
+
+/// Statuses an on-chain cancel by the indexer ends.
+const CANCEL_BY_INDEXER_FROM: &[IndexingAgreementStatus] = &[
+    IndexingAgreementStatus::AcceptedOnChain,
+    IndexingAgreementStatus::Cancelling,
+];
+
 /// A row that needs a `request.expired` lifecycle event emitted. Sourced from
 /// the agreement row alone; `request_expired_at` is the terms deadline (the true
 /// expiry instant), so the sweep needs no chain-time snapshot.
@@ -911,29 +944,158 @@ impl PgRegistry {
         &self,
         agreement_id: &IndexingAgreementId,
     ) -> Result<(), Error> {
-        let record: Option<(IndexingAgreementId,)> = sqlx::query_as(
+        self.set_status_from(
+            agreement_id,
+            IndexingAgreementStatus::CanceledByRequester,
+            CANCEL_BY_REQUESTER_FROM,
+        )
+        .await
+    }
+
+    /// Mark an agreement that may be live on-chain `Cancelling`, before dipper sends its
+    /// on-chain cancel. One marked `Expired` may have been accepted unseen by a lagging listener.
+    pub async fn mark_indexing_agreement_as_cancelling(
+        &self,
+        agreement_id: &IndexingAgreementId,
+    ) -> Result<(), Error> {
+        self.set_status_from(
+            agreement_id,
+            IndexingAgreementStatus::Cancelling,
+            &[
+                IndexingAgreementStatus::Created,
+                IndexingAgreementStatus::AcceptedOnChain,
+                IndexingAgreementStatus::Rejected,
+                IndexingAgreementStatus::Expired,
+            ],
+        )
+        .await
+    }
+
+    /// Move an agreement dipper had already ended, cancelled or rejected, back to `Cancelling`
+    /// once the chain shows it live after all, with its cancel attempts started afresh.
+    pub async fn reopen_indexing_agreement_cancel(
+        &self,
+        agreement_id: &IndexingAgreementId,
+    ) -> Result<(), Error> {
+        let updated = sqlx::query(
             r#"
             UPDATE dipper_reg_indexing_agreements
             SET
                 status = $1,
+                cancel_attempts = 0,
+                cancel_checked_at = NULL,
                 updated_at = timezone('UTC', now())
-            WHERE id = $2 AND status IN ($3, $4, $5)
-            RETURNING id
+            WHERE id = $2 AND status IN ($3, $4)
             "#,
         )
-        .bind(IndexingAgreementStatus::CanceledByRequester)
+        .bind(IndexingAgreementStatus::Cancelling)
         .bind(agreement_id)
-        .bind(IndexingAgreementStatus::Created)
-        .bind(IndexingAgreementStatus::AcceptedOnChain)
+        .bind(IndexingAgreementStatus::CanceledByRequester)
         .bind(IndexingAgreementStatus::Rejected)
-        .fetch_optional(&self.pool)
+        .execute(&self.pool)
         .await?;
-
-        if record.is_none() {
+        if updated.rows_affected() == 0 {
             return Err(Error::NoRecordsUpdated);
         }
-
         Ok(())
+    }
+
+    /// `Cancelling` agreements marked over `min_age_minutes` ago, those checked longest ago
+    /// first; one whose cancel has failed `max_attempts` times only once an hour. One that may be paying
+    /// an indexer (accepted, or past the offer deadline, which only an accepted one outlives)
+    /// counts as checked an hour earlier, so it goes first without holding the rest back.
+    pub async fn get_cancelling_agreements(
+        &self,
+        batch_size: i64,
+        max_attempts: u32,
+        min_age_minutes: i32,
+    ) -> Result<Vec<CancellingAgreement>, Error> {
+        sqlx::query_as(
+            r#"
+            SELECT
+                id,
+                nonce_uuid,
+                created_at,
+                updated_at,
+                status,
+                indexing_request_id,
+                deployment_id,
+                indexer_id,
+                indexer_url,
+                terms,
+                last_block_height,
+                last_progress_at,
+                rejection_reason,
+                terms_version_hash,
+                accepted_at
+            FROM dipper_reg_indexing_agreements
+            WHERE status = $1
+              AND (
+                  cancel_attempts < $2
+                  OR cancel_checked_at < timezone('UTC', now()) - INTERVAL '1 hour'
+              )
+              AND updated_at < timezone('UTC', now()) - make_interval(mins => $4)
+            ORDER BY
+                cancel_checked_at - CASE
+                    WHEN accepted_at IS NOT NULL
+                        OR CAST(terms->>'deadline' AS bigint) < EXTRACT(EPOCH FROM now())
+                    THEN INTERVAL '1 hour'
+                    ELSE INTERVAL '0 seconds'
+                END ASC NULLS FIRST,
+                updated_at ASC
+            LIMIT $3
+            "#,
+        )
+        .bind(IndexingAgreementStatus::Cancelling)
+        .bind(i32::try_from(max_attempts).unwrap_or(i32::MAX))
+        .bind(batch_size)
+        .bind(min_age_minutes)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Record a check of a `Cancelling` agreement that left it cancelling, adding
+    /// `failed_attempts` to its failed cancels and returning the new count.
+    pub async fn record_cancel_check(
+        &self,
+        agreement_id: &IndexingAgreementId,
+        failed_attempts: u32,
+    ) -> Result<u32, Error> {
+        let record: Option<(i32,)> = sqlx::query_as(
+            r#"
+            UPDATE dipper_reg_indexing_agreements
+            SET
+                cancel_attempts = LEAST(cancel_attempts::BIGINT + $3, 2147483647)::INTEGER,
+                cancel_checked_at = timezone('UTC', now())
+            WHERE id = $1 AND status = $2
+            RETURNING cancel_attempts
+            "#,
+        )
+        .bind(agreement_id)
+        .bind(IndexingAgreementStatus::Cancelling)
+        .bind(i64::from(failed_attempts))
+        .fetch_optional(&self.pool)
+        .await?;
+        let (attempts,) = record.ok_or(Error::NoRecordsUpdated)?;
+        Ok(u32::try_from(attempts).unwrap_or_default())
+    }
+
+    /// Move an agreement to `new_status` if it is in one of `allowed_from`.
+    async fn set_status_from(
+        &self,
+        agreement_id: &IndexingAgreementId,
+        new_status: IndexingAgreementStatus,
+        allowed_from: &[IndexingAgreementStatus],
+    ) -> Result<(), Error> {
+        let mut tx = self.pool.begin().await?;
+        let updated = update_status_from(&mut tx, agreement_id, new_status, allowed_from).await?;
+        tx.commit().await?;
+        if updated {
+            Ok(())
+        } else {
+            Err(Error::NoRecordsUpdated)
+        }
     }
 
     /// Atomically apply a reconciliation-driven state transition (accept
@@ -986,15 +1148,11 @@ impl PgRegistry {
             let (new_status, allowed_from): (_, &[IndexingAgreementStatus]) = match kind {
                 CancelKind::ByRequester => (
                     IndexingAgreementStatus::CanceledByRequester,
-                    &[
-                        IndexingAgreementStatus::Created,
-                        IndexingAgreementStatus::AcceptedOnChain,
-                        IndexingAgreementStatus::Rejected,
-                    ],
+                    CANCEL_BY_REQUESTER_FROM,
                 ),
                 CancelKind::ByIndexer => (
                     IndexingAgreementStatus::CanceledByIndexer,
-                    &[IndexingAgreementStatus::AcceptedOnChain],
+                    CANCEL_BY_INDEXER_FROM,
                 ),
             };
             did_cancel =
@@ -1084,15 +1242,11 @@ impl PgRegistry {
             let (new_status, allowed_from): (_, &[IndexingAgreementStatus]) = match cancel_kind {
                 CancelKind::ByRequester => (
                     IndexingAgreementStatus::CanceledByRequester,
-                    &[
-                        IndexingAgreementStatus::Created,
-                        IndexingAgreementStatus::AcceptedOnChain,
-                        IndexingAgreementStatus::Rejected,
-                    ],
+                    CANCEL_BY_REQUESTER_FROM,
                 ),
                 CancelKind::ByIndexer => (
                     IndexingAgreementStatus::CanceledByIndexer,
-                    &[IndexingAgreementStatus::AcceptedOnChain],
+                    CANCEL_BY_INDEXER_FROM,
                 ),
             };
             let did_cancel =
@@ -1127,11 +1281,7 @@ impl PgRegistry {
             &mut tx,
             &cancel_by_requester,
             IndexingAgreementStatus::CanceledByRequester,
-            &[
-                IndexingAgreementStatus::Created,
-                IndexingAgreementStatus::AcceptedOnChain,
-                IndexingAgreementStatus::Rejected,
-            ],
+            CANCEL_BY_REQUESTER_FROM,
         )
         .await?
         {
@@ -1142,7 +1292,7 @@ impl PgRegistry {
             &mut tx,
             &cancel_by_indexer,
             IndexingAgreementStatus::CanceledByIndexer,
-            &[IndexingAgreementStatus::AcceptedOnChain],
+            CANCEL_BY_INDEXER_FROM,
         )
         .await?
         {
@@ -1834,8 +1984,8 @@ impl PgRegistry {
     /// Returns (agreement_id, indexer_id, deployment_id, base_rate_wei,
     /// entity_rate_wei) per active agreement for optimistic fee estimation.
     ///
-    /// Queries all `Created` or `AcceptedOnChain` agreements and extracts
-    /// both rate fields from the terms metadata.
+    /// Queries all `Created`, `AcceptedOnChain` or `Cancelling` agreements, the last
+    /// still paid until their cancel lands, and extracts both rate fields from the terms.
     pub async fn get_agreement_fee_rates(
         &self,
     ) -> Result<Vec<(IndexingAgreementId, IndexerId, DeploymentId, f64, f64)>, Error> {
@@ -1847,11 +1997,12 @@ impl PgRegistry {
             r#"
                 SELECT id, indexer_id, terms
                 FROM dipper_reg_indexing_agreements
-                WHERE status IN ($1, $2)
+                WHERE status IN ($1, $2, $3)
                 "#,
         )
         .bind(IndexingAgreementStatus::Created)
         .bind(IndexingAgreementStatus::AcceptedOnChain)
+        .bind(IndexingAgreementStatus::Cancelling)
         .fetch_all(&self.pool)
         .await?;
 
