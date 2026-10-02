@@ -1209,6 +1209,12 @@ mod tests {
             // not-active means "cancel confirmed", which these tests expect.
             Ok(false)
         }
+        async fn agreement_ended_by_indexer(
+            &self,
+            _agreement_id: &[u8; 16],
+        ) -> Result<bool, ChainClientError> {
+            Ok(false)
+        }
     }
 
     const DB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);

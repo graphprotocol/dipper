@@ -2663,6 +2663,12 @@ mod tests {
             // not-active here means "cancel confirmed", which these tests expect.
             Ok(self.live_until_cancelled && !self.cancels.lock().unwrap().contains(agreement_id))
         }
+        async fn agreement_ended_by_indexer(
+            &self,
+            _agreement_id: &[u8; 16],
+        ) -> Result<bool, crate::chain_client::ChainClientError> {
+            Ok(false)
+        }
     }
 
     #[async_trait::async_trait]

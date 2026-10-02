@@ -1023,6 +1023,12 @@ mod lifecycle_event_tests {
             // Cancel confirmed: agreement is no longer active on-chain.
             Ok(false)
         }
+        async fn agreement_ended_by_indexer(
+            &self,
+            _agreement_id: &[u8; 16],
+        ) -> Result<bool, ChainClientError> {
+            Ok(false)
+        }
     }
 
     // ---- Mock: registry (all five traits) -----------------------------------
@@ -2449,6 +2455,12 @@ mod deadline_clock_tests {
         }
 
         async fn agreement_still_active(
+            &self,
+            _agreement_id: &[u8; 16],
+        ) -> Result<bool, ChainClientError> {
+            Ok(false)
+        }
+        async fn agreement_ended_by_indexer(
             &self,
             _agreement_id: &[u8; 16],
         ) -> Result<bool, ChainClientError> {

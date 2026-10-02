@@ -639,6 +639,12 @@ mod tests {
             }
             Ok(self.live.load(Ordering::SeqCst))
         }
+        async fn agreement_ended_by_indexer(
+            &self,
+            _agreement_id: &[u8; 16],
+        ) -> Result<bool, ChainClientError> {
+            Ok(false)
+        }
     }
 
     fn test_agreement_conf() -> Arc<IndexingAgreementConfig> {
