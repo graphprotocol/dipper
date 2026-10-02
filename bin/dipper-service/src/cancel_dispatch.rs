@@ -107,17 +107,24 @@ where
     if agreement.status != IndexingAgreementStatus::AcceptedOnChain {
         return Ok(CancelStarted::Cancelling);
     }
-    Ok(confirm_cancelled(registry, agreement, tx_hash, config).await)
+    Ok(
+        if confirm_cancelled(registry, agreement, tx_hash, config).await {
+            CancelStarted::Ended
+        } else {
+            CancelStarted::Cancelling
+        },
+    )
 }
 
-/// Mark an accepted agreement whose cancel landed `CanceledByRequester` and record the
-/// cancel, so the `terminated` sweep announces it.
-async fn confirm_cancelled<R: AgreementRegistry + Sync>(
+/// Mark an agreement the chain shows dipper ended `CanceledByRequester`, recording the cancel
+/// when its transaction is known, so the `terminated` sweep announces it. False, logged, when
+/// the mark fails; it stays `Cancelling` for the cancel retry.
+pub async fn confirm_cancelled<R: AgreementRegistry + Sync>(
     registry: &R,
     agreement: &IndexingAgreement,
     tx_hash: Option<B256>,
     config: &IndexingAgreementConfig,
-) -> CancelStarted {
+) -> bool {
     if let Err(err) = registry
         .mark_indexing_agreement_as_canceled_by_requester(&agreement.id)
         .await
@@ -125,17 +132,27 @@ async fn confirm_cancelled<R: AgreementRegistry + Sync>(
         tracing::warn!(
             agreement_id = %agreement.id,
             error = %err,
-            "Failed to mark a cancelled agreement; the chain listener finishes it"
+            "Failed to mark an ended agreement cancelled; the cancel retry tries again"
         );
-        return CancelStarted::Cancelling;
+        return false;
     }
-    record_cancel(registry, agreement, tx_hash, config).await;
-    CancelStarted::Ended
+    tracing::info!(
+        agreement_id = %agreement.id,
+        indexing_request_id = %agreement.indexing_request_id,
+        old_status = "CANCELLING",
+        new_status = "CANCELED_BY_REQUESTER",
+        reason = "cancel_confirmed_on_chain",
+        "agreement state transition"
+    );
+    if tx_hash.is_some() {
+        record_cancel(registry, agreement, tx_hash, config).await;
+    }
+    true
 }
 
 /// Record dipper's own cancel of an accepted agreement, so the `terminated` sweep
 /// announces it.
-pub async fn record_cancel<R: AgreementRegistry + Sync>(
+async fn record_cancel<R: AgreementRegistry + Sync>(
     registry: &R,
     agreement: &IndexingAgreement,
     tx_hash: Option<B256>,
