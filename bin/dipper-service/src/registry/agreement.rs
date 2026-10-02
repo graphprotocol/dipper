@@ -266,8 +266,8 @@ pub trait AgreementRegistry {
         id: &IndexingAgreementId,
     ) -> RegistryResult<()>;
 
-    /// Mark a `CREATED`, `ACCEPTED_ON_CHAIN` or `REJECTED` agreement `CANCELLING`, before its
-    /// on-chain cancel is sent; [`NoRecordUpdated`](Error::NoRecordsUpdated) otherwise.
+    /// Mark a `CREATED`, `ACCEPTED_ON_CHAIN`, `REJECTED` or `EXPIRED` agreement `CANCELLING`,
+    /// before its cancel is sent; [`NoRecordUpdated`](Error::NoRecordsUpdated) otherwise.
     async fn mark_indexing_agreement_as_cancelling(
         &self,
         id: &IndexingAgreementId,

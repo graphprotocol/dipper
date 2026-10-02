@@ -957,7 +957,7 @@ impl PgRegistry {
     }
 
     /// Mark an agreement that may be live on-chain `Cancelling`, before dipper sends its
-    /// on-chain cancel.
+    /// on-chain cancel. One marked `Expired` may have been accepted unseen by a lagging listener.
     pub async fn mark_indexing_agreement_as_cancelling(
         &self,
         agreement_id: &IndexingAgreementId,
@@ -969,6 +969,7 @@ impl PgRegistry {
                 IndexingAgreementStatus::Created,
                 IndexingAgreementStatus::AcceptedOnChain,
                 IndexingAgreementStatus::Rejected,
+                IndexingAgreementStatus::Expired,
             ],
         )
         .await

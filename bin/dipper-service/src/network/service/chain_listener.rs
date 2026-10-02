@@ -3540,6 +3540,13 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_pending_cancellations_cancel_an_agreement_marked_expired() {
+        // A lagging listener can mark an agreement expired that was in fact accepted.
+        let marked = marked_at_pending_cancel(IndexingAgreementStatus::Expired).await;
+        assert_eq!(marked, vec![true]);
+    }
+
+    #[tokio::test]
     async fn test_pending_cancellations_mark_an_accepted_agreement_before_its_cancel() {
         // A failed cancel then leaves it cancelling, which the cancel retry picks up.
         let marked = marked_at_pending_cancel(IndexingAgreementStatus::AcceptedOnChain).await;

@@ -3369,19 +3369,21 @@ async fn cancelling_agreements_are_listed_until_their_cancel_fails_too_often() {
         IndexingAgreementId::from_bytes([0xaa, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
     let expired = fixture_agreement(0xcc);
 
-    for id in [created, accepted] {
+    for id in [created, accepted, expired] {
         registry
             .mark_indexing_agreement_as_cancelling(&id)
             .await
-            .expect("a live agreement can be marked cancelling");
+            .expect("an agreement that may be live can be marked cancelling");
     }
-    for id in [ended, expired] {
-        let result = registry.mark_indexing_agreement_as_cancelling(&id).await;
-        assert!(
-            matches!(result, Err(Error::NoRecordsUpdated)),
-            "got {result:?}"
-        );
-    }
+    let result = registry.mark_indexing_agreement_as_cancelling(&ended).await;
+    assert!(
+        matches!(result, Err(Error::NoRecordsUpdated)),
+        "got {result:?}"
+    );
+    registry
+        .mark_indexing_agreement_as_canceled_by_requester(&expired)
+        .await
+        .expect("leave 2 cancelling");
     registry
         .record_accepted_audit(&accepted, 1_700_000_000, "0xacc")
         .await
