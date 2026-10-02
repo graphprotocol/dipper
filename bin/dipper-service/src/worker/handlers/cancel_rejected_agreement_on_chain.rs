@@ -11,7 +11,7 @@ use std::{
 use dipper_core::ids::IndexingAgreementId;
 
 use crate::{
-    cancel_dispatch::cancel_agreement_on_chain,
+    cancel_dispatch::{LiveCancel, cancel_agreement_on_chain, cancel_if_live},
     chain_client::{ChainClient, ChainClientError},
     config::IndexingAgreementConfig,
     registry::{AgreementRegistry, IndexingAgreement, IndexingAgreementStatus},
@@ -190,25 +190,32 @@ where
         );
         return Ok(());
     };
-    if !live_on_chain(&ctx.chain_client, agreement).await? {
-        tracing::info!(
-            agreement_id = %agreement.id,
-            "Cancelled agreement is no longer live on-chain; nothing to cancel"
-        );
-        return Ok(());
-    }
-
-    match cancel_agreement_on_chain(&ctx.chain_client, agreement, &ctx.agreement_conf).await {
-        Ok(tx_hash) => {
+    match cancel_if_live(&ctx.chain_client, agreement, &ctx.agreement_conf).await {
+        LiveCancel::NotLive => {
+            tracing::info!(
+                agreement_id = %agreement.id,
+                "Cancelled agreement is no longer live on-chain; nothing to cancel"
+            );
+            Ok(())
+        }
+        LiveCancel::ReadFailed(err) => {
+            tracing::warn!(
+                agreement_id = %agreement.id,
+                error = %err,
+                "Failed to read whether a cancelled agreement is live on-chain, will retry"
+            );
+            Err(JobError::Retryable(err.into(), Duration::from_secs(30)))
+        }
+        LiveCancel::Ended(tx_hash) => {
             let tx = tx_hash.map_or_else(|| "none".to_owned(), |hash| hash.to_string());
             log_caught_live_agreement(agreement, "cancelled", &tx);
             Ok(())
         }
-        Err(err @ ChainClientError::MissingTermsVersionHash { .. }) => {
+        LiveCancel::CancelFailed(err @ ChainClientError::MissingTermsVersionHash { .. }) => {
             log_caught_live_agreement(agreement, "cancel_impossible", &err.to_string());
             Err(JobError::Fatal(err.into()))
         }
-        Err(err) => {
+        LiveCancel::CancelFailed(err) => {
             log_caught_live_agreement(agreement, "cancel_failed", &err.to_string());
             Err(JobError::Retryable(err.into(), Duration::from_secs(30)))
         }
@@ -228,24 +235,6 @@ fn log_caught_live_agreement(agreement: &IndexingAgreement, outcome: &str, detai
         detail,
         "Agreement dipper had cancelled is live on-chain"
     );
-}
-
-/// Read the chain for whether the agreement is still live; a failed read retries.
-async fn live_on_chain<T: ChainClient>(
-    chain_client: &T,
-    agreement: &IndexingAgreement,
-) -> JobResult<bool> {
-    chain_client
-        .agreement_still_active(agreement.id.as_bytes())
-        .await
-        .map_err(|err| {
-            tracing::warn!(
-                agreement_id = %agreement.id,
-                error = %err,
-                "Failed to read whether a cancelled agreement is live on-chain, will retry"
-            );
-            JobError::Retryable(err.into(), Duration::from_secs(30))
-        })
 }
 
 /// Flip the row to CanceledByRequester once the chain shows it cancelled. A failure

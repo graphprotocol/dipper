@@ -23,7 +23,7 @@ use thegraph_core::{DeploymentId, alloy::primitives::ChainId};
 use url::Url;
 
 use crate::{
-    cancel_dispatch::cancel_agreement_on_chain,
+    cancel_dispatch::{LiveCancel, cancel_if_live},
     chain_client::{ChainClient, ChainClientError, decode_revert_reason},
     config::IndexingAgreementConfig,
     indexer_rpc_client::into_sol_rca,
@@ -232,16 +232,9 @@ async fn withdraw_offer_if_stored<R, T: ChainClient>(
     ctx: &Ctx<R, T>,
     agreement: &IndexingAgreement,
 ) -> JobResult<()> {
-    let stored = ctx
-        .chain_client
-        .agreement_still_active(agreement.id.as_bytes())
-        .await
-        .map_err(|err| retry_withdraw(agreement, err))?;
-    if !stored {
-        return Ok(());
-    }
-    match cancel_agreement_on_chain(&ctx.chain_client, agreement, &ctx.agreement_conf).await {
-        Ok(tx_hash) => {
+    match cancel_if_live(&ctx.chain_client, agreement, &ctx.agreement_conf).await {
+        LiveCancel::NotLive => Ok(()),
+        LiveCancel::Ended(tx_hash) => {
             tracing::info!(
                 agreement_id = %agreement.id,
                 tx_hash = ?tx_hash,
@@ -249,7 +242,7 @@ async fn withdraw_offer_if_stored<R, T: ChainClient>(
             );
             Ok(())
         }
-        Err(err @ ChainClientError::MissingTermsVersionHash { .. }) => {
+        LiveCancel::CancelFailed(err @ ChainClientError::MissingTermsVersionHash { .. }) => {
             tracing::error!(
                 agreement_id = %agreement.id,
                 error = %err,
@@ -257,7 +250,9 @@ async fn withdraw_offer_if_stored<R, T: ChainClient>(
             );
             Err(JobError::Fatal(err.into()))
         }
-        Err(err) => Err(retry_withdraw(agreement, err)),
+        LiveCancel::ReadFailed(err) | LiveCancel::CancelFailed(err) => {
+            Err(retry_withdraw(agreement, err))
+        }
     }
 }
 
