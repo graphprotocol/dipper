@@ -128,6 +128,13 @@ pub trait ChainClient {
         agreement_id: &[u8; 16],
     ) -> Result<bool, ChainClientError>;
 
+    /// Read whether the indexer ended the agreement on-chain, which `getAgreementDetails`
+    /// reports with its BY_PROVIDER flag. False for one still live or ended by dipper.
+    async fn agreement_ended_by_indexer(
+        &self,
+        agreement_id: &[u8; 16],
+    ) -> Result<bool, ChainClientError>;
+
     /// Read the latest block's unix timestamp from the chain. Lets agreement
     /// deadlines be stamped from live chain time when the chain-clock bypass is
     /// on, instead of a cached listener timestamp that can lag a fast chain.
@@ -180,6 +187,13 @@ impl<T: ChainClient + Send + Sync + ?Sized> ChainClient for Arc<T> {
         agreement_id: &[u8; 16],
     ) -> Result<bool, ChainClientError> {
         (**self).agreement_still_active(agreement_id).await
+    }
+
+    async fn agreement_ended_by_indexer(
+        &self,
+        agreement_id: &[u8; 16],
+    ) -> Result<bool, ChainClientError> {
+        (**self).agreement_ended_by_indexer(agreement_id).await
     }
 
     async fn latest_block_timestamp(&self) -> Result<u64, ChainClientError> {

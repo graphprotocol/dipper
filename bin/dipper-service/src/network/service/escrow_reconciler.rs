@@ -698,6 +698,12 @@ mod tests {
         ) -> Result<bool, ChainClientError> {
             unimplemented!()
         }
+        async fn agreement_ended_by_indexer(
+            &self,
+            _agreement_id: &[u8; 16],
+        ) -> Result<bool, ChainClientError> {
+            Ok(false)
+        }
         async fn reconcile_agreement(
             &self,
             _collector: Address,

@@ -280,6 +280,12 @@ pub(crate) mod tests {
             *self.active_reads.lock().unwrap() += 1;
             Ok(self.still_active_after_cancel)
         }
+        async fn agreement_ended_by_indexer(
+            &self,
+            _agreement_id: &[u8; 16],
+        ) -> Result<bool, ChainClientError> {
+            Ok(false)
+        }
     }
 
     fn manager_conf(collector: Address) -> IndexingAgreementConfig {

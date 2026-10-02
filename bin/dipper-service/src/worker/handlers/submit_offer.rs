@@ -418,6 +418,12 @@ mod tests {
         ) -> Result<bool, ChainClientError> {
             Ok(self.on_chain.load(Ordering::SeqCst))
         }
+        async fn agreement_ended_by_indexer(
+            &self,
+            _agreement_id: &[u8; 16],
+        ) -> Result<bool, ChainClientError> {
+            Ok(false)
+        }
         async fn latest_block_timestamp(&self) -> Result<u64, ChainClientError> {
             unimplemented!()
         }
