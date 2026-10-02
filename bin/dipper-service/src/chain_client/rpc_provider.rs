@@ -97,6 +97,10 @@ pub struct RpcProviderPool {
 
 impl RpcProviderPool {
     /// Create a new RPC provider pool. Errors if no providers are configured.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "predates this lint; fix when next touched"
+    )]
     pub fn new(
         providers: Vec<Url>,
         request_timeout: Duration,

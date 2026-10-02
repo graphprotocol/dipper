@@ -47,6 +47,10 @@ pub struct Ctx<R, W> {
 /// Create a new expiration service: a control handle plus a future to spawn
 /// that periodically queries for `Created` agreements past their deadline,
 /// marks them `Expired`, and queues reassessment jobs.
+#[expect(
+    clippy::too_many_lines,
+    reason = "predates this lint; fix when next touched"
+)]
 pub fn new<R, W>(ctx: Ctx<R, W>) -> (Handle, impl Future<Output = anyhow::Result<()>>)
 where
     R: AgreementRegistry

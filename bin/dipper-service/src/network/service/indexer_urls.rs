@@ -153,6 +153,10 @@ fn parse_indexer_entry(entry: &IndexerEntity) -> Option<(IndexerId, Url)> {
 /// Create a new indexer URLs service: refetches the full set of registered
 /// indexers at regular intervals and publishes the result. Failed or empty
 /// refreshes preserve the previous snapshot.
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "predates this lint; fix when next touched"
+)]
 pub fn new(ctx: Ctx, init: Snapshot) -> (Handle, impl Future<Output = anyhow::Result<()>>) {
     let (tx_stop, mut rx_stop) = mpsc::channel(1);
     let (tx_snapshot, rx_snapshot) = watch::channel(init);

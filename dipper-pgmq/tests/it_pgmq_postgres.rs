@@ -8,6 +8,10 @@ use sqlx::{Pool, Postgres};
 /// Initialize a temporary database for integration testing: spins up a temp
 /// Postgres, runs the migrations, and returns the connection pool and the
 /// temporary database guard.
+#[expect(
+    clippy::expect_used,
+    reason = "predates this lint; fix when next touched"
+)]
 async fn temp_pgmq_db() -> (Pool<Postgres>, PgTempDB) {
     let temp_db = PgTempDB::new();
     let db = Pool::connect(&temp_db.connection_uri())
@@ -350,6 +354,10 @@ async fn failed_job_rescheduled_for_future() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "predates this lint; fix when next touched"
+)]
 async fn custom_max_retries_sets_max_attempts() {
     //* Given
     let (db, _temp_db) = temp_pgmq_db().await;
@@ -418,6 +426,10 @@ async fn default_max_attempts_value() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "predates this lint; fix when next touched"
+)]
 async fn max_retries_with_scheduled_job() {
     //* Given
     let (db, _temp_db) = temp_pgmq_db().await;
@@ -451,6 +463,10 @@ async fn max_retries_with_scheduled_job() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "predates this lint; fix when next touched"
+)]
 async fn pop_marks_only_one_row_running_with_multiple_queued() {
     // Regression: the previous pop used `WHERE id IN (subquery)` with FOR UPDATE
     // SKIP LOCKED inside, which Postgres re-ran per outer row and marked every

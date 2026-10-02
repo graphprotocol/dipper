@@ -55,6 +55,11 @@ const TEARDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(75);
 const STOP_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[tokio::main]
+#[expect(
+    clippy::expect_used,
+    clippy::too_many_lines,
+    reason = "predates this lint; fix when next touched"
+)]
 pub async fn main() -> anyhow::Result<()> {
     // Set up logging
     tracing_subscriber::fmt()

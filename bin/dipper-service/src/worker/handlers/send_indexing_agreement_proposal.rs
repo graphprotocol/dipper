@@ -45,6 +45,12 @@ pub struct Message {
 /// - `Reject`: The indexer explicitly rejected the proposal. Agreement is marked
 ///   `Rejected` and the indexing request is reassessed to find replacement indexers.
 /// - Network error / no response: Agreement is marked `Unresponsive` and reassessed.
+#[expect(
+    clippy::cognitive_complexity,
+    clippy::too_many_lines,
+    clippy::unwrap_used,
+    reason = "predates this lint; fix when next touched"
+)]
 pub async fn handle<R, W, C>(
     ctx: Ctx<R, W, C>,
     Message {

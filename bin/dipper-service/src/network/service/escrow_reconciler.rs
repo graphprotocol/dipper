@@ -321,6 +321,10 @@ enum Outcome<T> {
 /// Agreements the manager still counts against a provider although the collector says
 /// nothing more can be claimed on them. Checks up to `limit` agreements from `cursor`,
 /// stopping once `max_ended` are found; the rest, and any unreadable, wait for later sweeps.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "predates this lint; fix when next touched"
+)]
 async fn ended_agreements<T>(
     chain_client: &T,
     collector: Address,
@@ -413,6 +417,10 @@ fn hex_id(id: &[u8; 16]) -> String {
 
 /// Call `reconcileAgreement` for each ended agreement, so the manager drops it and starts
 /// releasing its escrow. One failure never aborts the rest; a later sweep finds it again.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "predates this lint; fix when next touched"
+)]
 async fn release_agreements<T>(
     chain_client: &T,
     rx_stop: &mut mpsc::Receiver<()>,
@@ -455,6 +463,10 @@ where
 
 /// Call `reconcileProvider` once per distinct provider. One failed tx never aborts
 /// the sweep: the next provider runs and the failed one is picked up by a later sweep.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "predates this lint; fix when next touched"
+)]
 async fn reconcile_providers<T>(
     chain_client: &T,
     rx_stop: &mut mpsc::Receiver<()>,
@@ -623,6 +635,10 @@ mod tests {
                 .map_or(0, |ids| ids.len() as u64))
         }
 
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "predates this lint; fix when next touched"
+        )]
         async fn tracked_agreement_at(
             &self,
             _collector: Address,

@@ -22,6 +22,10 @@ pub struct Config {
     pub ipfs_url: Url,
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "predates this lint; fix when next touched"
+)]
 fn default_ipfs_url() -> Url {
     crate::chain::DEFAULT_IPFS_URL
         .parse()

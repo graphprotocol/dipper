@@ -58,6 +58,10 @@ impl Shutdown {
 /// Drains `task_tree`. A task finishing before shutdown was requested, and any failure or panic
 /// at all (a crash mid-teardown must never read as clean), is fatal: shutdown is requested, the
 /// drain continues, and the result is `Err`. `teardown_grace` bounds the whole teardown.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "predates this lint; fix when next touched"
+)]
 pub async fn supervise(
     mut task_tree: JoinSet<anyhow::Result<()>>,
     shutdown: &Shutdown,

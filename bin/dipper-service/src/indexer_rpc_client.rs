@@ -96,6 +96,10 @@ impl DipsIndexerClient {
     /// Sign the RCA over the RecurringCollector EIP-712 domain so the indexer
     /// recovers this signer. The typed-data hash carries the 0x1901 prefix, so
     /// no EIP-191 message prefix is applied.
+    #[expect(
+        clippy::expect_used,
+        reason = "predates this lint; fix when next touched"
+    )]
     fn sign_rca(&self, rca: &sol::RecurringCollectionAgreement) -> Result<Vec<u8>, DipsError> {
         let domain = self
             .rca_domain
@@ -188,6 +192,10 @@ fn calculate_retry_delay(attempt: u32) -> Duration {
 ///
 /// Note: `get_client` errors (e.g., invalid URL) are NOT retried - they fail immediately.
 /// This is intentional since URL parsing errors are permanent, not transient.
+#[expect(
+    clippy::expect_used,
+    reason = "predates this lint; fix when next touched"
+)]
 async fn with_retry<C, F, Fut, T>(
     max_retries: u32,
     indexer: &Url,

@@ -117,6 +117,11 @@ impl RegistryProvider {
 
 #[async_trait]
 impl IndexingRequestRegistry for RegistryProvider {
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "predates this lint; fix when next touched"
+    )]
     async fn set_indexing_target_candidates(
         &self,
         requested_by: Address,

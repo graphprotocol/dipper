@@ -28,3 +28,6 @@ serde_json.workspace = true
 thegraph-core = { workspace = true, features = ["fake"] }
 tokio = { workspace = true, features = ["macros", "test-util"] }
 uuid.workspace = true
+
+[lints]
+workspace = true

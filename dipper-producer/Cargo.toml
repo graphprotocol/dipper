@@ -25,9 +25,8 @@ webpki-roots = "1.0.8"
 [target.'cfg(gen_event_proto)'.build-dependencies]
 prost-build = "0.14.4"
 
-[lints.rust]
-# Allow the gen_event_proto cfg flag used for conditional protobuf code generation
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(gen_event_proto)'] }
+[lints]
+workspace = true
 
 [build-dependencies]
 prost-build = "0.14.4"
