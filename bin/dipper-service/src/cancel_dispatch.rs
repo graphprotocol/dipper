@@ -173,6 +173,51 @@ async fn record_cancel<R: AgreementRegistry + Sync>(
     }
 }
 
+/// Move an agreement dipper had already rejected or cancelled back into `Cancelling` when the
+/// chain shows it live after all, so the cancel retry ends it. The chain is read first, so a
+/// subgraph report from before dipper's cancel landed reopens nothing; an unreadable chain
+/// reopens it anyway, as the retry reads again before sending. True if it was reopened.
+pub async fn reopen_if_live<R, T>(
+    registry: &R,
+    chain_client: &T,
+    agreement: &IndexingAgreement,
+) -> RegistryResult<bool>
+where
+    R: AgreementRegistry + Sync,
+    T: ChainClient,
+{
+    match chain_client
+        .agreement_still_active(agreement.id.as_bytes())
+        .await
+    {
+        Ok(false) => return Ok(false),
+        Ok(true) => {}
+        Err(err) => tracing::warn!(
+            agreement_id = %agreement.id,
+            error = %err,
+            "Failed to read an ended agreement reported live; the cancel retry checks it"
+        ),
+    }
+    match registry
+        .reopen_indexing_agreement_cancel(&agreement.id)
+        .await
+    {
+        Ok(()) => {}
+        Err(crate::registry::Error::NoRecordsUpdated) => return Ok(false),
+        Err(err) => return Err(err),
+    }
+    tracing::warn!(
+        agreement_id = %agreement.id,
+        indexer_id = %agreement.indexer.id,
+        indexing_request_id = %agreement.indexing_request_id,
+        old_status = %agreement.status,
+        new_status = "CANCELLING",
+        reason = "live_on_chain_after_end",
+        "agreement state transition"
+    );
+    Ok(true)
+}
+
 /// What [`cancel_if_live`] found and did.
 #[derive(Debug)]
 pub enum LiveCancel {

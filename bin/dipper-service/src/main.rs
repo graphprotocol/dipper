@@ -522,7 +522,6 @@ pub async fn main() -> anyhow::Result<()> {
 
             let ctx = network::service::chain_listener::Ctx {
                 registry: registry.clone(),
-                worker_queue: worker_handle.queue().clone(),
                 event_source,
                 chain_client: chain_client.clone(),
                 agreement_conf: chain_listener_agreement_conf.clone(),

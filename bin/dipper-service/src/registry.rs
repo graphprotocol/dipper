@@ -401,6 +401,16 @@ impl AgreementRegistry for RegistryProvider {
             .map_err(Into::into)
     }
 
+    async fn reopen_indexing_agreement_cancel(
+        &self,
+        id: &IndexingAgreementId,
+    ) -> RegistryResult<()> {
+        self.inner
+            .reopen_indexing_agreement_cancel(id)
+            .await
+            .map_err(Into::into)
+    }
+
     async fn get_cancelling_agreements(
         &self,
         batch_size: i64,

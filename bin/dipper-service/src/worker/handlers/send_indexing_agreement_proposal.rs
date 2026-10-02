@@ -529,6 +529,13 @@ mod tests {
             Ok(())
         }
 
+        async fn reopen_indexing_agreement_cancel(
+            &self,
+            _id: &IndexingAgreementId,
+        ) -> crate::registry::Result<()> {
+            unimplemented!()
+        }
+
         async fn get_cancelling_agreements(
             &self,
             _batch_size: i64,
@@ -750,14 +757,6 @@ mod tests {
                 chain_id,
                 num_candidates,
             ));
-            Ok(JobId::default())
-        }
-
-        async fn cancel_rejected_agreement_on_chain(
-            &self,
-            _agreement_id: IndexingAgreementId,
-            _priority: JobPriority,
-        ) -> anyhow::Result<JobId> {
             Ok(JobId::default())
         }
 

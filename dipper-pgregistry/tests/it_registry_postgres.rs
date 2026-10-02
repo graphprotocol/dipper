@@ -3483,6 +3483,47 @@ async fn cancelling_agreements_are_listed_until_their_cancel_fails_too_often() {
 }
 
 #[tokio::test]
+async fn an_ended_agreement_found_live_on_chain_goes_back_to_cancelling() {
+    let (db, _temp_db) = temp_registry_db().await;
+    run_fixture(
+        &db,
+        include_str!("fixtures/0003_multi_indexer_agreements.sql"),
+    )
+    .await
+    .expect("Failed to run fixture");
+    let registry = PgRegistry::new(db);
+    let ended = fixture_agreement(0xaa);
+    let accepted =
+        IndexingAgreementId::from_bytes([0xaa, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    registry
+        .mark_indexing_agreement_as_cancelling(&ended)
+        .await
+        .expect("mark cancelling");
+    assert_eq!(registry.record_cancel_check(&ended, 2).await.unwrap(), 2);
+    registry
+        .mark_indexing_agreement_as_canceled_by_requester(&ended)
+        .await
+        .expect("mark ended");
+
+    registry
+        .reopen_indexing_agreement_cancel(&ended)
+        .await
+        .expect("an ended agreement can be reopened");
+
+    let listed = registry
+        .get_cancelling_agreements(100, 1, 0)
+        .await
+        .expect("cancelling query");
+    let ids: Vec<_> = listed.iter().map(|row| row.agreement.id).collect();
+    assert_eq!(ids, vec![ended], "its cancel attempts start afresh");
+    let still_wanted = registry.reopen_indexing_agreement_cancel(&accepted).await;
+    assert!(
+        matches!(still_wanted, Err(Error::NoRecordsUpdated)),
+        "got {still_wanted:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_cancelling_agreement_stays_live_and_unannounced_until_it_ends() {
     let (db, _temp_db) = temp_registry_db().await;
     run_fixture(

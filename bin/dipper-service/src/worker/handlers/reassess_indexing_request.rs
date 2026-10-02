@@ -932,15 +932,6 @@ mod lifecycle_event_tests {
             unimplemented!("not exercised by reassess handler")
         }
 
-        async fn cancel_rejected_agreement_on_chain(
-            &self,
-            agreement_id: IndexingAgreementId,
-            _priority: crate::worker::queue::JobPriority,
-        ) -> anyhow::Result<crate::worker::queue::JobId> {
-            self.cancels_queued.lock().unwrap().push(agreement_id);
-            Ok(crate::worker::queue::JobId::default())
-        }
-
         async fn submit_offer(
             &self,
             _agreement_id: IndexingAgreementId,
@@ -1207,6 +1198,13 @@ mod lifecycle_event_tests {
         ) -> RegistryResult<()> {
             self.marked_cancelling.lock().unwrap().push(*id);
             Ok(())
+        }
+
+        async fn reopen_indexing_agreement_cancel(
+            &self,
+            _id: &IndexingAgreementId,
+        ) -> crate::registry::Result<()> {
+            unimplemented!()
         }
 
         async fn get_cancelling_agreements(

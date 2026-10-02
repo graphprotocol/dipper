@@ -273,6 +273,14 @@ pub trait AgreementRegistry {
         id: &IndexingAgreementId,
     ) -> RegistryResult<()>;
 
+    /// Move a `CANCELED_BY_REQUESTER` or `REJECTED` agreement the chain shows live back to
+    /// `CANCELLING`, its cancel attempts reset; [`NoRecordUpdated`](Error::NoRecordsUpdated)
+    /// otherwise.
+    async fn reopen_indexing_agreement_cancel(
+        &self,
+        id: &IndexingAgreementId,
+    ) -> RegistryResult<()>;
+
     /// `CANCELLING` agreements marked over `min_age_minutes` ago whose cancel has failed
     /// fewer than `max_attempts` times, those checked longest ago first. One that may be paying
     /// an indexer (accepted, or past the offer deadline, which only an accepted one outlives)

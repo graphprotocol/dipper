@@ -538,13 +538,6 @@ mod tests {
         ) -> anyhow::Result<JobId> {
             Ok(JobId::default())
         }
-        async fn cancel_rejected_agreement_on_chain(
-            &self,
-            _agreement_id: IndexingAgreementId,
-            _priority: JobPriority,
-        ) -> anyhow::Result<JobId> {
-            unimplemented!()
-        }
         async fn submit_offer(
             &self,
             _agreement_id: IndexingAgreementId,
