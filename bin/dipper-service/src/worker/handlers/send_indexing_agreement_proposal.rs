@@ -415,7 +415,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl AgreementRegistry for MockRegistry {
+    impl crate::registry::StubAgreementRegistry for MockRegistry {
         async fn get_indexing_agreement_by_id(
             &self,
             _id: &IndexingAgreementId,
@@ -527,30 +527,6 @@ mod tests {
             _id: &IndexingAgreementId,
         ) -> crate::registry::Result<()> {
             Ok(())
-        }
-
-        async fn reopen_indexing_agreement_cancel(
-            &self,
-            _id: &IndexingAgreementId,
-        ) -> crate::registry::Result<()> {
-            unimplemented!()
-        }
-
-        async fn get_cancelling_agreements(
-            &self,
-            _batch_size: i64,
-            _max_attempts: u32,
-            _min_age_minutes: i32,
-        ) -> crate::registry::Result<Vec<crate::registry::CancellingAgreement>> {
-            Ok(Vec::new())
-        }
-
-        async fn record_cancel_check(
-            &self,
-            _id: &IndexingAgreementId,
-            failed_attempts: u32,
-        ) -> crate::registry::Result<u32> {
-            Ok(failed_attempts)
         }
 
         async fn apply_reconciliation(

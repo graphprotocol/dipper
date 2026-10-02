@@ -2063,7 +2063,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl AgreementRegistry for MockRegistry {
+    impl crate::registry::StubAgreementRegistry for MockRegistry {
         async fn get_indexing_agreement_by_id(
             &self,
             id: &IndexingAgreementId,
@@ -2200,23 +2200,6 @@ mod tests {
             Ok(())
         }
 
-        async fn get_cancelling_agreements(
-            &self,
-            _batch_size: i64,
-            _max_attempts: u32,
-            _min_age_minutes: i32,
-        ) -> RegistryResult<Vec<crate::registry::CancellingAgreement>> {
-            Ok(Vec::new())
-        }
-
-        async fn record_cancel_check(
-            &self,
-            _id: &IndexingAgreementId,
-            failed_attempts: u32,
-        ) -> RegistryResult<u32> {
-            Ok(failed_attempts)
-        }
-
         async fn record_cancel_audit(
             &self,
             agreement_id: &IndexingAgreementId,
@@ -2345,9 +2328,13 @@ mod tests {
             }
             let mut outcomes = std::collections::HashMap::with_capacity(items.len());
             for item in items {
-                let outcome = self
-                    .apply_reconciliation(&item.agreement_id, item.apply_accept, item.cancel)
-                    .await?;
+                let outcome = crate::registry::StubAgreementRegistry::apply_reconciliation(
+                    self,
+                    &item.agreement_id,
+                    item.apply_accept,
+                    item.cancel,
+                )
+                .await?;
                 outcomes.insert(item.agreement_id, outcome);
             }
             Ok(outcomes)

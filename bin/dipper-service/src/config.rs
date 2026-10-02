@@ -1204,7 +1204,7 @@ pub struct IndexingAgreementConfig {
 
 #[cfg(test)]
 impl IndexingAgreementConfig {
-    /// Zero addresses and limits, with permissive breaker and cache settings, for tests
+    /// Addresses and limits all set to 0, with permissive breaker and cache settings, for tests
     /// to adjust the fields they care about.
     pub fn for_tests() -> Self {
         Self {
