@@ -15,11 +15,16 @@ use crate::{
 /// retrying it and leaves it to an operator. An unreachable chain doesn't count.
 pub const MAX_CANCEL_ATTEMPTS: u32 = 10;
 
-/// Agreements checked per sweep; the rest wait for the next one.
-const BATCH_SIZE: i64 = 100;
+/// Agreements checked per sweep, those checked longest ago first. Each can wait up to
+/// 15 s for a cancel to be mined, holding up the chain listener meanwhile.
+const BATCH_SIZE: i64 = 10;
 
-/// Retry the cancel of every agreement still `Cancelling`. `chain_now`, in chain
-/// seconds, decides when an offer that was never accepted no longer can be.
+/// Minutes an agreement stays out of the retry after it is marked, so the cancel sent
+/// when it was marked can be mined first instead of being sent again.
+const SETTLE_MINUTES: i32 = 2;
+
+/// Retry the cancel of agreements still `Cancelling`. `chain_now`, in chain seconds,
+/// decides when an offer that was never accepted no longer can be.
 pub async fn retry_cancelling_agreements<R, T>(
     registry: &R,
     chain_client: &T,
@@ -30,7 +35,7 @@ pub async fn retry_cancelling_agreements<R, T>(
     T: ChainClient,
 {
     let cancelling = match registry
-        .get_cancelling_agreements(BATCH_SIZE, MAX_CANCEL_ATTEMPTS)
+        .get_cancelling_agreements(BATCH_SIZE, MAX_CANCEL_ATTEMPTS, SETTLE_MINUTES)
         .await
     {
         Ok(cancelling) => cancelling,
@@ -55,23 +60,30 @@ async fn retry_cancel<R, T>(
     T: ChainClient,
 {
     let agreement_id = row.agreement.id;
-    match cancel_if_live(chain_client, &row.agreement, config).await {
-        LiveCancel::ReadFailed(err) => tracing::warn!(
-            %agreement_id,
-            error = %err,
-            "Failed to read a cancelling agreement on-chain, will retry"
-        ),
-        LiveCancel::NotLive => confirm_if_over(registry, config, row, None, chain_now).await,
+    let (tx_hash, failure) = match cancel_if_live(chain_client, &row.agreement, config).await {
+        LiveCancel::ReadFailed(err) => {
+            tracing::warn!(
+                %agreement_id,
+                error = %err,
+                "Failed to read a cancelling agreement on-chain, will retry"
+            );
+            (None, None)
+        }
+        LiveCancel::NotLive => (None, None),
         LiveCancel::Ended(tx_hash) => {
             tracing::info!(
                 %agreement_id,
                 tx_hash = ?tx_hash,
                 "Cancelled an agreement still live on-chain"
             );
-            confirm_if_over(registry, config, row, tx_hash, chain_now).await;
+            (tx_hash, None)
         }
-        LiveCancel::CancelFailed(err) => count_failed_cancel(registry, row, &err).await,
+        LiveCancel::CancelFailed(err) => (None, Some(err)),
+    };
+    if failure.is_none() && confirm_if_over(registry, config, row, tx_hash, chain_now).await {
+        return;
     }
+    note_check(registry, row, failure.as_ref()).await;
 }
 
 /// Mark the agreement `CanceledByRequester` once it can't go live again: this sweep's cancel
@@ -83,7 +95,7 @@ async fn confirm_if_over<R: AgreementRegistry + Sync>(
     row: &CancellingAgreement,
     tx_hash: Option<B256>,
     chain_now: u64,
-) {
+) -> bool {
     let agreement = &row.agreement;
     let can_confirm = if row.accepted_on_chain {
         tx_hash.is_some()
@@ -91,7 +103,7 @@ async fn confirm_if_over<R: AgreementRegistry + Sync>(
         chain_now > agreement.terms.deadline
     };
     if !can_confirm {
-        return;
+        return false;
     }
     if let Err(err) = registry
         .mark_indexing_agreement_as_canceled_by_requester(&agreement.id)
@@ -102,7 +114,7 @@ async fn confirm_if_over<R: AgreementRegistry + Sync>(
             error = %err,
             "Failed to mark an ended agreement cancelled, will retry"
         );
-        return;
+        return false;
     }
     tracing::info!(
         agreement_id = %agreement.id,
@@ -115,30 +127,40 @@ async fn confirm_if_over<R: AgreementRegistry + Sync>(
     if row.accepted_on_chain {
         record_cancel(registry, agreement, tx_hash, config).await;
     }
+    true
 }
 
-/// Count a cancel the chain answered without ending the agreement; past the limit,
-/// dipper gives up on it with an ERROR.
-async fn count_failed_cancel<R: AgreementRegistry + Sync>(
+/// Record that the agreement was checked and is still cancelling, counting a cancel the
+/// chain answered without ending it; past the limit, dipper gives up with an ERROR.
+async fn note_check<R: AgreementRegistry + Sync>(
     registry: &R,
     row: &CancellingAgreement,
-    err: &ChainClientError,
+    failure: Option<&ChainClientError>,
 ) {
     let agreement = &row.agreement;
-    if !cancel_does_not_work(err) {
+    let failed_attempts = u32::from(failure.is_some_and(cancel_does_not_work));
+    if let Some(err) = failure
+        && failed_attempts == 0
+    {
         tracing::warn!(
             agreement_id = %agreement.id,
             error = %err,
             "Failed to send the cancel of an agreement, will retry"
         );
-        return;
     }
-    match registry.record_cancel_attempt(&agreement.id).await {
-        Ok(attempts) => log_failed_cancel(agreement, attempts, err),
-        Err(record_err) => tracing::warn!(
+    match registry
+        .record_cancel_check(&agreement.id, failed_attempts)
+        .await
+    {
+        Ok(attempts) => {
+            if let Some(err) = failure.filter(|_| failed_attempts > 0) {
+                log_failed_cancel(agreement, attempts, err);
+            }
+        }
+        Err(err) => tracing::warn!(
             agreement_id = %agreement.id,
-            error = %record_err,
-            "Failed to count a failed cancel"
+            error = %err,
+            "Failed to record a check of a cancelling agreement"
         ),
     }
 }
@@ -203,6 +225,7 @@ mod tests {
         marked_cancelled: Mutex<Vec<IndexingAgreementId>>,
         audits: Mutex<Vec<Option<String>>>,
         attempts: AtomicU32,
+        checks: AtomicU32,
     }
 
     #[async_trait]
@@ -211,6 +234,7 @@ mod tests {
             &self,
             _batch_size: i64,
             _max_attempts: u32,
+            _min_age_minutes: i32,
         ) -> crate::registry::Result<Vec<CancellingAgreement>> {
             Ok(self.cancelling.clone())
         }
@@ -234,11 +258,13 @@ mod tests {
                 .push(canceled_tx.map(str::to_owned));
             Ok(())
         }
-        async fn record_cancel_attempt(
+        async fn record_cancel_check(
             &self,
             _id: &IndexingAgreementId,
+            failed_attempts: u32,
         ) -> crate::registry::Result<u32> {
-            Ok(self.attempts.fetch_add(1, Ordering::SeqCst) + 1)
+            self.checks.fetch_add(1, Ordering::SeqCst);
+            Ok(self.attempts.fetch_add(failed_attempts, Ordering::SeqCst) + failed_attempts)
         }
     }
 
@@ -378,6 +404,18 @@ mod tests {
 
         assert_eq!(chain.cancels_sent.load(Ordering::SeqCst), 1);
         assert!(registry.marked_cancelled.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn notes_each_check_that_leaves_an_agreement_cancelling() {
+        // So the next sweep starts with the agreements checked longest ago.
+        let registry = registry_with_one(false);
+        let chain = MockChain::default();
+
+        retry(&registry, &chain, DEADLINE).await;
+
+        assert_eq!(registry.checks.load(Ordering::SeqCst), 1);
+        assert_eq!(registry.attempts.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

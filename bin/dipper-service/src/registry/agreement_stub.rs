@@ -141,12 +141,17 @@ pub trait StubAgreementRegistry: Send + Sync {
         &self,
         _batch_size: i64,
         _max_attempts: u32,
+        _min_age_minutes: i32,
     ) -> Result<Vec<CancellingAgreement>> {
         Ok(Vec::new())
     }
 
-    async fn record_cancel_attempt(&self, _id: &IndexingAgreementId) -> Result<u32> {
-        Ok(1)
+    async fn record_cancel_check(
+        &self,
+        _id: &IndexingAgreementId,
+        failed_attempts: u32,
+    ) -> Result<u32> {
+        Ok(failed_attempts)
     }
 
     async fn apply_reconciliation(
@@ -439,12 +444,23 @@ impl<T: StubAgreementRegistry> AgreementRegistry for T {
         &self,
         batch_size: i64,
         max_attempts: u32,
+        min_age_minutes: i32,
     ) -> Result<Vec<CancellingAgreement>> {
-        StubAgreementRegistry::get_cancelling_agreements(self, batch_size, max_attempts).await
+        StubAgreementRegistry::get_cancelling_agreements(
+            self,
+            batch_size,
+            max_attempts,
+            min_age_minutes,
+        )
+        .await
     }
 
-    async fn record_cancel_attempt(&self, id: &IndexingAgreementId) -> Result<u32> {
-        StubAgreementRegistry::record_cancel_attempt(self, id).await
+    async fn record_cancel_check(
+        &self,
+        id: &IndexingAgreementId,
+        failed_attempts: u32,
+    ) -> Result<u32> {
+        StubAgreementRegistry::record_cancel_check(self, id, failed_attempts).await
     }
 
     async fn apply_reconciliation(

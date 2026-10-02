@@ -974,12 +974,13 @@ impl PgRegistry {
         .await
     }
 
-    /// `Cancelling` agreements whose cancel has failed fewer than `max_attempts` times,
-    /// longest waiting first.
+    /// `Cancelling` agreements marked over `min_age_minutes` ago whose cancel has failed
+    /// fewer than `max_attempts` times, those checked longest ago first.
     pub async fn get_cancelling_agreements(
         &self,
         batch_size: i64,
         max_attempts: u32,
+        min_age_minutes: i32,
     ) -> Result<Vec<CancellingAgreement>, Error> {
         sqlx::query_as(
             r#"
@@ -1001,35 +1002,42 @@ impl PgRegistry {
                 accepted_at,
                 cancel_attempts
             FROM dipper_reg_indexing_agreements
-            WHERE status = $1 AND cancel_attempts < $2
-            ORDER BY updated_at ASC
+            WHERE status = $1
+              AND cancel_attempts < $2
+              AND updated_at < timezone('UTC', now()) - make_interval(mins => $4)
+            ORDER BY cancel_checked_at ASC NULLS FIRST, updated_at ASC
             LIMIT $3
             "#,
         )
         .bind(IndexingAgreementStatus::Cancelling)
         .bind(i32::try_from(max_attempts).unwrap_or(i32::MAX))
         .bind(batch_size)
+        .bind(min_age_minutes)
         .fetch_all(&self.pool)
         .await
         .map_err(Into::into)
     }
 
-    /// Count a cancel that went out without ending a `Cancelling` agreement, returning
-    /// the new count.
-    pub async fn record_cancel_attempt(
+    /// Record a check of a `Cancelling` agreement that left it cancelling, adding
+    /// `failed_attempts` to its failed cancels and returning the new count.
+    pub async fn record_cancel_check(
         &self,
         agreement_id: &IndexingAgreementId,
+        failed_attempts: u32,
     ) -> Result<u32, Error> {
         let record: Option<(i32,)> = sqlx::query_as(
             r#"
             UPDATE dipper_reg_indexing_agreements
-            SET cancel_attempts = cancel_attempts + 1
+            SET
+                cancel_attempts = LEAST(cancel_attempts::BIGINT + $3, 2147483647)::INTEGER,
+                cancel_checked_at = timezone('UTC', now())
             WHERE id = $1 AND status = $2
             RETURNING cancel_attempts
             "#,
         )
         .bind(agreement_id)
         .bind(IndexingAgreementStatus::Cancelling)
+        .bind(i64::from(failed_attempts))
         .fetch_optional(&self.pool)
         .await?;
         let (attempts,) = record.ok_or(Error::NoRecordsUpdated)?;

@@ -3387,8 +3387,17 @@ async fn cancelling_agreements_are_listed_until_their_cancel_fails_too_often() {
         .await
         .expect("accept record");
 
+    let just_marked = registry
+        .get_cancelling_agreements(100, 2, 5)
+        .await
+        .expect("cancelling query");
+    assert!(
+        just_marked.is_empty(),
+        "one just marked waits for the cancel sent with the mark to be mined"
+    );
+
     let listed = registry
-        .get_cancelling_agreements(100, 2)
+        .get_cancelling_agreements(100, 2, 0)
         .await
         .expect("cancelling query");
     let mut seen: Vec<_> = listed
@@ -3410,10 +3419,22 @@ async fn cancelling_agreements_are_listed_until_their_cancel_fails_too_often() {
         ]
     );
 
-    assert_eq!(registry.record_cancel_attempt(&created).await.unwrap(), 1);
-    assert_eq!(registry.record_cancel_attempt(&created).await.unwrap(), 2);
+    assert_eq!(registry.record_cancel_check(&accepted, 0).await.unwrap(), 0);
     let listed = registry
-        .get_cancelling_agreements(100, 2)
+        .get_cancelling_agreements(100, 2, 0)
+        .await
+        .expect("cancelling query");
+    let ids: Vec<_> = listed.iter().map(|row| row.agreement.id).collect();
+    assert_eq!(
+        ids,
+        vec![created, accepted],
+        "one checked longest ago goes first"
+    );
+
+    assert_eq!(registry.record_cancel_check(&created, 1).await.unwrap(), 1);
+    assert_eq!(registry.record_cancel_check(&created, 1).await.unwrap(), 2);
+    let listed = registry
+        .get_cancelling_agreements(100, 2, 0)
         .await
         .expect("cancelling query");
     let ids: Vec<_> = listed.iter().map(|row| row.agreement.id).collect();
@@ -3424,7 +3445,7 @@ async fn cancelling_agreements_are_listed_until_their_cancel_fails_too_often() {
     );
 
     let not_cancelling = registry
-        .record_cancel_attempt(&fixture_agreement(0xbb))
+        .record_cancel_check(&fixture_agreement(0xbb), 1)
         .await;
     assert!(matches!(not_cancelling, Err(Error::NoRecordsUpdated)));
 }

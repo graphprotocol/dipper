@@ -405,10 +405,11 @@ impl AgreementRegistry for RegistryProvider {
         &self,
         batch_size: i64,
         max_attempts: u32,
+        min_age_minutes: i32,
     ) -> RegistryResult<Vec<CancellingAgreement>> {
         Ok(self
             .inner
-            .get_cancelling_agreements(batch_size, max_attempts)
+            .get_cancelling_agreements(batch_size, max_attempts, min_age_minutes)
             .await?
             .into_iter()
             .map(CancellingAgreement::try_from)
@@ -416,9 +417,13 @@ impl AgreementRegistry for RegistryProvider {
             .collect())
     }
 
-    async fn record_cancel_attempt(&self, id: &IndexingAgreementId) -> RegistryResult<u32> {
+    async fn record_cancel_check(
+        &self,
+        id: &IndexingAgreementId,
+        failed_attempts: u32,
+    ) -> RegistryResult<u32> {
         self.inner
-            .record_cancel_attempt(id)
+            .record_cancel_check(id, failed_attempts)
             .await
             .map_err(Into::into)
     }
