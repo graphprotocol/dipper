@@ -15,8 +15,9 @@ use crate::{
 /// leaves it to an operator. Other failures don't count (see `failed_attempts`).
 pub const MAX_CANCEL_ATTEMPTS: u32 = 10;
 
-/// Agreements checked per sweep, those checked longest ago first.
-const BATCH_SIZE: i64 = 10;
+/// Agreements a sweep takes on, those that may be paying an indexer first; the time budget
+/// below decides how many it gets through.
+const BATCH_SIZE: i64 = 50;
 
 /// Time a sweep may take before leaving the rest to the next one: it holds up the chain
 /// listener while it runs, and each cancel can wait up to 15 s to be mined.

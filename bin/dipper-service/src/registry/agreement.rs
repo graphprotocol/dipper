@@ -274,7 +274,8 @@ pub trait AgreementRegistry {
     ) -> RegistryResult<()>;
 
     /// `CANCELLING` agreements marked over `min_age_minutes` ago whose cancel has failed
-    /// fewer than `max_attempts` times, those checked longest ago first.
+    /// fewer than `max_attempts` times. Those that may be paying an indexer come first (accepted,
+    /// or past the offer deadline, which only an accepted one outlives), then those checked longest ago.
     async fn get_cancelling_agreements(
         &self,
         batch_size: i64,
