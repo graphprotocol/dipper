@@ -69,8 +69,9 @@ pub struct Ctx<R, W, I, T> {
     /// is true. `None` disables the bypass path even if the flag is set
     /// (handler falls back to wall clock with a warning).
     pub chain_listener_chain_id: Option<u64>,
-    /// Global reassess lock; only one reassessment runs at a time across all
-    /// worker loops (see `crate::worker::context::ReassessLock`).
+    /// Global reassess lock, taken exclusively: only one reassessment runs at a
+    /// time across all worker loops, and none while an offer is being submitted
+    /// (see `crate::worker::context::ReassessLock`).
     pub reassess_lock: crate::worker::context::ReassessLock,
     /// Mass-unresponsive circuit breaker (see its module).
     pub unresponsive_breaker: Arc<UnresponsiveBreaker>,
@@ -127,8 +128,10 @@ where
 {
     // Only one reassessment runs globally at a time; if another loop holds the
     // lock this pass would diff the same baseline, so defer ~1s rather than park
-    // this loop. Deferral isn't a failure: no backoff, no attempt count.
-    let _reassess_guard = match ctx.reassess_lock.try_lock() {
+    // this loop. An offer being submitted holds it shared, so this also waits for
+    // in-flight offers to land before deciding what to cancel. Deferral isn't a
+    // failure: no backoff, no attempt count.
+    let _reassess_guard = match ctx.reassess_lock.try_write() {
         Ok(guard) => guard,
         Err(_) => return Err(JobError::Deferred(Duration::from_secs(1))),
     };
@@ -1498,7 +1501,7 @@ mod lifecycle_event_tests {
             chain_listener_notify: Arc::new(tokio::sync::Notify::new()),
             bypass_chain_clock_defenses: false,
             chain_listener_chain_id: None,
-            reassess_lock: Arc::new(tokio::sync::Mutex::new(())),
+            reassess_lock: Arc::new(tokio::sync::RwLock::new(())),
             unresponsive_breaker: Arc::new(crate::worker::UnresponsiveBreaker::new()),
             dips_accepting_cache: crate::worker::DipsAcceptingCache::new(
                 std::time::Duration::from_secs(300),
@@ -1922,6 +1925,37 @@ mod lifecycle_event_tests {
             "only Proposed; never-accepted unpaired cancel emits no Terminated: {captured:?}"
         );
         assert!(matches!(captured[0], CapturedEvent::Proposed { .. }));
+    }
+
+    #[tokio::test]
+    async fn waits_while_an_offer_is_being_sent() {
+        // An offer job holds the lock shared from its status check until its offer
+        // lands. Deciding what to cancel now could slip a cancel in front of that
+        // offer, which would then land after it and stay open.
+        let ctx = build_ctx(
+            MockRegistry::default(),
+            MockIisa { selected: vec![] },
+            MockQueue::default(),
+            MockChainClient::default(),
+            CapturingEventsProducer::new(),
+            indexer_urls::Snapshot::new(),
+        );
+        let _offer = ctx
+            .reassess_lock
+            .clone()
+            .try_read_owned()
+            .expect("lock is free");
+
+        let result = handle(ctx, &test_message(0)).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(crate::worker::result::JobError::Deferred(delay))
+                    if delay == std::time::Duration::from_secs(1)
+            ),
+            "got {result:?}"
+        );
     }
 
     #[tokio::test]

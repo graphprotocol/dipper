@@ -431,7 +431,7 @@ pub async fn main() -> anyhow::Result<()> {
         }
 
         // A single global reassess lock, shared across all worker loops.
-        let reassess_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let reassess_lock = Arc::new(tokio::sync::RwLock::new(()));
         let unresponsive_breaker = Arc::new(worker::UnresponsiveBreaker::new());
         let dips_accepting_cache = worker::DipsAcceptingCache::new(std::time::Duration::from_secs(
             agreement_conf.dips_accepting_cache_ttl_seconds(),

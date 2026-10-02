@@ -619,14 +619,14 @@ where
                 }
             }
             Err(JobError::Deferred(delay)) => {
-                // Couldn't run now (another reassessment holds the global lock);
-                // re-queue at a flat delay without counting a failed attempt.
-                // Logged at info so sustained contention is visible per job id.
+                // Couldn't run now (the global reassess lock is busy, or pacing
+                // held it back); re-queue at a flat delay without counting a failed
+                // attempt. Logged at info so sustained contention is visible per job id.
                 let scheduled_for = OffsetDateTime::now_utc() + delay;
                 tracing::info!(
                     job = %job.id(),
                     delay_secs = %delay.as_secs(),
-                    "Deferring job; another reassessment holds the global lock, will retry"
+                    "Deferring job; it can't run yet, will retry"
                 );
                 if let Err(err) = job.reschedule(scheduled_for).await {
                     tracing::error!(error=?err, "Failed to reschedule deferred job");

@@ -26,7 +26,10 @@ use crate::{
     chain_client::{ChainClient, ChainClientError, decode_revert_reason},
     indexer_rpc_client::into_sol_rca,
     registry::{AgreementRegistry, IndexingAgreementStatus},
-    worker::result::{JobError, JobResult},
+    worker::{
+        context::ReassessLock,
+        result::{JobError, JobResult},
+    },
 };
 
 /// Backoff base for a tx the RPC accepted and then dropped from the mempool.
@@ -38,6 +41,8 @@ pub const TRANSIENT_RETRY_BASE: Duration = Duration::from_secs(30);
 pub struct Ctx<R, T> {
     pub registry: R,
     pub chain_client: T,
+    /// Taken shared while the offer is checked and sent (see `ReassessLock`).
+    pub reassess_lock: ReassessLock,
 }
 
 /// Submit an RCA offer on-chain.
@@ -68,6 +73,14 @@ where
     R: AgreementRegistry,
     T: ChainClient,
 {
+    // Held shared from the status check until the offer lands, so a reassessment
+    // can't decide to cancel this agreement in between. Its cancel then either
+    // comes after this offer (a later nonce from the same wallet) and withdraws
+    // it, or finished first and the check below sees the agreement cancelled.
+    let Ok(_reassess_guard) = ctx.reassess_lock.try_read() else {
+        return Err(JobError::Deferred(Duration::from_secs(1)));
+    };
+
     // Fetch the agreement. Skip silently if it's already been transitioned
     // out of Created (e.g. expired by the reassignment service).
     let agreement = match ctx
@@ -197,7 +210,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
     use thegraph_core::{
@@ -236,9 +249,13 @@ mod tests {
     }
 
     /// Yields the configured result once; a second call means the handler
-    /// retried inside one run, which must never happen.
+    /// retried inside one run, and a call with no result configured means the
+    /// handler sent when it must not. Records whether a reassessment could have
+    /// taken `reassess_lock` while the offer was being sent.
     struct MockChainClient {
         offer_result: Mutex<Option<Result<Option<B256>, ChainClientError>>>,
+        reassess_lock: ReassessLock,
+        reassessment_could_start_mid_send: Arc<Mutex<Option<bool>>>,
     }
 
     #[async_trait]
@@ -247,11 +264,13 @@ mod tests {
             &self,
             _rca: &dipper_rpc::indexer::indexer_client::sol::RecurringCollectionAgreement,
         ) -> Result<Option<B256>, ChainClientError> {
+            *self.reassessment_could_start_mid_send.lock().unwrap() =
+                Some(self.reassess_lock.try_write().is_ok());
             self.offer_result
                 .lock()
                 .unwrap()
                 .take()
-                .expect("offer_via_manager called more than once")
+                .expect("offer_via_manager called more than once, or when it must not send")
         }
         async fn cancel_via_manager(
             &self,
@@ -349,14 +368,106 @@ mod tests {
         agreement: IndexingAgreement,
         offer_result: Result<Option<B256>, ChainClientError>,
     ) -> Ctx<MockRegistry, MockChainClient> {
+        ctx_with_lock(agreement, Some(offer_result), ReassessLock::default())
+    }
+
+    /// `offer_result: None` makes any send panic.
+    fn ctx_with_lock(
+        agreement: IndexingAgreement,
+        offer_result: Option<Result<Option<B256>, ChainClientError>>,
+        reassess_lock: ReassessLock,
+    ) -> Ctx<MockRegistry, MockChainClient> {
         Ctx {
             registry: MockRegistry {
                 agreement: Some(agreement),
             },
             chain_client: MockChainClient {
-                offer_result: Mutex::new(Some(offer_result)),
+                offer_result: Mutex::new(offer_result),
+                reassess_lock: reassess_lock.clone(),
+                reassessment_could_start_mid_send: Arc::default(),
             },
+            reassess_lock,
         }
+    }
+
+    #[tokio::test]
+    async fn waits_without_sending_while_a_reassessment_holds_the_lock() {
+        //* Arrange - a reassessment holds the lock; no offer result is configured,
+        // so a send would panic
+        let agreement = make_test_agreement();
+        let message = make_message(agreement.id);
+        let lock = ReassessLock::default();
+        let _reassessment = lock.clone().try_write_owned().expect("lock is free");
+        let ctx = ctx_with_lock(agreement, None, lock);
+
+        //* Act
+        let result = handle(ctx, &message).await;
+
+        //* Assert - deferred, not failed, so it runs once the reassessment ends
+        assert!(
+            matches!(result, Err(JobError::Deferred(delay)) if delay == Duration::from_secs(1)),
+            "an offer must wait while a reassessment runs, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_reassessment_can_start_while_the_offer_is_sent() {
+        //* Arrange
+        let agreement = make_test_agreement();
+        let message = make_message(agreement.id);
+        let ctx = ctx_with_offer_result(agreement, Ok(Some(B256::repeat_byte(0xab))));
+        let lock = ctx.reassess_lock.clone();
+        let could_start = ctx.chain_client.reassessment_could_start_mid_send.clone();
+
+        //* Act
+        let result = handle(ctx, &message).await;
+
+        //* Assert - the lock was held during the send and is free once the job ends
+        assert!(result.is_ok(), "got {result:?}");
+        assert_eq!(
+            *could_start.lock().unwrap(),
+            Some(false),
+            "a reassessment must not be able to start while the offer is sent"
+        );
+        assert!(
+            lock.try_write().is_ok(),
+            "the job must release the lock when it ends"
+        );
+    }
+
+    #[tokio::test]
+    async fn sends_alongside_another_offer() {
+        //* Arrange - another offer job holds the lock shared
+        let agreement = make_test_agreement();
+        let message = make_message(agreement.id);
+        let lock = ReassessLock::default();
+        let _other_offer = lock.clone().try_read_owned().expect("lock is free");
+        let ctx = ctx_with_lock(agreement, Some(Ok(Some(B256::repeat_byte(0xab)))), lock);
+
+        //* Act
+        let result = handle(ctx, &message).await;
+
+        //* Assert
+        assert!(
+            result.is_ok(),
+            "offers must not wait for each other, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn skips_an_agreement_a_reassessment_already_cancelled() {
+        //* Arrange - the reassessment ran first and cancelled the agreement; no offer
+        // result is configured, so a send would panic
+        let mut agreement = make_test_agreement();
+        agreement.status = IndexingAgreementStatus::CanceledByRequester;
+        let message = make_message(agreement.id);
+        let ctx = ctx_with_lock(agreement, None, ReassessLock::default());
+
+        //* Act
+        let result = handle(ctx, &message).await;
+
+        //* Assert
+        assert!(result.is_ok(), "got {result:?}");
     }
 
     #[tokio::test]
