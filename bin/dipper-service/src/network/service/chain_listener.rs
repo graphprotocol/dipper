@@ -957,9 +957,10 @@ where
     }
 }
 
-/// How long after an offer's deadline dipper's cancel can still have raced an
-/// accept the listener hadn't caught up with.
-const LISTENER_LAG_SLACK_SECS: i64 = 3_600;
+/// When v0.1.10, the first release that announces lifecycle events, came out (2026-08-11
+/// UTC). Agreements dipper created before then are never announced, even when a replay of
+/// the chain reads them again.
+const LIFECYCLE_EVENTS_START: i64 = 1_786_406_400;
 
 /// Record the accept and cancel of an agreement dipper had already marked
 /// cancelled that went live on-chain first, so its accepted and terminated
@@ -970,7 +971,7 @@ async fn record_accept_and_cancel_from_chain<R: AgreementRegistry + Sync>(
     agreement: &IndexingAgreement,
     registry: &R,
 ) {
-    if snapshot.accepted_at == 0 || !cancelled_while_offer_open(agreement) {
+    if snapshot.accepted_at == 0 || !created_after_events_started(agreement) {
         return;
     }
     let canceled_by = snapshot.canceled_by.to_string();
@@ -1000,12 +1001,10 @@ async fn record_accept_and_cancel_from_chain<R: AgreementRegistry + Sync>(
     }
 }
 
-/// Whether dipper cancelled the agreement while its offer could still be accepted,
-/// so an accept on-chain may have slipped past it. One accepted before lifecycle
-/// events existed was cancelled long after its deadline and is never announced.
-fn cancelled_while_offer_open(agreement: &IndexingAgreement) -> bool {
-    let deadline = i64::try_from(agreement.terms.deadline).unwrap_or(i64::MAX);
-    agreement.updated_at.unix_timestamp() <= deadline.saturating_add(LISTENER_LAG_SLACK_SECS)
+/// Whether dipper created the agreement once it announced lifecycle events. Its own clock
+/// at creation, unlike any read of the chain, doesn't depend on how far the listener lags.
+fn created_after_events_started(agreement: &IndexingAgreement) -> bool {
+    agreement.created_at.unix_timestamp() >= LIFECYCLE_EVENTS_START
 }
 
 /// Safety net for an agreement dipper cancelled whose offer the indexer accepted
@@ -2034,6 +2033,12 @@ mod tests {
             if let Some(a) = self.state.lock().unwrap().agreements.get_mut(&agreement_id) {
                 let deadline = OffsetDateTime::now_utc().unix_timestamp() + secs;
                 a.terms.deadline = u64::try_from(deadline).unwrap();
+            }
+        }
+
+        fn set_agreement_created_at(&self, agreement_id: IndexingAgreementId, unix: i64) {
+            if let Some(a) = self.state.lock().unwrap().agreements.get_mut(&agreement_id) {
+                a.created_at = OffsetDateTime::from_unix_timestamp(unix).unwrap();
             }
         }
 
@@ -3164,8 +3169,9 @@ mod tests {
         let worker_queue = MockWorkerQueue::default();
         let agreement_id = IndexingAgreementId::from_bytes(rand::random());
         registry.add_agreement(agreement_id, IndexingAgreementStatus::CanceledByRequester);
-        // Dipper cancelled it while its offer could still be accepted.
-        registry.set_agreement_deadline_from_now(agreement_id, 600);
+        // The listener lagged: dipper only cancelled it locally long after the offer's
+        // deadline, which once made this accept look too old to announce.
+        registry.set_agreement_deadline_from_now(agreement_id, -2 * 86_400);
 
         let snapshot = make_snapshot(agreement_id, AgreementState::CanceledByPayer, Address::ZERO);
         let result = reconcile_agreement(
@@ -3193,7 +3199,6 @@ mod tests {
         let worker_queue = MockWorkerQueue::default();
         let agreement_id = IndexingAgreementId::from_bytes(rand::random());
         registry.add_agreement(agreement_id, IndexingAgreementStatus::CanceledByRequester);
-        registry.set_agreement_deadline_from_now(agreement_id, 600);
         registry.state.lock().unwrap().fail_cancel_audit = true;
 
         let snapshot = make_snapshot(agreement_id, AgreementState::CanceledByPayer, Address::ZERO);
@@ -3212,15 +3217,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_reconcile_does_not_announce_an_agreement_accepted_before_events_existed() {
-        // Agreements accepted before lifecycle events existed have no recorded
-        // accept and are never announced. Dipper cancelled this one long after its
-        // offer's deadline, so it can't be an accept dipper missed.
+        // Agreements created before lifecycle events existed have no recorded accept
+        // and are never announced, even when a replay of the chain reads them again.
         let registry = MockRegistry::new();
         let chain_client = MockChainClient::default();
         let worker_queue = MockWorkerQueue::default();
         let agreement_id = IndexingAgreementId::from_bytes(rand::random());
         registry.add_agreement(agreement_id, IndexingAgreementStatus::CanceledByRequester);
-        registry.set_agreement_deadline_from_now(agreement_id, -2 * 86_400);
+        registry.set_agreement_created_at(agreement_id, LIFECYCLE_EVENTS_START - 1);
 
         let snapshot = make_snapshot(agreement_id, AgreementState::CanceledByPayer, Address::ZERO);
         let result = reconcile_agreement(
