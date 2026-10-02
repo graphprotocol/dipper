@@ -11,8 +11,8 @@ use crate::{
     registry::{AgreementRegistry, CancellingAgreement, IndexingAgreement},
 };
 
-/// Cancels that reach the chain without ending an agreement before dipper stops
-/// retrying it and leaves it to an operator. An unreachable chain doesn't count.
+/// Retried cancels mined without ending an agreement before dipper stops retrying it and
+/// leaves it to an operator. Other failures don't count (see `failed_attempts`).
 pub const MAX_CANCEL_ATTEMPTS: u32 = 10;
 
 /// Agreements checked per sweep, those checked longest ago first. Each can wait up to
@@ -138,7 +138,7 @@ async fn note_check<R: AgreementRegistry + Sync>(
     failure: Option<&ChainClientError>,
 ) {
     let agreement = &row.agreement;
-    let failed_attempts = u32::from(failure.is_some_and(cancel_does_not_work));
+    let failed_attempts = failure.map_or(0, failed_attempts);
     if let Some(err) = failure
         && failed_attempts == 0
     {
@@ -186,17 +186,15 @@ fn log_failed_cancel(agreement: &IndexingAgreement, attempts: u32, err: &ChainCl
     );
 }
 
-/// Whether the chain answered and the cancel itself didn't work, as opposed to the chain
-/// being unreachable, which only waiting fixes.
-fn cancel_does_not_work(err: &ChainClientError) -> bool {
-    matches!(
-        err,
-        ChainClientError::CancelNotConfirmed { .. }
-            | ChainClientError::MissingTermsVersionHash { .. }
-            | ChainClientError::TxReverted { .. }
-            | ChainClientError::ContractRevert { .. }
-            | ChainClientError::ConfigError(_)
-    )
+/// How many of an agreement's cancel attempts a failure uses up. Only a cancel mined without
+/// ending it counts, and one that can never be sent uses them all. An unreachable chain or a
+/// misconfigured or paused manager isn't the agreement's doing, so it is retried freely.
+fn failed_attempts(err: &ChainClientError) -> u32 {
+    match err {
+        ChainClientError::CancelNotConfirmed { .. } => 1,
+        ChainClientError::MissingTermsVersionHash { .. } => MAX_CANCEL_ATTEMPTS,
+        _ => 0,
+    }
 }
 
 #[cfg(test)]
@@ -438,6 +436,22 @@ mod tests {
             assert_eq!(registry.attempts.load(Ordering::SeqCst), 0);
             assert!(registry.marked_cancelled.lock().unwrap().is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn gives_up_at_once_on_an_agreement_it_can_never_cancel() {
+        // Without a stored terms hash no cancel can be sent, so retrying only delays the alert.
+        let mut registry = registry_with_one(true);
+        registry.cancelling[0].agreement.terms_version_hash = None;
+        let chain = live_chain();
+
+        retry(&registry, &chain, 0).await;
+
+        assert_eq!(
+            registry.attempts.load(Ordering::SeqCst),
+            MAX_CANCEL_ATTEMPTS
+        );
+        assert_eq!(chain.cancels_sent.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
