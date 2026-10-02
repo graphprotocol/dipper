@@ -37,6 +37,9 @@ use crate::{
 /// Backoff base for a tx the RPC accepted and then dropped from the mempool.
 pub const DROPPED_TX_RETRY_BASE: Duration = Duration::from_secs(5);
 
+/// Retry shortly while a reassessment runs or waits; not counted as a failure.
+const DEFER_WHILE_REASSESSING: JobError = JobError::Deferred(Duration::from_secs(1));
+
 /// Backoff base for a transient submission failure: RPC, gas or nonce.
 pub const TRANSIENT_RETRY_BASE: Duration = Duration::from_secs(30);
 
@@ -76,13 +79,10 @@ where
     R: AgreementRegistry,
     T: ChainClient,
 {
-    // Held shared from the status check until the offer lands, so a reassessment
-    // can't decide to cancel this agreement in between. Its cancel then either
-    // comes after this offer (a later nonce from the same wallet) and withdraws
-    // it, or finished first and the check below sees the agreement cancelled.
-    let Some(_reassess_guard) = ctx.reassess_lock.offer() else {
-        return Err(JobError::Deferred(Duration::from_secs(1)));
-    };
+    // Held from the status check until the offer lands: a reassessment's cancel
+    // then either follows this offer (later nonce, same wallet) and withdraws it,
+    // or finished first and the check below sees the agreement cancelled.
+    let reassess_guard = ctx.reassess_lock.offer().ok_or(DEFER_WHILE_REASSESSING)?;
 
     // Fetch the agreement. Skip silently if it's already been transitioned
     // out of Created (e.g. expired by the reassignment service).
@@ -205,6 +205,8 @@ where
         }
     }
 
+    // Landed, so any later cancel follows it; stop holding up reassessments.
+    drop(reassess_guard);
     withdraw_if_cancelled_meanwhile(&ctx, agreement_id).await;
 
     // Offer is confirmed on-chain (or was already there). The indexer-agent will
