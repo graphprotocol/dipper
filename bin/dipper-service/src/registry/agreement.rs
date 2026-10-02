@@ -274,27 +274,21 @@ pub trait AgreementRegistry {
     ) -> RegistryResult<()>;
 
     /// `CANCELLING` agreements marked over `min_age_minutes` ago whose cancel has failed
-    /// fewer than `max_attempts` times, those checked longest ago first. Default returns
-    /// empty so mocks need not override.
+    /// fewer than `max_attempts` times, those checked longest ago first.
     async fn get_cancelling_agreements(
         &self,
-        _batch_size: i64,
-        _max_attempts: u32,
-        _min_age_minutes: i32,
-    ) -> RegistryResult<Vec<CancellingAgreement>> {
-        Ok(Vec::new())
-    }
+        batch_size: i64,
+        max_attempts: u32,
+        min_age_minutes: i32,
+    ) -> RegistryResult<Vec<CancellingAgreement>>;
 
     /// Record a check of a `CANCELLING` agreement that left it cancelling, adding
-    /// `failed_attempts` to its failed cancels and returning the new count. Default
-    /// returns `failed_attempts` so mocks need not override.
+    /// `failed_attempts` to its failed cancels and returning the new count.
     async fn record_cancel_check(
         &self,
-        _id: &IndexingAgreementId,
+        id: &IndexingAgreementId,
         failed_attempts: u32,
-    ) -> RegistryResult<u32> {
-        Ok(failed_attempts)
-    }
+    ) -> RegistryResult<u32>;
 
     /// Apply a reconciliation-driven state transition atomically.
     ///

@@ -1202,6 +1202,23 @@ mod lifecycle_event_tests {
             self.marked_cancelling.lock().unwrap().push(*id);
             Ok(())
         }
+
+        async fn get_cancelling_agreements(
+            &self,
+            _batch_size: i64,
+            _max_attempts: u32,
+            _min_age_minutes: i32,
+        ) -> RegistryResult<Vec<crate::registry::CancellingAgreement>> {
+            Ok(Vec::new())
+        }
+
+        async fn record_cancel_check(
+            &self,
+            _id: &IndexingAgreementId,
+            failed_attempts: u32,
+        ) -> RegistryResult<u32> {
+            Ok(failed_attempts)
+        }
         async fn apply_reconciliation(
             &self,
             _id: &IndexingAgreementId,
