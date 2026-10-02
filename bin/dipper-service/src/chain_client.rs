@@ -29,7 +29,7 @@ pub use client::AlloyChainClient;
 use dipper_rpc::indexer::indexer_client::sol::RecurringCollectionAgreement;
 pub use eip5267::{fetch_rca_eip712_domain, refresh_rca_eip712_domain};
 pub use manager_role::verify_signer_has_agreement_manager_role;
-use thegraph_core::alloy::primitives::{B256, Bytes};
+use thegraph_core::alloy::primitives::{Address, B256, Bytes, U256};
 
 /// Error type for chain client operations
 #[derive(Debug, thiserror::Error)]
@@ -63,7 +63,7 @@ pub enum ChainClientError {
     ///
     /// In practice the tx was evicted from the mempool — typically a same-sender
     /// tx claimed the nonce with a higher fee. Callers re-sync the nonce and
-    /// resubmit; there is no idempotency guard, so a replay re-sends the offer.
+    /// resubmit; there is no idempotency guard, so a replay re-sends the call.
     #[error("tx {tx_hash} did not mine within the receipt-poll window")]
     TxDropped { tx_hash: B256 },
 
@@ -104,11 +104,20 @@ pub trait ChainClient {
 
     /// Reconcile a provider's escrow via the RecurringAgreementManager
     /// (`AgreementManager` mode) by calling `reconcileProvider(collector,
-    /// provider)`. Permissionless and idempotent; `Ok(Some(tx_hash))` on submit.
+    /// provider)`. Permissionless and idempotent; `Ok(Some(tx_hash))` once mined.
     async fn reconcile_provider(
         &self,
         collector: thegraph_core::alloy::primitives::Address,
         provider: thegraph_core::alloy::primitives::Address,
+    ) -> Result<Option<B256>, ChainClientError>;
+
+    /// Have the RecurringAgreementManager re-read one agreement from `collector`
+    /// (`reconcileAgreement`), dropping it once it has ended so its escrow can be
+    /// released. Permissionless and idempotent; `Ok(Some(tx_hash))` once mined.
+    async fn reconcile_agreement(
+        &self,
+        collector: Address,
+        agreement_id: &[u8; 16],
     ) -> Result<Option<B256>, ChainClientError>;
 
     /// Read whether the agreement is still live on-chain (terms accepted and no
@@ -158,6 +167,14 @@ impl<T: ChainClient + Send + Sync + ?Sized> ChainClient for Arc<T> {
         (**self).reconcile_provider(collector, provider).await
     }
 
+    async fn reconcile_agreement(
+        &self,
+        collector: Address,
+        agreement_id: &[u8; 16],
+    ) -> Result<Option<B256>, ChainClientError> {
+        (**self).reconcile_agreement(collector, agreement_id).await
+    }
+
     async fn agreement_still_active(
         &self,
         agreement_id: &[u8; 16],
@@ -167,5 +184,107 @@ impl<T: ChainClient + Send + Sync + ?Sized> ChainClient for Arc<T> {
 
     async fn latest_block_timestamp(&self) -> Result<u64, ChainClientError> {
         (**self).latest_block_timestamp().await
+    }
+}
+
+/// The RecurringAgreementManager's escrow account with one provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EscrowAccount {
+    pub balance: U256,
+    pub tokens_thawing: U256,
+    pub thaw_end_timestamp: U256,
+}
+
+/// The providers the RecurringAgreementManager tracks, as read one entry at a time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackedProviders {
+    pub providers: Vec<Address>,
+    /// False when the list changed or a read failed part way, so some may be missing.
+    pub complete: bool,
+}
+
+/// Reads of the RecurringAgreementManager's escrow records, so the escrow reconciler
+/// sends a transaction only when one would change something. Kept apart from
+/// [`ChainClient`] so only the reconciler and its tests need to provide it.
+#[async_trait]
+pub trait ManagerEscrowReader {
+    /// Providers the manager tracks escrow for under `collector`.
+    async fn tracked_providers(
+        &self,
+        collector: Address,
+    ) -> Result<TrackedProviders, ChainClientError>;
+
+    /// The manager's escrow account with `provider` under `collector`.
+    async fn escrow_account(
+        &self,
+        collector: Address,
+        provider: Address,
+    ) -> Result<EscrowAccount, ChainClientError>;
+
+    /// Number of agreements the manager tracks for `provider` under `collector`.
+    async fn tracked_agreement_count(
+        &self,
+        collector: Address,
+        provider: Address,
+    ) -> Result<u64, ChainClientError>;
+
+    /// The agreement at `index` among those the manager tracks for `provider`.
+    async fn tracked_agreement_at(
+        &self,
+        collector: Address,
+        provider: Address,
+        index: u64,
+    ) -> Result<[u8; 16], ChainClientError>;
+
+    /// What `collector` says could still be claimed on the agreement; 0 once it has ended.
+    async fn max_next_claim(
+        &self,
+        collector: Address,
+        agreement_id: &[u8; 16],
+    ) -> Result<U256, ChainClientError>;
+}
+
+#[async_trait]
+impl<T: ManagerEscrowReader + Send + Sync + ?Sized> ManagerEscrowReader for Arc<T> {
+    async fn tracked_providers(
+        &self,
+        collector: Address,
+    ) -> Result<TrackedProviders, ChainClientError> {
+        (**self).tracked_providers(collector).await
+    }
+
+    async fn escrow_account(
+        &self,
+        collector: Address,
+        provider: Address,
+    ) -> Result<EscrowAccount, ChainClientError> {
+        (**self).escrow_account(collector, provider).await
+    }
+
+    async fn tracked_agreement_count(
+        &self,
+        collector: Address,
+        provider: Address,
+    ) -> Result<u64, ChainClientError> {
+        (**self).tracked_agreement_count(collector, provider).await
+    }
+
+    async fn tracked_agreement_at(
+        &self,
+        collector: Address,
+        provider: Address,
+        index: u64,
+    ) -> Result<[u8; 16], ChainClientError> {
+        (**self)
+            .tracked_agreement_at(collector, provider, index)
+            .await
+    }
+
+    async fn max_next_claim(
+        &self,
+        collector: Address,
+        agreement_id: &[u8; 16],
+    ) -> Result<U256, ChainClientError> {
+        (**self).max_next_claim(collector, agreement_id).await
     }
 }

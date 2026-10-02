@@ -2,6 +2,7 @@
 //! alloy for Ethereum interactions.
 
 use std::{
+    collections::HashSet,
     future::Future,
     sync::{
         Arc,
@@ -15,7 +16,7 @@ use dipper_rpc::indexer::indexer_client::sol::RecurringCollectionAgreement;
 use thegraph_core::alloy::{
     eips::{BlockNumberOrTag, eip2718::Encodable2718},
     network::{EthereumWallet, TransactionBuilder},
-    primitives::{Address, B256, FixedBytes},
+    primitives::{Address, B256, FixedBytes, U256},
     providers::Provider,
     rpc::types::TransactionRequest,
     signers::local::PrivateKeySigner,
@@ -30,7 +31,9 @@ use super::{
     rpc_provider::RpcProviderPool,
 };
 use crate::{
-    chain_client::{ChainClient, ChainClientError},
+    chain_client::{
+        ChainClient, ChainClientError, EscrowAccount, ManagerEscrowReader, TrackedProviders,
+    },
     config::ChainClientConfig,
     worker::service::PROCESS_JOB_TIMEOUT,
 };
@@ -277,7 +280,7 @@ impl AlloyChainClient {
     }
 
     /// Build, gas-estimate, and send a call to any contract. Shared entry point for the
-    /// manager-routed offer and cancel calls; `log_agreement_id` is only for logging.
+    /// manager-routed offer, cancel and reconcile calls; `log_agreement_id` is only for logging.
     async fn build_and_send_call(
         &self,
         to: Address,
@@ -549,6 +552,68 @@ impl AlloyChainClient {
             })
     }
 
+    /// Send a reconcile call to the manager and wait for its receipt, as offers and
+    /// cancels do, so a reverted or dropped reconcile is reported as failed, not done.
+    /// `subject` names what is being reconciled, for the logs.
+    async fn send_reconcile(
+        &self,
+        calldata: Vec<u8>,
+        log_agreement_id: &[u8; 16],
+        subject: &str,
+    ) -> Result<Option<B256>, ChainClientError> {
+        let SubmittedTx {
+            hash: tx_hash,
+            nonce: dropped_nonce,
+        } = self
+            .build_and_send_call(
+                self.inner.recurring_agreement_manager_address,
+                calldata,
+                log_agreement_id,
+            )
+            .await?;
+
+        match self.wait_for_receipt(tx_hash, RECEIPT_POLL_TIMEOUT).await? {
+            Some(true) => Ok(Some(tx_hash)),
+            Some(false) => Err(ChainClientError::TxReverted { tx_hash }),
+            None => {
+                tracing::warn!(
+                    reconciling = subject,
+                    tx_hash = %tx_hash,
+                    nonce = dropped_nonce,
+                    "Reconcile tx did not mine within receipt-poll window; treating as dropped"
+                );
+                if let Err(err) = self.fill_nonce_gap(dropped_nonce).await {
+                    tracing::warn!(nonce = dropped_nonce, error = %err, "Failed to fill mempool nonce gap");
+                }
+                Err(ChainClientError::TxDropped { tx_hash })
+            }
+        }
+    }
+
+    /// Run a read-only contract call and decode its return value.
+    async fn view<C: SolCall>(
+        &self,
+        to: Address,
+        call: C,
+        operation: &'static str,
+    ) -> Result<C::Return, ChainClientError> {
+        let calldata = call.abi_encode();
+        let output = self
+            .inner
+            .rpc_pool
+            .execute(operation, |provider| {
+                let calldata = calldata.clone();
+                async move {
+                    let tx = TransactionRequest::default().to(to).input(calldata.into());
+                    provider.call(tx).await
+                }
+            })
+            .await?;
+        C::abi_decode_returns(&output).map_err(|err| {
+            ChainClientError::RpcError(anyhow::anyhow!("undecodable {operation} from {to}: {err}"))
+        })
+    }
+
     /// Poll `eth_getTransactionReceipt` until the tx has mined or the timeout elapses.
     /// `Ok(Some(status))` reports the receipt's success flag; `Ok(None)` says the tx never
     /// appeared in time (dropped from the mempool). Transient RPC errors keep polling.
@@ -768,11 +833,172 @@ impl ChainClient for AlloyChainClient {
         );
 
         // No agreement context here; pass a zero id for the shared call's
-        // logging field only. The call target is the manager.
-        let tx = self
-            .build_and_send_call(manager, calldata, &[0u8; 16])
+        // logging field only.
+        self.send_reconcile(calldata, &[0u8; 16], &format!("provider {provider}"))
+            .await
+    }
+
+    async fn reconcile_agreement(
+        &self,
+        collector: Address,
+        agreement_id: &[u8; 16],
+    ) -> Result<Option<B256>, ChainClientError> {
+        let calldata = IRecurringAgreementManager::reconcileAgreementCall {
+            collector,
+            agreementId: FixedBytes::<16>::from_slice(agreement_id),
+        }
+        .abi_encode();
+
+        tracing::info!(
+            agreement_id = %format_args!("0x{}", agreement_id.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+            collector = %collector,
+            "Reconciling agreement escrow via RecurringAgreementManager"
+        );
+
+        let subject = format!(
+            "agreement 0x{}",
+            thegraph_core::alloy::primitives::hex::encode(agreement_id)
+        );
+        self.send_reconcile(calldata, agreement_id, &subject).await
+    }
+}
+
+#[async_trait]
+impl ManagerEscrowReader for AlloyChainClient {
+    async fn tracked_providers(
+        &self,
+        collector: Address,
+    ) -> Result<TrackedProviders, ChainClientError> {
+        let manager = self.inner.recurring_agreement_manager_address;
+        let count = self
+            .view(
+                manager,
+                IRecurringAgreementManager::getProviderCountCall { collector },
+                "get_provider_count",
+            )
             .await?;
-        Ok(Some(tx.hash))
+        let count = u64::try_from(count).map_err(|_| {
+            ChainClientError::RpcError(anyhow::anyhow!("implausible provider count {count}"))
+        })?;
+
+        // Each read sees the latest block (pruned nodes refuse older state), so the list
+        // can change mid-read: an entry can turn up twice or the list can end early, and
+        // either means another entry may have been missed.
+        let mut providers = Vec::new();
+        let mut seen = HashSet::new();
+        let mut complete = true;
+        for index in 0..count {
+            let read = self
+                .view(
+                    manager,
+                    IRecurringAgreementManager::getProviderAtCall {
+                        collector,
+                        index: U256::from(index),
+                    },
+                    "get_provider_at",
+                )
+                .await;
+            match read {
+                Ok(provider) => {
+                    if seen.insert(provider) {
+                        providers.push(provider);
+                    } else {
+                        complete = false;
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        index,
+                        count,
+                        error = %err,
+                        "Failed to read a provider from the manager's list; using those read so far"
+                    );
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        Ok(TrackedProviders {
+            providers,
+            complete,
+        })
+    }
+
+    async fn escrow_account(
+        &self,
+        collector: Address,
+        provider: Address,
+    ) -> Result<EscrowAccount, ChainClientError> {
+        let account = self
+            .view(
+                self.inner.recurring_agreement_manager_address,
+                IRecurringAgreementManager::getEscrowAccountCall {
+                    collector,
+                    provider,
+                },
+                "get_escrow_account",
+            )
+            .await?;
+        Ok(EscrowAccount {
+            balance: account.balance,
+            tokens_thawing: account.tokensThawing,
+            thaw_end_timestamp: account.thawEndTimestamp,
+        })
+    }
+
+    async fn tracked_agreement_count(
+        &self,
+        collector: Address,
+        provider: Address,
+    ) -> Result<u64, ChainClientError> {
+        let count = self
+            .view(
+                self.inner.recurring_agreement_manager_address,
+                IRecurringAgreementManager::getAgreementCountCall {
+                    collector,
+                    provider,
+                },
+                "get_agreement_count",
+            )
+            .await?;
+        u64::try_from(count).map_err(|_| {
+            ChainClientError::RpcError(anyhow::anyhow!("implausible agreement count {count}"))
+        })
+    }
+
+    async fn tracked_agreement_at(
+        &self,
+        collector: Address,
+        provider: Address,
+        index: u64,
+    ) -> Result<[u8; 16], ChainClientError> {
+        let id = self
+            .view(
+                self.inner.recurring_agreement_manager_address,
+                IRecurringAgreementManager::getAgreementAtCall {
+                    collector,
+                    provider,
+                    index: U256::from(index),
+                },
+                "get_agreement_at",
+            )
+            .await?;
+        Ok(id.0)
+    }
+
+    async fn max_next_claim(
+        &self,
+        collector: Address,
+        agreement_id: &[u8; 16],
+    ) -> Result<U256, ChainClientError> {
+        self.view(
+            collector,
+            IRecurringCollector::getMaxNextClaimCall {
+                agreementId: FixedBytes::<16>::from_slice(agreement_id),
+            },
+            "get_max_next_claim",
+        )
+        .await
     }
 }
 
@@ -1581,5 +1807,342 @@ mod tests {
             .await
             .expect("a further submission succeeds");
         assert_eq!(next.nonce, 6, "a successful broadcast spends its slot");
+    }
+
+    /// Answers every call a manager transaction makes, through to a receipt that mined
+    /// with the given status. Only the hash of the bytes actually broadcast has a receipt,
+    /// so a client polling for any other hash never sees one.
+    struct MinedResponder {
+        succeeded: bool,
+        broadcast: Arc<std::sync::Mutex<Option<B256>>>,
+    }
+
+    impl Respond for MinedResponder {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).expect("JSON-RPC request body");
+            let zero = format!("{:#x}", B256::ZERO);
+            let result = match body["method"].as_str().unwrap_or_default() {
+                "eth_estimateGas" => serde_json::json!("0x30000"),
+                "eth_maxPriorityFeePerGas" => serde_json::json!("0x1"),
+                "eth_getTransactionCount" => serde_json::json!("0x0"),
+                "eth_sendRawTransaction" => {
+                    let raw = body["params"][0].as_str().expect("raw tx");
+                    let bytes = thegraph_core::alloy::primitives::hex::decode(raw).expect("hex");
+                    *self.broadcast.lock().unwrap() =
+                        Some(thegraph_core::alloy::primitives::keccak256(bytes));
+                    // A made-up hash, so a client trusting the endpoint's answer is caught.
+                    serde_json::json!(format!("{:#x}", B256::repeat_byte(0xab)))
+                }
+                "eth_getBlockByNumber" => serde_json::json!({
+                    "hash": zero, "parentHash": zero, "sha3Uncles": zero,
+                    "miner": format!("{:#x}", Address::ZERO), "stateRoot": zero,
+                    "transactionsRoot": zero, "receiptsRoot": zero,
+                    "logsBloom": format!("0x{}", "00".repeat(256)), "difficulty": "0x0",
+                    "number": "0x1", "gasLimit": "0x1c9c380", "gasUsed": "0x0",
+                    "timestamp": "0x1", "extraData": "0x", "mixHash": zero,
+                    "nonce": "0x0000000000000000", "baseFeePerGas": "0x1",
+                    "uncles": [], "transactions": [],
+                }),
+                "eth_getTransactionReceipt"
+                    if body["params"][0].as_str()
+                        != (*self.broadcast.lock().unwrap())
+                            .map(|h| format!("{h:#x}"))
+                            .as_deref() =>
+                {
+                    serde_json::Value::Null
+                }
+                "eth_getTransactionReceipt" => serde_json::json!({
+                    "transactionHash": body["params"][0],
+                    "transactionIndex": "0x0", "blockHash": zero, "blockNumber": "0x1",
+                    "from": format!("{:#x}", Address::ZERO),
+                    "to": format!("{:#x}", Address::repeat_byte(0x22)),
+                    "cumulativeGasUsed": "0x30000", "gasUsed": "0x30000",
+                    "effectiveGasPrice": "0x2", "contractAddress": null, "logs": [],
+                    "logsBloom": format!("0x{}", "00".repeat(256)), "type": "0x2",
+                    "status": if self.succeeded { "0x1" } else { "0x0" },
+                }),
+                other => panic!("unexpected method {other}"),
+            };
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": body["id"],
+                "result": result,
+            }))
+        }
+    }
+
+    async fn client_whose_tx_mines(
+        succeeded: bool,
+    ) -> (
+        AlloyChainClient,
+        MockServer,
+        Arc<std::sync::Mutex<Option<B256>>>,
+    ) {
+        let broadcast = Arc::new(std::sync::Mutex::new(None));
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(MinedResponder {
+                succeeded,
+                broadcast: broadcast.clone(),
+            })
+            .mount(&server)
+            .await;
+        let client = client_over(vec![server.uri().parse().expect("provider URL")]);
+        (client, server, broadcast)
+    }
+
+    /// A reconcile that reverted on-chain must not be reported as done: the reconciler
+    /// counts and logs what this returns, and a reverted call reclaimed nothing.
+    #[tokio::test]
+    async fn reconcile_provider_reports_a_reverted_transaction() {
+        let (client, _server, _broadcast) = client_whose_tx_mines(false).await;
+
+        let result = client
+            .reconcile_provider(Address::repeat_byte(0x11), Address::repeat_byte(0x44))
+            .await;
+
+        assert!(
+            matches!(result, Err(ChainClientError::TxReverted { .. })),
+            "got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_provider_returns_the_hash_once_mined() {
+        let (client, _server, broadcast) = client_whose_tx_mines(true).await;
+
+        let tx_hash = client
+            .reconcile_provider(Address::repeat_byte(0x11), Address::repeat_byte(0x44))
+            .await
+            .expect("a mined reconcile succeeds");
+
+        assert_eq!(
+            tx_hash,
+            *broadcast.lock().unwrap(),
+            "the hash of what was broadcast"
+        );
+    }
+
+    /// Answers the manager's escrow views as a manager whose provider list is `providers`
+    /// would. A `None` entry reverts, as a read past the end of a list that shrank does.
+    struct ManagerViewsResponder {
+        providers: Vec<Option<Address>>,
+    }
+
+    impl Default for ManagerViewsResponder {
+        /// A manager tracking 2 providers.
+        fn default() -> Self {
+            Self {
+                providers: vec![
+                    Some(Address::repeat_byte(0x10)),
+                    Some(Address::repeat_byte(0x11)),
+                ],
+            }
+        }
+    }
+
+    impl Respond for ManagerViewsResponder {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).expect("JSON-RPC request body");
+            assert_eq!(body["method"], "eth_call", "only views are expected");
+            let input = body["params"][0]["input"]
+                .as_str()
+                .or_else(|| body["params"][0]["data"].as_str())
+                .expect("calldata");
+            let data = thegraph_core::alloy::primitives::hex::decode(input).expect("hex");
+            let selector: [u8; 4] = data[..4].try_into().expect("selector");
+
+            let output = if selector == IRecurringAgreementManager::getProviderCountCall::SELECTOR {
+                IRecurringAgreementManager::getProviderCountCall::abi_encode_returns(&U256::from(
+                    self.providers.len(),
+                ))
+            } else if selector == IRecurringAgreementManager::getProviderAtCall::SELECTOR {
+                let call = IRecurringAgreementManager::getProviderAtCall::abi_decode(&data)
+                    .expect("getProviderAt args");
+                let entry = usize::try_from(call.index)
+                    .ok()
+                    .and_then(|index| self.providers.get(index).copied().flatten());
+                let Some(provider) = entry else {
+                    return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": body["id"],
+                        "error": { "code": 3, "message": "execution reverted" },
+                    }));
+                };
+                IRecurringAgreementManager::getProviderAtCall::abi_encode_returns(&provider)
+            } else if selector == IRecurringAgreementManager::getAgreementCountCall::SELECTOR {
+                IRecurringAgreementManager::getAgreementCountCall::abi_encode_returns(&U256::from(
+                    1,
+                ))
+            } else if selector == IRecurringAgreementManager::getAgreementAtCall::SELECTOR {
+                IRecurringAgreementManager::getAgreementAtCall::abi_encode_returns(
+                    &FixedBytes::<16>::repeat_byte(0xe0),
+                )
+            } else if selector == IRecurringCollector::getMaxNextClaimCall::SELECTOR {
+                IRecurringCollector::getMaxNextClaimCall::abi_encode_returns(&U256::ZERO)
+            } else if selector == IRecurringAgreementManager::getEscrowAccountCall::SELECTOR {
+                IRecurringAgreementManager::getEscrowAccountCall::abi_encode_returns(
+                    &IRecurringAgreementManager::EscrowAccount {
+                        balance: U256::from(100),
+                        tokensThawing: U256::from(40),
+                        thawEndTimestamp: U256::from(1_234),
+                    },
+                )
+            } else {
+                panic!("unexpected call {}", input)
+            };
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": body["id"],
+                "result": format!("0x{}", thegraph_core::alloy::primitives::hex::encode(output)),
+            }))
+        }
+    }
+
+    async fn client_over_manager(
+        responder: ManagerViewsResponder,
+    ) -> (AlloyChainClient, MockServer) {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(responder)
+            .mount(&server)
+            .await;
+        let client = client_over(vec![server.uri().parse().expect("provider URL")]);
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn reads_the_providers_and_escrow_the_manager_tracks() {
+        let (client, _server) = client_over_manager(ManagerViewsResponder::default()).await;
+
+        let tracked = client
+            .tracked_providers(Address::repeat_byte(0x11))
+            .await
+            .expect("providers");
+        let account = client
+            .escrow_account(Address::repeat_byte(0x11), tracked.providers[0])
+            .await
+            .expect("escrow account");
+
+        assert_eq!(
+            tracked,
+            TrackedProviders {
+                providers: vec![Address::repeat_byte(0x10), Address::repeat_byte(0x11)],
+                complete: true,
+            }
+        );
+        assert_eq!(
+            account,
+            EscrowAccount {
+                balance: U256::from(100),
+                tokens_thawing: U256::from(40),
+                thaw_end_timestamp: U256::from(1_234),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn reads_the_agreements_the_manager_tracks() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ManagerViewsResponder::default())
+            .mount(&server)
+            .await;
+        let client = client_over(vec![server.uri().parse().expect("provider URL")]);
+        let (collector, provider) = (Address::repeat_byte(0x11), Address::repeat_byte(0x44));
+
+        let count = client
+            .tracked_agreement_count(collector, provider)
+            .await
+            .expect("count");
+        let id = client
+            .tracked_agreement_at(collector, provider, 0)
+            .await
+            .expect("agreement id");
+        let claim = client.max_next_claim(collector, &id).await.expect("claim");
+
+        assert_eq!((count, id, claim), (1, [0xe0; 16], U256::ZERO));
+    }
+
+    #[tokio::test]
+    async fn reconcile_agreement_reports_a_reverted_transaction() {
+        let (client, _server, _broadcast) = client_whose_tx_mines(false).await;
+
+        let result = client
+            .reconcile_agreement(Address::repeat_byte(0x11), &[0xe0; 16])
+            .await;
+
+        assert!(
+            matches!(result, Err(ChainClientError::TxReverted { .. })),
+            "got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_agreement_returns_the_hash_once_mined() {
+        let (client, _server, broadcast) = client_whose_tx_mines(true).await;
+
+        let tx_hash = client
+            .reconcile_agreement(Address::repeat_byte(0x11), &[0xe0; 16])
+            .await
+            .expect("a mined reconcile succeeds");
+
+        assert_eq!(
+            tx_hash,
+            *broadcast.lock().unwrap(),
+            "the hash of what was broadcast"
+        );
+    }
+
+    /// The list can shrink between reading its length and reading an entry, so a failed
+    /// read keeps the providers read before it rather than failing the whole sweep.
+    #[tokio::test]
+    async fn tracked_providers_keeps_what_was_read_before_a_failed_read() {
+        let (client, _server) = client_over_manager(ManagerViewsResponder {
+            providers: vec![Some(Address::repeat_byte(0x10)), None],
+        })
+        .await;
+
+        let tracked = client
+            .tracked_providers(Address::repeat_byte(0x11))
+            .await
+            .expect("the providers read before the failure");
+
+        assert_eq!(
+            tracked,
+            TrackedProviders {
+                providers: vec![Address::repeat_byte(0x10)],
+                complete: false,
+            }
+        );
+    }
+
+    /// An entry can move within the list mid-read and turn up twice; list it once, and
+    /// report the list as incomplete, since the move may have hidden another entry.
+    #[tokio::test]
+    async fn tracked_providers_lists_a_provider_read_twice_once() {
+        let (client, _server) = client_over_manager(ManagerViewsResponder {
+            providers: vec![
+                Some(Address::repeat_byte(0x10)),
+                Some(Address::repeat_byte(0x11)),
+                Some(Address::repeat_byte(0x10)),
+            ],
+        })
+        .await;
+
+        let tracked = client
+            .tracked_providers(Address::repeat_byte(0x11))
+            .await
+            .expect("providers");
+
+        assert_eq!(
+            tracked,
+            TrackedProviders {
+                providers: vec![Address::repeat_byte(0x10), Address::repeat_byte(0x11)],
+                complete: false,
+            }
+        );
     }
 }

@@ -269,6 +269,13 @@ mod tests {
         ) -> Result<Option<B256>, ChainClientError> {
             unimplemented!()
         }
+        async fn reconcile_agreement(
+            &self,
+            _collector: Address,
+            _agreement_id: &[u8; 16],
+        ) -> Result<Option<B256>, ChainClientError> {
+            unimplemented!()
+        }
         async fn agreement_still_active(
             &self,
             _agreement_id: &[u8; 16],

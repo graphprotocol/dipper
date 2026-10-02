@@ -1638,33 +1638,6 @@ impl PgRegistry {
         .map_err(Into::into)
     }
 
-    /// Distinct `indexer_id` (on-chain `service_provider`) of agreements whose
-    /// protocol-manager escrow may be orphaned or mid-thaw: ended, canceled, or
-    /// still-accepted. Bounded by `limit`.
-    pub async fn get_providers_for_escrow_reconciliation(
-        &self,
-        limit: i64,
-    ) -> Result<Vec<Address>, Error> {
-        let rows: Vec<(PgIndexerId,)> = sqlx::query_as(
-            r#"
-            SELECT DISTINCT indexer_id
-            FROM dipper_reg_indexing_agreements
-            WHERE status IN ($1, $2, $3, $4)
-            ORDER BY indexer_id
-            LIMIT CASE WHEN $5 > 0 THEN $5 ELSE NULL END
-            "#,
-        )
-        .bind(IndexingAgreementStatus::CanceledByRequester)
-        .bind(IndexingAgreementStatus::CanceledByIndexer)
-        .bind(IndexingAgreementStatus::Expired)
-        .bind(IndexingAgreementStatus::AcceptedOnChain)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(rows.into_iter().map(|(id,)| id.0.into_inner()).collect())
-    }
-
     /// Update the sync progress for an agreement.
     ///
     /// Called when the liveness checker observes the block height has changed

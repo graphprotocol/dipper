@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.2.1](https://github.com/graphprotocol/dipper/compare/v0.2.0...v0.2.1) (2026-10-01)
+
+
+### Fixed
+
+* **escrow:** release escrow held by agreements that have ended ([#703](https://github.com/graphprotocol/dipper/issues/703)) ([37c980d](https://github.com/graphprotocol/dipper/commit/37c980d732e657e4677738277dc3d2498a6d9b1c))
+* **escrow:** send reconciles only where the escrow needs one ([#702](https://github.com/graphprotocol/dipper/issues/702)) ([9300302](https://github.com/graphprotocol/dipper/commit/930030212de2cf6a7cd8d111043898cd8c66601d))
+* **escrow:** wait for reconcile transactions to be mined ([#701](https://github.com/graphprotocol/dipper/issues/701)) ([3400d51](https://github.com/graphprotocol/dipper/commit/3400d51bea76593c65fe9430e08bbb76ed3a9337))
+
+
+### Changed
+
+* **ci:** fail the build on dead code and unused dependencies ([#705](https://github.com/graphprotocol/dipper/issues/705)) ([837090d](https://github.com/graphprotocol/dipper/commit/837090dffe92d00c0797b5c4c7ae5537f3f7d368))
+
 ## [0.2.0](https://github.com/graphprotocol/dipper/compare/v0.1.12...v0.2.0) (2026-10-01)
 
 

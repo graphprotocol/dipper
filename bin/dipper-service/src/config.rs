@@ -70,7 +70,7 @@ pub struct Config {
     /// The liveness checker service configuration (detects silent agreement abandonment)
     #[serde(default)]
     pub liveness_checker: Option<LivenessCheckerConfig>,
-    /// The escrow reconciler service configuration (AgreementManager mode only)
+    /// The escrow reconciler service configuration (runs only when this section is present)
     #[serde(default)]
     pub escrow_reconciler: Option<EscrowReconcilerConfig>,
     /// Additional chain ID to network name mappings for dev/test chains.
@@ -402,14 +402,15 @@ impl Default for ExpirationConfig {
     }
 }
 
-/// Escrow reconciler service config. Runs only in `AgreementManager` mode;
-/// each tick calls the manager's permissionless `reconcileProvider` for
-/// distinct providers with agreements needing escrow cleanup.
+/// Escrow reconciler service config. Each sweep checks what the RecurringAgreementManager
+/// tracks and calls its permissionless `reconcileAgreement` / `reconcileProvider` only
+/// where that would change something.
 #[serde_as]
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EscrowReconcilerConfig {
-    /// Whether the escrow reconciler is enabled (default: true).
+    /// Whether the escrow reconciler runs (default: true). This default only applies
+    /// once the section exists: without an `escrow_reconciler` section it does not run.
     #[serde(default = "default_escrow_reconciler_enabled")]
     pub enabled: bool,
 
@@ -418,9 +419,20 @@ pub struct EscrowReconcilerConfig {
     #[serde(default = "default_escrow_reconciler_interval")]
     pub interval: Duration,
 
-    /// Maximum distinct providers to reconcile per sweep (default: 500).
+    /// Maximum reconcile transactions to send per sweep (default: 500).
     #[serde(default = "default_escrow_reconciler_batch_size")]
     pub batch_size: i64,
+
+    /// How often each tracked provider gets a rebalance even when no thaw has finished,
+    /// so escrow is topped up once the manager can afford it (default: 86400s; 0 = never).
+    #[serde_as(as = "serde_with::DurationSeconds<u64>")]
+    #[serde(default = "default_escrow_reconciler_rebalance_interval")]
+    pub rebalance_interval: Duration,
+
+    /// How many tracked agreements to check for having ended per sweep; each sweep
+    /// carries on from where the last stopped (default: 500).
+    #[serde(default = "default_escrow_reconciler_agreements_per_sweep")]
+    pub agreements_per_sweep: u64,
 }
 
 fn default_escrow_reconciler_enabled() -> bool {
@@ -435,12 +447,22 @@ fn default_escrow_reconciler_batch_size() -> i64 {
     500
 }
 
+fn default_escrow_reconciler_rebalance_interval() -> Duration {
+    Duration::from_secs(86_400)
+}
+
+fn default_escrow_reconciler_agreements_per_sweep() -> u64 {
+    500
+}
+
 impl Default for EscrowReconcilerConfig {
     fn default() -> Self {
         Self {
             enabled: default_escrow_reconciler_enabled(),
             interval: default_escrow_reconciler_interval(),
             batch_size: default_escrow_reconciler_batch_size(),
+            rebalance_interval: default_escrow_reconciler_rebalance_interval(),
+            agreements_per_sweep: default_escrow_reconciler_agreements_per_sweep(),
         }
     }
 }

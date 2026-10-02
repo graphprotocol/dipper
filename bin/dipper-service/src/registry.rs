@@ -631,16 +631,6 @@ impl AgreementRegistry for RegistryProvider {
             .collect())
     }
 
-    async fn get_providers_for_escrow_reconciliation(
-        &self,
-        limit: i64,
-    ) -> RegistryResult<Vec<Address>> {
-        self.inner
-            .get_providers_for_escrow_reconciliation(limit)
-            .await
-            .map_err(Into::into)
-    }
-
     async fn update_agreement_sync_progress(
         &self,
         id: &IndexingAgreementId,
