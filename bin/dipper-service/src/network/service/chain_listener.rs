@@ -876,6 +876,8 @@ where
         }
     }
 
+    queue_cancel_if_cancelled_but_accepted(snapshot, &agreement, worker_queue).await?;
+
     // Both transitions are applied atomically downstream so the
     // Accept-then-Cancel-in-one-snapshot path can't leak an intermediate
     // AcceptedOnChain to concurrent readers.
@@ -931,6 +933,31 @@ where
         }
         Ok(None)
     }
+}
+
+/// Safety net for an agreement dipper cancelled whose offer the indexer accepted
+/// anyway, such as one that landed after dipper's cancel. Nothing else would end
+/// it: reconciliation ignores an accept on a cancelled row. The job reads the
+/// chain before acting, so a stale snapshot of an agreement already ended is free.
+async fn queue_cancel_if_cancelled_but_accepted<W: WorkerQueue>(
+    snapshot: &AgreementStateSnapshot,
+    agreement: &IndexingAgreement,
+    worker_queue: &W,
+) -> anyhow::Result<()> {
+    if agreement.status == IndexingAgreementStatus::CanceledByRequester
+        && snapshot.state.reached_accepted()
+        && !snapshot.state.is_canceled()
+    {
+        tracing::warn!(
+            agreement_id = %agreement.id,
+            indexer = %snapshot.indexer,
+            "Cancelled agreement accepted on-chain, queuing cancellation"
+        );
+        worker_queue
+            .cancel_rejected_agreement_on_chain(agreement.id, JobPriority::Background)
+            .await?;
+    }
+    Ok(())
 }
 
 /// Log the transition that landed and, on fresh accepts, fan out the
@@ -2890,6 +2917,54 @@ mod tests {
         assert!(!registry.was_marked_canceled_by_indexer(&agreement_id));
         assert!(!registry.was_marked_accepted_on_chain(&agreement_id));
         // Already canceled on-chain: must not queue a fresh cancel job.
+        assert!(!worker_queue.was_cancellation_queued(&agreement_id));
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_queues_cancel_for_cancelled_agreement_accepted_on_chain() {
+        // Dipper cancelled the agreement locally, but the indexer accepted its offer
+        // (for example one that landed after dipper's cancel). Nothing else would end
+        // it, so the listener queues an on-chain cancel and leaves the row cancelled.
+        let registry = MockRegistry::new();
+        let chain_client = MockChainClient::default();
+        let worker_queue = MockWorkerQueue::default();
+        let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+        registry.add_agreement(agreement_id, IndexingAgreementStatus::CanceledByRequester);
+
+        let snapshot = make_snapshot(agreement_id, AgreementState::Accepted, Address::ZERO);
+        let result = reconcile_agreement(
+            &snapshot,
+            &registry,
+            &worker_queue,
+            &chain_client,
+            test_agreement_conf().as_ref(),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert!(worker_queue.was_cancellation_queued(&agreement_id));
+        assert!(!registry.was_marked_accepted_on_chain(&agreement_id));
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_cancelled_agreement_already_cancelled_on_chain_queues_nothing() {
+        let registry = MockRegistry::new();
+        let chain_client = MockChainClient::default();
+        let worker_queue = MockWorkerQueue::default();
+        let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+        registry.add_agreement(agreement_id, IndexingAgreementStatus::CanceledByRequester);
+
+        let snapshot = make_snapshot(agreement_id, AgreementState::CanceledByPayer, Address::ZERO);
+        let result = reconcile_agreement(
+            &snapshot,
+            &registry,
+            &worker_queue,
+            &chain_client,
+            test_agreement_conf().as_ref(),
+        )
+        .await;
+
+        assert!(result.is_ok());
         assert!(!worker_queue.was_cancellation_queued(&agreement_id));
     }
 
