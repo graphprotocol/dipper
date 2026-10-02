@@ -71,9 +71,9 @@ pub enum CancelStarted {
     Cancelling,
 }
 
-/// Start ending an agreement that may be live on-chain. It is marked `Cancelling` before
-/// its cancel goes out, so an offer for it still in flight withdraws itself on landing.
-/// Fails, sending nothing, when the mark can't be written.
+/// Start ending an agreement that may be live on-chain. It is marked `Cancelling` first, so an
+/// offer for it still in flight withdraws itself on landing, then cancelled only if the chain
+/// shows it live. Fails, sending nothing, when the mark can't be written.
 pub async fn start_cancel<R, T>(
     registry: &R,
     chain_client: &T,
@@ -87,9 +87,10 @@ where
     registry
         .mark_indexing_agreement_as_cancelling(&agreement.id)
         .await?;
-    let tx_hash = match cancel_agreement_on_chain(chain_client, agreement, config).await {
-        Ok(tx_hash) => tx_hash,
-        Err(err) => {
+    let tx_hash = match cancel_if_live(chain_client, agreement, config).await {
+        LiveCancel::Ended(tx_hash) => tx_hash,
+        LiveCancel::NotLive => return Ok(CancelStarted::Cancelling),
+        LiveCancel::ReadFailed(err) | LiveCancel::CancelFailed(err) => {
             tracing::warn!(
                 agreement_id = %agreement.id,
                 error = %err,

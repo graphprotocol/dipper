@@ -956,11 +956,12 @@ mod lifecycle_event_tests {
 
     // ---- Mock: chain client --------------------------------------------------
 
-    /// Always reports a successful cancel that the post-cancel read confirms, and
-    /// records the id of every agreement it was asked to cancel.
+    /// Shows every agreement live until a cancel is sent for it, unless nothing is on
+    /// chain, and records the id of every agreement it was asked to cancel.
     #[derive(Default, Clone)]
     struct MockChainClient {
         cancelled: Arc<Mutex<Vec<[u8; 16]>>>,
+        nothing_on_chain: bool,
         /// When set, each cancel records whether its agreement was already marked cancelling.
         marked_cancelling: Option<Arc<Mutex<Vec<IndexingAgreementId>>>>,
         marked_at_cancel: Arc<Mutex<Vec<bool>>>,
@@ -1018,10 +1019,9 @@ mod lifecycle_event_tests {
 
         async fn agreement_still_active(
             &self,
-            _agreement_id: &[u8; 16],
+            agreement_id: &[u8; 16],
         ) -> std::result::Result<bool, ChainClientError> {
-            // Cancel confirmed: agreement is no longer active on-chain.
-            Ok(false)
+            Ok(!self.nothing_on_chain && !self.cancelled.lock().unwrap().contains(agreement_id))
         }
         async fn agreement_ended_by_indexer(
             &self,
@@ -1919,6 +1919,22 @@ mod lifecycle_event_tests {
         );
         assert_eq!(*chain.marked_at_cancel.lock().unwrap(), vec![true]);
         assert!(cancelled.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sends_no_cancel_for_an_offer_that_never_reached_the_chain() {
+        // A cancel of nothing still mines and costs gas. The mark made first means an
+        // offer still in flight withdraws itself when it lands.
+        let (mut ctx, leaving) = ctx_cancelling_one(IndexingAgreementStatus::Created);
+        ctx.chain_client.nothing_on_chain = true;
+        let chain = ctx.chain_client.clone();
+        let marked = ctx.registry.marked_cancelling.clone();
+
+        let result = handle(ctx, &test_message(0)).await;
+
+        assert!(result.is_ok(), "got {result:?}");
+        assert!(chain.cancelled.lock().unwrap().is_empty());
+        assert_eq!(*marked.lock().unwrap(), vec![leaving.id]);
     }
 
     #[tokio::test]

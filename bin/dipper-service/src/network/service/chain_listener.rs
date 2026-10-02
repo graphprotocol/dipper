@@ -2573,6 +2573,14 @@ mod tests {
         live_until_cancelled: bool,
     }
 
+    /// A chain on which every agreement is live until a cancel is sent for it.
+    fn live_chain() -> MockChainClient {
+        MockChainClient {
+            live_until_cancelled: true,
+            ..MockChainClient::default()
+        }
+    }
+
     impl MockChainClient {
         fn was_on_chain_cancel_attempted(&self, id: &IndexingAgreementId) -> bool {
             self.cancels.lock().unwrap().contains(id.as_bytes())
@@ -3058,7 +3066,7 @@ mod tests {
     #[tokio::test]
     async fn test_reconcile_recovers_expired_agreement() {
         let registry = MockRegistry::new();
-        let chain_client = MockChainClient::default();
+        let chain_client = live_chain();
         let worker_queue = MockWorkerQueue::default();
         let agreement_id = IndexingAgreementId::from_bytes(rand::random());
         let old_agreement_id = IndexingAgreementId::from_bytes(rand::random());
@@ -3434,7 +3442,7 @@ mod tests {
         // We should run the acceptance-side bookkeeping (pending cancellations)
         // AND mark the agreement as CanceledByRequester.
         let registry = MockRegistry::new();
-        let chain_client = MockChainClient::default();
+        let chain_client = live_chain();
         let worker_queue = MockWorkerQueue::default();
         let agreement_id = IndexingAgreementId::from_bytes(rand::random());
         let old_agreement_id = IndexingAgreementId::from_bytes(rand::random());
@@ -3474,7 +3482,7 @@ mod tests {
     #[tokio::test]
     async fn test_pending_cancellations_all_succeed_records_deleted() {
         let registry = MockRegistry::new();
-        let chain_client = MockChainClient::default();
+        let chain_client = live_chain();
         let new_id = IndexingAgreementId::from_bytes(rand::random());
         let old_id_1 = IndexingAgreementId::from_bytes(rand::random());
         let old_id_2 = IndexingAgreementId::from_bytes(rand::random());
@@ -3510,7 +3518,7 @@ mod tests {
         // execute_pending no longer emits `terminated` directly; it records the
         // cancel audit and the chain_listener sweep announces it durably.
         let registry = MockRegistry::new();
-        let chain_client = MockChainClient::default();
+        let chain_client = live_chain();
         let new_id = IndexingAgreementId::from_bytes(rand::random());
         let old_id = IndexingAgreementId::from_bytes(rand::random());
 
@@ -3568,6 +3576,7 @@ mod tests {
         let registry = MockRegistry::new();
         let chain_client = MockChainClient {
             registry: Some(registry.clone()),
+            live_until_cancelled: true,
             ..MockChainClient::default()
         };
         let new_id = IndexingAgreementId::from_bytes(rand::random());
@@ -3696,7 +3705,7 @@ mod tests {
     #[tokio::test]
     async fn test_pending_cancellations_transient_failure_retains_record() {
         let registry = MockRegistry::new();
-        let chain_client = MockChainClient::default();
+        let chain_client = live_chain();
         let new_id = IndexingAgreementId::from_bytes(rand::random());
         let old_ok = IndexingAgreementId::from_bytes(rand::random());
         let old_fail = IndexingAgreementId::from_bytes(rand::random());
@@ -3782,13 +3791,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_pending_cancellations_already_canceled_on_chain_succeeds() {
-        // Crash-recovery edge case: the cancel tx confirmed on-chain on a
-        // prior pass, but dipper crashed before deleting the pending row.
-        // On the next sweep the chain call surfaces as Ok(None) (the
-        // SubgraphService contract reverts with IndexingAgreementNotActive;
-        // the chain client translates that into "already canceled"). The
-        // handler must still flip the local row to CanceledByRequester and
-        // delete the pending row, not loop forever.
+        // Crash-recovery edge case: the cancel landed on a prior pass, but dipper
+        // crashed before deleting the pending row. The chain shows nothing live, so no
+        // cancel is sent; the row is left cancelling for the cancel retry to confirm
+        // and the pending row is deleted rather than retried forever.
         let registry = MockRegistry::new();
         let chain_client = MockChainClient::default();
         let new_id = IndexingAgreementId::from_bytes(rand::random());
@@ -3811,8 +3817,8 @@ mod tests {
             result.is_ok(),
             "expected idempotent success, got {result:?}"
         );
-        assert!(chain_client.was_on_chain_cancel_attempted(&old_id));
-        assert!(registry.was_marked_canceled_by_requester(&old_id));
+        assert!(!chain_client.was_on_chain_cancel_attempted(&old_id));
+        assert!(registry.was_marked_cancelling(&old_id));
         assert!(registry.was_pending_cancellation_deleted(&new_id, &old_id));
     }
 
@@ -3838,7 +3844,7 @@ mod tests {
         )
         .await;
 
-        assert!(registry.was_marked_canceled_by_requester(&old_id));
+        assert!(registry.was_marked_cancelling(&old_id));
         assert!(registry.was_pending_cancellation_deleted(&new_id, &old_id));
         let remaining = registry
             .get_pending_cancellations_by_new_agreement(new_id)
@@ -3857,7 +3863,7 @@ mod tests {
         // and the old agreement is still alive. The sweep must complete
         // the cancellation without needing another snapshot to arrive.
         let registry = MockRegistry::new();
-        let chain_client = MockChainClient::default();
+        let chain_client = live_chain();
         let new_id = IndexingAgreementId::from_bytes(rand::random());
         let old_id = IndexingAgreementId::from_bytes(rand::random());
 
@@ -4539,7 +4545,7 @@ mod tests {
         // Canceled is the orphan signature: reassessment fired the chain
         // cancel and failed, then bailed out. The sweep must pick it up.
         let registry = MockRegistry::new();
-        let chain_client = MockChainClient::default();
+        let chain_client = live_chain();
         let agreement_id = IndexingAgreementId::from_bytes(rand::random());
         let request_id = IndexingRequestId::new();
 
@@ -4586,7 +4592,7 @@ mod tests {
         // The orphan sweep no longer emits `terminated` directly; it records the
         // cancel audit and `sweep_pending_terminated_events` announces it.
         let registry = MockRegistry::new();
-        let chain_client = MockChainClient::default();
+        let chain_client = live_chain();
         let agreement_id = IndexingAgreementId::from_bytes(rand::random());
         let request_id = IndexingRequestId::new();
 
@@ -4606,8 +4612,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_orphan_sweep_handles_already_canceled_on_chain() {
-        // Idempotency check: the chain reports the agreement is already
-        // canceled (Ok(None)). The sweep must still clean up the local row.
+        // The chain shows the agreement already ended, so no cancel is sent; it is
+        // left cancelling for the cancel retry to confirm who ended it.
         let registry = MockRegistry::new();
         let chain_client = MockChainClient::default();
         let agreement_id = IndexingAgreementId::from_bytes(rand::random());
@@ -4621,8 +4627,9 @@ mod tests {
         sweep_orphan_canceled_agreements(&registry, &chain_client, test_agreement_conf().as_ref())
             .await;
 
-        assert!(chain_client.was_on_chain_cancel_attempted(&agreement_id));
-        assert!(registry.was_marked_canceled_by_requester(&agreement_id));
+        assert!(!chain_client.was_on_chain_cancel_attempted(&agreement_id));
+        assert!(registry.was_marked_cancelling(&agreement_id));
+        assert!(!registry.was_marked_canceled_by_requester(&agreement_id));
     }
 
     #[tokio::test]
