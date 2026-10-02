@@ -56,7 +56,6 @@ use crate::{
         AgreementRegistry, CancelKind, IndexingAgreement, IndexingAgreementStatus,
         PendingCancellationRegistry, ReconciliationItem,
     },
-    worker::service::{JobPriority, WorkerQueue},
 };
 
 /// Idle interval used when no `Created` agreements are awaiting acceptance.
@@ -106,11 +105,9 @@ impl Handle {
 }
 
 /// Context required by the chain listener service
-pub struct Ctx<R, W, E, T> {
+pub struct Ctx<R, E, T> {
     /// Registry for querying and updating agreements
     pub registry: R,
-    /// Worker queue (still used by reconciliation paths that hand work back to the worker)
-    pub worker_queue: W,
     /// Chain event source (subgraph)
     pub event_source: E,
     /// Chain client used to cancel on-chain via the RecurringAgreementManager
@@ -150,10 +147,9 @@ pub struct ChainListenerState {
     clippy::too_many_lines,
     reason = "predates this lint; fix when next touched"
 )]
-pub fn new<R, W, E, T>(ctx: Ctx<R, W, E, T>) -> (Handle, impl Future<Output = anyhow::Result<()>>)
+pub fn new<R, E, T>(ctx: Ctx<R, E, T>) -> (Handle, impl Future<Output = anyhow::Result<()>>)
 where
     R: AgreementRegistry + ChainListenerStateRegistry + PendingCancellationRegistry + Send + Sync,
-    W: WorkerQueue + Send + Sync,
     E: ChainEventSource,
     T: ChainClient + Send + Sync,
 {
@@ -161,7 +157,6 @@ where
 
     let Ctx {
         registry,
-        worker_queue,
         event_source,
         chain_client,
         agreement_conf,
@@ -321,7 +316,6 @@ where
                 chain_ts_drift_tolerance_secs,
                 bypass_chain_clock_defenses,
                 &registry,
-                &worker_queue,
                 &chain_client,
                 &event_source,
                 &mut rx_stop,
@@ -440,7 +434,7 @@ struct DrainOutcome {
     clippy::too_many_lines,
     reason = "predates this lint; fix when next touched"
 )]
-async fn drain_once<R, W, E, T>(
+async fn drain_once<R, E, T>(
     cursor: &mut Cursor,
     last_persisted_timestamp: &mut Option<u64>,
     last_chain_ts_persist_wall: &mut std::time::Instant,
@@ -452,7 +446,6 @@ async fn drain_once<R, W, E, T>(
     chain_ts_drift_tolerance_secs: u64,
     bypass_chain_clock_defenses: bool,
     registry: &R,
-    worker_queue: &W,
     chain_client: &T,
     event_source: &E,
     rx_stop: &mut mpsc::Receiver<()>,
@@ -460,7 +453,6 @@ async fn drain_once<R, W, E, T>(
 ) -> Result<DrainOutcome, ()>
 where
     R: AgreementRegistry + ChainListenerStateRegistry + PendingCancellationRegistry + Send + Sync,
-    W: WorkerQueue + Send + Sync,
     E: ChainEventSource,
     T: ChainClient + Send + Sync,
 {
@@ -603,7 +595,7 @@ where
             }
 
             let agreement = agreements_by_id.remove(&snapshot.agreement_id);
-            match prepare_reconciliation(&snapshot, agreement, registry, worker_queue).await {
+            match prepare_reconciliation(&snapshot, agreement, registry, chain_client).await {
                 Ok(Some(prep)) => prepared.push(prep),
                 Ok(None) => {}
                 Err(err) => {
@@ -823,15 +815,15 @@ fn apply_chain_ts_drift_cap(
     clippy::cognitive_complexity,
     reason = "predates this lint; fix when next touched"
 )]
-async fn prepare_reconciliation<R, W>(
+async fn prepare_reconciliation<R, T>(
     snapshot: &AgreementStateSnapshot,
     agreement: Option<IndexingAgreement>,
     registry: &R,
-    worker_queue: &W,
+    chain_client: &T,
 ) -> anyhow::Result<Option<PreparedReconciliation>>
 where
     R: AgreementRegistry + Sync,
-    W: WorkerQueue,
+    T: ChainClient,
 {
     tracing::debug!(
         agreement_id = %snapshot.agreement_id,
@@ -868,12 +860,9 @@ where
         tracing::warn!(
             agreement_id = %agreement.id,
             indexer = %snapshot.indexer,
-            "Rejected agreement accepted on-chain, queuing cancellation"
+            "Rejected agreement accepted on-chain, cancelling it"
         );
-        worker_queue
-            // Background: on-chain cleanup of a rejected-then-accepted agreement.
-            .cancel_rejected_agreement_on_chain(agreement.id, JobPriority::Background)
-            .await?;
+        crate::cancel_dispatch::reopen_if_live(registry, chain_client, &agreement).await?;
 
         // This row goes Rejected -> Canceled without ever transiting
         // AcceptedOnChain, so `apply_reconciliation` never records the accept.
@@ -892,7 +881,7 @@ where
         }
     }
 
-    queue_cancel_if_cancelled_but_accepted(snapshot, &agreement, worker_queue).await?;
+    reopen_if_cancelled_but_accepted(snapshot, &agreement, registry, chain_client).await?;
     record_accept_of_cancelling(snapshot, &agreement, registry).await;
 
     // Both transitions are applied atomically downstream so the
@@ -1008,25 +997,23 @@ fn created_after_events_started(agreement: &IndexingAgreement) -> bool {
 
 /// Safety net for an agreement dipper cancelled whose offer the indexer accepted
 /// anyway, such as one that landed after dipper's cancel. Nothing else would end
-/// it: reconciliation ignores an accept on a cancelled row. The job reads the
-/// chain before acting, so a stale snapshot of an agreement already ended is free.
-async fn queue_cancel_if_cancelled_but_accepted<W: WorkerQueue>(
+/// it: reconciliation ignores an accept on a cancelled row. It goes back to
+/// `Cancelling` for the cancel retry, unless the chain shows it already ended.
+async fn reopen_if_cancelled_but_accepted<R, T>(
     snapshot: &AgreementStateSnapshot,
     agreement: &IndexingAgreement,
-    worker_queue: &W,
-) -> anyhow::Result<()> {
+    registry: &R,
+    chain_client: &T,
+) -> anyhow::Result<()>
+where
+    R: AgreementRegistry + Sync,
+    T: ChainClient,
+{
     if agreement.status == IndexingAgreementStatus::CanceledByRequester
         && snapshot.state.reached_accepted()
         && !snapshot.state.is_canceled()
     {
-        tracing::warn!(
-            agreement_id = %agreement.id,
-            indexer = %snapshot.indexer,
-            "Cancelled agreement accepted on-chain, queuing cancellation"
-        );
-        worker_queue
-            .cancel_rejected_agreement_on_chain(agreement.id, JobPriority::Background)
-            .await?;
+        crate::cancel_dispatch::reopen_if_live(registry, chain_client, agreement).await?;
     }
     Ok(())
 }
@@ -1131,22 +1118,20 @@ where
 /// and applies whatever transitions the diff implies. See the module-level
 /// transition table for the full mapping.
 #[cfg(test)]
-async fn reconcile_agreement<R, W, T>(
+async fn reconcile_agreement<R, T>(
     snapshot: &AgreementStateSnapshot,
     registry: &R,
-    worker_queue: &W,
     chain_client: &T,
     config: &crate::config::IndexingAgreementConfig,
 ) -> anyhow::Result<()>
 where
     R: AgreementRegistry + PendingCancellationRegistry + Sync,
-    W: WorkerQueue,
     T: ChainClient,
 {
     let agreement = registry
         .get_indexing_agreement_by_id(&snapshot.agreement_id)
         .await?;
-    let Some(prep) = prepare_reconciliation(snapshot, agreement, registry, worker_queue).await?
+    let Some(prep) = prepare_reconciliation(snapshot, agreement, registry, chain_client).await?
     else {
         return Ok(());
     };
@@ -1817,7 +1802,6 @@ mod tests {
     use dipper_core::ids::{IndexingAgreementId, IndexingRequestId};
     use thegraph_core::{DeploymentId, IndexerId, alloy::primitives::ChainId};
     use time::OffsetDateTime;
-    use url::Url;
 
     use super::{super::chain_events::AgreementState, *};
     use crate::registry::{
@@ -1902,6 +1886,7 @@ mod tests {
         marked_accepted_on_chain: Vec<IndexingAgreementId>,
         marked_canceled_by_requester: Vec<IndexingAgreementId>,
         marked_cancelling: Vec<IndexingAgreementId>,
+        reopened: Vec<IndexingAgreementId>,
         marked_canceled_by_indexer: Vec<IndexingAgreementId>,
         /// Ids passed to `record_cancel_audit` -- the signal a cancel path drives
         /// the terminated event (the sweep emits from this audit).
@@ -2010,6 +1995,10 @@ mod tests {
 
         fn was_marked_cancelling(&self, id: &IndexingAgreementId) -> bool {
             self.state.lock().unwrap().marked_cancelling.contains(id)
+        }
+
+        fn was_reopened(&self, id: &IndexingAgreementId) -> bool {
+            self.state.lock().unwrap().reopened.contains(id)
         }
 
         fn was_marked_canceled_by_requester(&self, id: &IndexingAgreementId) -> bool {
@@ -2200,6 +2189,14 @@ mod tests {
                 ));
             }
             state.marked_cancelling.push(*id);
+            Ok(())
+        }
+
+        async fn reopen_indexing_agreement_cancel(
+            &self,
+            id: &IndexingAgreementId,
+        ) -> RegistryResult<()> {
+            self.state.lock().unwrap().reopened.push(*id);
             Ok(())
         }
 
@@ -2545,18 +2542,6 @@ mod tests {
         }
     }
 
-    // Mock worker queue
-    #[derive(Clone, Default)]
-    struct MockWorkerQueue {
-        cancel_jobs: Arc<Mutex<Vec<IndexingAgreementId>>>,
-    }
-
-    impl MockWorkerQueue {
-        fn was_cancellation_queued(&self, id: &IndexingAgreementId) -> bool {
-            self.cancel_jobs.lock().unwrap().contains(id)
-        }
-    }
-
     /// Minimal `ChainClient` mock for chain_listener tests. Records every
     /// on-chain cancel attempt. Tests can mark specific agreements as
     /// already-canceled-on-chain (cancel returns `Ok(None)`); unmarked
@@ -2571,6 +2556,14 @@ mod tests {
         fail_cancels: bool,
         /// When set, every agreement reads as live until a cancel is sent for it.
         live_until_cancelled: bool,
+    }
+
+    /// A chain on which every agreement is live until a cancel is sent for it.
+    fn live_chain() -> MockChainClient {
+        MockChainClient {
+            live_until_cancelled: true,
+            ..MockChainClient::default()
+        }
     }
 
     impl MockChainClient {
@@ -2671,60 +2664,12 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
-    impl crate::worker::service::WorkerQueue for MockWorkerQueue {
-        async fn send_indexing_agreement_proposal(
-            &self,
-            _candidate_url: Url,
-            _agreement_id: IndexingAgreementId,
-            _indexing_request_id: IndexingRequestId,
-            _deployment_id: DeploymentId,
-            _deployment_chain_id: ChainId,
-            _priority: JobPriority,
-        ) -> anyhow::Result<dipper_pgmq::JobId> {
-            Ok(dipper_pgmq::JobId::default())
-        }
-
-        async fn reassess_indexing_request(
-            &self,
-            _indexing_request_id: IndexingRequestId,
-            _deployment_id: DeploymentId,
-            _deployment_chain_id: ChainId,
-            _num_candidates: usize,
-            _priority: JobPriority,
-        ) -> anyhow::Result<dipper_pgmq::JobId> {
-            Ok(dipper_pgmq::JobId::default())
-        }
-
-        async fn cancel_rejected_agreement_on_chain(
-            &self,
-            agreement_id: IndexingAgreementId,
-            _priority: JobPriority,
-        ) -> anyhow::Result<dipper_pgmq::JobId> {
-            self.cancel_jobs.lock().unwrap().push(agreement_id);
-            Ok(dipper_pgmq::JobId::default())
-        }
-
-        async fn submit_offer(
-            &self,
-            _agreement_id: IndexingAgreementId,
-            _indexing_request_id: IndexingRequestId,
-            _indexer_url: Url,
-            _deployment_id: DeploymentId,
-            _deployment_chain_id: ChainId,
-            _priority: JobPriority,
-        ) -> anyhow::Result<dipper_pgmq::JobId> {
-            Ok(dipper_pgmq::JobId::default())
-        }
-    }
-
     // -- reconcile_agreement tests --
 
     #[tokio::test]
     async fn test_reconcile_transitions_created_to_accepted() {
         let registry = MockRegistry::new();
         let chain_client = MockChainClient::default();
-        let worker_queue = MockWorkerQueue::default();
         let agreement_id = IndexingAgreementId::from_bytes(rand::random());
 
         registry.add_agreement(agreement_id, IndexingAgreementStatus::Created);
@@ -2733,7 +2678,6 @@ mod tests {
         let result = reconcile_agreement(
             &snapshot,
             &registry,
-            &worker_queue,
             &chain_client,
             test_agreement_conf().as_ref(),
         )
@@ -2741,7 +2685,7 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(registry.was_marked_accepted_on_chain(&agreement_id));
-        assert!(!worker_queue.was_cancellation_queued(&agreement_id));
+        assert!(!registry.was_reopened(&agreement_id));
     }
 
     #[tokio::test]
@@ -2749,7 +2693,6 @@ mod tests {
         // It stays cancelling, and the recorded accept lets its end be announced.
         let registry = MockRegistry::new();
         let chain_client = MockChainClient::default();
-        let worker_queue = MockWorkerQueue::default();
         let agreement_id = IndexingAgreementId::from_bytes(rand::random());
         registry.add_agreement(agreement_id, IndexingAgreementStatus::Cancelling);
 
@@ -2757,7 +2700,6 @@ mod tests {
         reconcile_agreement(
             &snapshot,
             &registry,
-            &worker_queue,
             &chain_client,
             test_agreement_conf().as_ref(),
         )
@@ -2766,14 +2708,13 @@ mod tests {
 
         assert!(!registry.was_marked_accepted_on_chain(&agreement_id));
         assert_eq!(registry.audit_writes(), vec![("accept", agreement_id)]);
-        assert!(!worker_queue.was_cancellation_queued(&agreement_id));
+        assert!(!registry.was_reopened(&agreement_id));
     }
 
     #[tokio::test]
     async fn reconcile_records_no_accept_of_an_agreement_from_before_events_existed() {
         let registry = MockRegistry::new();
         let chain_client = MockChainClient::default();
-        let worker_queue = MockWorkerQueue::default();
         let agreement_id = IndexingAgreementId::from_bytes(rand::random());
         registry.add_agreement(agreement_id, IndexingAgreementStatus::Cancelling);
         registry.set_agreement_created_at(agreement_id, LIFECYCLE_EVENTS_START - 1);
@@ -2782,7 +2723,6 @@ mod tests {
         reconcile_agreement(
             &snapshot,
             &registry,
-            &worker_queue,
             &chain_client,
             test_agreement_conf().as_ref(),
         )
@@ -2798,7 +2738,6 @@ mod tests {
         // time; recording it would announce an agreement that was never live.
         let registry = MockRegistry::new();
         let chain_client = MockChainClient::default();
-        let worker_queue = MockWorkerQueue::default();
         let agreement_id = IndexingAgreementId::from_bytes(rand::random());
         registry.add_agreement(agreement_id, IndexingAgreementStatus::Cancelling);
         let mut snapshot =
@@ -2808,7 +2747,6 @@ mod tests {
         reconcile_agreement(
             &snapshot,
             &registry,
-            &worker_queue,
             &chain_client,
             test_agreement_conf().as_ref(),
         )
@@ -2834,7 +2772,6 @@ mod tests {
         ] {
             let registry = MockRegistry::new();
             let chain_client = MockChainClient::default();
-            let worker_queue = MockWorkerQueue::default();
             let agreement_id = IndexingAgreementId::from_bytes(rand::random());
             registry.add_agreement(agreement_id, status);
             let mut snapshot =
@@ -2844,7 +2781,6 @@ mod tests {
             reconcile_agreement(
                 &snapshot,
                 &registry,
-                &worker_queue,
                 &chain_client,
                 test_agreement_conf().as_ref(),
             )
@@ -2873,7 +2809,6 @@ mod tests {
         ] {
             let registry = MockRegistry::new();
             let chain_client = MockChainClient::default();
-            let worker_queue = MockWorkerQueue::default();
             let agreement_id = IndexingAgreementId::from_bytes(rand::random());
             registry.add_agreement(agreement_id, IndexingAgreementStatus::Cancelling);
 
@@ -2881,7 +2816,6 @@ mod tests {
             reconcile_agreement(
                 &snapshot,
                 &registry,
-                &worker_queue,
                 &chain_client,
                 test_agreement_conf().as_ref(),
             )
@@ -2905,7 +2839,6 @@ mod tests {
 
         let registry = MockRegistry::new();
         let chain_client = MockChainClient::default();
-        let worker_queue = MockWorkerQueue::default();
         let events = CapturingEventsProducer::new();
         let agreement_id = IndexingAgreementId::from_bytes(rand::random());
         registry.add_agreement(agreement_id, IndexingAgreementStatus::Created);
@@ -2914,7 +2847,6 @@ mod tests {
         reconcile_agreement(
             &snapshot,
             &registry,
-            &worker_queue,
             &chain_client,
             test_agreement_conf().as_ref(),
         )
@@ -2937,7 +2869,6 @@ mod tests {
 
         let registry = MockRegistry::new();
         let chain_client = MockChainClient::default();
-        let worker_queue = MockWorkerQueue::default();
         let events = CapturingEventsProducer::new();
         let agreement_id = IndexingAgreementId::from_bytes(rand::random());
         registry.add_agreement(agreement_id, IndexingAgreementStatus::AcceptedOnChain);
@@ -2954,7 +2885,6 @@ mod tests {
         reconcile_agreement(
             &snapshot,
             &registry,
-            &worker_queue,
             &chain_client,
             test_agreement_conf().as_ref(),
         )
@@ -2972,10 +2902,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reconcile_queues_cancellation_for_rejected() {
+    async fn test_reconcile_reopens_the_cancel_of_a_rejected_agreement_live_on_chain() {
         let registry = MockRegistry::new();
-        let chain_client = MockChainClient::default();
-        let worker_queue = MockWorkerQueue::default();
+        let chain_client = MockChainClient {
+            live_until_cancelled: true,
+            ..MockChainClient::default()
+        };
         let agreement_id = IndexingAgreementId::from_bytes(rand::random());
 
         registry.add_agreement(agreement_id, IndexingAgreementStatus::Rejected);
@@ -2984,7 +2916,6 @@ mod tests {
         let result = reconcile_agreement(
             &snapshot,
             &registry,
-            &worker_queue,
             &chain_client,
             test_agreement_conf().as_ref(),
         )
@@ -2992,7 +2923,7 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(!registry.was_marked_accepted_on_chain(&agreement_id));
-        assert!(worker_queue.was_cancellation_queued(&agreement_id));
+        assert!(registry.was_reopened(&agreement_id));
     }
 
     #[tokio::test]
@@ -3004,7 +2935,6 @@ mod tests {
         // the canceler address.
         let registry = MockRegistry::new();
         let chain_client = MockChainClient::default();
-        let worker_queue = MockWorkerQueue::default();
         let agreement_id = IndexingAgreementId::from_bytes(rand::random());
         let signer_address: Address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             .parse()
@@ -3020,14 +2950,13 @@ mod tests {
         let result = reconcile_agreement(
             &snapshot,
             &registry,
-            &worker_queue,
             &chain_client,
             test_agreement_conf().as_ref(),
         )
         .await;
 
         assert!(result.is_ok());
-        assert!(!worker_queue.was_cancellation_queued(&agreement_id));
+        assert!(!registry.was_reopened(&agreement_id));
         assert!(registry.was_marked_canceled_by_requester(&agreement_id));
         assert!(!registry.was_marked_accepted_on_chain(&agreement_id));
     }
@@ -3036,7 +2965,6 @@ mod tests {
     async fn test_reconcile_ignores_unknown_agreement() {
         let registry = MockRegistry::new();
         let chain_client = MockChainClient::default();
-        let worker_queue = MockWorkerQueue::default();
         let agreement_id = IndexingAgreementId::from_bytes(rand::random());
         // Don't add the agreement to the registry
 
@@ -3044,7 +2972,6 @@ mod tests {
         let result = reconcile_agreement(
             &snapshot,
             &registry,
-            &worker_queue,
             &chain_client,
             test_agreement_conf().as_ref(),
         )
@@ -3052,14 +2979,13 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(!registry.was_marked_accepted_on_chain(&agreement_id));
-        assert!(!worker_queue.was_cancellation_queued(&agreement_id));
+        assert!(!registry.was_reopened(&agreement_id));
     }
 
     #[tokio::test]
     async fn test_reconcile_recovers_expired_agreement() {
         let registry = MockRegistry::new();
-        let chain_client = MockChainClient::default();
-        let worker_queue = MockWorkerQueue::default();
+        let chain_client = live_chain();
         let agreement_id = IndexingAgreementId::from_bytes(rand::random());
         let old_agreement_id = IndexingAgreementId::from_bytes(rand::random());
 
@@ -3071,7 +2997,6 @@ mod tests {
         let result = reconcile_agreement(
             &snapshot,
             &registry,
-            &worker_queue,
             &chain_client,
             test_agreement_conf().as_ref(),
         )
@@ -3087,7 +3012,6 @@ mod tests {
     async fn test_reconcile_marks_canceled_by_indexer() {
         let registry = MockRegistry::new();
         let chain_client = MockChainClient::default();
-        let worker_queue = MockWorkerQueue::default();
         let agreement_id = IndexingAgreementId::from_bytes(rand::random());
         let indexer_address: Address = "0x1234567890123456789012345678901234567890"
             .parse()
@@ -3103,7 +3027,6 @@ mod tests {
         let result = reconcile_agreement(
             &snapshot,
             &registry,
-            &worker_queue,
             &chain_client,
             test_agreement_conf().as_ref(),
         )
@@ -3118,7 +3041,6 @@ mod tests {
     async fn test_reconcile_marks_canceled_by_requester() {
         let registry = MockRegistry::new();
         let chain_client = MockChainClient::default();
-        let worker_queue = MockWorkerQueue::default();
         let agreement_id = IndexingAgreementId::from_bytes(rand::random());
         let signer_address: Address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             .parse()
@@ -3134,7 +3056,6 @@ mod tests {
         let result = reconcile_agreement(
             &snapshot,
             &registry,
-            &worker_queue,
             &chain_client,
             test_agreement_conf().as_ref(),
         )
@@ -3152,7 +3073,6 @@ mod tests {
         // the state: CanceledByPayer -> ByRequester, the only kind allowed here.
         let registry = MockRegistry::new();
         let chain_client = MockChainClient::default();
-        let worker_queue = MockWorkerQueue::default();
         let agreement_id = IndexingAgreementId::from_bytes(rand::random());
         // A payer address deliberately distinct from dipper's signer key.
         let payer_address: Address = "0xcccccccccccccccccccccccccccccccccccccccc"
@@ -3165,7 +3085,6 @@ mod tests {
         let result = reconcile_agreement(
             &snapshot,
             &registry,
-            &worker_queue,
             &chain_client,
             test_agreement_conf().as_ref(),
         )
@@ -3176,17 +3095,19 @@ mod tests {
         assert!(!registry.was_marked_canceled_by_indexer(&agreement_id));
         assert!(!registry.was_marked_accepted_on_chain(&agreement_id));
         // Already canceled on-chain: must not queue a fresh cancel job.
-        assert!(!worker_queue.was_cancellation_queued(&agreement_id));
+        assert!(!registry.was_reopened(&agreement_id));
     }
 
     #[tokio::test]
-    async fn test_reconcile_queues_cancel_for_cancelled_agreement_accepted_on_chain() {
+    async fn test_reconcile_reopens_the_cancel_of_a_cancelled_agreement_live_on_chain() {
         // Dipper cancelled the agreement locally, but the indexer accepted its offer
         // (for example one that landed after dipper's cancel). Nothing else would end
-        // it, so the listener queues an on-chain cancel and leaves the row cancelled.
+        // it, so it goes back to cancelling for the cancel retry to end.
         let registry = MockRegistry::new();
-        let chain_client = MockChainClient::default();
-        let worker_queue = MockWorkerQueue::default();
+        let chain_client = MockChainClient {
+            live_until_cancelled: true,
+            ..MockChainClient::default()
+        };
         let agreement_id = IndexingAgreementId::from_bytes(rand::random());
         registry.add_agreement(agreement_id, IndexingAgreementStatus::CanceledByRequester);
 
@@ -3194,22 +3115,42 @@ mod tests {
         let result = reconcile_agreement(
             &snapshot,
             &registry,
-            &worker_queue,
             &chain_client,
             test_agreement_conf().as_ref(),
         )
         .await;
 
         assert!(result.is_ok());
-        assert!(worker_queue.was_cancellation_queued(&agreement_id));
+        assert!(registry.was_reopened(&agreement_id));
         assert!(!registry.was_marked_accepted_on_chain(&agreement_id));
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_leaves_a_cancelled_agreement_the_chain_shows_ended() {
+        // The subgraph can still report an agreement accepted for a few polls after
+        // dipper's cancel lands; reopening it would only bring it back to cancelling.
+        let registry = MockRegistry::new();
+        let chain_client = MockChainClient::default();
+        let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+        registry.add_agreement(agreement_id, IndexingAgreementStatus::CanceledByRequester);
+
+        let snapshot = make_snapshot(agreement_id, AgreementState::Accepted, Address::ZERO);
+        reconcile_agreement(
+            &snapshot,
+            &registry,
+            &chain_client,
+            test_agreement_conf().as_ref(),
+        )
+        .await
+        .expect("reconcile ok");
+
+        assert!(!registry.was_reopened(&agreement_id));
     }
 
     #[tokio::test]
     async fn test_reconcile_cancelled_agreement_already_cancelled_on_chain_queues_nothing() {
         let registry = MockRegistry::new();
         let chain_client = MockChainClient::default();
-        let worker_queue = MockWorkerQueue::default();
         let agreement_id = IndexingAgreementId::from_bytes(rand::random());
         registry.add_agreement(agreement_id, IndexingAgreementStatus::CanceledByRequester);
 
@@ -3217,14 +3158,13 @@ mod tests {
         let result = reconcile_agreement(
             &snapshot,
             &registry,
-            &worker_queue,
             &chain_client,
             test_agreement_conf().as_ref(),
         )
         .await;
 
         assert!(result.is_ok());
-        assert!(!worker_queue.was_cancellation_queued(&agreement_id));
+        assert!(!registry.was_reopened(&agreement_id));
     }
 
     #[tokio::test]
@@ -3235,7 +3175,6 @@ mod tests {
         // waits for the accept.
         let registry = MockRegistry::new();
         let chain_client = MockChainClient::default();
-        let worker_queue = MockWorkerQueue::default();
         let agreement_id = IndexingAgreementId::from_bytes(rand::random());
         registry.add_agreement(agreement_id, IndexingAgreementStatus::CanceledByRequester);
         // The listener lagged: dipper only cancelled it locally long after the offer's
@@ -3246,7 +3185,6 @@ mod tests {
         let result = reconcile_agreement(
             &snapshot,
             &registry,
-            &worker_queue,
             &chain_client,
             test_agreement_conf().as_ref(),
         )
@@ -3265,7 +3203,6 @@ mod tests {
         // out with fallback cancel fields.
         let registry = MockRegistry::new();
         let chain_client = MockChainClient::default();
-        let worker_queue = MockWorkerQueue::default();
         let agreement_id = IndexingAgreementId::from_bytes(rand::random());
         registry.add_agreement(agreement_id, IndexingAgreementStatus::CanceledByRequester);
         registry.state.lock().unwrap().fail_cancel_audit = true;
@@ -3274,7 +3211,6 @@ mod tests {
         let result = reconcile_agreement(
             &snapshot,
             &registry,
-            &worker_queue,
             &chain_client,
             test_agreement_conf().as_ref(),
         )
@@ -3290,7 +3226,6 @@ mod tests {
         // and are never announced, even when a replay of the chain reads them again.
         let registry = MockRegistry::new();
         let chain_client = MockChainClient::default();
-        let worker_queue = MockWorkerQueue::default();
         let agreement_id = IndexingAgreementId::from_bytes(rand::random());
         registry.add_agreement(agreement_id, IndexingAgreementStatus::CanceledByRequester);
         registry.set_agreement_created_at(agreement_id, LIFECYCLE_EVENTS_START - 1);
@@ -3299,7 +3234,6 @@ mod tests {
         let result = reconcile_agreement(
             &snapshot,
             &registry,
-            &worker_queue,
             &chain_client,
             test_agreement_conf().as_ref(),
         )
@@ -3314,7 +3248,6 @@ mod tests {
         // A withdrawn offer was never accepted, so there is nothing to announce.
         let registry = MockRegistry::new();
         let chain_client = MockChainClient::default();
-        let worker_queue = MockWorkerQueue::default();
         let agreement_id = IndexingAgreementId::from_bytes(rand::random());
         registry.add_agreement(agreement_id, IndexingAgreementStatus::CanceledByRequester);
 
@@ -3324,7 +3257,6 @@ mod tests {
         let result = reconcile_agreement(
             &snapshot,
             &registry,
-            &worker_queue,
             &chain_client,
             test_agreement_conf().as_ref(),
         )
@@ -3340,7 +3272,6 @@ mod tests {
         // agreement has actually ended on-chain.
         let registry = MockRegistry::new();
         let chain_client = MockChainClient::default();
-        let worker_queue = MockWorkerQueue::default();
         let agreement_id = IndexingAgreementId::from_bytes(rand::random());
         registry.add_agreement(agreement_id, IndexingAgreementStatus::CanceledByRequester);
 
@@ -3348,7 +3279,6 @@ mod tests {
         let result = reconcile_agreement(
             &snapshot,
             &registry,
-            &worker_queue,
             &chain_client,
             test_agreement_conf().as_ref(),
         )
@@ -3362,7 +3292,6 @@ mod tests {
     async fn test_reconcile_ignores_already_canceled() {
         let registry = MockRegistry::new();
         let chain_client = MockChainClient::default();
-        let worker_queue = MockWorkerQueue::default();
         let agreement_id = IndexingAgreementId::from_bytes(rand::random());
 
         registry.add_agreement(agreement_id, IndexingAgreementStatus::CanceledByIndexer);
@@ -3375,7 +3304,6 @@ mod tests {
         let result = reconcile_agreement(
             &snapshot,
             &registry,
-            &worker_queue,
             &chain_client,
             test_agreement_conf().as_ref(),
         )
@@ -3399,7 +3327,6 @@ mod tests {
         // rather than incrementing its `errors` counter.
         let registry = MockRegistry::new();
         let chain_client = MockChainClient::default();
-        let worker_queue = MockWorkerQueue::default();
         let agreement_id = IndexingAgreementId::from_bytes(rand::random());
         let signer_address: Address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             .parse()
@@ -3415,7 +3342,6 @@ mod tests {
         let result = reconcile_agreement(
             &snapshot,
             &registry,
-            &worker_queue,
             &chain_client,
             test_agreement_conf().as_ref(),
         )
@@ -3434,8 +3360,7 @@ mod tests {
         // We should run the acceptance-side bookkeeping (pending cancellations)
         // AND mark the agreement as CanceledByRequester.
         let registry = MockRegistry::new();
-        let chain_client = MockChainClient::default();
-        let worker_queue = MockWorkerQueue::default();
+        let chain_client = live_chain();
         let agreement_id = IndexingAgreementId::from_bytes(rand::random());
         let old_agreement_id = IndexingAgreementId::from_bytes(rand::random());
         let signer_address: Address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -3454,7 +3379,6 @@ mod tests {
         let result = reconcile_agreement(
             &snapshot,
             &registry,
-            &worker_queue,
             &chain_client,
             test_agreement_conf().as_ref(),
         )
@@ -3474,7 +3398,7 @@ mod tests {
     #[tokio::test]
     async fn test_pending_cancellations_all_succeed_records_deleted() {
         let registry = MockRegistry::new();
-        let chain_client = MockChainClient::default();
+        let chain_client = live_chain();
         let new_id = IndexingAgreementId::from_bytes(rand::random());
         let old_id_1 = IndexingAgreementId::from_bytes(rand::random());
         let old_id_2 = IndexingAgreementId::from_bytes(rand::random());
@@ -3510,7 +3434,7 @@ mod tests {
         // execute_pending no longer emits `terminated` directly; it records the
         // cancel audit and the chain_listener sweep announces it durably.
         let registry = MockRegistry::new();
-        let chain_client = MockChainClient::default();
+        let chain_client = live_chain();
         let new_id = IndexingAgreementId::from_bytes(rand::random());
         let old_id = IndexingAgreementId::from_bytes(rand::random());
 
@@ -3568,6 +3492,7 @@ mod tests {
         let registry = MockRegistry::new();
         let chain_client = MockChainClient {
             registry: Some(registry.clone()),
+            live_until_cancelled: true,
             ..MockChainClient::default()
         };
         let new_id = IndexingAgreementId::from_bytes(rand::random());
@@ -3696,7 +3621,7 @@ mod tests {
     #[tokio::test]
     async fn test_pending_cancellations_transient_failure_retains_record() {
         let registry = MockRegistry::new();
-        let chain_client = MockChainClient::default();
+        let chain_client = live_chain();
         let new_id = IndexingAgreementId::from_bytes(rand::random());
         let old_ok = IndexingAgreementId::from_bytes(rand::random());
         let old_fail = IndexingAgreementId::from_bytes(rand::random());
@@ -3782,13 +3707,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_pending_cancellations_already_canceled_on_chain_succeeds() {
-        // Crash-recovery edge case: the cancel tx confirmed on-chain on a
-        // prior pass, but dipper crashed before deleting the pending row.
-        // On the next sweep the chain call surfaces as Ok(None) (the
-        // SubgraphService contract reverts with IndexingAgreementNotActive;
-        // the chain client translates that into "already canceled"). The
-        // handler must still flip the local row to CanceledByRequester and
-        // delete the pending row, not loop forever.
+        // Crash-recovery edge case: the cancel landed on a prior pass, but dipper
+        // crashed before deleting the pending row. The chain shows nothing live, so no
+        // cancel is sent; the row is left cancelling for the cancel retry to confirm
+        // and the pending row is deleted rather than retried forever.
         let registry = MockRegistry::new();
         let chain_client = MockChainClient::default();
         let new_id = IndexingAgreementId::from_bytes(rand::random());
@@ -3811,8 +3733,8 @@ mod tests {
             result.is_ok(),
             "expected idempotent success, got {result:?}"
         );
-        assert!(chain_client.was_on_chain_cancel_attempted(&old_id));
-        assert!(registry.was_marked_canceled_by_requester(&old_id));
+        assert!(!chain_client.was_on_chain_cancel_attempted(&old_id));
+        assert!(registry.was_marked_cancelling(&old_id));
         assert!(registry.was_pending_cancellation_deleted(&new_id, &old_id));
     }
 
@@ -3838,7 +3760,7 @@ mod tests {
         )
         .await;
 
-        assert!(registry.was_marked_canceled_by_requester(&old_id));
+        assert!(registry.was_marked_cancelling(&old_id));
         assert!(registry.was_pending_cancellation_deleted(&new_id, &old_id));
         let remaining = registry
             .get_pending_cancellations_by_new_agreement(new_id)
@@ -3857,7 +3779,7 @@ mod tests {
         // and the old agreement is still alive. The sweep must complete
         // the cancellation without needing another snapshot to arrive.
         let registry = MockRegistry::new();
-        let chain_client = MockChainClient::default();
+        let chain_client = live_chain();
         let new_id = IndexingAgreementId::from_bytes(rand::random());
         let old_id = IndexingAgreementId::from_bytes(rand::random());
 
@@ -4012,7 +3934,6 @@ mod tests {
 
         let ctx = Ctx {
             registry: registry.clone(),
-            worker_queue: MockWorkerQueue::default(),
             chain_client: MockChainClient::default(),
             event_source,
             config,
@@ -4096,7 +4017,6 @@ mod tests {
 
         let ctx = Ctx {
             registry: registry.clone(),
-            worker_queue: MockWorkerQueue::default(),
             chain_client: MockChainClient::default(),
             event_source,
             config,
@@ -4177,7 +4097,6 @@ mod tests {
 
         let ctx = Ctx {
             registry: registry.clone(),
-            worker_queue: MockWorkerQueue::default(),
             chain_client: MockChainClient::default(),
             event_source,
             config,
@@ -4262,7 +4181,6 @@ mod tests {
             10,
             false,
             &registry,
-            &MockWorkerQueue::default(),
             &chain_client,
             &event_source,
             &mut rx_stop,
@@ -4327,7 +4245,6 @@ mod tests {
             10,
             false,
             &registry,
-            &MockWorkerQueue::default(),
             &chain_client,
             &event_source,
             &mut rx_stop,
@@ -4355,7 +4272,6 @@ mod tests {
             10,
             false,
             &registry,
-            &MockWorkerQueue::default(),
             &chain_client,
             &event_source,
             &mut rx_stop,
@@ -4459,7 +4375,6 @@ mod tests {
             10,
             false,
             &registry,
-            &MockWorkerQueue::default(),
             &chain_client,
             &event_source,
             &mut rx_stop,
@@ -4500,7 +4415,6 @@ mod tests {
 
         let ctx = Ctx {
             registry: MockRegistry::new(),
-            worker_queue: MockWorkerQueue::default(),
             chain_client: MockChainClient::default(),
             event_source: TimingEventSource {
                 poll_times: poll_times.clone(),
@@ -4539,7 +4453,7 @@ mod tests {
         // Canceled is the orphan signature: reassessment fired the chain
         // cancel and failed, then bailed out. The sweep must pick it up.
         let registry = MockRegistry::new();
-        let chain_client = MockChainClient::default();
+        let chain_client = live_chain();
         let agreement_id = IndexingAgreementId::from_bytes(rand::random());
         let request_id = IndexingRequestId::new();
 
@@ -4586,7 +4500,7 @@ mod tests {
         // The orphan sweep no longer emits `terminated` directly; it records the
         // cancel audit and `sweep_pending_terminated_events` announces it.
         let registry = MockRegistry::new();
-        let chain_client = MockChainClient::default();
+        let chain_client = live_chain();
         let agreement_id = IndexingAgreementId::from_bytes(rand::random());
         let request_id = IndexingRequestId::new();
 
@@ -4606,8 +4520,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_orphan_sweep_handles_already_canceled_on_chain() {
-        // Idempotency check: the chain reports the agreement is already
-        // canceled (Ok(None)). The sweep must still clean up the local row.
+        // The chain shows the agreement already ended, so no cancel is sent; it is
+        // left cancelling for the cancel retry to confirm who ended it.
         let registry = MockRegistry::new();
         let chain_client = MockChainClient::default();
         let agreement_id = IndexingAgreementId::from_bytes(rand::random());
@@ -4621,8 +4535,9 @@ mod tests {
         sweep_orphan_canceled_agreements(&registry, &chain_client, test_agreement_conf().as_ref())
             .await;
 
-        assert!(chain_client.was_on_chain_cancel_attempted(&agreement_id));
-        assert!(registry.was_marked_canceled_by_requester(&agreement_id));
+        assert!(!chain_client.was_on_chain_cancel_attempted(&agreement_id));
+        assert!(registry.was_marked_cancelling(&agreement_id));
+        assert!(!registry.was_marked_canceled_by_requester(&agreement_id));
     }
 
     #[tokio::test]

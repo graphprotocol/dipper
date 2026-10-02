@@ -971,6 +971,35 @@ impl PgRegistry {
         .await
     }
 
+    /// Move an agreement dipper had already ended, cancelled or rejected, back to `Cancelling`
+    /// once the chain shows it live after all, with its cancel attempts started afresh.
+    pub async fn reopen_indexing_agreement_cancel(
+        &self,
+        agreement_id: &IndexingAgreementId,
+    ) -> Result<(), Error> {
+        let updated = sqlx::query(
+            r#"
+            UPDATE dipper_reg_indexing_agreements
+            SET
+                status = $1,
+                cancel_attempts = 0,
+                cancel_checked_at = NULL,
+                updated_at = timezone('UTC', now())
+            WHERE id = $2 AND status IN ($3, $4)
+            "#,
+        )
+        .bind(IndexingAgreementStatus::Cancelling)
+        .bind(agreement_id)
+        .bind(IndexingAgreementStatus::CanceledByRequester)
+        .bind(IndexingAgreementStatus::Rejected)
+        .execute(&self.pool)
+        .await?;
+        if updated.rows_affected() == 0 {
+            return Err(Error::NoRecordsUpdated);
+        }
+        Ok(())
+    }
+
     /// `Cancelling` agreements marked over `min_age_minutes` ago whose cancel has failed
     /// fewer than `max_attempts` times, those checked longest ago first. One that may be paying
     /// an indexer (accepted, or past the offer deadline, which only an accepted one outlives)

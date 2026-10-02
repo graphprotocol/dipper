@@ -137,6 +137,10 @@ pub trait StubAgreementRegistry: Send + Sync {
         unimplemented!("mark_indexing_agreement_as_cancelling")
     }
 
+    async fn reopen_indexing_agreement_cancel(&self, _id: &IndexingAgreementId) -> Result<()> {
+        unimplemented!("reopen_indexing_agreement_cancel")
+    }
+
     async fn get_cancelling_agreements(
         &self,
         _batch_size: i64,
@@ -438,6 +442,10 @@ impl<T: StubAgreementRegistry> AgreementRegistry for T {
 
     async fn mark_indexing_agreement_as_cancelling(&self, id: &IndexingAgreementId) -> Result<()> {
         StubAgreementRegistry::mark_indexing_agreement_as_cancelling(self, id).await
+    }
+
+    async fn reopen_indexing_agreement_cancel(&self, id: &IndexingAgreementId) -> Result<()> {
+        StubAgreementRegistry::reopen_indexing_agreement_cancel(self, id).await
     }
 
     async fn get_cancelling_agreements(

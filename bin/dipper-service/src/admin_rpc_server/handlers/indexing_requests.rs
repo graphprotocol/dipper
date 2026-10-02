@@ -364,14 +364,6 @@ mod tests {
             Ok(JobId::default())
         }
 
-        async fn cancel_rejected_agreement_on_chain(
-            &self,
-            _agreement_id: IndexingAgreementId,
-            _priority: crate::worker::queue::JobPriority,
-        ) -> anyhow::Result<JobId> {
-            unimplemented!()
-        }
-
         async fn submit_offer(
             &self,
             _agreement_id: IndexingAgreementId,

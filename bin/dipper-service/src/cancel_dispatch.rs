@@ -71,9 +71,9 @@ pub enum CancelStarted {
     Cancelling,
 }
 
-/// Start ending an agreement that may be live on-chain. It is marked `Cancelling` before
-/// its cancel goes out, so an offer for it still in flight withdraws itself on landing.
-/// Fails, sending nothing, when the mark can't be written.
+/// Start ending an agreement that may be live on-chain. It is marked `Cancelling` first, so an
+/// offer for it still in flight withdraws itself on landing, then cancelled only if the chain
+/// shows it live. Fails, sending nothing, when the mark can't be written.
 pub async fn start_cancel<R, T>(
     registry: &R,
     chain_client: &T,
@@ -87,9 +87,10 @@ where
     registry
         .mark_indexing_agreement_as_cancelling(&agreement.id)
         .await?;
-    let tx_hash = match cancel_agreement_on_chain(chain_client, agreement, config).await {
-        Ok(tx_hash) => tx_hash,
-        Err(err) => {
+    let tx_hash = match cancel_if_live(chain_client, agreement, config).await {
+        LiveCancel::Ended(tx_hash) => tx_hash,
+        LiveCancel::NotLive => return Ok(CancelStarted::Cancelling),
+        LiveCancel::ReadFailed(err) | LiveCancel::CancelFailed(err) => {
             tracing::warn!(
                 agreement_id = %agreement.id,
                 error = %err,
@@ -107,17 +108,24 @@ where
     if agreement.status != IndexingAgreementStatus::AcceptedOnChain {
         return Ok(CancelStarted::Cancelling);
     }
-    Ok(confirm_cancelled(registry, agreement, tx_hash, config).await)
+    Ok(
+        if confirm_cancelled(registry, agreement, tx_hash, config).await {
+            CancelStarted::Ended
+        } else {
+            CancelStarted::Cancelling
+        },
+    )
 }
 
-/// Mark an accepted agreement whose cancel landed `CanceledByRequester` and record the
-/// cancel, so the `terminated` sweep announces it.
-async fn confirm_cancelled<R: AgreementRegistry + Sync>(
+/// Mark an agreement the chain shows dipper ended `CanceledByRequester`, recording the cancel
+/// when its transaction is known, so the `terminated` sweep announces it. False, logged, when
+/// the mark fails; it stays `Cancelling` for the cancel retry.
+pub async fn confirm_cancelled<R: AgreementRegistry + Sync>(
     registry: &R,
     agreement: &IndexingAgreement,
     tx_hash: Option<B256>,
     config: &IndexingAgreementConfig,
-) -> CancelStarted {
+) -> bool {
     if let Err(err) = registry
         .mark_indexing_agreement_as_canceled_by_requester(&agreement.id)
         .await
@@ -125,17 +133,27 @@ async fn confirm_cancelled<R: AgreementRegistry + Sync>(
         tracing::warn!(
             agreement_id = %agreement.id,
             error = %err,
-            "Failed to mark a cancelled agreement; the chain listener finishes it"
+            "Failed to mark an ended agreement cancelled; the cancel retry tries again"
         );
-        return CancelStarted::Cancelling;
+        return false;
     }
-    record_cancel(registry, agreement, tx_hash, config).await;
-    CancelStarted::Ended
+    tracing::info!(
+        agreement_id = %agreement.id,
+        indexing_request_id = %agreement.indexing_request_id,
+        old_status = "CANCELLING",
+        new_status = "CANCELED_BY_REQUESTER",
+        reason = "cancel_confirmed_on_chain",
+        "agreement state transition"
+    );
+    if tx_hash.is_some() {
+        record_cancel(registry, agreement, tx_hash, config).await;
+    }
+    true
 }
 
 /// Record dipper's own cancel of an accepted agreement, so the `terminated` sweep
 /// announces it.
-pub async fn record_cancel<R: AgreementRegistry + Sync>(
+async fn record_cancel<R: AgreementRegistry + Sync>(
     registry: &R,
     agreement: &IndexingAgreement,
     tx_hash: Option<B256>,
@@ -153,6 +171,51 @@ pub async fn record_cancel<R: AgreementRegistry + Sync>(
             "failed to record cancel audit; terminated event may emit with fallback fields"
         );
     }
+}
+
+/// Move an agreement dipper had already rejected or cancelled back into `Cancelling` when the
+/// chain shows it live after all, so the cancel retry ends it. The chain is read first, so a
+/// subgraph report from before dipper's cancel landed reopens nothing; an unreadable chain
+/// reopens it anyway, as the retry reads again before sending. True if it was reopened.
+pub async fn reopen_if_live<R, T>(
+    registry: &R,
+    chain_client: &T,
+    agreement: &IndexingAgreement,
+) -> RegistryResult<bool>
+where
+    R: AgreementRegistry + Sync,
+    T: ChainClient,
+{
+    match chain_client
+        .agreement_still_active(agreement.id.as_bytes())
+        .await
+    {
+        Ok(false) => return Ok(false),
+        Ok(true) => {}
+        Err(err) => tracing::warn!(
+            agreement_id = %agreement.id,
+            error = %err,
+            "Failed to read an ended agreement reported live; the cancel retry checks it"
+        ),
+    }
+    match registry
+        .reopen_indexing_agreement_cancel(&agreement.id)
+        .await
+    {
+        Ok(()) => {}
+        Err(crate::registry::Error::NoRecordsUpdated) => return Ok(false),
+        Err(err) => return Err(err),
+    }
+    tracing::warn!(
+        agreement_id = %agreement.id,
+        indexer_id = %agreement.indexer.id,
+        indexing_request_id = %agreement.indexing_request_id,
+        old_status = %agreement.status,
+        new_status = "CANCELLING",
+        reason = "live_on_chain_after_end",
+        "agreement state transition"
+    );
+    Ok(true)
 }
 
 /// What [`cancel_if_live`] found and did.

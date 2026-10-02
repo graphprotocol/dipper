@@ -6,7 +6,7 @@ use dipper_core::time::now_secs;
 use thegraph_core::alloy::primitives::B256;
 
 use crate::{
-    cancel_dispatch::{LiveCancel, cancel_if_live, record_cancel},
+    cancel_dispatch::{LiveCancel, cancel_if_live, confirm_cancelled},
     chain_client::{ChainClient, ChainClientError},
     config::IndexingAgreementConfig,
     registry::{AgreementRegistry, CancelKind, CancellingAgreement, IndexingAgreement},
@@ -154,30 +154,7 @@ where
             Some(false) => {}
         }
     }
-    if let Err(err) = registry
-        .mark_indexing_agreement_as_canceled_by_requester(&agreement.id)
-        .await
-    {
-        tracing::warn!(
-            agreement_id = %agreement.id,
-            error = %err,
-            "Failed to mark an ended agreement cancelled, will retry"
-        );
-        return false;
-    }
-    tracing::info!(
-        agreement_id = %agreement.id,
-        indexing_request_id = %agreement.indexing_request_id,
-        old_status = "CANCELLING",
-        new_status = "CANCELED_BY_REQUESTER",
-        reason = "cancel_confirmed_on_chain",
-        "agreement state transition"
-    );
-    // Without its own transaction, a late read by the chain listener fills in the cancel.
-    if row.accepted_on_chain && tx_hash.is_some() {
-        record_cancel(registry, agreement, tx_hash, config).await;
-    }
-    true
+    confirm_cancelled(registry, agreement, tx_hash, config).await
 }
 
 /// Whether the chain shows the indexer ended the agreement, or `None` when it can't be read,
