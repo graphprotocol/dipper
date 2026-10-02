@@ -10,8 +10,9 @@ use crate::{
 };
 
 /// Pass both ACTIVE and PENDING; local status lags the chain, so let the
-/// collector no-op the absent scope. Never SCOPE_SIGNED (=4): acceptance is
-/// offer-based and dipper never retracts a pending offer, so it isn't needed.
+/// collector no-op the absent scope. PENDING revokes an offer not yet accepted.
+/// Never SCOPE_SIGNED (=4): acceptance is offer-based, so revoking the stored
+/// offer is enough.
 const SCOPE_ACTIVE: u16 = 1;
 const SCOPE_PENDING: u16 = 2;
 const SCOPE_BOTH: u16 = SCOPE_ACTIVE | SCOPE_PENDING;
