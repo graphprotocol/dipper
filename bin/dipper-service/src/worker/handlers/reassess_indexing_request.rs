@@ -1356,19 +1356,11 @@ mod lifecycle_event_tests {
             min_seconds_per_collection: 60,
             duration_seconds: 86400,
             deadline_seconds: 3600,
-            max_grt_per_30_days: std::collections::BTreeMap::new(),
-            max_grt_per_billion_entities_per_30_days: 0.0,
             declined_indexer_lookback_days: 30,
             price_rejection_lookback_days: 1,
             transient_rejection_lookback_minutes: 30,
             uncertain_rejection_lookback_days: 1,
-            unresponsive_indexer_lookback_days: 0,
-            mass_unresponsive_trip_fraction: 0.5,
-            mass_unresponsive_reset_fraction: 0.25,
-            dips_accepting_snapshot_max_age_hours: 48,
-            dips_accepting_cache_ttl_seconds: 300,
-            max_in_flight_offers_per_indexer: None,
-            max_in_flight_offers_total: None,
+            ..IndexingAgreementConfig::for_tests()
         }
     }
 

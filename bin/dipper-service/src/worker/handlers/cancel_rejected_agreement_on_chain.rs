@@ -625,29 +625,7 @@ mod tests {
     }
 
     fn test_agreement_conf() -> Arc<IndexingAgreementConfig> {
-        Arc::new(IndexingAgreementConfig {
-            data_service: Address::ZERO,
-            recurring_collector: Address::ZERO,
-            recurring_agreement_manager: Address::ZERO,
-            max_agreement_grt_per_30_days: 0.0,
-            max_seconds_per_collection: 0,
-            min_seconds_per_collection: 0,
-            duration_seconds: 0,
-            deadline_seconds: 0,
-            max_grt_per_30_days: std::collections::BTreeMap::new(),
-            max_grt_per_billion_entities_per_30_days: 0.0,
-            declined_indexer_lookback_days: 0,
-            price_rejection_lookback_days: 0,
-            transient_rejection_lookback_minutes: 0,
-            uncertain_rejection_lookback_days: 0,
-            unresponsive_indexer_lookback_days: 0,
-            mass_unresponsive_trip_fraction: 0.5,
-            mass_unresponsive_reset_fraction: 0.25,
-            dips_accepting_snapshot_max_age_hours: 48,
-            dips_accepting_cache_ttl_seconds: 300,
-            max_in_flight_offers_per_indexer: None,
-            max_in_flight_offers_total: None,
-        })
+        Arc::new(IndexingAgreementConfig::for_tests())
     }
 
     fn test_deployment_id() -> DeploymentId {
