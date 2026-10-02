@@ -28,7 +28,7 @@ use tokio::sync::Mutex;
 use super::{
     abi::{IRecurringAgreementManager, IRecurringCollector},
     gas::{GasEstimator, calculate_max_fee, exceeds_max_gas_price, get_gas_prices},
-    rpc_provider::RpcProviderPool,
+    rpc_provider::{BEHIND_A_SEEN_BLOCK, RpcProviderPool},
 };
 use crate::{
     chain_client::{
@@ -642,7 +642,7 @@ impl AlloyChainClient {
                     let head = provider.get_block_number().await?;
                     if head < seen {
                         return Err(TransportErrorKind::custom_str(&format!(
-                            "endpoint is at block {head}, behind block {seen} already seen"
+                            "endpoint is at block {head}, {BEHIND_A_SEEN_BLOCK} ({seen})"
                         )));
                     }
                     let tx = TransactionRequest::default().to(to).input(calldata.into());
@@ -2083,7 +2083,9 @@ mod tests {
     /// Answers as an endpoint whose latest block is `head`, reporting `state` for any
     /// agreement read at that block.
     struct AgreementStateResponder {
-        head: u64,
+        head: AtomicU64,
+        /// Blocks the endpoint gains each time it reports its head.
+        catch_up: u64,
         state: u16,
     }
 
@@ -2092,12 +2094,16 @@ mod tests {
             let body: serde_json::Value =
                 serde_json::from_slice(&request.body).expect("JSON-RPC request body");
             let result = match body["method"].as_str().unwrap_or_default() {
-                "eth_blockNumber" => format!("{:#x}", self.head),
+                "eth_blockNumber" => {
+                    let head = self.head.fetch_add(self.catch_up, Ordering::SeqCst);
+                    format!("{head:#x}")
+                }
                 "eth_call" => {
-                    assert_eq!(
-                        body["params"][1],
-                        format!("{:#x}", self.head),
-                        "read at the endpoint's latest block"
+                    let at = body["params"][1].as_str().expect("a block number");
+                    let at = u64::from_str_radix(at.trim_start_matches("0x"), 16).expect("hex");
+                    assert!(
+                        at <= self.head.load(Ordering::SeqCst),
+                        "read at a block the endpoint has"
                     );
                     let details = IRecurringCollector::AgreementDetails {
                         agreementId: FixedBytes::<16>::ZERO,
@@ -2125,12 +2131,36 @@ mod tests {
     }
 
     async fn server_at_block(head: u64, state: u16) -> MockServer {
+        server_catching_up(head, 0, state).await
+    }
+
+    async fn server_catching_up(head: u64, catch_up: u64, state: u16) -> MockServer {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .respond_with(AgreementStateResponder { head, state })
+            .respond_with(AgreementStateResponder {
+                head: AtomicU64::new(head),
+                catch_up,
+                state,
+            })
             .mount(&server)
             .await;
         server
+    }
+
+    #[tokio::test]
+    async fn waits_for_an_endpoint_a_block_behind_to_catch_up() {
+        // Hosted endpoints spread calls across nodes, so one a block behind is routine
+        // rather than a reason to give up on the endpoint.
+        let endpoint = server_catching_up(94, 1, STATE_REGISTERED | STATE_ACCEPTED).await;
+        let client = client_over_retrying(vec![endpoint.uri().parse().expect("provider URL")], 1);
+        client.note_block(95);
+
+        let live = client
+            .agreement_still_active(&[0xab; 16])
+            .await
+            .expect("read once the endpoint caught up");
+
+        assert!(live);
     }
 
     #[tokio::test]
