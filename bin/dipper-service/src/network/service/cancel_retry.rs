@@ -23,6 +23,10 @@ const BATCH_SIZE: i64 = 10;
 /// when it was marked can be mined first instead of being sent again.
 const SETTLE_MINUTES: i32 = 2;
 
+/// How long the chain listener gets to record who ended an accepted agreement, and when,
+/// before the retry marks it ended without those details.
+const LISTENER_GRACE: time::Duration = time::Duration::HOUR;
+
 /// Retry the cancel of agreements still `Cancelling`. `chain_now`, in chain seconds,
 /// decides when an offer that was never accepted no longer can be.
 pub async fn retry_cancelling_agreements<R, T>(
@@ -89,7 +93,7 @@ async fn retry_cancel<R, T>(
 
 /// Mark the agreement `CanceledByRequester` once it can't go live again: this sweep's cancel
 /// ended it, or nobody accepted its offer before the deadline to. One accepted that ended
-/// otherwise is left to the chain listener, which reads who ended it and when.
+/// otherwise is left to the chain listener, which reads who ended it and when, for a while.
 async fn confirm_if_over<R: AgreementRegistry + Sync>(
     registry: &R,
     config: &IndexingAgreementConfig,
@@ -99,7 +103,7 @@ async fn confirm_if_over<R: AgreementRegistry + Sync>(
 ) -> bool {
     let agreement = &row.agreement;
     let can_confirm = if row.accepted_on_chain {
-        tx_hash.is_some()
+        tx_hash.is_some() || agreement.updated_at < time::OffsetDateTime::now_utc() - LISTENER_GRACE
     } else {
         chain_now > agreement.terms.deadline
     };
@@ -125,7 +129,8 @@ async fn confirm_if_over<R: AgreementRegistry + Sync>(
         reason = "cancel_confirmed_on_chain",
         "agreement state transition"
     );
-    if row.accepted_on_chain {
+    // Without its own transaction, a late read by the chain listener fills in the cancel.
+    if row.accepted_on_chain && tx_hash.is_some() {
         record_cancel(registry, agreement, tx_hash, config).await;
     }
     true
@@ -397,6 +402,20 @@ mod tests {
 
         assert_eq!(chain.cancels_sent.load(Ordering::SeqCst), 0);
         assert!(registry.marked_cancelled.lock().unwrap().is_empty());
+        assert!(registry.audits.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn marks_an_ended_accepted_agreement_itself_once_the_listener_has_had_long_enough() {
+        // In case the listener never reads its end, it would otherwise stay cancelling.
+        let mut registry = registry_with_one(true);
+        registry.cancelling[0].agreement.updated_at =
+            time::OffsetDateTime::now_utc() - LISTENER_GRACE - time::Duration::MINUTE;
+        let chain = MockChain::default();
+
+        retry(&registry, &chain, 0).await;
+
+        assert_eq!(registry.marked_cancelled.lock().unwrap().len(), 1);
         assert!(registry.audits.lock().unwrap().is_empty());
     }
 
