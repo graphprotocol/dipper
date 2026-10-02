@@ -236,5 +236,6 @@ impl_from_state!(CancelRejectedAgreementOnChainCtx<R, T> {
 impl_from_state!(SubmitOfferCtx<R, T> {
     registry,
     chain_client,
+    agreement_conf,
     reassess_lock,
 });
