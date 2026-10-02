@@ -6,9 +6,9 @@ use std::{sync::Arc, time::Duration};
 
 use tokio::sync::{Mutex, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
-/// Longest a reassessment waits for offers already being sent to land before
-/// it defers. An offer holds the lock for at most its receipt wait (15 s) plus
-/// its turn at the chain client's send.
+/// Longest a reassessment waits for offers already being sent to land before it
+/// defers. An offer holds the lock through its receipt wait (15 s) and its turn
+/// at the chain client's send, so a slow RPC can outlast this.
 const OFFER_DRAIN_WAIT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Default)]
@@ -20,25 +20,31 @@ pub struct ReassessLock {
     offers: Arc<RwLock<()>>,
 }
 
-/// Held for a whole reassessment.
+/// The running reassessment, before it has waited out the offers in flight.
+pub struct Reassessment {
+    reassessment: OwnedMutexGuard<()>,
+    offers: Arc<RwLock<()>>,
+}
+
+/// Held for the rest of a reassessment once offers in flight have landed.
 pub struct ReassessmentGuard {
     _reassessment: OwnedMutexGuard<()>,
     _offers: OwnedRwLockWriteGuard<()>,
 }
 
 impl ReassessLock {
-    /// `None` (defer) if another reassessment runs or offers in flight don't land
-    /// within `OFFER_DRAIN_WAIT`. Waiting blocks new offers, so a stream of them
-    /// can't keep it out; only the reassessment holding the mutex ever waits.
-    pub async fn reassessment(&self) -> Option<ReassessmentGuard> {
-        let reassessment = self.reassessment.clone().try_lock_owned().ok()?;
-        let offers = tokio::time::timeout(OFFER_DRAIN_WAIT, self.offers.clone().write_owned())
-            .await
-            .ok()?;
-        Some(ReassessmentGuard {
-            _reassessment: reassessment,
-            _offers: offers,
+    /// Start a reassessment, or `None` (defer) if another one is running.
+    pub fn start_reassessment(&self) -> Option<Reassessment> {
+        Some(Reassessment {
+            reassessment: self.reassessment.clone().try_lock_owned().ok()?,
+            offers: self.offers.clone(),
         })
+    }
+
+    /// Both steps at once.
+    #[cfg(test)]
+    pub async fn reassessment(&self) -> Option<ReassessmentGuard> {
+        self.start_reassessment()?.wait_for_offers().await
     }
 
     /// Start an offer submission, or `None` (defer) while a reassessment is
@@ -47,10 +53,31 @@ impl ReassessLock {
         self.offers.clone().try_read_owned().ok()
     }
 
-    /// Whether a reassessment could take the lock right now without waiting.
+    /// Whether a reassessment could start and take the lock right now.
     #[cfg(test)]
     pub fn reassessment_could_start_now(&self) -> bool {
         self.reassessment.try_lock().is_ok() && self.offers.try_write().is_ok()
+    }
+}
+
+impl Reassessment {
+    /// Wait for offers in flight to land, or `None` (defer) after
+    /// `OFFER_DRAIN_WAIT`. Must come before any cancel this reassessment sends.
+    /// Waiting blocks new offers, so a stream of them can't keep it out.
+    pub async fn wait_for_offers(self) -> Option<ReassessmentGuard> {
+        let Ok(offers) =
+            tokio::time::timeout(OFFER_DRAIN_WAIT, self.offers.clone().write_owned()).await
+        else {
+            tracing::info!(
+                wait_secs = OFFER_DRAIN_WAIT.as_secs(),
+                "Offers in flight did not land in time; deferring the reassessment"
+            );
+            return None;
+        };
+        Some(ReassessmentGuard {
+            _reassessment: self.reassessment,
+            _offers: offers,
+        })
     }
 }
 
@@ -120,9 +147,11 @@ mod tests {
         let started = tokio::time::Instant::now();
         assert!(lock.reassessment().await.is_none());
         assert_eq!(started.elapsed(), OFFER_DRAIN_WAIT);
+
+        drop(_stuck);
         assert!(
-            lock.reassessment_could_start_now() || lock.offer().is_some(),
-            "giving up must release what it held"
+            lock.reassessment_could_start_now(),
+            "giving up must release both locks"
         );
     }
 }

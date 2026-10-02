@@ -128,9 +128,8 @@ where
 {
     // Only one reassessment runs globally at a time; if another loop holds the
     // lock this pass would diff the same baseline, so defer ~1s rather than park
-    // this loop. Offers in flight are waited out first so none lands after a
-    // cancel decided here. Deferral isn't a failure: no backoff, no attempt count.
-    let Some(_reassess_guard) = ctx.reassess_lock.reassessment().await else {
+    // this loop. Deferral isn't a failure: no backoff, no attempt count.
+    let Some(reassessment) = ctx.reassess_lock.start_reassessment() else {
         return Err(JobError::Deferred(Duration::from_secs(1)));
     };
 
@@ -176,6 +175,13 @@ where
         );
         return Err(JobError::Deferred(pacing_defer_delay(indexing_request_id)));
     }
+
+    // Offers in flight are waited out before anything is decided, so none lands
+    // after a cancel sent below. Kept after the saturation check: a pass that
+    // would only defer shouldn't hold up new offers while it waits.
+    let Some(_reassess_guard) = reassessment.wait_for_offers().await else {
+        return Err(JobError::Deferred(Duration::from_secs(1)));
+    };
 
     // Gather load balancing context for IISA, including chain/ceiling info
     let (mut context, unresponsive) = gather_selection_context(
@@ -1923,6 +1929,34 @@ mod lifecycle_event_tests {
             "only Proposed; never-accepted unpaired cancel emits no Terminated: {captured:?}"
         );
         assert!(matches!(captured[0], CapturedEvent::Proposed { .. }));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_saturated_pass_defers_without_holding_up_offers() {
+        // A pass that will only defer must not first wait out offers in flight,
+        // which would block new offers for nothing.
+        let mut ctx = build_ctx(
+            MockRegistry::default(),
+            MockIisa { selected: vec![] },
+            MockQueue::default(),
+            MockChainClient::default(),
+            CapturingEventsProducer::new(),
+            indexer_urls::Snapshot::new(),
+        );
+        ctx.agreement_conf = Arc::new(IndexingAgreementConfig {
+            max_in_flight_offers_total: Some(0),
+            ..test_agreement_conf()
+        });
+        let _offer = ctx.reassess_lock.offer().expect("lock is free");
+
+        let started = tokio::time::Instant::now();
+        let result = handle(ctx, &test_message(1)).await;
+
+        assert!(
+            matches!(result, Err(crate::worker::result::JobError::Deferred(_))),
+            "got {result:?}"
+        );
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
     }
 
     #[tokio::test(start_paused = true)]
