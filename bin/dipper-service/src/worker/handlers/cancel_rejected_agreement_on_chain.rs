@@ -148,7 +148,7 @@ where
 }
 
 /// Agreements a job in this process is cancelling right now. The listener can
-/// queue one twice before the chain shows it ended, and two jobs at once would
+/// queue one twice before the chain shows it ended, and 2 jobs at once would
 /// both cancel it and both alert.
 static CANCELLING: LazyLock<Mutex<HashSet<IndexingAgreementId>>> = LazyLock::new(Mutex::default);
 
@@ -822,7 +822,7 @@ mod tests {
     #[tokio::test]
     async fn a_second_job_for_the_same_agreement_leaves_it_to_the_first() {
         // The listener can queue an agreement twice before the chain shows it
-        // ended; two jobs at once would both cancel it and both alert.
+        // ended; 2 jobs at once would both cancel it and both alert.
         let agreement = make_agreement(IndexingAgreementStatus::CanceledByRequester);
         let agreement_id = agreement.id;
         let chain = MockChainClient::live();
