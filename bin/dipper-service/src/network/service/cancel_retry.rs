@@ -12,8 +12,8 @@ use crate::{
     registry::{AgreementRegistry, CancelKind, CancellingAgreement, IndexingAgreement},
 };
 
-/// Retried cancels mined without ending an agreement before dipper stops retrying it and
-/// leaves it to an operator. Other failures don't count (see `failed_attempts`).
+/// Failed cancels before dipper alerts an operator and retries the agreement only hourly, so a
+/// paused manager recovers once unpaused. Outages don't count (see `failed_attempts`).
 pub const MAX_CANCEL_ATTEMPTS: u32 = 10;
 
 /// Agreements a sweep takes on, those that may be paying an indexer first; the time budget
@@ -250,7 +250,7 @@ async fn note_check<R: AgreementRegistry + Sync>(
     {
         Ok(attempts) => {
             if let Some(err) = failure.filter(|_| failed_attempts > 0) {
-                log_failed_cancel(agreement, attempts, err);
+                log_failed_cancel(agreement, attempts, failed_attempts, err);
             }
         }
         Err(err) => tracing::warn!(
@@ -261,26 +261,25 @@ async fn note_check<R: AgreementRegistry + Sync>(
     }
 }
 
-/// A revert before sending is logged as an ERROR: a paused or misconfigured manager makes
-/// every cancel revert, so it is retried rather than counted against the agreement.
 fn log_uncounted_failure(agreement: &IndexingAgreement, err: &ChainClientError) {
-    if matches!(err, ChainClientError::ContractRevert { .. }) {
-        tracing::error!(
-            agreement_id = %agreement.id,
-            error = %err,
-            "Cancel of an agreement reverted before it was sent, will retry"
-        );
-    } else {
-        tracing::warn!(
-            agreement_id = %agreement.id,
-            error = %err,
-            "Cancel of an agreement failed or could not be confirmed, will retry"
-        );
-    }
+    tracing::warn!(
+        agreement_id = %agreement.id,
+        error = %err,
+        "Cancel of an agreement failed or could not be confirmed, will retry"
+    );
 }
 
-fn log_failed_cancel(agreement: &IndexingAgreement, attempts: u32, err: &ChainClientError) {
-    if attempts < MAX_CANCEL_ATTEMPTS {
+/// One ERROR as an agreement reaches the limit, for an operator to look into; a WARN for
+/// every other failed cancel.
+fn log_failed_cancel(
+    agreement: &IndexingAgreement,
+    attempts: u32,
+    failed: u32,
+    err: &ChainClientError,
+) {
+    let reached_limit =
+        attempts >= MAX_CANCEL_ATTEMPTS && attempts.saturating_sub(failed) < MAX_CANCEL_ATTEMPTS;
+    if !reached_limit {
         tracing::warn!(
             agreement_id = %agreement.id,
             attempts,
@@ -290,22 +289,24 @@ fn log_failed_cancel(agreement: &IndexingAgreement, attempts: u32, err: &ChainCl
         return;
     }
     tracing::error!(
-        event = "agreement_cancel_abandoned",
+        event = "agreement_cancel_stuck",
         agreement_id = %agreement.id,
         indexer_id = %agreement.indexer.id,
         indexing_request_id = %agreement.indexing_request_id,
         attempts,
         error = %err,
-        "Gave up cancelling an agreement on-chain; it may still be live"
+        "Cancelling an agreement keeps failing; it may still be live. Dipper now retries it hourly"
     );
 }
 
-/// How many of an agreement's cancel attempts a failure uses up. A cancel mined without
-/// ending it, or reverted, counts, and one that can never be sent uses them all. An
-/// unreachable chain or a revert before sending is retried freely.
+/// How many of an agreement's cancel attempts a failure uses up. A cancel the contract
+/// refused, before sending or once mined, or that mined without ending the agreement counts,
+/// and one that can never be sent uses them all. An unreachable chain is retried freely.
 fn failed_attempts(err: &ChainClientError) -> u32 {
     match err {
-        ChainClientError::CancelNotConfirmed { .. } | ChainClientError::TxReverted { .. } => 1,
+        ChainClientError::CancelNotConfirmed { .. }
+        | ChainClientError::TxReverted { .. }
+        | ChainClientError::ContractRevert { .. } => 1,
         ChainClientError::MissingTermsVersionHash { .. } => MAX_CANCEL_ATTEMPTS,
         _ => 0,
     }
@@ -403,6 +404,7 @@ mod tests {
         read_fails: bool,
         send_fails: bool,
         mined_cancel_reverts: bool,
+        reverts_before_sending: bool,
         cancel_has_no_effect: bool,
         clock_fails: bool,
         now: AtomicU64,
@@ -428,6 +430,12 @@ mod tests {
         ) -> Result<Option<B256>, ChainClientError> {
             if self.send_fails {
                 return Err(ChainClientError::RpcError(anyhow::anyhow!("rpc down")));
+            }
+            if self.reverts_before_sending {
+                return Err(ChainClientError::ContractRevert {
+                    selector: [0xde, 0xad, 0xbe, 0xef],
+                    data: Default::default(),
+                });
             }
             if self.mined_cancel_reverts {
                 return Err(ChainClientError::TxReverted {
@@ -713,6 +721,20 @@ mod tests {
         let registry = registry_with_one(true);
         let chain = MockChain {
             mined_cancel_reverts: true,
+            ..live_chain()
+        };
+
+        retry(&registry, &chain, 0).await;
+
+        assert_eq!(registry.attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn counts_a_cancel_the_contract_refuses_before_it_is_sent() {
+        // Otherwise one that always reverts is retried, and alerted on, for ever.
+        let registry = registry_with_one(true);
+        let chain = MockChain {
+            reverts_before_sending: true,
             ..live_chain()
         };
 
