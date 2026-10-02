@@ -4,9 +4,8 @@ use dipper_core::state::FromState;
 use dipper_producer::events::SubgraphIndexingAgreementEventsProducer;
 use graph_networks_registry::NetworksRegistry;
 use thegraph_core::alloy::primitives::ChainId;
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, Notify};
 
-pub use super::reassess_lock::ReassessLock;
 use super::{
     handlers::{
         CancelRejectedAgreementOnChainCtx, ReassessIndexingRequestCtx,
@@ -19,6 +18,11 @@ use crate::{
     network::{provider::NetworkProviderService, service::entity_count_cache::EntityCountCache},
     signing::eip712::Eip712Signer,
 };
+
+/// A single process-wide async mutex. Only one reassessment runs at a time
+/// across every worker loop, so two loops can't diff the same baseline and both
+/// create agreements. In-process only (dipper is single-replica).
+pub type ReassessLock = Arc<Mutex<()>>;
 
 /// Generates a `FromState<InnerCtx<...>>` impl mapping InnerCtx fields onto a
 /// handler context type. Syntax: `impl_from_state!(Target<generics> { mappings })`,
@@ -237,5 +241,4 @@ impl_from_state!(SubmitOfferCtx<R, T> {
     registry,
     chain_client,
     agreement_conf,
-    reassess_lock,
 });
