@@ -176,7 +176,7 @@ where
 
     // Every cancel of an unaccepted agreement marks it before it is sent, so a cancel
     // that went out ahead of this offer, and found nothing to withdraw, shows here.
-    if let Some(agreement) = cancelled_meanwhile(&ctx.registry, agreement_id).await? {
+    if let Some(agreement) = cancelled_meanwhile(&ctx.registry, agreement_id).await {
         return withdraw_offer_if_stored(&ctx, &agreement).await;
     }
 
@@ -273,22 +273,24 @@ fn dipper_cancelled(status: IndexingAgreementStatus) -> bool {
     )
 }
 
-/// The agreement, if it was cancelled after this job's status check. A failed read
-/// retries the job, whose status check then withdraws the offer of a cancelled one.
+/// The agreement, if it was cancelled after this job's status check. After a failed read
+/// the job still finishes: retrying would send the offer again, and the chain listener's
+/// cancel retry withdraws the offer of an agreement left cancelling.
 async fn cancelled_meanwhile<R: AgreementRegistry>(
     registry: &R,
     agreement_id: &IndexingAgreementId,
-) -> JobResult<Option<IndexingAgreement>> {
+) -> Option<IndexingAgreement> {
     match registry.get_indexing_agreement_by_id(agreement_id).await {
-        Ok(Some(agreement)) if dipper_cancelled(agreement.status) => Ok(Some(agreement)),
-        Ok(_) => Ok(None),
+        Ok(Some(agreement)) if dipper_cancelled(agreement.status) => Some(agreement),
+        Ok(_) => None,
         Err(err) => {
             tracing::warn!(
                 agreement_id = %agreement_id,
                 error = %err,
-                "Failed to re-read agreement after its offer landed, will retry"
+                "Failed to re-read agreement after its offer landed; the cancel retry \
+                 withdraws the offer if it was cancelled"
             );
-            Err(JobError::Retryable(err.into(), TRANSIENT_RETRY_BASE))
+            None
         }
     }
 }
@@ -533,9 +535,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retries_when_it_cannot_check_the_agreement_after_its_offer_lands() {
-        //* Arrange - finishing here would leave the offer open had the agreement
-        // been cancelled while it was sent
+    async fn finishes_without_resending_when_it_cannot_recheck_the_agreement() {
+        //* Arrange - a retry would send the offer again; the mock panics on a second send
         let agreement = make_test_agreement();
         let message = make_message(agreement.id);
         let mut ctx = ctx_with_offer_result(agreement, Ok(Some(B256::repeat_byte(0xab))));
@@ -545,10 +546,7 @@ mod tests {
         let result = handle(ctx, &message).await;
 
         //* Assert
-        assert!(
-            matches!(result, Err(JobError::Retryable(..))),
-            "got {result:?}"
-        );
+        assert!(result.is_ok(), "got {result:?}");
     }
 
     #[tokio::test]
