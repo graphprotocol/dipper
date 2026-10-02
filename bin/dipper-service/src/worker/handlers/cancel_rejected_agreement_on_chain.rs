@@ -1,6 +1,6 @@
-//! Cancel on-chain, via the RecurringAgreementManager, an agreement dipper doesn't
-//! want that is still live: one the indexer rejected off-chain, or one dipper had already
-//! cancelled. The chain listener queues it, and a reassessment does when its own cancel fails.
+//! Cancel on-chain, via the RecurringAgreementManager, an agreement dipper doesn't want
+//! that was accepted anyway: one the indexer rejected off-chain, or one dipper had already
+//! cancelled. The chain listener queues it.
 
 use std::{
     collections::HashSet,
@@ -173,9 +173,9 @@ impl Drop for Cancelling {
     }
 }
 
-/// Cancel on-chain an agreement dipper had already cancelled that is still live: accepted
-/// anyway, or an offer a failed cancel left open. The row is already terminal. The chain is
-/// read first, so a stale snapshot of one dipper has since ended raises no alert.
+/// Cancel on-chain an agreement dipper had already cancelled that the indexer accepted
+/// anyway; the row is already terminal. The chain is read first, so a stale snapshot of
+/// one dipper has since ended raises no alert.
 async fn cancel_live_agreement_dipper_cancelled<R, T>(
     ctx: &Ctx<R, T>,
     agreement: &IndexingAgreement,
