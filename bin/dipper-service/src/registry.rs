@@ -431,9 +431,10 @@ impl AgreementRegistry for RegistryProvider {
         &self,
         id: &IndexingAgreementId,
         failed_attempts: u32,
+        ended: Option<bool>,
     ) -> RegistryResult<u32> {
         self.inner
-            .record_cancel_check(id, failed_attempts)
+            .record_cancel_check(id, failed_attempts, ended)
             .await
             .map_err(Into::into)
     }

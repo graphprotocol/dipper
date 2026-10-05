@@ -193,6 +193,8 @@ pub struct CancellingAgreement {
     pub agreement: IndexingAgreement,
     /// Whether dipper saw it accepted on-chain, so its end is announced.
     pub accepted_on_chain: bool,
+    /// When a check first found it no longer live on-chain, if one has.
+    pub ended_seen_at: Option<time::OffsetDateTime>,
 }
 
 impl sqlx::FromRow<'_, sqlx::postgres::PgRow> for CancellingAgreement {
@@ -202,6 +204,7 @@ impl sqlx::FromRow<'_, sqlx::postgres::PgRow> for CancellingAgreement {
         Ok(Self {
             agreement: IndexingAgreement::from_row(row)?,
             accepted_on_chain: accepted_at.is_some(),
+            ended_seen_at: row.try_get("ended_seen_at")?,
         })
     }
 }
@@ -972,7 +975,9 @@ impl PgRegistry {
     }
 
     /// Move an agreement dipper had already ended, cancelled or rejected, back to `Cancelling`
-    /// once the chain shows it live after all, with its cancel attempts started afresh.
+    /// once the chain shows it live after all, with its cancel attempts started afresh. It counts
+    /// as checked, since no cancel is sent with it, so the retry takes it on its next sweep rather
+    /// than waiting for one to be mined.
     pub async fn reopen_indexing_agreement_cancel(
         &self,
         agreement_id: &IndexingAgreementId,
@@ -983,7 +988,8 @@ impl PgRegistry {
             SET
                 status = $1,
                 cancel_attempts = 0,
-                cancel_checked_at = NULL,
+                cancel_checked_at = timezone('UTC', now()),
+                ended_seen_at = NULL,
                 updated_at = timezone('UTC', now())
             WHERE id = $2 AND status IN ($3, $4)
             "#,
@@ -1000,10 +1006,12 @@ impl PgRegistry {
         Ok(())
     }
 
-    /// `Cancelling` agreements marked over `min_age_minutes` ago, those checked longest ago
-    /// first; one whose cancel has failed `max_attempts` times only once an hour. One that may be paying
+    /// `Cancelling` agreements, those checked longest ago first, leaving out any never checked
+    /// that was marked in the last `min_age_minutes`, so the cancel sent with its mark can be
+    /// mined first; one whose cancel has failed `max_attempts` times only once an hour. One that may be paying
     /// an indexer (accepted, or past the offer deadline, which only an accepted one outlives)
-    /// counts as checked an hour earlier, so it goes first without holding the rest back.
+    /// counts as checked an hour earlier, so it goes first without holding the rest back. One
+    /// never checked counts as checked when it was marked, so a burst of new ones can't jump it.
     pub async fn get_cancelling_agreements(
         &self,
         batch_size: i64,
@@ -1027,21 +1035,25 @@ impl PgRegistry {
                 last_progress_at,
                 rejection_reason,
                 terms_version_hash,
-                accepted_at
+                accepted_at,
+                ended_seen_at
             FROM dipper_reg_indexing_agreements
             WHERE status = $1
               AND (
                   cancel_attempts < $2
                   OR cancel_checked_at < timezone('UTC', now()) - INTERVAL '1 hour'
               )
-              AND updated_at < timezone('UTC', now()) - make_interval(mins => $4)
+              AND (
+                  cancel_checked_at IS NOT NULL
+                  OR updated_at < timezone('UTC', now()) - make_interval(mins => $4)
+              )
             ORDER BY
-                cancel_checked_at - CASE
+                COALESCE(cancel_checked_at, updated_at) - CASE
                     WHEN accepted_at IS NOT NULL
                         OR CAST(terms->>'deadline' AS bigint) < EXTRACT(EPOCH FROM now())
                     THEN INTERVAL '1 hour'
                     ELSE INTERVAL '0 seconds'
-                END ASC NULLS FIRST,
+                END ASC,
                 updated_at ASC
             LIMIT $3
             "#,
@@ -1056,18 +1068,26 @@ impl PgRegistry {
     }
 
     /// Record a check of a `Cancelling` agreement that left it cancelling, adding
-    /// `failed_attempts` to its failed cancels and returning the new count.
+    /// `failed_attempts` to its failed cancels and returning the new count. `ended` says whether
+    /// the check found it no longer live on-chain, or `None` when the chain couldn't tell; the
+    /// first time it is found ended is kept until it is found live again.
     pub async fn record_cancel_check(
         &self,
         agreement_id: &IndexingAgreementId,
         failed_attempts: u32,
+        ended: Option<bool>,
     ) -> Result<u32, Error> {
         let record: Option<(i32,)> = sqlx::query_as(
             r#"
             UPDATE dipper_reg_indexing_agreements
             SET
                 cancel_attempts = LEAST(cancel_attempts::BIGINT + $3, 2147483647)::INTEGER,
-                cancel_checked_at = timezone('UTC', now())
+                cancel_checked_at = timezone('UTC', now()),
+                ended_seen_at = CASE
+                    WHEN $4::BOOLEAN IS NULL THEN ended_seen_at
+                    WHEN $4 THEN COALESCE(ended_seen_at, timezone('UTC', now()))
+                    ELSE NULL
+                END
             WHERE id = $1 AND status = $2
             RETURNING cancel_attempts
             "#,
@@ -1075,6 +1095,7 @@ impl PgRegistry {
         .bind(agreement_id)
         .bind(IndexingAgreementStatus::Cancelling)
         .bind(i64::from(failed_attempts))
+        .bind(ended)
         .fetch_optional(&self.pool)
         .await?;
         let (attempts,) = record.ok_or(Error::NoRecordsUpdated)?;
