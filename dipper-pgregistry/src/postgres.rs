@@ -1008,10 +1008,13 @@ impl PgRegistry {
     /// Move an agreement dipper had already ended, cancelled or rejected, back to `Cancelling`
     /// once the chain shows it live after all, with its cancel attempts started afresh. It counts
     /// as checked, since no cancel is sent with it, so the retry takes it on its next sweep rather
-    /// than waiting for one to be mined.
+    /// than waiting for one to be mined. When the chain was read and showed it live (`seen_live`),
+    /// the end on record, and any announcement of it, no longer stands, so both are cleared for
+    /// the end still to come; an unread chain leaves them, as the agreement may have ended.
     pub async fn reopen_indexing_agreement_cancel(
         &self,
         agreement_id: &IndexingAgreementId,
+        seen_live: bool,
     ) -> Result<(), Error> {
         let updated = sqlx::query(
             r#"
@@ -1021,6 +1024,11 @@ impl PgRegistry {
                 cancel_attempts = 0,
                 cancel_checked_at = timezone('UTC', now()),
                 ended_seen_at = NULL,
+                canceled_at = CASE WHEN $5::BOOLEAN THEN NULL ELSE canceled_at END,
+                canceled_by = CASE WHEN $5 THEN NULL ELSE canceled_by END,
+                canceled_tx = CASE WHEN $5 THEN NULL ELSE canceled_tx END,
+                terminated_event_emitted_at =
+                    CASE WHEN $5 THEN NULL ELSE terminated_event_emitted_at END,
                 updated_at = timezone('UTC', now())
             WHERE id = $2 AND status IN ($3, $4)
             "#,
@@ -1029,6 +1037,7 @@ impl PgRegistry {
         .bind(agreement_id)
         .bind(IndexingAgreementStatus::CanceledByRequester)
         .bind(IndexingAgreementStatus::Rejected)
+        .bind(seen_live)
         .execute(&self.pool)
         .await?;
         if updated.rows_affected() == 0 {

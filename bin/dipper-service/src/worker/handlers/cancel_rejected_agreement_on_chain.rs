@@ -82,6 +82,7 @@ mod tests {
         async fn reopen_indexing_agreement_cancel(
             &self,
             id: &IndexingAgreementId,
+            _seen_live: bool,
         ) -> crate::registry::Result<()> {
             self.reopened.lock().unwrap().push(*id);
             Ok(())

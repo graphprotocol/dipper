@@ -3617,7 +3617,7 @@ async fn an_ended_agreement_found_live_on_chain_goes_back_to_cancelling() {
     )
     .await
     .expect("Failed to run fixture");
-    let registry = PgRegistry::new(db);
+    let registry = PgRegistry::new(db.clone());
     let ended = fixture_agreement(0xaa);
     let accepted =
         IndexingAgreementId::from_bytes([0xaa, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
@@ -3625,6 +3625,11 @@ async fn an_ended_agreement_found_live_on_chain_goes_back_to_cancelling() {
         .mark_indexing_agreement_as_cancelling(&ended)
         .await
         .expect("mark cancelling");
+    // The withdrawal of its offer, recorded as its end before the offer landed after all.
+    registry
+        .record_cancel_audit(&ended, 1_700_000_000, "0xpayer", Some("0xwithdrawal"))
+        .await
+        .expect("cancel record");
     assert_eq!(
         registry.record_cancel_check(&ended, 2, None).await.unwrap(),
         2
@@ -3635,9 +3640,19 @@ async fn an_ended_agreement_found_live_on_chain_goes_back_to_cancelling() {
         .expect("mark ended");
 
     registry
-        .reopen_indexing_agreement_cancel(&ended)
+        .reopen_indexing_agreement_cancel(&ended, true)
         .await
         .expect("an ended agreement can be reopened");
+    let (canceled_tx,): (Option<String>,) =
+        sqlx::query_as("SELECT canceled_tx FROM dipper_reg_indexing_agreements WHERE id = $1")
+            .bind(ended)
+            .fetch_one(&db)
+            .await
+            .expect("cancel record query");
+    assert_eq!(
+        canceled_tx, None,
+        "the end on record no longer stands once the chain shows it live"
+    );
 
     // Reopening sends no cancel, so there is none to wait on being mined.
     let listed = registry
@@ -3646,7 +3661,9 @@ async fn an_ended_agreement_found_live_on_chain_goes_back_to_cancelling() {
         .expect("cancelling query");
     let ids: Vec<_> = listed.iter().map(|row| row.agreement.id).collect();
     assert_eq!(ids, vec![ended], "its cancel attempts start afresh");
-    let still_wanted = registry.reopen_indexing_agreement_cancel(&accepted).await;
+    let still_wanted = registry
+        .reopen_indexing_agreement_cancel(&accepted, true)
+        .await;
     assert!(
         matches!(still_wanted, Err(Error::NoRecordsUpdated)),
         "got {still_wanted:?}"
