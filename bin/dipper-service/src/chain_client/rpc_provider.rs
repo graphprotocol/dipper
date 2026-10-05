@@ -72,12 +72,16 @@ const RETRYABLE_ERROR_PATTERNS: &[&str] = &[
 ];
 
 /// How a read refused by an endpoint behind a block dipper has already seen describes it. It
-/// gets 1 quick retry, since an endpoint a block or so behind catches up within a second, then
+/// gets quick retries, since an endpoint a few blocks behind catches up within a second, then
 /// the next endpoint, rather than the backoff for a failing one.
 pub(super) const BEHIND_A_SEEN_BLOCK: &str = "behind a block already seen";
 
 /// How long a read waits before asking an endpoint behind a block already seen again: 2 blocks.
 const LAG_PAUSE: Duration = Duration::from_millis(500);
+
+/// How many times an endpoint behind a block already seen is asked again: about 4 blocks of
+/// lag in all, so the read just after a transaction mines can wait out a node a little behind.
+const LAG_RETRIES: u32 = 2;
 
 /// Type alias for the provider with default fillers.
 pub type HttpProvider = FillProvider<
@@ -286,18 +290,22 @@ impl RpcProviderPool {
         // TLS handshake on the path that is already running out of time.
         let provider = ProviderBuilder::new().connect_reqwest(self.http.clone(), url.clone());
         let mut endpoint_error: Option<TransportError> = None;
-        let mut lag_retried = false;
+        let mut lag_retries = 0;
         for attempt in 0..=max_retries {
             match f(provider.clone()).await {
                 Ok(result) => return Ok(result),
-                Err(e) if Self::is_behind(&e) && !lag_retried && attempt < max_retries => {
+                Err(e)
+                    if Self::is_behind(&e)
+                        && lag_retries < LAG_RETRIES
+                        && attempt < max_retries =>
+                {
                     tracing::debug!(
                         operation,
                         provider = %endpoint,
                         error = %describe_failure(url, &e),
                         "RPC endpoint behind a block already seen, asking again"
                     );
-                    lag_retried = true;
+                    lag_retries += 1;
                     tokio::time::sleep(LAG_PAUSE).await;
                     endpoint_error = Some(e);
                 }
@@ -688,9 +696,9 @@ mod tests {
     }
 
     /// Hosted endpoints spread calls across nodes, so one a block behind is routine: it is
-    /// asked once more after a short pause, then passed over, never backed off from.
+    /// asked again after short pauses, then passed over, never backed off from.
     #[tokio::test]
-    async fn an_endpoint_behind_a_block_already_seen_gets_one_quick_retry() {
+    async fn an_endpoint_behind_a_block_already_seen_gets_quick_retries() {
         let lagging = server_answering_block(1).await;
         let current = server_answering_block(2).await;
         let pool = RpcProviderPool::new(
@@ -718,9 +726,9 @@ mod tests {
         assert_eq!(block, 2);
         assert_eq!(
             lagging.received_requests().await.unwrap_or_default().len(),
-            2
+            3
         );
-        assert!(started.elapsed() < Duration::from_secs(1), "no backoff");
+        assert!(started.elapsed() < Duration::from_secs(2), "no backoff");
     }
 
     #[test]
