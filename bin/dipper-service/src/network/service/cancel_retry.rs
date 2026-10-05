@@ -279,14 +279,17 @@ fn log_failed_cancel(
 }
 
 /// How many of an agreement's cancel attempts a failure uses up. A cancel the contract
-/// refused, before sending or once mined, that mined without ending the agreement, or that an
-/// endpoint took but never mined counts, and one that can never be sent uses them all. An
-/// unreachable chain is retried freely.
+/// refused, before sending or once mined, that mined without ending the agreement, or that
+/// endpoints answered had no receipt counts, and one that can never be sent uses them all. An
+/// unreachable chain, including one whose receipt checks all failed, is retried freely.
 fn failed_attempts(err: &ChainClientError) -> u32 {
     match err {
         ChainClientError::CancelNotConfirmed { .. }
         | ChainClientError::TxReverted { .. }
-        | ChainClientError::TxDropped { .. }
+        | ChainClientError::TxDropped {
+            receipt_checked: true,
+            ..
+        }
         | ChainClientError::ContractRevert { .. } => 1,
         ChainClientError::MissingTermsVersionHash { .. } => MAX_CANCEL_ATTEMPTS,
         _ => 0,
@@ -393,6 +396,7 @@ mod tests {
         send_fails: bool,
         mined_cancel_reverts: bool,
         never_mines: bool,
+        receipt_unreadable: bool,
         reverts_before_sending: bool,
         cancel_has_no_effect: bool,
         clock_fails: bool,
@@ -434,9 +438,10 @@ mod tests {
                     tx_hash: B256::repeat_byte(0xee),
                 });
             }
-            if self.never_mines {
+            if self.never_mines || self.receipt_unreadable {
                 return Err(ChainClientError::TxDropped {
                     tx_hash: B256::repeat_byte(0xdd),
+                    receipt_checked: self.never_mines,
                 });
             }
             self.cancels_sent.fetch_add(1, Ordering::SeqCst);
@@ -832,6 +837,20 @@ mod tests {
         retry(&registry, &chain, 0).await;
 
         assert_eq!(registry.attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn does_not_count_a_cancel_whose_receipt_could_not_be_checked() {
+        // Every receipt check failing is an outage, which may hide a cancel that mined.
+        let registry = registry_with_one(true);
+        let chain = MockChain {
+            receipt_unreadable: true,
+            ..live_chain()
+        };
+
+        retry(&registry, &chain, 0).await;
+
+        assert_eq!(registry.attempts.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
