@@ -975,7 +975,9 @@ impl PgRegistry {
     }
 
     /// Move an agreement dipper had already ended, cancelled or rejected, back to `Cancelling`
-    /// once the chain shows it live after all, with its cancel attempts started afresh.
+    /// once the chain shows it live after all, with its cancel attempts started afresh. It counts
+    /// as checked, since the chain was just read and no cancel sent, so the retry takes it on its
+    /// next sweep rather than waiting for a cancel to be mined.
     pub async fn reopen_indexing_agreement_cancel(
         &self,
         agreement_id: &IndexingAgreementId,
@@ -986,7 +988,7 @@ impl PgRegistry {
             SET
                 status = $1,
                 cancel_attempts = 0,
-                cancel_checked_at = NULL,
+                cancel_checked_at = timezone('UTC', now()),
                 ended_seen_at = NULL,
                 updated_at = timezone('UTC', now())
             WHERE id = $2 AND status IN ($3, $4)
@@ -1004,8 +1006,9 @@ impl PgRegistry {
         Ok(())
     }
 
-    /// `Cancelling` agreements marked over `min_age_minutes` ago, those checked longest ago
-    /// first; one whose cancel has failed `max_attempts` times only once an hour. One that may be paying
+    /// `Cancelling` agreements, those checked longest ago first, leaving out any never checked
+    /// that was marked in the last `min_age_minutes`, so the cancel sent with its mark can be
+    /// mined first; one whose cancel has failed `max_attempts` times only once an hour. One that may be paying
     /// an indexer (accepted, or past the offer deadline, which only an accepted one outlives)
     /// counts as checked an hour earlier, so it goes first without holding the rest back.
     pub async fn get_cancelling_agreements(
@@ -1039,7 +1042,10 @@ impl PgRegistry {
                   cancel_attempts < $2
                   OR cancel_checked_at < timezone('UTC', now()) - INTERVAL '1 hour'
               )
-              AND updated_at < timezone('UTC', now()) - make_interval(mins => $4)
+              AND (
+                  cancel_checked_at IS NOT NULL
+                  OR updated_at < timezone('UTC', now()) - make_interval(mins => $4)
+              )
             ORDER BY
                 cancel_checked_at - CASE
                     WHEN accepted_at IS NOT NULL

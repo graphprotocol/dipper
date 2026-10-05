@@ -25,7 +25,8 @@ const BATCH_SIZE: i64 = 50;
 const SWEEP_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Minutes an agreement stays out of the retry after it is marked, so the cancel sent
-/// when it was marked can be mined first instead of being sent again.
+/// when it was marked can be mined first instead of being sent again. One moved back to
+/// cancelling had none sent, so it doesn't wait.
 const SETTLE_MINUTES: i32 = 2;
 
 /// How long the chain listener gets, from when a check first finds an agreement ended, to

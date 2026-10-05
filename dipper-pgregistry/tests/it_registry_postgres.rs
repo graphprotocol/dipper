@@ -3600,8 +3600,9 @@ async fn an_ended_agreement_found_live_on_chain_goes_back_to_cancelling() {
         .await
         .expect("an ended agreement can be reopened");
 
+    // Reopening sends no cancel, so there is none to wait on being mined.
     let listed = registry
-        .get_cancelling_agreements(100, 1, 0)
+        .get_cancelling_agreements(100, 1, 5)
         .await
         .expect("cancelling query");
     let ids: Vec<_> = listed.iter().map(|row| row.agreement.id).collect();
