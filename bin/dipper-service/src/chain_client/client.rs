@@ -54,6 +54,15 @@ const RECEIPT_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 /// loose enough to avoid hammering the RPC.
 const RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// What waiting for a transaction's receipt found.
+enum ReceiptWait {
+    /// It mined; whether it succeeded.
+    Mined(bool),
+    /// No receipt appeared in time; `checked` when an endpoint did answer that it had none,
+    /// rather than every check failing.
+    NotSeen { checked: bool },
+}
+
 /// VERSION_CURRENT index from `IAgreementCollector.sol`: the active (or
 /// pre-acceptance) terms. `getAgreementDetails(id, 0)` reports their state.
 const VERSION_CURRENT: u64 = 0;
@@ -795,9 +804,9 @@ impl AlloyChainClient {
             .await?;
 
         match self.wait_for_receipt(tx_hash, RECEIPT_POLL_TIMEOUT).await? {
-            Some(true) => Ok(Some(tx_hash)),
-            Some(false) => Err(ChainClientError::TxReverted { tx_hash }),
-            None => {
+            ReceiptWait::Mined(true) => Ok(Some(tx_hash)),
+            ReceiptWait::Mined(false) => Err(ChainClientError::TxReverted { tx_hash }),
+            ReceiptWait::NotSeen { checked } => {
                 tracing::warn!(
                     reconciling = subject,
                     tx_hash = %tx_hash,
@@ -807,7 +816,10 @@ impl AlloyChainClient {
                 if let Err(err) = self.fill_nonce_gap(dropped_nonce).await {
                     tracing::warn!(nonce = dropped_nonce, error = %err, "Failed to fill mempool nonce gap");
                 }
-                Err(ChainClientError::TxDropped { tx_hash })
+                Err(ChainClientError::TxDropped {
+                    tx_hash,
+                    receipt_checked: checked,
+                })
             }
         }
     }
@@ -930,15 +942,16 @@ impl AlloyChainClient {
         })
     }
 
-    /// Poll `eth_getTransactionReceipt` until the tx has mined or the timeout elapses.
-    /// `Ok(Some(status))` reports the receipt's success flag; `Ok(None)` says the tx never
-    /// appeared in time (dropped from the mempool). Transient RPC errors keep polling.
+    /// Poll `eth_getTransactionReceipt` until the tx has mined or the timeout elapses, saying
+    /// whether it mined and succeeded, or never appeared in time (dropped from the mempool), and
+    /// then whether any check got an answer. Transient RPC errors keep polling.
     async fn wait_for_receipt(
         &self,
         tx_hash: B256,
         timeout: Duration,
-    ) -> Result<Option<bool>, ChainClientError> {
+    ) -> Result<ReceiptWait, ChainClientError> {
         let deadline = tokio::time::Instant::now() + timeout;
+        let mut checked = false;
         loop {
             let receipt = self
                 .inner
@@ -953,9 +966,9 @@ impl AlloyChainClient {
                     if let Some(block) = r.block_number {
                         self.seen_block().confirm(block, Instant::now());
                     }
-                    return Ok(Some(r.status()));
+                    return Ok(ReceiptWait::Mined(r.status()));
                 }
-                Ok(None) => {} // not mined yet
+                Ok(None) => checked = true, // not mined yet
                 Err(e) => {
                     // Transient RPC error: log and keep polling. If it persists, the outer
                     // handler sees the timeout as `Ok(None)` and resubmits, the safe default.
@@ -968,7 +981,7 @@ impl AlloyChainClient {
             }
 
             if tokio::time::Instant::now() >= deadline {
-                return Ok(None);
+                return Ok(ReceiptWait::NotSeen { checked });
             }
             tokio::time::sleep(RECEIPT_POLL_INTERVAL).await;
         }
@@ -1039,9 +1052,9 @@ impl ChainClient for AlloyChainClient {
             nonce: dropped_nonce,
         } = submitted;
         match self.wait_for_receipt(tx_hash, RECEIPT_POLL_TIMEOUT).await? {
-            Some(true) => Ok(Some(tx_hash)),
-            Some(false) => Err(ChainClientError::TxReverted { tx_hash }),
-            None => {
+            ReceiptWait::Mined(true) => Ok(Some(tx_hash)),
+            ReceiptWait::Mined(false) => Err(ChainClientError::TxReverted { tx_hash }),
+            ReceiptWait::NotSeen { checked } => {
                 tracing::warn!(
                     agreement_id = %format_args!("0x{}", agreement_id.iter().map(|b| format!("{b:02x}")).collect::<String>()),
                     tx_hash = %tx_hash,
@@ -1051,7 +1064,10 @@ impl ChainClient for AlloyChainClient {
                 if let Err(err) = self.fill_nonce_gap(dropped_nonce).await {
                     tracing::warn!(nonce = dropped_nonce, error = %err, "Failed to fill mempool nonce gap");
                 }
-                Err(ChainClientError::TxDropped { tx_hash })
+                Err(ChainClientError::TxDropped {
+                    tx_hash,
+                    receipt_checked: checked,
+                })
             }
         }
     }
@@ -1092,9 +1108,9 @@ impl ChainClient for AlloyChainClient {
             nonce: dropped_nonce,
         } = submitted;
         match self.wait_for_receipt(tx_hash, RECEIPT_POLL_TIMEOUT).await? {
-            Some(true) => Ok(Some(tx_hash)),
-            Some(false) => Err(ChainClientError::TxReverted { tx_hash }),
-            None => {
+            ReceiptWait::Mined(true) => Ok(Some(tx_hash)),
+            ReceiptWait::Mined(false) => Err(ChainClientError::TxReverted { tx_hash }),
+            ReceiptWait::NotSeen { checked } => {
                 tracing::warn!(
                     agreement_id = %format_args!("0x{}", agreement_id.iter().map(|b| format!("{b:02x}")).collect::<String>()),
                     tx_hash = %tx_hash,
@@ -1104,7 +1120,10 @@ impl ChainClient for AlloyChainClient {
                 if let Err(err) = self.fill_nonce_gap(dropped_nonce).await {
                     tracing::warn!(nonce = dropped_nonce, error = %err, "Failed to fill mempool nonce gap");
                 }
-                Err(ChainClientError::TxDropped { tx_hash })
+                Err(ChainClientError::TxDropped {
+                    tx_hash,
+                    receipt_checked: checked,
+                })
             }
         }
     }
@@ -2532,6 +2551,36 @@ mod tests {
 
         assert_eq!(seen.bounds(now), (100, 100 + WEEK_OF_BLOCKS + 2_400));
         assert_eq!(SeenBlock::new().bounds(now), (0, u64::MAX));
+    }
+
+    #[tokio::test]
+    async fn says_whether_any_receipt_check_was_answered() {
+        // A receipt that was never seen only shows the chain didn't mine it when an endpoint
+        // answered; when every check failed, an outage may be hiding one that did.
+        let empty = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 0,
+                "result": null,
+            })))
+            .mount(&empty)
+            .await;
+        let down = server_answering_500().await;
+        let wait = Duration::from_millis(100);
+
+        for (server, answered) in [(empty, true), (down, false)] {
+            let client = client_over(vec![server.uri().parse().expect("provider URL")]);
+            let found = client
+                .wait_for_receipt(B256::repeat_byte(0x01), wait)
+                .await
+                .expect("waited");
+
+            assert!(
+                matches!(found, ReceiptWait::NotSeen { checked } if checked == answered),
+                "answered: {answered}"
+            );
+        }
     }
 
     #[test]
