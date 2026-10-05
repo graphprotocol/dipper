@@ -8,7 +8,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -56,6 +56,110 @@ const RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// VERSION_CURRENT index from `IAgreementCollector.sol`: the active (or
 /// pre-acceptance) terms. `getAgreementDetails(id, 0)` reports their state.
 const VERSION_CURRENT: u64 = 0;
+
+/// Blocks Arbitrum adds in a week, at its 4 a second.
+const WEEK_OF_BLOCKS: u64 = 2_419_200;
+
+/// The most blocks Arbitrum adds a second.
+const BLOCKS_PER_SECOND: u64 = 4;
+
+/// An hour of blocks. A read every endpoint fails while the nearest is further than this from
+/// the newest block dipper has seen raises an ERROR; nearer is lag that clears by itself.
+const ALERT_GAP_BLOCKS: u64 = 14_400;
+
+/// How a read refused by an endpoint whose latest block is too far ahead to be real says so.
+const FAR_AHEAD_OF_A_SEEN_BLOCK: &str = "too far ahead of the newest block seen";
+
+/// The newest block dipper has seen, from reads and receipts, and when it last moved.
+#[derive(Debug)]
+struct SeenBlock {
+    number: u64,
+    moved_at: Instant,
+}
+
+impl SeenBlock {
+    fn new() -> Self {
+        Self {
+            number: 0,
+            moved_at: Instant::now(),
+        }
+    }
+
+    /// The highest block an endpoint can believably report: a week of blocks past the newest
+    /// one seen, plus what the chain can have added since. Unbounded until a block is seen, so
+    /// the first one after a restart, which may follow a long outage, is taken as it is.
+    fn highest_believable(&self, now: Instant) -> u64 {
+        if self.number == 0 {
+            return u64::MAX;
+        }
+        let since = now.saturating_duration_since(self.moved_at).as_secs();
+        self.number
+            .saturating_add(WEEK_OF_BLOCKS)
+            .saturating_add(since.saturating_mul(BLOCKS_PER_SECOND))
+    }
+
+    /// Move up to `block`, unless it is too far ahead to be real; false when it is.
+    fn advance(&mut self, block: u64, now: Instant) -> bool {
+        if block > self.highest_believable(now) {
+            return false;
+        }
+        if block > self.number {
+            self.number = block;
+            self.moved_at = now;
+        }
+        true
+    }
+}
+
+/// Refuse an endpoint whose latest block is too far ahead to be real, noting how far off it was.
+fn refuse_far_ahead(
+    head: u64,
+    seen: u64,
+    highest: u64,
+    nearest_refused: &AtomicU64,
+) -> Result<(), TransportError> {
+    if head <= highest {
+        return Ok(());
+    }
+    nearest_refused.fetch_min(head - seen, Ordering::Relaxed);
+    Err(TransportErrorKind::custom_str(&format!(
+        "endpoint is at block {head}, {FAR_AHEAD_OF_A_SEEN_BLOCK} ({seen})"
+    )))
+}
+
+/// Refuse an endpoint whose latest block is older than one dipper has already seen, noting how
+/// far behind it was.
+fn refuse_behind(head: u64, seen: u64, nearest_refused: &AtomicU64) -> Result<(), TransportError> {
+    if head >= seen {
+        return Ok(());
+    }
+    nearest_refused.fetch_min(seen - head, Ordering::Relaxed);
+    Err(TransportErrorKind::custom_str(&format!(
+        "endpoint is at block {head}, {BEHIND_A_SEEN_BLOCK} ({seen})"
+    )))
+}
+
+/// Whether a read every endpoint failed came with one refused for its block, the nearest of
+/// them over an hour of blocks off: then the newest block seen is likely wrong.
+fn refused_far_off(nearest_refused: u64) -> bool {
+    nearest_refused != u64::MAX && nearest_refused > ALERT_GAP_BLOCKS
+}
+
+/// An ERROR for a read every endpoint failed while the nearest refused for its block was far
+/// off. The newest block seen is then likely wrong, such as one from a faulty endpoint read on
+/// start-up or from a test chain since reset, and reads stay refused until dipper restarts.
+fn alert_if_refused_far_off(operation: &str, seen: u64, nearest_refused: u64) {
+    if refused_far_off(nearest_refused) {
+        tracing::error!(
+            event = "rpc_blocks_refused",
+            operation,
+            seen_block = seen,
+            blocks_off = nearest_refused,
+            "Every RPC endpoint is over an hour of blocks from the newest block dipper has \
+             seen, so chain reads are refused; restart dipper if the endpoints are right"
+        );
+    }
+}
 
 /// `AgreementDetails.state` flags from `IAgreementCollector.sol` (REGISTERED=1,
 /// ACCEPTED=2, NOTICE_GIVEN=4, SETTLED=8, BY_PROVIDER=32). `getAgreementDetails` keeps
@@ -240,9 +344,10 @@ struct AlloyChainClientInner {
     submit_lock: Mutex<()>,
     /// How long one submission may hold `submit_lock`; see `derive_submit_deadline`.
     submit_deadline: Duration,
-    /// The newest block dipper has seen, from reads and receipts. An agreement's state is
-    /// never read from an endpoint behind it, so a lagging endpoint can't undo what dipper saw.
-    seen_block: AtomicU64,
+    /// The newest block dipper has seen. An agreement's state is never read from an endpoint
+    /// behind it, so a lagging endpoint can't undo what dipper saw, nor from one too far
+    /// ahead of it to be real, so a faulty endpoint can't refuse every read after it.
+    seen_block: std::sync::Mutex<SeenBlock>,
 }
 
 impl AlloyChainClient {
@@ -293,7 +398,7 @@ impl AlloyChainClient {
                 nonce: AtomicU64::new(NONCE_UNINITIALIZED),
                 submit_lock: Mutex::new(()),
                 submit_deadline,
-                seen_block: AtomicU64::new(0),
+                seen_block: std::sync::Mutex::new(SeenBlock::new()),
             }),
         })
     }
@@ -623,8 +728,8 @@ impl AlloyChainClient {
     }
 
     /// Run a read-only contract call at the endpoint's latest block, refusing an endpoint
-    /// whose latest block is older than one dipper has already seen; the pool moves on to
-    /// the next endpoint instead.
+    /// whose latest block is older than one dipper has already seen, or too far ahead of it
+    /// to be real; the pool moves on to the next endpoint instead.
     async fn view_at_seen_block<C: SolCall>(
         &self,
         to: Address,
@@ -632,34 +737,60 @@ impl AlloyChainClient {
         operation: &'static str,
     ) -> Result<C::Return, ChainClientError> {
         let calldata = call.abi_encode();
-        let seen = self.inner.seen_block.load(Ordering::Relaxed);
-        let (head, output) = self
+        let (seen, highest) = self.block_bounds();
+        let nearest_refused = AtomicU64::new(u64::MAX);
+        let read = self
             .inner
             .rpc_pool
             .execute(operation, |provider| {
                 let calldata = calldata.clone();
+                let nearest_refused = &nearest_refused;
                 async move {
                     let head = provider.get_block_number().await?;
-                    if head < seen {
-                        return Err(TransportErrorKind::custom_str(&format!(
-                            "endpoint is at block {head}, {BEHIND_A_SEEN_BLOCK} ({seen})"
-                        )));
-                    }
+                    refuse_behind(head, seen, nearest_refused)?;
+                    refuse_far_ahead(head, seen, highest, nearest_refused)?;
                     let tx = TransactionRequest::default().to(to).input(calldata.into());
                     let output = provider.call(tx).block(BlockId::number(head)).await?;
                     Ok((head, output))
                 }
             })
-            .await?;
+            .await;
+        let (head, output) = read.inspect_err(|_| {
+            alert_if_refused_far_off(operation, seen, nearest_refused.load(Ordering::Relaxed));
+        })?;
         self.note_block(head);
         C::abi_decode_returns(&output).map_err(|err| {
             ChainClientError::RpcError(anyhow::anyhow!("undecodable {operation} from {to}: {err}"))
         })
     }
 
-    /// Remember a block dipper has seen, so later reads are never older.
+    fn seen_block(&self) -> std::sync::MutexGuard<'_, SeenBlock> {
+        self.inner
+            .seen_block
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The newest block dipper has seen, and the highest it believes an endpoint can report.
+    fn block_bounds(&self) -> (u64, u64) {
+        let seen = self.seen_block();
+        (seen.number, seen.highest_believable(Instant::now()))
+    }
+
+    /// Remember a block dipper has seen, so later reads are never older. One too far ahead to
+    /// be real is ignored, so it can't refuse every read after it.
     fn note_block(&self, block: u64) {
-        self.inner.seen_block.fetch_max(block, Ordering::Relaxed);
+        let (taken, seen) = {
+            let mut seen = self.seen_block();
+            (seen.advance(block, Instant::now()), seen.number)
+        };
+        if !taken {
+            tracing::warn!(
+                block,
+                seen_block = seen,
+                "Ignoring a block too far ahead of the newest block dipper has seen"
+            );
+        }
     }
 
     /// Run a read-only contract call and decode its return value.
@@ -734,13 +865,33 @@ impl AlloyChainClient {
 #[async_trait]
 impl ChainClient for AlloyChainClient {
     async fn latest_block_timestamp(&self) -> Result<u64, ChainClientError> {
-        let block = self
+        let (seen, highest) = self.block_bounds();
+        let nearest_refused = AtomicU64::new(u64::MAX);
+        let read = self
             .inner
             .rpc_pool
-            .execute("get_latest_block", |provider| async move {
-                provider.get_block_by_number(BlockNumberOrTag::Latest).await
+            .execute("get_latest_block", |provider| {
+                let nearest_refused = &nearest_refused;
+                async move {
+                    let block = provider
+                        .get_block_by_number(BlockNumberOrTag::Latest)
+                        .await?;
+                    // A lagging endpoint's time is only a little early, which brings nothing forward.
+                    if let Some(block) = &block {
+                        refuse_far_ahead(block.header.number, seen, highest, nearest_refused)?;
+                    }
+                    Ok(block)
+                }
             })
-            .await?
+            .await;
+        let block = read
+            .inspect_err(|_| {
+                alert_if_refused_far_off(
+                    "get_latest_block",
+                    seen,
+                    nearest_refused.load(Ordering::Relaxed),
+                );
+            })?
             .ok_or_else(|| {
                 ChainClientError::RpcError(anyhow::anyhow!("no latest block returned"))
             })?;
@@ -2181,7 +2332,7 @@ mod tests {
             .expect("read");
 
         assert!(!live, "read from the endpoint that has reached block 95");
-        assert_eq!(client.inner.seen_block.load(Ordering::Relaxed), 100);
+        assert_eq!(client.seen_block().number, 100);
     }
 
     #[tokio::test]
@@ -2193,6 +2344,74 @@ mod tests {
         let read = client.agreement_still_active(&[0xab; 16]).await;
 
         assert!(read.is_err(), "got {read:?}");
+    }
+
+    #[tokio::test]
+    async fn skips_an_endpoint_too_far_ahead_to_be_real() {
+        // Otherwise its block would refuse every read from the endpoints that are right.
+        let faulty = server_at_block(100 + WEEK_OF_BLOCKS + 1_000, STATE_REGISTERED).await;
+        let current =
+            server_at_block(150, STATE_REGISTERED | STATE_ACCEPTED | STATE_NOTICE_GIVEN).await;
+        let client = client_over(vec![
+            faulty.uri().parse().expect("provider URL"),
+            current.uri().parse().expect("provider URL"),
+        ]);
+        client.note_block(100);
+
+        let live = client
+            .agreement_still_active(&[0xab; 16])
+            .await
+            .expect("read");
+
+        assert!(!live, "read from the endpoint at block 150");
+        assert_eq!(client.seen_block().number, 150);
+    }
+
+    #[tokio::test]
+    async fn takes_the_first_block_after_a_restart_however_far_ahead() {
+        // Dipper may have been down for over a week.
+        let endpoint = server_at_block(WEEK_OF_BLOCKS * 3, STATE_REGISTERED).await;
+        let client = client_over(vec![endpoint.uri().parse().expect("provider URL")]);
+
+        client
+            .agreement_still_active(&[0xab; 16])
+            .await
+            .expect("read");
+
+        assert_eq!(client.seen_block().number, WEEK_OF_BLOCKS * 3);
+    }
+
+    #[test]
+    fn ignores_a_receipt_block_too_far_ahead_to_be_real() {
+        let client = client_over(vec!["http://127.0.0.1:1".parse().expect("provider URL")]);
+        client.note_block(100);
+
+        client.note_block(100 + WEEK_OF_BLOCKS + 1);
+        assert_eq!(client.seen_block().number, 100);
+
+        client.note_block(100 + WEEK_OF_BLOCKS);
+        assert_eq!(client.seen_block().number, 100 + WEEK_OF_BLOCKS);
+    }
+
+    #[test]
+    fn believes_a_week_of_blocks_ahead_plus_what_the_chain_added_since() {
+        // A quiet spell with no reads mustn't make the chain's real progress look faulty.
+        let now = Instant::now();
+        let seen = SeenBlock {
+            number: 100,
+            moved_at: now.checked_sub(Duration::from_secs(600)).expect("instant"),
+        };
+
+        assert_eq!(seen.highest_believable(now), 100 + WEEK_OF_BLOCKS + 2_400);
+        assert_eq!(SeenBlock::new().highest_believable(now), u64::MAX);
+    }
+
+    #[test]
+    fn alerts_only_when_every_endpoint_is_refused_far_off() {
+        assert!(!refused_far_off(u64::MAX), "none refused for its block");
+        assert!(!refused_far_off(3), "a few blocks of lag clears by itself");
+        assert!(!refused_far_off(ALERT_GAP_BLOCKS));
+        assert!(refused_far_off(ALERT_GAP_BLOCKS + 1));
     }
 
     async fn client_over_manager(
