@@ -136,6 +136,10 @@ pub async fn confirm_cancelled<R: AgreementRegistry + Sync>(
     tx_hash: Option<B256>,
     config: &IndexingAgreementConfig,
 ) -> bool {
+    // First, so the sweep, which announces the end once the mark lands, finds the transaction.
+    if tx_hash.is_some() {
+        record_cancel(registry, agreement, tx_hash, config).await;
+    }
     if let Err(err) = registry
         .mark_indexing_agreement_as_canceled_by_requester(&agreement.id)
         .await
@@ -155,9 +159,6 @@ pub async fn confirm_cancelled<R: AgreementRegistry + Sync>(
         reason = "cancel_confirmed_on_chain",
         "agreement state transition"
     );
-    if tx_hash.is_some() {
-        record_cancel(registry, agreement, tx_hash, config).await;
-    }
     true
 }
 

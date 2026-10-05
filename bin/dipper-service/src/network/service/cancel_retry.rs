@@ -313,6 +313,7 @@ mod tests {
         audited_by: Mutex<Vec<String>>,
         attempts: AtomicU32,
         checks: AtomicU32,
+        writes: Mutex<Vec<&'static str>>,
     }
 
     #[async_trait]
@@ -330,6 +331,7 @@ mod tests {
             id: &IndexingAgreementId,
         ) -> crate::registry::Result<()> {
             self.marked_cancelled.lock().unwrap().push(*id);
+            self.writes.lock().unwrap().push("ended");
             Ok(())
         }
         async fn record_cancel_audit(
@@ -340,6 +342,7 @@ mod tests {
             canceled_tx: Option<&str>,
         ) -> crate::registry::Result<()> {
             self.audited_by.lock().unwrap().push(canceled_by.to_owned());
+            self.writes.lock().unwrap().push("cancel recorded");
             self.audits
                 .lock()
                 .unwrap()
@@ -510,6 +513,20 @@ mod tests {
         assert_eq!(registry.marked_cancelled.lock().unwrap().len(), 1);
         let tx = B256::repeat_byte(0xcd).to_string();
         assert_eq!(*registry.audits.lock().unwrap(), vec![Some(tx)]);
+    }
+
+    #[tokio::test]
+    async fn records_the_cancel_before_marking_the_agreement_ended() {
+        // The end is announced once the mark lands; recorded after, the announcement could
+        // go out without its transaction and never be sent again.
+        let registry = registry_with_one(true);
+
+        retry(&registry, &live_chain(), 0).await;
+
+        assert_eq!(
+            *registry.writes.lock().unwrap(),
+            vec!["cancel recorded", "ended"]
+        );
     }
 
     #[tokio::test]
