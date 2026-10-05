@@ -1553,6 +1553,8 @@ impl PgRegistry {
     /// emission sweep can populate the `terminated` event's tx/by/at fields.
     /// `COALESCE` keeps any value already observed on-chain. Best-effort
     /// enrichment: the event still emits (with fallbacks) if never recorded.
+    /// An end recorded before the agreement's accept, such as its offer's withdrawal before the
+    /// offer landed after all, can't be its end, so a later one replaces it and is announced.
     #[expect(
         clippy::cast_possible_wrap,
         reason = "predates this lint; fix when next touched"
@@ -1567,9 +1569,16 @@ impl PgRegistry {
         sqlx::query(
             r#"
             UPDATE dipper_reg_indexing_agreements
-            SET canceled_at = COALESCE(canceled_at, $2),
-                canceled_by = COALESCE(canceled_by, $3),
-                canceled_tx = COALESCE(canceled_tx, $4)
+            SET canceled_at = CASE WHEN canceled_at < accepted_at AND $2 >= accepted_at
+                    THEN $2 ELSE COALESCE(canceled_at, $2) END,
+                canceled_by = CASE WHEN canceled_at < accepted_at AND $2 >= accepted_at
+                    THEN $3 ELSE COALESCE(canceled_by, $3) END,
+                canceled_tx = CASE WHEN canceled_at < accepted_at AND $2 >= accepted_at
+                    THEN $4 ELSE COALESCE(canceled_tx, $4) END,
+                terminated_event_emitted_at = CASE
+                    WHEN canceled_at < accepted_at AND $2 >= accepted_at THEN NULL
+                    ELSE terminated_event_emitted_at
+                END
             WHERE id = $1
             "#,
         )

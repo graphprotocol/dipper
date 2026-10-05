@@ -3671,6 +3671,54 @@ async fn an_ended_agreement_found_live_on_chain_goes_back_to_cancelling() {
 }
 
 #[tokio::test]
+async fn an_end_recorded_before_the_accept_gives_way_to_the_real_one() {
+    // An offer withdrawn, then accepted when it landed after all: the withdrawal can't be the
+    // end of an agreement accepted later, however the agreement came back to be cancelled.
+    let (db, _temp_db) = temp_registry_db().await;
+    run_fixture(
+        &db,
+        include_str!("fixtures/0003_multi_indexer_agreements.sql"),
+    )
+    .await
+    .expect("Failed to run fixture");
+    let registry = PgRegistry::new(db.clone());
+    let id = fixture_agreement(0xaa);
+    let canceled_tx = async || -> Option<String> {
+        let (tx,): (Option<String>,) =
+            sqlx::query_as("SELECT canceled_tx FROM dipper_reg_indexing_agreements WHERE id = $1")
+                .bind(id)
+                .fetch_one(&db)
+                .await
+                .expect("cancel record query");
+        tx
+    };
+    registry
+        .record_cancel_audit(&id, 1_000, "0xpayer", Some("0xwithdrawal"))
+        .await
+        .expect("cancel record");
+    registry
+        .record_accepted_audit(&id, 2_000, "0xaccept")
+        .await
+        .expect("accept record");
+
+    registry
+        .record_cancel_audit(&id, 3_000, "0xpayer", Some("0xcancel"))
+        .await
+        .expect("cancel record");
+    assert_eq!(canceled_tx().await.as_deref(), Some("0xcancel"));
+
+    registry
+        .record_cancel_audit(&id, 4_000, "0xpayer", Some("0xlater"))
+        .await
+        .expect("cancel record");
+    assert_eq!(
+        canceled_tx().await.as_deref(),
+        Some("0xcancel"),
+        "a real end, after the accept, is kept"
+    );
+}
+
+#[tokio::test]
 async fn a_cancelling_agreement_stays_live_and_unannounced_until_it_ends() {
     let (db, _temp_db) = temp_registry_db().await;
     run_fixture(
