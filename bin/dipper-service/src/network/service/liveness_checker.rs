@@ -503,6 +503,16 @@ async fn cancel_and_reassess<R, W, C>(
     W: WorkerQueue + Send + Sync,
     C: ChainClient + Send + Sync,
 {
+    // Without a cancel that can ever be sent, replacing it would pay 2 indexers until an
+    // operator ends it, so it stays as it is, active, for one to deal with.
+    if crate::cancel_dispatch::cancel_hash(agreement).is_none() {
+        tracing::error!(
+            agreement_id = %agreement.id,
+            "cannot cancel stale agreement: missing terms_version_hash; leaving active for operator action"
+        );
+        return;
+    }
+
     // 1. Start the cancel
     match crate::cancel_dispatch::start_cancel(
         registry,
@@ -1455,6 +1465,22 @@ mod tests {
             calls.reassessments.lock().unwrap().as_slice(),
             &[agreement.indexing_request_id]
         );
+    }
+
+    #[tokio::test]
+    async fn leaves_a_stale_agreement_it_can_never_cancel_for_an_operator() {
+        // Replacing it would pay both indexers, since its cancel can never be sent.
+        let mut agreement = stale_agreement();
+        agreement.terms_version_hash = None;
+        let calls = MockCalls::default();
+        let registry = MockRegistry::new(calls.clone(), agreement.clone());
+        let chain = MockChainClient::success(calls.clone());
+
+        end_stale(&agreement, &registry, &chain).await;
+
+        assert!(calls.abandoning.lock().unwrap().is_empty());
+        assert!(calls.chain_cancels.lock().unwrap().is_empty());
+        assert!(calls.reassessments.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -28,12 +28,7 @@ async fn cancel_agreement_on_chain<T: ChainClient>(
     agreement: &IndexingAgreement,
     config: &IndexingAgreementConfig,
 ) -> LiveCancel {
-    let Some(version_hash) = agreement
-        .terms_version_hash
-        .as_deref()
-        .filter(|h| h.len() == 32)
-        .map(B256::from_slice)
-    else {
+    let Some(version_hash) = cancel_hash(agreement) else {
         return LiveCancel::CancelFailed(ChainClientError::MissingTermsVersionHash {
             agreement_id: agreement.id.to_string(),
         });
@@ -66,6 +61,16 @@ async fn cancel_agreement_on_chain<T: ChainClient>(
         }
         Err(err) => LiveCancel::Unconfirmed { tx_hash, err },
     }
+}
+
+/// The stored terms hash an on-chain cancel needs, or `None` when the agreement has no 32-byte
+/// one, so no cancel can ever be sent for it.
+pub fn cancel_hash(agreement: &IndexingAgreement) -> Option<B256> {
+    agreement
+        .terms_version_hash
+        .as_deref()
+        .filter(|h| h.len() == 32)
+        .map(B256::from_slice)
 }
 
 /// Why dipper is ending an agreement, which decides the status it ends in once the chain
