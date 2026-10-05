@@ -337,6 +337,8 @@ mod tests {
         attempts: AtomicU32,
         checks: AtomicU32,
         found_ended: Mutex<Vec<Option<bool>>>,
+        /// The chain listener marks it ended before the retry's own mark lands.
+        listener_ended_it: bool,
         writes: Mutex<Vec<&'static str>>,
     }
 
@@ -354,6 +356,9 @@ mod tests {
             &self,
             id: &IndexingAgreementId,
         ) -> crate::registry::Result<()> {
+            if self.listener_ended_it {
+                return Err(crate::registry::Error::NoRecordsUpdated);
+            }
             self.marked_cancelled.lock().unwrap().push(*id);
             self.writes.lock().unwrap().push("ended");
             Ok(())
@@ -575,6 +580,19 @@ mod tests {
             *registry.writes.lock().unwrap(),
             vec!["cancel recorded", "ended"]
         );
+    }
+
+    #[tokio::test]
+    async fn counts_an_agreement_the_listener_marked_ended_first_as_ended() {
+        // Not a failure: there is nothing left to retry.
+        let registry = MockRegistry {
+            listener_ended_it: true,
+            ..registry_with_one(true)
+        };
+
+        retry(&registry, &live_chain(), 0).await;
+
+        assert_eq!(registry.checks.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

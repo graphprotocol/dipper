@@ -163,7 +163,8 @@ where
 
 /// Mark an agreement the chain shows dipper ended as ended, recording the cancel when its
 /// transaction is known, so the `terminated` sweep announces it. False, logged, when the mark
-/// fails; it stays `Cancelling` for the cancel retry.
+/// fails; it stays `Cancelling` for the cancel retry. One the chain listener already marked
+/// ended counts as ended.
 pub async fn confirm_cancelled<R: AgreementRegistry + Sync>(
     registry: &R,
     agreement: &IndexingAgreement,
@@ -175,16 +176,26 @@ pub async fn confirm_cancelled<R: AgreementRegistry + Sync>(
     if tx_hash.is_some() {
         record_cancel(registry, agreement, tx_hash, config).await;
     }
-    if let Err(err) = registry
+    match registry
         .mark_indexing_agreement_as_canceled_by_requester(&agreement.id)
         .await
     {
-        tracing::warn!(
-            agreement_id = %agreement.id,
-            error = %err,
-            "Failed to mark an ended agreement cancelled; the cancel retry tries again"
-        );
-        return false;
+        Ok(()) => {}
+        Err(crate::registry::Error::NoRecordsUpdated) => {
+            tracing::debug!(
+                agreement_id = %agreement.id,
+                "Agreement already marked ended, as the chain listener can do first"
+            );
+            return true;
+        }
+        Err(err) => {
+            tracing::warn!(
+                agreement_id = %agreement.id,
+                error = %err,
+                "Failed to mark an ended agreement cancelled; the cancel retry tries again"
+            );
+            return false;
+        }
     }
     tracing::info!(
         agreement_id = %agreement.id,
