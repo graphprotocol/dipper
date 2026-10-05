@@ -32,7 +32,8 @@ use super::{
 };
 use crate::{
     chain_client::{
-        ChainClient, ChainClientError, EscrowAccount, ManagerEscrowReader, TrackedProviders,
+        AgreementOnChain, ChainClient, ChainClientError, EscrowAccount, ManagerEscrowReader,
+        TrackedProviders,
     },
     config::ChainClientConfig,
     worker::service::PROCESS_JOB_TIMEOUT,
@@ -52,6 +53,15 @@ const RECEIPT_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 /// tx to mine. Tight enough to respond quickly on sub-second block times,
 /// loose enough to avoid hammering the RPC.
 const RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// What waiting for a transaction's receipt found.
+enum ReceiptWait {
+    /// It mined; whether it succeeded.
+    Mined(bool),
+    /// No receipt appeared in time; `checked` when an endpoint did answer that it had none,
+    /// rather than every check failing.
+    NotSeen { checked: bool },
+}
 
 /// VERSION_CURRENT index from `IAgreementCollector.sol`: the active (or
 /// pre-acceptance) terms. `getAgreementDetails(id, 0)` reports their state.
@@ -267,6 +277,16 @@ fn still_live(state: u16) -> bool {
     let accepted = state & STATE_ACCEPTED != 0;
     let pending_offer = state & STATE_REGISTERED != 0 && !accepted && state & STATE_SETTLED == 0;
     pending_offer || (accepted && state & STATE_NOTICE_GIVEN == 0)
+}
+
+fn on_chain(state: u16) -> AgreementOnChain {
+    if still_live(state) {
+        AgreementOnChain::Live
+    } else if state & STATE_BY_PROVIDER != 0 {
+        AgreementOnChain::EndedByIndexer
+    } else {
+        AgreementOnChain::NotLive
+    }
 }
 
 /// Error patterns that indicate a nonce-related issue.
@@ -784,9 +804,9 @@ impl AlloyChainClient {
             .await?;
 
         match self.wait_for_receipt(tx_hash, RECEIPT_POLL_TIMEOUT).await? {
-            Some(true) => Ok(Some(tx_hash)),
-            Some(false) => Err(ChainClientError::TxReverted { tx_hash }),
-            None => {
+            ReceiptWait::Mined(true) => Ok(Some(tx_hash)),
+            ReceiptWait::Mined(false) => Err(ChainClientError::TxReverted { tx_hash }),
+            ReceiptWait::NotSeen { checked } => {
                 tracing::warn!(
                     reconciling = subject,
                     tx_hash = %tx_hash,
@@ -796,7 +816,10 @@ impl AlloyChainClient {
                 if let Err(err) = self.fill_nonce_gap(dropped_nonce).await {
                     tracing::warn!(nonce = dropped_nonce, error = %err, "Failed to fill mempool nonce gap");
                 }
-                Err(ChainClientError::TxDropped { tx_hash })
+                Err(ChainClientError::TxDropped {
+                    tx_hash,
+                    receipt_checked: checked,
+                })
             }
         }
     }
@@ -919,15 +942,16 @@ impl AlloyChainClient {
         })
     }
 
-    /// Poll `eth_getTransactionReceipt` until the tx has mined or the timeout elapses.
-    /// `Ok(Some(status))` reports the receipt's success flag; `Ok(None)` says the tx never
-    /// appeared in time (dropped from the mempool). Transient RPC errors keep polling.
+    /// Poll `eth_getTransactionReceipt` until the tx has mined or the timeout elapses, saying
+    /// whether it mined and succeeded, or never appeared in time (dropped from the mempool), and
+    /// then whether any check got an answer. Transient RPC errors keep polling.
     async fn wait_for_receipt(
         &self,
         tx_hash: B256,
         timeout: Duration,
-    ) -> Result<Option<bool>, ChainClientError> {
+    ) -> Result<ReceiptWait, ChainClientError> {
         let deadline = tokio::time::Instant::now() + timeout;
+        let mut checked = false;
         loop {
             let receipt = self
                 .inner
@@ -942,9 +966,9 @@ impl AlloyChainClient {
                     if let Some(block) = r.block_number {
                         self.seen_block().confirm(block, Instant::now());
                     }
-                    return Ok(Some(r.status()));
+                    return Ok(ReceiptWait::Mined(r.status()));
                 }
-                Ok(None) => {} // not mined yet
+                Ok(None) => checked = true, // not mined yet
                 Err(e) => {
                     // Transient RPC error: log and keep polling. If it persists, the outer
                     // handler sees the timeout as `Ok(None)` and resubmits, the safe default.
@@ -957,7 +981,7 @@ impl AlloyChainClient {
             }
 
             if tokio::time::Instant::now() >= deadline {
-                return Ok(None);
+                return Ok(ReceiptWait::NotSeen { checked });
             }
             tokio::time::sleep(RECEIPT_POLL_INTERVAL).await;
         }
@@ -1028,9 +1052,9 @@ impl ChainClient for AlloyChainClient {
             nonce: dropped_nonce,
         } = submitted;
         match self.wait_for_receipt(tx_hash, RECEIPT_POLL_TIMEOUT).await? {
-            Some(true) => Ok(Some(tx_hash)),
-            Some(false) => Err(ChainClientError::TxReverted { tx_hash }),
-            None => {
+            ReceiptWait::Mined(true) => Ok(Some(tx_hash)),
+            ReceiptWait::Mined(false) => Err(ChainClientError::TxReverted { tx_hash }),
+            ReceiptWait::NotSeen { checked } => {
                 tracing::warn!(
                     agreement_id = %format_args!("0x{}", agreement_id.iter().map(|b| format!("{b:02x}")).collect::<String>()),
                     tx_hash = %tx_hash,
@@ -1040,7 +1064,10 @@ impl ChainClient for AlloyChainClient {
                 if let Err(err) = self.fill_nonce_gap(dropped_nonce).await {
                     tracing::warn!(nonce = dropped_nonce, error = %err, "Failed to fill mempool nonce gap");
                 }
-                Err(ChainClientError::TxDropped { tx_hash })
+                Err(ChainClientError::TxDropped {
+                    tx_hash,
+                    receipt_checked: checked,
+                })
             }
         }
     }
@@ -1081,9 +1108,9 @@ impl ChainClient for AlloyChainClient {
             nonce: dropped_nonce,
         } = submitted;
         match self.wait_for_receipt(tx_hash, RECEIPT_POLL_TIMEOUT).await? {
-            Some(true) => Ok(Some(tx_hash)),
-            Some(false) => Err(ChainClientError::TxReverted { tx_hash }),
-            None => {
+            ReceiptWait::Mined(true) => Ok(Some(tx_hash)),
+            ReceiptWait::Mined(false) => Err(ChainClientError::TxReverted { tx_hash }),
+            ReceiptWait::NotSeen { checked } => {
                 tracing::warn!(
                     agreement_id = %format_args!("0x{}", agreement_id.iter().map(|b| format!("{b:02x}")).collect::<String>()),
                     tx_hash = %tx_hash,
@@ -1093,23 +1120,19 @@ impl ChainClient for AlloyChainClient {
                 if let Err(err) = self.fill_nonce_gap(dropped_nonce).await {
                     tracing::warn!(nonce = dropped_nonce, error = %err, "Failed to fill mempool nonce gap");
                 }
-                Err(ChainClientError::TxDropped { tx_hash })
+                Err(ChainClientError::TxDropped {
+                    tx_hash,
+                    receipt_checked: checked,
+                })
             }
         }
     }
 
-    async fn agreement_still_active(
+    async fn agreement_on_chain(
         &self,
         agreement_id: &[u8; 16],
-    ) -> Result<bool, ChainClientError> {
-        Ok(still_live(self.agreement_state(agreement_id).await?))
-    }
-
-    async fn agreement_ended_by_indexer(
-        &self,
-        agreement_id: &[u8; 16],
-    ) -> Result<bool, ChainClientError> {
-        Ok(self.agreement_state(agreement_id).await? & STATE_BY_PROVIDER != 0)
+    ) -> Result<AgreementOnChain, ChainClientError> {
+        Ok(on_chain(self.agreement_state(agreement_id).await?))
     }
 
     async fn reconcile_provider(
@@ -1333,6 +1356,22 @@ mod tests {
             STATE_REGISTERED | STATE_ACCEPTED | STATE_NOTICE_GIVEN | BY_PAYER | STATE_SETTLED
         ));
         assert!(!still_live(0), "revoked or never offered");
+    }
+
+    #[test]
+    fn tells_an_end_by_the_indexer_from_any_other() {
+        const BY_PAYER: u16 = 16;
+        let ended = STATE_REGISTERED | STATE_ACCEPTED | STATE_NOTICE_GIVEN;
+        assert_eq!(
+            on_chain(ended | STATE_BY_PROVIDER),
+            AgreementOnChain::EndedByIndexer
+        );
+        assert_eq!(on_chain(ended | BY_PAYER), AgreementOnChain::NotLive);
+        assert_eq!(on_chain(0), AgreementOnChain::NotLive);
+        assert_eq!(
+            on_chain(STATE_REGISTERED | STATE_ACCEPTED),
+            AgreementOnChain::Live
+        );
     }
 
     /// Answers a send with a fixed transaction hash, echoing the request id so alloy's
@@ -2403,9 +2442,10 @@ mod tests {
         client.note_block(95);
 
         let live = client
-            .agreement_still_active(&[0xab; 16])
+            .agreement_on_chain(&[0xab; 16])
             .await
-            .expect("read once the endpoint caught up");
+            .expect("read once the endpoint caught up")
+            .is_live();
 
         assert!(live);
     }
@@ -2424,9 +2464,10 @@ mod tests {
         client.note_block(95);
 
         let live = client
-            .agreement_still_active(&[0xab; 16])
+            .agreement_on_chain(&[0xab; 16])
             .await
-            .expect("read");
+            .expect("read")
+            .is_live();
 
         assert!(!live, "read from the endpoint that has reached block 95");
         assert_eq!(client.seen_block().number, 100);
@@ -2438,7 +2479,7 @@ mod tests {
         let client = client_over(vec![lagging.uri().parse().expect("provider URL")]);
         client.note_block(95);
 
-        let read = client.agreement_still_active(&[0xab; 16]).await;
+        let read = client.agreement_on_chain(&[0xab; 16]).await;
 
         assert!(read.is_err(), "got {read:?}");
     }
@@ -2456,9 +2497,10 @@ mod tests {
         trust_block(&client, 100);
 
         let live = client
-            .agreement_still_active(&[0xab; 16])
+            .agreement_on_chain(&[0xab; 16])
             .await
-            .expect("read");
+            .expect("read")
+            .is_live();
 
         assert!(!live, "read from the endpoint at block 150");
         assert_eq!(client.seen_block().number, 150);
@@ -2476,9 +2518,10 @@ mod tests {
         let client = client_over(vec![endpoint.uri().parse().expect("provider URL")]);
 
         client
-            .agreement_still_active(&[0xab; 16])
+            .agreement_on_chain(&[0xab; 16])
             .await
-            .expect("read");
+            .expect("read")
+            .is_live();
 
         assert_eq!(client.seen_block().number, WEEK_OF_BLOCKS * 3);
     }
@@ -2508,6 +2551,36 @@ mod tests {
 
         assert_eq!(seen.bounds(now), (100, 100 + WEEK_OF_BLOCKS + 2_400));
         assert_eq!(SeenBlock::new().bounds(now), (0, u64::MAX));
+    }
+
+    #[tokio::test]
+    async fn says_whether_any_receipt_check_was_answered() {
+        // A receipt that was never seen only shows the chain didn't mine it when an endpoint
+        // answered; when every check failed, an outage may be hiding one that did.
+        let empty = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 0,
+                "result": null,
+            })))
+            .mount(&empty)
+            .await;
+        let down = server_answering_500().await;
+        let wait = Duration::from_millis(100);
+
+        for (server, answered) in [(empty, true), (down, false)] {
+            let client = client_over(vec![server.uri().parse().expect("provider URL")]);
+            let found = client
+                .wait_for_receipt(B256::repeat_byte(0x01), wait)
+                .await
+                .expect("waited");
+
+            assert!(
+                matches!(found, ReceiptWait::NotSeen { checked } if checked == answered),
+                "answered: {answered}"
+            );
+        }
     }
 
     #[test]
@@ -2576,9 +2649,10 @@ mod tests {
         ]);
 
         let live = client
-            .agreement_still_active(&[0xab; 16])
+            .agreement_on_chain(&[0xab; 16])
             .await
-            .expect("read");
+            .expect("read")
+            .is_live();
 
         assert!(!live, "read from an endpoint that is right");
         assert!(client.seen_block().confirmed);

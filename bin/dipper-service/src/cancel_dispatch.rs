@@ -5,7 +5,7 @@ use dipper_core::time::now_secs;
 use thegraph_core::alloy::primitives::B256;
 
 use crate::{
-    chain_client::{ChainClient, ChainClientError},
+    chain_client::{AgreementOnChain, ChainClient, ChainClientError},
     config::IndexingAgreementConfig,
     registry::{
         AgreementRegistry, IndexingAgreement, IndexingAgreementStatus, Result as RegistryResult,
@@ -27,39 +27,45 @@ pub async fn cancel_agreement_on_chain<T: ChainClient>(
     chain_client: &T,
     agreement: &IndexingAgreement,
     config: &IndexingAgreementConfig,
-) -> Result<Option<B256>, ChainClientError> {
-    let version_hash = agreement
+) -> LiveCancel {
+    let Some(version_hash) = agreement
         .terms_version_hash
         .as_deref()
         .filter(|h| h.len() == 32)
         .map(B256::from_slice)
-        .ok_or_else(|| ChainClientError::MissingTermsVersionHash {
+    else {
+        return LiveCancel::CancelFailed(ChainClientError::MissingTermsVersionHash {
             agreement_id: agreement.id.to_string(),
-        })?;
-    // Hazard: the manager's cancel mines successfully even when it does nothing
-    // (stale/wrong hash, unknown id, already-terminal). So after a submitted
-    // cancel we re-read on-chain and surface CancelNotConfirmed if still active.
-    let outcome = chain_client
+        });
+    };
+    let tx_hash = match chain_client
         .cancel_via_manager(
             config.recurring_collector(),
             agreement.id.as_bytes(),
             version_hash,
             SCOPE_BOTH,
         )
-        .await?;
-
-    // cancel_via_manager only returns Ok(Some) (its tx always submits);
-    // Ok(None) is reserved. Verify only when a cancel actually mined.
-    if outcome.is_some()
-        && chain_client
-            .agreement_still_active(agreement.id.as_bytes())
-            .await?
+        .await
     {
-        return Err(ChainClientError::CancelNotConfirmed {
-            agreement_id: agreement.id.to_string(),
-        });
+        Ok(tx_hash) => tx_hash,
+        Err(err) => return LiveCancel::CancelFailed(err),
+    };
+    // The manager's cancel mines even when it does nothing (a stale hash, an unknown id, an
+    // agreement already ended), and the indexer may have ended it first, so only a read
+    // afterwards says whether this cancel is what ended it.
+    match chain_client
+        .agreement_on_chain(agreement.id.as_bytes())
+        .await
+    {
+        Ok(AgreementOnChain::NotLive) => LiveCancel::Ended(tx_hash),
+        Ok(AgreementOnChain::EndedByIndexer) => LiveCancel::NotLive { by_indexer: true },
+        Ok(AgreementOnChain::Live) => {
+            LiveCancel::CancelFailed(ChainClientError::CancelNotConfirmed {
+                agreement_id: agreement.id.to_string(),
+            })
+        }
+        Err(err) => LiveCancel::Unconfirmed { tx_hash, err },
     }
-    Ok(outcome)
 }
 
 /// What [`start_cancel`] left an agreement as.
@@ -89,13 +95,17 @@ where
         .await?;
     let tx_hash = match cancel_if_live(chain_client, agreement, config).await {
         LiveCancel::Ended(tx_hash) => tx_hash,
-        LiveCancel::NotLive => return Ok(CancelStarted::Cancelling),
+        LiveCancel::NotLive { .. } => return Ok(CancelStarted::Cancelling),
         LiveCancel::ReadFailed(err) | LiveCancel::CancelFailed(err) => {
             tracing::warn!(
                 agreement_id = %agreement.id,
                 error = %err,
                 "On-chain cancel failed; the chain listener retries it"
             );
+            return Ok(CancelStarted::Cancelling);
+        }
+        LiveCancel::Unconfirmed { tx_hash, err } => {
+            log_unconfirmed(agreement, tx_hash, &err);
             return Ok(CancelStarted::Cancelling);
         }
     };
@@ -126,6 +136,10 @@ pub async fn confirm_cancelled<R: AgreementRegistry + Sync>(
     tx_hash: Option<B256>,
     config: &IndexingAgreementConfig,
 ) -> bool {
+    // First, so the sweep, which announces the end once the mark lands, finds the transaction.
+    if tx_hash.is_some() {
+        record_cancel(registry, agreement, tx_hash, config).await;
+    }
     if let Err(err) = registry
         .mark_indexing_agreement_as_canceled_by_requester(&agreement.id)
         .await
@@ -145,9 +159,6 @@ pub async fn confirm_cancelled<R: AgreementRegistry + Sync>(
         reason = "cancel_confirmed_on_chain",
         "agreement state transition"
     );
-    if tx_hash.is_some() {
-        record_cancel(registry, agreement, tx_hash, config).await;
-    }
     true
 }
 
@@ -187,11 +198,11 @@ where
     T: ChainClient,
 {
     match chain_client
-        .agreement_still_active(agreement.id.as_bytes())
+        .agreement_on_chain(agreement.id.as_bytes())
         .await
     {
-        Ok(false) => return Ok(false),
-        Ok(true) => {}
+        Ok(AgreementOnChain::Live) => {}
+        Ok(_) => return Ok(false),
         Err(err) => tracing::warn!(
             agreement_id = %agreement.id,
             error = %err,
@@ -218,15 +229,37 @@ where
     Ok(true)
 }
 
+/// Log a cancel that mined but could not be read back, naming its transaction so it isn't lost;
+/// the cancel retry reads the agreement again, and the chain listener records the end.
+pub fn log_unconfirmed(
+    agreement: &IndexingAgreement,
+    tx_hash: Option<B256>,
+    err: &ChainClientError,
+) {
+    tracing::warn!(
+        agreement_id = %agreement.id,
+        tx_hash = ?tx_hash,
+        error = %err,
+        "On-chain cancel mined, but whether it ended the agreement couldn't be read; will check again"
+    );
+}
+
 /// What [`cancel_if_live`] found and did.
 #[derive(Debug)]
 pub enum LiveCancel {
-    /// The chain showed nothing live, so no cancel was sent.
-    NotLive,
+    /// The chain showed nothing live, so no cancel was sent or the one sent did nothing;
+    /// `by_indexer` when the indexer ended it.
+    NotLive { by_indexer: bool },
     /// A cancel went out and the chain confirmed the agreement ended.
     Ended(Option<B256>),
     /// The chain could not be read, so nothing was sent.
     ReadFailed(ChainClientError),
+    /// A cancel mined, but the read after it failed, so whether it ended the agreement, and
+    /// who did, is not known yet.
+    Unconfirmed {
+        tx_hash: Option<B256>,
+        err: ChainClientError,
+    },
     /// The cancel failed or did not end the agreement.
     CancelFailed(ChainClientError),
 }
@@ -240,14 +273,15 @@ pub async fn cancel_if_live<T: ChainClient>(
     config: &IndexingAgreementConfig,
 ) -> LiveCancel {
     match chain_client
-        .agreement_still_active(agreement.id.as_bytes())
+        .agreement_on_chain(agreement.id.as_bytes())
         .await
     {
         Err(err) => LiveCancel::ReadFailed(err),
-        Ok(false) => LiveCancel::NotLive,
-        Ok(true) => match cancel_agreement_on_chain(chain_client, agreement, config).await {
-            Ok(tx_hash) => LiveCancel::Ended(tx_hash),
-            Err(err) => LiveCancel::CancelFailed(err),
+        Ok(AgreementOnChain::Live) => {
+            cancel_agreement_on_chain(chain_client, agreement, config).await
+        }
+        Ok(ended) => LiveCancel::NotLive {
+            by_indexer: ended == AgreementOnChain::EndedByIndexer,
         },
     }
 }
@@ -266,9 +300,9 @@ pub(crate) mod tests {
     use time::OffsetDateTime;
     use url::Url;
 
-    use super::{SCOPE_BOTH, cancel_agreement_on_chain};
+    use super::{LiveCancel, SCOPE_BOTH, cancel_agreement_on_chain};
     use crate::{
-        chain_client::{ChainClient, ChainClientError},
+        chain_client::{AgreementOnChain, ChainClient, ChainClientError},
         config::IndexingAgreementConfig,
         registry::{
             IndexingAgreement, IndexingAgreementStatus, IndexingAgreementTerms,
@@ -286,6 +320,8 @@ pub(crate) mod tests {
     struct RecordingChainClient {
         manager_cancels: Mutex<Vec<ManagerCancelArgs>>,
         still_active_after_cancel: bool,
+        ended_by_indexer: bool,
+        read_back_fails: bool,
         active_reads: Mutex<u32>,
     }
 
@@ -336,18 +372,18 @@ pub(crate) mod tests {
             unimplemented!()
         }
 
-        async fn agreement_still_active(
+        async fn agreement_on_chain(
             &self,
             _agreement_id: &[u8; 16],
-        ) -> Result<bool, ChainClientError> {
+        ) -> Result<AgreementOnChain, ChainClientError> {
             *self.active_reads.lock().unwrap() += 1;
-            Ok(self.still_active_after_cancel)
-        }
-        async fn agreement_ended_by_indexer(
-            &self,
-            _agreement_id: &[u8; 16],
-        ) -> Result<bool, ChainClientError> {
-            Ok(false)
+            if self.read_back_fails {
+                return Err(ChainClientError::RpcError(anyhow::anyhow!("rpc down")));
+            }
+            if self.ended_by_indexer {
+                return Ok(AgreementOnChain::EndedByIndexer);
+            }
+            Ok(AgreementOnChain::live_if(self.still_active_after_cancel))
         }
     }
 
@@ -416,9 +452,7 @@ pub(crate) mod tests {
             Some(vec![7u8; 32]),
         );
 
-        cancel_agreement_on_chain(&client, &ag, &manager_conf(collector))
-            .await
-            .expect("cancel dispatch");
+        cancel_agreement_on_chain(&client, &ag, &manager_conf(collector)).await;
 
         let calls = client.manager_cancels.lock().unwrap();
         assert_eq!(calls.len(), 1);
@@ -438,9 +472,7 @@ pub(crate) mod tests {
         let client = RecordingChainClient::default();
         let ag = agreement(IndexingAgreementStatus::Rejected, Some(vec![9u8; 32]));
 
-        cancel_agreement_on_chain(&client, &ag, &manager_conf(Address::ZERO))
-            .await
-            .expect("cancel dispatch");
+        cancel_agreement_on_chain(&client, &ag, &manager_conf(Address::ZERO)).await;
 
         let calls = client.manager_cancels.lock().unwrap();
         assert_eq!(calls.len(), 1);
@@ -455,13 +487,11 @@ pub(crate) mod tests {
         let client = RecordingChainClient::default();
         let ag = agreement(IndexingAgreementStatus::AcceptedOnChain, None);
 
-        let err = cancel_agreement_on_chain(&client, &ag, &manager_conf(Address::ZERO))
-            .await
-            .unwrap_err();
+        let out = cancel_agreement_on_chain(&client, &ag, &manager_conf(Address::ZERO)).await;
 
         assert!(matches!(
-            err,
-            ChainClientError::MissingTermsVersionHash { .. }
+            out,
+            LiveCancel::CancelFailed(ChainClientError::MissingTermsVersionHash { .. })
         ));
         assert!(client.manager_cancels.lock().unwrap().is_empty());
     }
@@ -475,13 +505,11 @@ pub(crate) mod tests {
             Some(vec![1u8; 16]),
         );
 
-        let err = cancel_agreement_on_chain(&client, &ag, &manager_conf(Address::ZERO))
-            .await
-            .unwrap_err();
+        let out = cancel_agreement_on_chain(&client, &ag, &manager_conf(Address::ZERO)).await;
 
         assert!(matches!(
-            err,
-            ChainClientError::MissingTermsVersionHash { .. }
+            out,
+            LiveCancel::CancelFailed(ChainClientError::MissingTermsVersionHash { .. })
         ));
         assert!(client.manager_cancels.lock().unwrap().is_empty());
     }
@@ -500,11 +528,12 @@ pub(crate) mod tests {
             Some(vec![7u8; 32]),
         );
 
-        let err = cancel_agreement_on_chain(&client, &ag, &manager_conf(Address::ZERO))
-            .await
-            .unwrap_err();
+        let out = cancel_agreement_on_chain(&client, &ag, &manager_conf(Address::ZERO)).await;
 
-        assert!(matches!(err, ChainClientError::CancelNotConfirmed { .. }));
+        assert!(matches!(
+            out,
+            LiveCancel::CancelFailed(ChainClientError::CancelNotConfirmed { .. })
+        ));
         assert_eq!(client.manager_cancels.lock().unwrap().len(), 1);
         assert_eq!(*client.active_reads.lock().unwrap(), 1, "verified once");
     }
@@ -522,12 +551,50 @@ pub(crate) mod tests {
             Some(vec![7u8; 32]),
         );
 
-        let out = cancel_agreement_on_chain(&client, &ag, &manager_conf(Address::ZERO))
-            .await
-            .expect("cancel confirmed");
+        let out = cancel_agreement_on_chain(&client, &ag, &manager_conf(Address::ZERO)).await;
 
-        assert!(out.is_some());
+        assert!(matches!(out, LiveCancel::Ended(Some(_))));
         assert_eq!(client.manager_cancels.lock().unwrap().len(), 1);
         assert_eq!(*client.active_reads.lock().unwrap(), 1, "verified once");
+    }
+
+    #[tokio::test]
+    async fn a_cancel_the_indexer_beat_to_it_is_not_dipper_s() {
+        // The indexer's cancel landed first, so dipper's mined as a no-op: crediting the end
+        // to dipper would announce the wrong canceller.
+        let client = RecordingChainClient {
+            ended_by_indexer: true,
+            ..Default::default()
+        };
+        let ag = agreement(
+            IndexingAgreementStatus::AcceptedOnChain,
+            Some(vec![7u8; 32]),
+        );
+
+        let out = cancel_agreement_on_chain(&client, &ag, &manager_conf(Address::ZERO)).await;
+
+        assert!(matches!(out, LiveCancel::NotLive { by_indexer: true }));
+    }
+
+    #[tokio::test]
+    async fn a_mined_cancel_that_cannot_be_read_back_keeps_its_transaction() {
+        let client = RecordingChainClient {
+            read_back_fails: true,
+            ..Default::default()
+        };
+        let ag = agreement(
+            IndexingAgreementStatus::AcceptedOnChain,
+            Some(vec![7u8; 32]),
+        );
+
+        let out = cancel_agreement_on_chain(&client, &ag, &manager_conf(Address::ZERO)).await;
+
+        assert!(matches!(
+            out,
+            LiveCancel::Unconfirmed {
+                tx_hash: Some(B256::ZERO),
+                ..
+            }
+        ));
     }
 }

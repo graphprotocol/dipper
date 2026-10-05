@@ -43,6 +43,7 @@ use tokio::{sync::mpsc, time::MissedTickBehavior};
 use url::Url;
 
 use crate::{
+    cancel_dispatch::LiveCancel,
     chain_client::{ChainClient, ChainClientError},
     config::LivenessCheckerConfig,
     network::provider::NetworkProviderService,
@@ -508,21 +509,21 @@ async fn cancel_and_reassess<R, W, C>(
     match crate::cancel_dispatch::cancel_agreement_on_chain(chain_client, agreement, agreement_conf)
         .await
     {
-        Ok(Some(tx_hash)) => {
+        LiveCancel::Ended(tx_hash) => {
             tracing::info!(
                 agreement_id = %agreement.id,
-                tx_hash = %tx_hash,
+                tx_hash = ?tx_hash,
                 "canceled stale agreement on-chain"
             );
-            on_chain_cancel_tx = Some(tx_hash.to_string());
+            on_chain_cancel_tx = tx_hash.map(|hash| hash.to_string());
         }
-        Ok(None) => {
+        LiveCancel::NotLive { .. } => {
             tracing::info!(
                 agreement_id = %agreement.id,
                 "stale agreement already canceled on-chain; proceeding to mark abandoned"
             );
         }
-        Err(err @ ChainClientError::MissingTermsVersionHash { .. }) => {
+        LiveCancel::CancelFailed(err @ ChainClientError::MissingTermsVersionHash { .. }) => {
             // Permanent per-agreement condition: the on-chain agreement is
             // still live, so do NOT mark abandoned (that would hide a
             // money-draining agreement). Surface for operator action.
@@ -533,7 +534,7 @@ async fn cancel_and_reassess<R, W, C>(
             );
             return;
         }
-        Err(ChainClientError::ConfigError(_)) => {
+        LiveCancel::CancelFailed(ChainClientError::ConfigError(_)) => {
             // Chain client disabled: still proceed to mark and reassess so the
             // DB reflects the detected abandonment even without an on-chain tx.
             tracing::warn!(
@@ -541,7 +542,11 @@ async fn cancel_and_reassess<R, W, C>(
                 "chain client not configured, skipping on-chain cancellation"
             );
         }
-        Err(err) => {
+        LiveCancel::Unconfirmed { tx_hash, err } => {
+            crate::cancel_dispatch::log_unconfirmed(agreement, tx_hash, &err);
+            return;
+        }
+        LiveCancel::ReadFailed(err) | LiveCancel::CancelFailed(err) => {
             tracing::error!(
                 agreement_id = %agreement.id,
                 error = %err,
@@ -834,7 +839,7 @@ mod tests {
         record_progress, tolerance_duration,
     };
     use crate::{
-        chain_client::{ChainClient, ChainClientError},
+        chain_client::{AgreementOnChain, ChainClient, ChainClientError},
         config::LivenessCheckerConfig,
         registry::{
             AgreementFeeRate, IndexingAgreement, IndexingAgreementStatus, IndexingAgreementTerms,
@@ -1194,19 +1199,13 @@ mod tests {
             unimplemented!()
         }
 
-        async fn agreement_still_active(
+        async fn agreement_on_chain(
             &self,
             _agreement_id: &[u8; 16],
-        ) -> Result<bool, ChainClientError> {
+        ) -> Result<AgreementOnChain, ChainClientError> {
             // Cancel dispatch reads back after a mined cancel; reporting
             // not-active means "cancel confirmed", which these tests expect.
-            Ok(false)
-        }
-        async fn agreement_ended_by_indexer(
-            &self,
-            _agreement_id: &[u8; 16],
-        ) -> Result<bool, ChainClientError> {
-            Ok(false)
+            Ok(AgreementOnChain::NotLive)
         }
     }
 

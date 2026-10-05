@@ -829,7 +829,7 @@ mod lifecycle_event_tests {
 
     use super::{Ctx, Message, handle};
     use crate::{
-        chain_client::{ChainClient, ChainClientError},
+        chain_client::{AgreementOnChain, ChainClient, ChainClientError},
         config::IndexingAgreementConfig,
         network::{
             provider::NetworkProviderService,
@@ -1007,17 +1007,13 @@ mod lifecycle_event_tests {
             unimplemented!()
         }
 
-        async fn agreement_still_active(
+        async fn agreement_on_chain(
             &self,
             agreement_id: &[u8; 16],
-        ) -> std::result::Result<bool, ChainClientError> {
-            Ok(!self.nothing_on_chain && !self.cancelled.lock().unwrap().contains(agreement_id))
-        }
-        async fn agreement_ended_by_indexer(
-            &self,
-            _agreement_id: &[u8; 16],
-        ) -> Result<bool, ChainClientError> {
-            Ok(false)
+        ) -> std::result::Result<AgreementOnChain, ChainClientError> {
+            Ok(AgreementOnChain::live_if(
+                !self.nothing_on_chain && !self.cancelled.lock().unwrap().contains(agreement_id),
+            ))
         }
     }
 
@@ -2297,7 +2293,7 @@ mod deadline_clock_tests {
 
     use super::{JobError, resolve_deadline_clock};
     use crate::{
-        chain_client::{ChainClient, ChainClientError},
+        chain_client::{AgreementOnChain, ChainClient, ChainClientError},
         network::service::{
             chain_events::Cursor,
             chain_listener::{ChainListenerState, ChainListenerStateRegistry},
@@ -2348,17 +2344,11 @@ mod deadline_clock_tests {
             unimplemented!()
         }
 
-        async fn agreement_still_active(
+        async fn agreement_on_chain(
             &self,
             _agreement_id: &[u8; 16],
-        ) -> Result<bool, ChainClientError> {
-            Ok(false)
-        }
-        async fn agreement_ended_by_indexer(
-            &self,
-            _agreement_id: &[u8; 16],
-        ) -> Result<bool, ChainClientError> {
-            Ok(false)
+        ) -> Result<AgreementOnChain, ChainClientError> {
+            Ok(AgreementOnChain::NotLive)
         }
     }
 
