@@ -377,6 +377,7 @@ mod tests {
         clock_fails: bool,
         now: AtomicU64,
         ended_by_indexer: bool,
+        indexer_ends_it_first: bool,
         cancels_sent: AtomicU32,
         reads: AtomicU32,
     }
@@ -411,7 +412,7 @@ mod tests {
                 });
             }
             self.cancels_sent.fetch_add(1, Ordering::SeqCst);
-            if !self.cancel_has_no_effect {
+            if !self.cancel_has_no_effect || self.indexer_ends_it_first {
                 self.live.store(false, Ordering::SeqCst);
             }
             Ok(Some(B256::repeat_byte(0xcd)))
@@ -440,7 +441,7 @@ mod tests {
             }
             Ok(if self.live.load(Ordering::SeqCst) {
                 AgreementOnChain::Live
-            } else if self.ended_by_indexer {
+            } else if self.ended_by_indexer || self.indexer_ends_it_first {
                 AgreementOnChain::EndedByIndexer
             } else {
                 AgreementOnChain::NotLive
@@ -588,6 +589,24 @@ mod tests {
 
         assert_eq!(chain.reads.load(Ordering::SeqCst), 1);
         assert_eq!(registry.marked_by_indexer.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn leaves_an_end_the_indexer_beat_dipper_to_as_theirs() {
+        // Dipper's cancel mined as a no-op after the indexer's; recording it as dipper's
+        // would announce the wrong canceller, and the listener's details would be ignored.
+        let registry = registry_with_one(true);
+        let chain = MockChain {
+            indexer_ends_it_first: true,
+            ..live_chain()
+        };
+
+        retry(&registry, &chain, 0).await;
+
+        assert_eq!(chain.cancels_sent.load(Ordering::SeqCst), 1);
+        assert!(registry.marked_cancelled.lock().unwrap().is_empty());
+        assert!(registry.audits.lock().unwrap().is_empty());
+        assert_eq!(registry.attempts.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
