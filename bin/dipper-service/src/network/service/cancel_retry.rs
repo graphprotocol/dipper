@@ -1,6 +1,7 @@
 //! Finishes the cancels dipper starts. An agreement dipper wants ended is marked
 //! `Cancelling` before its on-chain cancel goes out; this sweep re-sends the cancel while
-//! the chain shows it live, and marks it `CanceledByRequester` once it can no longer be.
+//! the chain shows it live, and marks it ended once it can no longer be: `CanceledByRequester`,
+//! or `AbandonedByIndexer` for one dipper ended because its indexer stopped serving it.
 
 use dipper_core::time::now_secs;
 use thegraph_core::alloy::primitives::B256;
@@ -134,7 +135,7 @@ async fn retry_cancel<R, T>(
     note_check(registry, row, failure.as_ref(), Some(failure.is_none())).await;
 }
 
-/// Mark the agreement `CanceledByRequester` once it can't go live again: this sweep's cancel
+/// Mark the agreement ended by dipper once it can't go live again: this sweep's cancel
 /// ended it, or nobody accepted its offer before the deadline to. One ended otherwise is left
 /// to the chain listener for a while; one the indexer ended then becomes `CanceledByIndexer`.
 async fn confirm_if_over<R: AgreementRegistry + Sync>(

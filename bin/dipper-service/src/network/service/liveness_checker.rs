@@ -1439,8 +1439,8 @@ mod tests {
 
     #[tokio::test]
     async fn leaves_a_failed_cancel_to_the_retry_and_still_reassesses() {
-        // Marked cancelling, the agreement is out of the checker's sight and its indexer out
-        // of selection, so it is replaced now and the cancel retry finishes the cancel.
+        // Marked cancelling, the agreement is out of the checker's sight, and its indexer out
+        // of selection until the cancel lands, so it is replaced now and the retry finishes it.
         let agreement = stale_agreement();
         let calls = MockCalls::default();
         let registry = MockRegistry::new(calls.clone(), agreement.clone());
