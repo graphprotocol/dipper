@@ -1,6 +1,7 @@
 //! Finishes the cancels dipper starts. An agreement dipper wants ended is marked
 //! `Cancelling` before its on-chain cancel goes out; this sweep re-sends the cancel while
-//! the chain shows it live, and marks it `CanceledByRequester` once it can no longer be.
+//! the chain shows it live, and marks it ended once it can no longer be: `CanceledByRequester`,
+//! or `AbandonedByIndexer` for one dipper ended because its indexer stopped serving it.
 
 use dipper_core::time::now_secs;
 use thegraph_core::alloy::primitives::B256;
@@ -134,7 +135,7 @@ async fn retry_cancel<R, T>(
     note_check(registry, row, failure.as_ref(), Some(failure.is_none())).await;
 }
 
-/// Mark the agreement `CanceledByRequester` once it can't go live again: this sweep's cancel
+/// Mark the agreement ended by dipper once it can't go live again: this sweep's cancel
 /// ended it, or nobody accepted its offer before the deadline to. One ended otherwise is left
 /// to the chain listener for a while; one the indexer ended then becomes `CanceledByIndexer`.
 async fn confirm_if_over<R: AgreementRegistry + Sync>(
@@ -236,7 +237,7 @@ async fn note_check<R: AgreementRegistry + Sync>(
     {
         Ok(attempts) => {
             if let Some(err) = failure.filter(|_| failed_attempts > 0) {
-                log_failed_cancel(agreement, attempts, failed_attempts, err);
+                log_failed_cancel(row, attempts, failed_attempts, err);
             }
         }
         Err(err) => tracing::warn!(
@@ -258,11 +259,12 @@ fn log_uncounted_failure(agreement: &IndexingAgreement, err: &ChainClientError) 
 /// One ERROR as an agreement reaches the limit, for an operator to look into; a WARN for
 /// every other failed cancel.
 fn log_failed_cancel(
-    agreement: &IndexingAgreement,
+    row: &CancellingAgreement,
     attempts: u32,
     failed: u32,
     err: &ChainClientError,
 ) {
+    let agreement = &row.agreement;
     let reached_limit =
         attempts >= MAX_CANCEL_ATTEMPTS && attempts.saturating_sub(failed) < MAX_CANCEL_ATTEMPTS;
     if !reached_limit {
@@ -279,6 +281,7 @@ fn log_failed_cancel(
         agreement_id = %agreement.id,
         indexer_id = %agreement.indexer.id,
         indexing_request_id = %agreement.indexing_request_id,
+        abandoned = row.abandoned,
         attempts,
         error = %err,
         "Cancelling an agreement keeps failing; it may still be live. Dipper now retries it hourly"

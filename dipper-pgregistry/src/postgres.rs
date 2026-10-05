@@ -2283,7 +2283,8 @@ impl PgRegistry {
 
 /// Batched form of `update_status_from`: transitions all rows whose `id`
 /// is in `agreement_ids` and whose current status is in `allowed_from` to
-/// `new_status`, in one statement. Returns the ids of the rows that
+/// `new_status`, in one statement; a row noted abandoned that `new_status` would make
+/// `CanceledByRequester` becomes `AbandonedByIndexer` instead. Returns the ids of the rows that
 /// actually flipped (matched the CAS guard) so callers can build per-id
 /// outcome maps. Empty input is a fast-path no-op.
 async fn batch_update_status_from(
