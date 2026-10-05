@@ -881,8 +881,9 @@ where
         }
     }
 
-    reopen_if_cancelled_but_accepted(snapshot, &agreement, registry, chain_client).await?;
-    record_accept_of_cancelling(snapshot, &agreement, registry).await;
+    let reopened =
+        reopen_if_cancelled_but_accepted(snapshot, &agreement, registry, chain_client).await?;
+    record_accept_of_cancelling(snapshot, &agreement, reopened, registry).await;
 
     // Both transitions are applied atomically downstream so the
     // Accept-then-Cancel-in-one-snapshot path can't leak an intermediate
@@ -998,13 +999,14 @@ fn created_after_events_started(agreement: &IndexingAgreement) -> bool {
 /// Safety net for an agreement dipper cancelled whose offer the indexer accepted
 /// anyway, such as one that landed after dipper's cancel. Nothing else would end
 /// it: reconciliation ignores an accept on a cancelled row. It goes back to
-/// `Cancelling` for the cancel retry, unless the chain shows it already ended.
+/// `Cancelling` for the cancel retry, unless the chain shows it already ended. Returns whether it
+/// moved it back.
 async fn reopen_if_cancelled_but_accepted<R, T>(
     snapshot: &AgreementStateSnapshot,
     agreement: &IndexingAgreement,
     registry: &R,
     chain_client: &T,
-) -> anyhow::Result<()>
+) -> anyhow::Result<bool>
 where
     R: AgreementRegistry + Sync,
     T: ChainClient,
@@ -1013,20 +1015,24 @@ where
         && snapshot.state.reached_accepted()
         && !snapshot.state.is_canceled()
     {
-        crate::cancel_dispatch::reopen_if_live(registry, chain_client, agreement).await?;
+        return Ok(
+            crate::cancel_dispatch::reopen_if_live(registry, chain_client, agreement).await?,
+        );
     }
-    Ok(())
+    Ok(false)
 }
 
-/// An agreement dipper is cancelling stays `Cancelling` when the chain shows it accepted,
-/// so its accept is recorded here; its end is then announced, along with the accept,
-/// once the cancel lands. A withdrawn offer reads as cancelled with no accept time.
+/// An agreement dipper is cancelling, or has just moved back to cancelling, stays `Cancelling`
+/// when the chain shows it accepted, so its accept is recorded here; its end is then announced,
+/// along with the accept, once the cancel lands. A withdrawn offer reads as cancelled with no
+/// accept time.
 async fn record_accept_of_cancelling<R: AgreementRegistry + Sync>(
     snapshot: &AgreementStateSnapshot,
     agreement: &IndexingAgreement,
+    reopened: bool,
     registry: &R,
 ) {
-    if agreement.status != IndexingAgreementStatus::Cancelling
+    if (agreement.status != IndexingAgreementStatus::Cancelling && !reopened)
         || !snapshot.state.reached_accepted()
         || snapshot.accepted_at == 0
         || !created_after_events_started(agreement)
@@ -1342,6 +1348,10 @@ fn log_orphan_cancel(
             ?started,
             reason = "request_canceled",
             "Cancelling orphan agreement"
+        ),
+        Err(crate::registry::Error::NoRecordsUpdated) => tracing::debug!(
+            agreement_id = %agreement.id,
+            "Orphan agreement already ended or being cancelled"
         ),
         Err(err) => tracing::warn!(
             error = %err,
@@ -2534,14 +2544,12 @@ mod tests {
         }
     }
 
-    /// Minimal `ChainClient` mock for chain_listener tests. Records every
-    /// on-chain cancel attempt. Tests can mark specific agreements as
-    /// already-canceled-on-chain (cancel returns `Ok(None)`); unmarked
-    /// agreements get a successful `Ok(Some(zero))`.
+    /// Minimal `ChainClient` mock for chain_listener tests. Records every on-chain cancel
+    /// attempt. Every agreement reads as not live, so nothing is sent, unless
+    /// `live_until_cancelled` is set.
     #[derive(Clone, Default)]
     struct MockChainClient {
         cancels: Arc<Mutex<Vec<[u8; 16]>>>,
-        already_canceled: Arc<Mutex<Vec<[u8; 16]>>>,
         /// When set, each cancel records whether its agreement was already marked.
         registry: Option<MockRegistry>,
         marked_at_cancel: Arc<Mutex<Vec<bool>>>,
@@ -2561,10 +2569,6 @@ mod tests {
     impl MockChainClient {
         fn was_on_chain_cancel_attempted(&self, id: &IndexingAgreementId) -> bool {
             self.cancels.lock().unwrap().contains(id.as_bytes())
-        }
-
-        fn mark_already_canceled_on_chain(&self, id: &IndexingAgreementId) {
-            self.already_canceled.lock().unwrap().push(*id.as_bytes());
         }
     }
 
@@ -3112,6 +3116,10 @@ mod tests {
         assert!(result.is_ok());
         assert!(registry.was_reopened(&agreement_id));
         assert!(!registry.was_marked_accepted_on_chain(&agreement_id));
+        assert!(
+            registry.audit_writes().contains(&("accept", agreement_id)),
+            "its accept is recorded, so the cancel retry treats it as paying"
+        );
     }
 
     #[tokio::test]
@@ -3708,7 +3716,6 @@ mod tests {
         registry.add_agreement(new_id, IndexingAgreementStatus::AcceptedOnChain);
         registry.add_agreement(old_id, IndexingAgreementStatus::AcceptedOnChain);
         registry.add_pending_cancellation(new_id, old_id);
-        chain_client.mark_already_canceled_on_chain(&old_id);
 
         let result = execute_pending_cancellations(
             &new_id,
@@ -3740,7 +3747,6 @@ mod tests {
         registry.add_agreement(new_id, IndexingAgreementStatus::AcceptedOnChain);
         registry.add_agreement(old_id, IndexingAgreementStatus::AcceptedOnChain);
         registry.add_pending_cancellation(new_id, old_id);
-        chain_client.mark_already_canceled_on_chain(&old_id);
 
         sweep_executable_pending_cancellations(
             &registry,
@@ -4519,7 +4525,6 @@ mod tests {
         registry.add_agreement(agreement_id, IndexingAgreementStatus::AcceptedOnChain);
         registry.set_agreement_request_id(agreement_id, request_id);
         registry.mark_request_canceled(request_id);
-        chain_client.mark_already_canceled_on_chain(&agreement_id);
 
         sweep_orphan_canceled_agreements(&registry, &chain_client, test_agreement_conf().as_ref())
             .await;
