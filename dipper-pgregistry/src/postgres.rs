@@ -1007,8 +1007,8 @@ impl PgRegistry {
 
     /// Move an agreement dipper had already ended, cancelled or rejected, back to `Cancelling`
     /// once the chain shows it live after all, with its cancel attempts started afresh. It counts
-    /// as checked, since the chain was just read and no cancel sent, so the retry takes it on its
-    /// next sweep rather than waiting for a cancel to be mined.
+    /// as checked, since no cancel is sent with it, so the retry takes it on its next sweep rather
+    /// than waiting for one to be mined.
     pub async fn reopen_indexing_agreement_cancel(
         &self,
         agreement_id: &IndexingAgreementId,
