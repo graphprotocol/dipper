@@ -401,6 +401,16 @@ impl AgreementRegistry for RegistryProvider {
             .map_err(Into::into)
     }
 
+    async fn mark_indexing_agreement_as_abandoning(
+        &self,
+        id: &IndexingAgreementId,
+    ) -> RegistryResult<()> {
+        self.inner
+            .mark_indexing_agreement_as_abandoning(id)
+            .await
+            .map_err(Into::into)
+    }
+
     async fn reopen_indexing_agreement_cancel(
         &self,
         id: &IndexingAgreementId,
@@ -714,17 +724,6 @@ impl AgreementRegistry for RegistryProvider {
             .exists_active_agreements()
             .await
             .map_err(Into::into)
-    }
-
-    async fn mark_indexing_agreement_as_abandoned(
-        &self,
-        id: &IndexingAgreementId,
-    ) -> RegistryResult<IndexingAgreement> {
-        let raw = self.inner.mark_indexing_agreement_as_abandoned(id).await?;
-        // The conversion only fails for Unknown status; since we just wrote
-        // AbandonedByIndexer, this cannot fail in practice.
-        IndexingAgreement::try_from(raw)
-            .map_err(|_| dipper_pgregistry::Error::NoRecordsUpdated.into())
     }
 
     async fn get_agreement_fee_rates(&self) -> RegistryResult<Vec<AgreementFeeRate>> {

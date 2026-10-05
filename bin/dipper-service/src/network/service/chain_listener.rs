@@ -1086,7 +1086,7 @@ where
         match prep.item.cancel {
             Some(CancelKind::ByRequester) => tracing::info!(
                 agreement_id = %prep.agreement.id,
-                "Agreement marked as CanceledByRequester (on-chain confirmation)"
+                "Agreement marked as ended by dipper (on-chain confirmation)"
             ),
             Some(CancelKind::ByIndexer) => tracing::info!(
                 agreement_id = %prep.agreement.id,
@@ -1224,8 +1224,14 @@ where
             None => return Ok(false),
         }
     }
-    let started =
-        crate::cancel_dispatch::start_cancel(registry, chain_client, &old_agreement, config).await;
+    let started = crate::cancel_dispatch::start_cancel(
+        registry,
+        chain_client,
+        &old_agreement,
+        crate::cancel_dispatch::CancelReason::NotWanted,
+        config,
+    )
+    .await;
     Ok(note_replaced_cancel(
         new_agreement_id,
         &old_agreement,
@@ -1314,8 +1320,14 @@ async fn sweep_orphan_canceled_agreements<R, T>(
     };
 
     for agreement in orphans {
-        let started =
-            crate::cancel_dispatch::start_cancel(registry, chain_client, &agreement, config).await;
+        let started = crate::cancel_dispatch::start_cancel(
+            registry,
+            chain_client,
+            &agreement,
+            crate::cancel_dispatch::CancelReason::NotWanted,
+            config,
+        )
+        .await;
         log_orphan_cancel(&agreement, started);
     }
 }
@@ -2437,13 +2449,6 @@ mod tests {
                 }
             }
             Ok((per_indexer, global))
-        }
-
-        async fn mark_indexing_agreement_as_abandoned(
-            &self,
-            _id: &IndexingAgreementId,
-        ) -> RegistryResult<IndexingAgreement> {
-            Err(crate::registry::Error::NoRecordsUpdated)
         }
 
         async fn get_agreement_fee_rates(&self) -> RegistryResult<Vec<AgreementFeeRate>> {

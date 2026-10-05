@@ -43,8 +43,8 @@ use tokio::{sync::mpsc, time::MissedTickBehavior};
 use url::Url;
 
 use crate::{
-    cancel_dispatch::LiveCancel,
-    chain_client::{ChainClient, ChainClientError},
+    cancel_dispatch::CancelReason,
+    chain_client::ChainClient,
     config::LivenessCheckerConfig,
     network::provider::NetworkProviderService,
     registry::{
@@ -481,10 +481,9 @@ async fn record_progress<R>(
     }
 }
 
-/// Cancel a stale agreement on-chain and queue reassessment.
-///
-/// If the on-chain cancel fails, the DB is not updated and reassessment is not
-/// queued, leaving the agreement in `AcceptedOnChain` for the next cycle to retry.
+/// End a stale agreement and queue a reassessment to replace it. It is marked `Cancelling`
+/// before any cancel is sent, so the cancel retry finishes one that fails here, and it ends
+/// `AbandonedByIndexer` once the chain confirms dipper's cancel.
 #[allow(clippy::too_many_arguments)]
 #[expect(
     clippy::cognitive_complexity,
@@ -504,102 +503,47 @@ async fn cancel_and_reassess<R, W, C>(
     W: WorkerQueue + Send + Sync,
     C: ChainClient + Send + Sync,
 {
-    // 1. Cancel on-chain (mode-aware dispatch)
-    let mut on_chain_cancel_tx: Option<String> = None;
-    match crate::cancel_dispatch::cancel_agreement_on_chain(chain_client, agreement, agreement_conf)
-        .await
-    {
-        LiveCancel::Ended(tx_hash) => {
-            tracing::info!(
-                agreement_id = %agreement.id,
-                tx_hash = ?tx_hash,
-                "canceled stale agreement on-chain"
-            );
-            on_chain_cancel_tx = tx_hash.map(|hash| hash.to_string());
-        }
-        LiveCancel::NotLive { .. } => {
-            tracing::info!(
-                agreement_id = %agreement.id,
-                "stale agreement already canceled on-chain; proceeding to mark abandoned"
-            );
-        }
-        LiveCancel::CancelFailed(err @ ChainClientError::MissingTermsVersionHash { .. }) => {
-            // Permanent per-agreement condition: the on-chain agreement is
-            // still live, so do NOT mark abandoned (that would hide a
-            // money-draining agreement). Surface for operator action.
-            tracing::error!(
-                agreement_id = %agreement.id,
-                error = %err,
-                "cannot cancel stale agreement: missing terms_version_hash; leaving active for operator action"
-            );
-            return;
-        }
-        LiveCancel::CancelFailed(ChainClientError::ConfigError(_)) => {
-            // Chain client disabled: still proceed to mark and reassess so the
-            // DB reflects the detected abandonment even without an on-chain tx.
-            tracing::warn!(
-                agreement_id = %agreement.id,
-                "chain client not configured, skipping on-chain cancellation"
-            );
-        }
-        LiveCancel::Unconfirmed { tx_hash, err } => {
-            crate::cancel_dispatch::log_unconfirmed(agreement, tx_hash, &err);
-            return;
-        }
-        LiveCancel::ReadFailed(err) | LiveCancel::CancelFailed(err) => {
-            tracing::error!(
-                agreement_id = %agreement.id,
-                error = %err,
-                "failed to cancel stale agreement on-chain, will retry next cycle"
-            );
-            return;
-        }
+    // Without a cancel that can ever be sent, replacing it would pay 2 indexers until an
+    // operator ends it, so it stays as it is, active, for one to deal with.
+    if crate::cancel_dispatch::cancel_hash(agreement).is_none() {
+        tracing::error!(
+            agreement_id = %agreement.id,
+            "cannot cancel stale agreement: missing terms_version_hash; leaving active for operator action"
+        );
+        return;
     }
 
-    // 2. Mark as abandoned in DB
-    let abandoned = match tokio::time::timeout(
-        db_timeout,
-        registry.mark_indexing_agreement_as_abandoned(&agreement.id),
+    // 1. Start the cancel
+    match crate::cancel_dispatch::start_cancel(
+        registry,
+        chain_client,
+        agreement,
+        CancelReason::Abandoned,
+        agreement_conf,
     )
     .await
     {
-        Ok(Ok(a)) => a,
-        Ok(Err(err)) => {
+        Ok(started) => tracing::info!(
+            agreement_id = %agreement.id,
+            ?started,
+            reason = "indexer_stale",
+            "Cancelling stale agreement"
+        ),
+        Err(crate::registry::Error::NoRecordsUpdated) => {
+            tracing::debug!(
+                agreement_id = %agreement.id,
+                "Stale agreement already ended or being cancelled"
+            );
+            return;
+        }
+        Err(err) => {
             tracing::error!(
                 agreement_id = %agreement.id,
                 error = %err,
-                "failed to mark agreement as abandoned"
+                "failed to mark stale agreement cancelling, will retry next cycle"
             );
             return;
         }
-        Err(_) => {
-            tracing::error!(
-                agreement_id = %agreement.id,
-                "timeout marking agreement as abandoned"
-            );
-            return;
-        }
-    };
-
-    // The accepted agreement was canceled on-chain because the indexer went
-    // stale. Record the cancel audit so the chain_listener's `terminated` sweep
-    // announces it durably: this row is marked `AbandonedByIndexer` (terminal)
-    // and was accepted on-chain, so it is sweep-eligible.
-    let manager = agreement_conf.recurring_agreement_manager().to_string();
-    if let Err(err) = registry
-        .record_cancel_audit(
-            &agreement.id,
-            dipper_core::time::now_secs(),
-            &manager,
-            on_chain_cancel_tx.as_deref(),
-        )
-        .await
-    {
-        tracing::warn!(
-            agreement_id = %agreement.id,
-            error = %err,
-            "failed to record cancel audit; terminated event may emit with fallback fields"
-        );
     }
 
     // Clean up pending cancellations: if this abandoned agreement was a
@@ -615,10 +559,10 @@ async fn cancel_and_reassess<R, W, C>(
         );
     }
 
-    // 3. Fetch the indexing request for num_candidates
+    // 2. Fetch the indexing request for num_candidates
     let request = match tokio::time::timeout(
         db_timeout,
-        registry.get_indexing_request_by_id(&abandoned.indexing_request_id),
+        registry.get_indexing_request_by_id(&agreement.indexing_request_id),
     )
     .await
     {
@@ -626,7 +570,7 @@ async fn cancel_and_reassess<R, W, C>(
         Ok(Ok(None)) => {
             tracing::warn!(
                 agreement_id = %agreement.id,
-                indexing_request_id = %abandoned.indexing_request_id,
+                indexing_request_id = %agreement.indexing_request_id,
                 "indexing request not found for abandoned agreement"
             );
             return;
@@ -648,13 +592,13 @@ async fn cancel_and_reassess<R, W, C>(
         }
     };
 
-    // 4. Queue reassessment
+    // 3. Queue reassessment
     let push_result = tokio::time::timeout(
         queue_timeout,
         worker_queue.reassess_indexing_request(
-            abandoned.indexing_request_id,
-            abandoned.terms.metadata.subgraph_deployment_id,
-            abandoned.terms.metadata.chain_id,
+            agreement.indexing_request_id,
+            agreement.terms.metadata.subgraph_deployment_id,
+            agreement.terms.metadata.chain_id,
             request.num_candidates,
             // Background: abandonment remediation yields to interactive work.
             JobPriority::Background,
@@ -666,7 +610,7 @@ async fn cancel_and_reassess<R, W, C>(
         Ok(Ok(_job_id)) => {
             tracing::info!(
                 agreement_id = %agreement.id,
-                indexing_request_id = %abandoned.indexing_request_id,
+                indexing_request_id = %agreement.indexing_request_id,
                 "queued reassessment for abandoned agreement"
             );
         }
@@ -920,7 +864,10 @@ mod tests {
     #[derive(Clone, Default)]
     struct MockCalls {
         progress_updates: Arc<Mutex<Vec<(IndexingAgreementId, u64)>>>,
-        abandoned: Arc<Mutex<Vec<IndexingAgreementId>>>,
+        /// Ids marked cancelling as abandoned, before any cancel is sent.
+        abandoning: Arc<Mutex<Vec<IndexingAgreementId>>>,
+        /// Ids marked ended once the chain confirmed dipper's cancel.
+        ended: Arc<Mutex<Vec<IndexingAgreementId>>>,
         reassessments: Arc<Mutex<Vec<IndexingRequestId>>>,
         chain_cancels: Arc<Mutex<Vec<[u8; 16]>>>,
         /// Ids passed to `record_cancel_audit` -- the signal the handler drives
@@ -930,29 +877,18 @@ mod tests {
 
     struct MockRegistry {
         calls: MockCalls,
-        mark_abandoned_result: Arc<Mutex<Option<RegistryResult<IndexingAgreement>>>>,
+        already_ending: bool,
         get_request_result: Arc<Mutex<Option<RegistryResult<Option<IndexingRequest>>>>>,
     }
 
     impl MockRegistry {
         fn new(calls: MockCalls, agreement: IndexingAgreement) -> Self {
-            let abandoned_agreement = {
-                let mut a = agreement.clone();
-                a.status = IndexingAgreementStatus::AbandonedByIndexer;
-                a
-            };
             let request = make_request(agreement.indexing_request_id, 2);
             Self {
                 calls,
-                mark_abandoned_result: Arc::new(Mutex::new(Some(Ok(abandoned_agreement)))),
+                already_ending: false,
                 get_request_result: Arc::new(Mutex::new(Some(Ok(Some(request))))),
             }
-        }
-
-        fn with_chain_error(calls: MockCalls, agreement: IndexingAgreement) -> Self {
-            let mut mock = Self::new(calls, agreement);
-            mock.mark_abandoned_result = Arc::new(Mutex::new(None));
-            mock
         }
     }
 
@@ -978,16 +914,23 @@ mod tests {
                 .push((*id, block_height));
             Ok(())
         }
-        async fn mark_indexing_agreement_as_abandoned(
+        async fn mark_indexing_agreement_as_abandoning(
             &self,
             id: &IndexingAgreementId,
-        ) -> RegistryResult<IndexingAgreement> {
-            self.calls.abandoned.lock().unwrap().push(*id);
-            self.mark_abandoned_result
-                .lock()
-                .unwrap()
-                .take()
-                .expect("mark_abandoned called more than once")
+        ) -> RegistryResult<()> {
+            if self.already_ending {
+                return Err(crate::registry::Error::NoRecordsUpdated);
+            }
+            self.calls.abandoning.lock().unwrap().push(*id);
+            Ok(())
+        }
+
+        async fn mark_indexing_agreement_as_canceled_by_requester(
+            &self,
+            id: &IndexingAgreementId,
+        ) -> RegistryResult<()> {
+            self.calls.ended.lock().unwrap().push(*id);
+            Ok(())
         }
 
         async fn record_cancel_audit(
@@ -1116,9 +1059,11 @@ mod tests {
         }
     }
 
+    /// An agreement live on-chain until a cancel that succeeds ends it.
     struct MockChainClient {
         calls: MockCalls,
         result: Result<B256, ChainClientError>,
+        live: std::sync::atomic::AtomicBool,
     }
 
     impl MockChainClient {
@@ -1126,13 +1071,7 @@ mod tests {
             Self {
                 calls,
                 result: Ok(B256::ZERO),
-            }
-        }
-
-        fn config_error(calls: MockCalls) -> Self {
-            Self {
-                calls,
-                result: Err(ChainClientError::ConfigError("disabled".into())),
+                live: true.into(),
             }
         }
 
@@ -1140,6 +1079,7 @@ mod tests {
             Self {
                 calls,
                 result: Err(ChainClientError::RpcError(anyhow::anyhow!("network error"))),
+                live: true.into(),
             }
         }
     }
@@ -1172,12 +1112,9 @@ mod tests {
             // existing cancel-path assertions hold.
             self.calls.chain_cancels.lock().unwrap().push(*agreement_id);
             match &self.result {
-                Ok(hash) => Ok(Some(*hash)),
-                Err(ChainClientError::ConfigError(s)) => {
-                    Err(ChainClientError::ConfigError(s.clone()))
-                }
-                Err(ChainClientError::RpcError(e)) => {
-                    Err(ChainClientError::RpcError(anyhow::anyhow!("{e}")))
+                Ok(hash) => {
+                    self.live.store(false, std::sync::atomic::Ordering::SeqCst);
+                    Ok(Some(*hash))
                 }
                 Err(e) => Err(ChainClientError::RpcError(anyhow::anyhow!("{e}"))),
             }
@@ -1203,9 +1140,9 @@ mod tests {
             &self,
             _agreement_id: &[u8; 16],
         ) -> Result<AgreementOnChain, ChainClientError> {
-            // Cancel dispatch reads back after a mined cancel; reporting
-            // not-active means "cancel confirmed", which these tests expect.
-            Ok(AgreementOnChain::NotLive)
+            Ok(AgreementOnChain::live_if(
+                self.live.load(std::sync::atomic::Ordering::SeqCst),
+            ))
         }
     }
 
@@ -1450,183 +1387,115 @@ mod tests {
 
     // ---- cancel_and_reassess behavior tests ----
 
-    #[tokio::test]
-    async fn test_cancel_and_reassess_success() {
-        // Arrange
+    fn stale_agreement() -> IndexingAgreement {
         let dep: DeploymentId = "QmTXzATwNfgGVukV1fX2T6xw9f6LAYRVWpsdXyRWzUR2H9"
             .parse()
             .unwrap();
-        let indexer_id = IndexerId::from(Address::ZERO);
         let url: Url = "http://indexer.example.com/".parse().unwrap();
-        let agreement = make_agreement(
-            indexer_id,
+        make_agreement(
+            IndexerId::from(Address::ZERO),
             url,
             dep,
             Some(100),
             Some(OffsetDateTime::now_utc()),
-        );
-        let req_id = agreement.indexing_request_id;
-        let agr_id = agreement.id;
+        )
+    }
 
-        let calls = MockCalls::default();
-        let registry = MockRegistry::new(calls.clone(), agreement.clone());
+    async fn end_stale(
+        agreement: &IndexingAgreement,
+        registry: &MockRegistry,
+        chain: &MockChainClient,
+    ) {
         let queue = MockWorkerQueue {
-            calls: calls.clone(),
+            calls: registry.calls.clone(),
         };
-        let chain = MockChainClient::success(calls.clone());
-
-        // Act
         cancel_and_reassess(
-            &agreement,
-            &registry,
+            agreement,
+            registry,
             &queue,
-            &chain,
+            chain,
             &test_agreement_conf(),
             DB_TIMEOUT,
             QUEUE_TIMEOUT,
         )
         .await;
+    }
 
-        // Assert
+    #[tokio::test]
+    async fn ends_a_stale_agreement_through_cancelling_and_reassesses() {
+        let agreement = stale_agreement();
+        let calls = MockCalls::default();
+        let registry = MockRegistry::new(calls.clone(), agreement.clone());
+        let chain = MockChainClient::success(calls.clone());
+
+        end_stale(&agreement, &registry, &chain).await;
+
+        assert_eq!(calls.abandoning.lock().unwrap().as_slice(), &[agreement.id]);
         assert_eq!(
             calls.chain_cancels.lock().unwrap().as_slice(),
             &[agreement.id.into_bytes()]
         );
-        assert_eq!(calls.abandoned.lock().unwrap().as_slice(), &[agr_id]);
-        assert_eq!(calls.reassessments.lock().unwrap().as_slice(), &[req_id]);
-    }
-
-    #[tokio::test]
-    async fn cancel_and_reassess_records_cancel_audit() {
-        // The stale-agreement cancel no longer emits `terminated` directly: it
-        // records the cancel audit and the chain_listener sweep announces it.
-        let dep: DeploymentId = "QmTXzATwNfgGVukV1fX2T6xw9f6LAYRVWpsdXyRWzUR2H9"
-            .parse()
-            .unwrap();
-        let indexer_id = IndexerId::from(Address::ZERO);
-        let url: Url = "http://indexer.example.com/".parse().unwrap();
-        let agreement = make_agreement(
-            indexer_id,
-            url,
-            dep,
-            Some(100),
-            Some(OffsetDateTime::now_utc()),
-        );
-        let agr_id = agreement.id;
-
-        let calls = MockCalls::default();
-        let registry = MockRegistry::new(calls.clone(), agreement.clone());
-        let queue = MockWorkerQueue {
-            calls: calls.clone(),
-        };
-        let chain = MockChainClient::success(calls.clone());
-
-        cancel_and_reassess(
-            &agreement,
-            &registry,
-            &queue,
-            &chain,
-            &test_agreement_conf(),
-            DB_TIMEOUT,
-            QUEUE_TIMEOUT,
-        )
-        .await;
-
+        assert_eq!(calls.ended.lock().unwrap().as_slice(), &[agreement.id]);
         assert_eq!(
             calls.cancel_audits.lock().unwrap().as_slice(),
-            &[agr_id],
-            "exactly one cancel audit recorded for the stale agreement"
+            &[agreement.id],
+            "its cancel is recorded, so the terminated sweep announces it"
+        );
+        assert_eq!(
+            calls.reassessments.lock().unwrap().as_slice(),
+            &[agreement.indexing_request_id]
         );
     }
 
     #[tokio::test]
-    async fn test_cancel_and_reassess_config_error_proceeds() {
-        // Arrange: chain client disabled (ConfigError) → still mark abandoned and reassess
-        let dep: DeploymentId = "QmTXzATwNfgGVukV1fX2T6xw9f6LAYRVWpsdXyRWzUR2H9"
-            .parse()
-            .unwrap();
-        let indexer_id = IndexerId::from(Address::ZERO);
-        let url: Url = "http://indexer.example.com/".parse().unwrap();
-        let agreement = make_agreement(
-            indexer_id,
-            url,
-            dep,
-            Some(100),
-            Some(OffsetDateTime::now_utc()),
-        );
-        let req_id = agreement.indexing_request_id;
-        let agr_id = agreement.id;
-
+    async fn leaves_a_failed_cancel_to_the_retry_and_still_reassesses() {
+        // Marked cancelling, the agreement is out of the checker's sight, and its indexer out
+        // of selection until the cancel lands, so it is replaced now and the retry finishes it.
+        let agreement = stale_agreement();
         let calls = MockCalls::default();
         let registry = MockRegistry::new(calls.clone(), agreement.clone());
-        let queue = MockWorkerQueue {
-            calls: calls.clone(),
-        };
-        let chain = MockChainClient::config_error(calls.clone());
+        let chain = MockChainClient::rpc_error(calls.clone());
 
-        // Act
-        cancel_and_reassess(
-            &agreement,
-            &registry,
-            &queue,
-            &chain,
-            &test_agreement_conf(),
-            DB_TIMEOUT,
-            QUEUE_TIMEOUT,
-        )
-        .await;
+        end_stale(&agreement, &registry, &chain).await;
 
-        // Assert: no on-chain cancel (ConfigError is treated as disabled, not a real error)
-        // but DB mark and reassessment still happen
+        assert_eq!(calls.abandoning.lock().unwrap().as_slice(), &[agreement.id]);
+        assert!(calls.ended.lock().unwrap().is_empty());
+        assert!(calls.cancel_audits.lock().unwrap().is_empty());
         assert_eq!(
-            calls.chain_cancels.lock().unwrap().as_slice(),
-            &[agreement.id.into_bytes()]
+            calls.reassessments.lock().unwrap().as_slice(),
+            &[agreement.indexing_request_id]
         );
-        assert_eq!(calls.abandoned.lock().unwrap().as_slice(), &[agr_id]);
-        assert_eq!(calls.reassessments.lock().unwrap().as_slice(), &[req_id]);
     }
 
     #[tokio::test]
-    async fn test_cancel_and_reassess_chain_error_skips() {
-        // Arrange: transient RPC error → do nothing (retry next cycle)
-        let dep: DeploymentId = "QmTXzATwNfgGVukV1fX2T6xw9f6LAYRVWpsdXyRWzUR2H9"
-            .parse()
-            .unwrap();
-        let indexer_id = IndexerId::from(Address::ZERO);
-        let url: Url = "http://indexer.example.com/".parse().unwrap();
-        let agreement = make_agreement(
-            indexer_id,
-            url,
-            dep,
-            Some(100),
-            Some(OffsetDateTime::now_utc()),
-        );
-
+    async fn leaves_a_stale_agreement_it_can_never_cancel_for_an_operator() {
+        // Replacing it would pay both indexers, since its cancel can never be sent.
+        let mut agreement = stale_agreement();
+        agreement.terms_version_hash = None;
         let calls = MockCalls::default();
-        let registry = MockRegistry::with_chain_error(calls.clone(), agreement.clone());
-        let queue = MockWorkerQueue {
-            calls: calls.clone(),
+        let registry = MockRegistry::new(calls.clone(), agreement.clone());
+        let chain = MockChainClient::success(calls.clone());
+
+        end_stale(&agreement, &registry, &chain).await;
+
+        assert!(calls.abandoning.lock().unwrap().is_empty());
+        assert!(calls.chain_cancels.lock().unwrap().is_empty());
+        assert!(calls.reassessments.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn leaves_an_agreement_already_ending_alone() {
+        let agreement = stale_agreement();
+        let calls = MockCalls::default();
+        let registry = MockRegistry {
+            already_ending: true,
+            ..MockRegistry::new(calls.clone(), agreement.clone())
         };
-        let chain = MockChainClient::rpc_error(calls.clone());
+        let chain = MockChainClient::success(calls.clone());
 
-        // Act
-        cancel_and_reassess(
-            &agreement,
-            &registry,
-            &queue,
-            &chain,
-            &test_agreement_conf(),
-            DB_TIMEOUT,
-            QUEUE_TIMEOUT,
-        )
-        .await;
+        end_stale(&agreement, &registry, &chain).await;
 
-        // Assert: chain cancel attempted, but DB and queue untouched
-        assert_eq!(
-            calls.chain_cancels.lock().unwrap().as_slice(),
-            &[agreement.id.into_bytes()]
-        );
-        assert!(calls.abandoned.lock().unwrap().is_empty());
+        assert!(calls.chain_cancels.lock().unwrap().is_empty());
         assert!(calls.reassessments.lock().unwrap().is_empty());
     }
 

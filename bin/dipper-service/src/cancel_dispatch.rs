@@ -1,5 +1,5 @@
-//! On-chain cancel dispatch. Every cancel goes through
-//! [`cancel_agreement_on_chain`] so the manager-routed path lives in one place.
+//! On-chain cancel dispatch. Every cancel starts with [`start_cancel`] and goes out through
+//! `cancel_agreement_on_chain`, so the manager-routed path lives in one place.
 
 use dipper_core::time::now_secs;
 use thegraph_core::alloy::primitives::B256;
@@ -23,17 +23,12 @@ const SCOPE_BOTH: u16 = SCOPE_ACTIVE | SCOPE_PENDING;
 /// Cancel an agreement on-chain through the RecurringAgreementManager. Passes
 /// both scope bits so the collector cancels whichever scope the agreement is in,
 /// and treats a missing or short stored hash as `MissingTermsVersionHash`.
-pub async fn cancel_agreement_on_chain<T: ChainClient>(
+async fn cancel_agreement_on_chain<T: ChainClient>(
     chain_client: &T,
     agreement: &IndexingAgreement,
     config: &IndexingAgreementConfig,
 ) -> LiveCancel {
-    let Some(version_hash) = agreement
-        .terms_version_hash
-        .as_deref()
-        .filter(|h| h.len() == 32)
-        .map(B256::from_slice)
-    else {
+    let Some(version_hash) = cancel_hash(agreement) else {
         return LiveCancel::CancelFailed(ChainClientError::MissingTermsVersionHash {
             agreement_id: agreement.id.to_string(),
         });
@@ -68,10 +63,39 @@ pub async fn cancel_agreement_on_chain<T: ChainClient>(
     }
 }
 
+/// The stored terms hash an on-chain cancel needs, or `None` when the agreement has no 32-byte
+/// one, so no cancel can ever be sent for it.
+pub fn cancel_hash(agreement: &IndexingAgreement) -> Option<B256> {
+    agreement
+        .terms_version_hash
+        .as_deref()
+        .filter(|h| h.len() == 32)
+        .map(B256::from_slice)
+}
+
+/// Why dipper is ending an agreement, which decides the status it ends in once the chain
+/// confirms dipper's cancel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelReason {
+    /// Dipper no longer wants it: it ends `CanceledByRequester`.
+    NotWanted,
+    /// Its indexer stopped serving it: it ends `AbandonedByIndexer`.
+    Abandoned,
+}
+
+impl CancelReason {
+    fn ended_status(self) -> &'static str {
+        match self {
+            Self::NotWanted => "CANCELED_BY_REQUESTER",
+            Self::Abandoned => "ABANDONED_BY_INDEXER",
+        }
+    }
+}
+
 /// What [`start_cancel`] left an agreement as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelStarted {
-    /// It was accepted and its cancel landed: now `CanceledByRequester`.
+    /// It was accepted and its cancel landed: now ended, as its [`CancelReason`] says.
     Ended,
     /// Still `Cancelling`; the chain listener finishes it once it can't go live.
     Cancelling,
@@ -84,15 +108,25 @@ pub async fn start_cancel<R, T>(
     registry: &R,
     chain_client: &T,
     agreement: &IndexingAgreement,
+    reason: CancelReason,
     config: &IndexingAgreementConfig,
 ) -> RegistryResult<CancelStarted>
 where
     R: AgreementRegistry + Sync,
     T: ChainClient,
 {
-    registry
-        .mark_indexing_agreement_as_cancelling(&agreement.id)
-        .await?;
+    match reason {
+        CancelReason::NotWanted => {
+            registry
+                .mark_indexing_agreement_as_cancelling(&agreement.id)
+                .await?
+        }
+        CancelReason::Abandoned => {
+            registry
+                .mark_indexing_agreement_as_abandoning(&agreement.id)
+                .await?
+        }
+    }
     let tx_hash = match cancel_if_live(chain_client, agreement, config).await {
         LiveCancel::Ended(tx_hash) => tx_hash,
         LiveCancel::NotLive { .. } => return Ok(CancelStarted::Cancelling),
@@ -119,7 +153,7 @@ where
         return Ok(CancelStarted::Cancelling);
     }
     Ok(
-        if confirm_cancelled(registry, agreement, tx_hash, config).await {
+        if confirm_cancelled(registry, agreement, reason, tx_hash, config).await {
             CancelStarted::Ended
         } else {
             CancelStarted::Cancelling
@@ -127,12 +161,13 @@ where
     )
 }
 
-/// Mark an agreement the chain shows dipper ended `CanceledByRequester`, recording the cancel
-/// when its transaction is known, so the `terminated` sweep announces it. False, logged, when
-/// the mark fails; it stays `Cancelling` for the cancel retry.
+/// Mark an agreement the chain shows dipper ended as ended, recording the cancel when its
+/// transaction is known, so the `terminated` sweep announces it. False, logged, when the mark
+/// fails; it stays `Cancelling` for the cancel retry.
 pub async fn confirm_cancelled<R: AgreementRegistry + Sync>(
     registry: &R,
     agreement: &IndexingAgreement,
+    reason: CancelReason,
     tx_hash: Option<B256>,
     config: &IndexingAgreementConfig,
 ) -> bool {
@@ -155,7 +190,7 @@ pub async fn confirm_cancelled<R: AgreementRegistry + Sync>(
         agreement_id = %agreement.id,
         indexing_request_id = %agreement.indexing_request_id,
         old_status = "CANCELLING",
-        new_status = "CANCELED_BY_REQUESTER",
+        new_status = reason.ended_status(),
         reason = "cancel_confirmed_on_chain",
         "agreement state transition"
     );

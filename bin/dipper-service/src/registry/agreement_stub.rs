@@ -137,6 +137,10 @@ pub trait StubAgreementRegistry: Send + Sync {
         unimplemented!("mark_indexing_agreement_as_cancelling")
     }
 
+    async fn mark_indexing_agreement_as_abandoning(&self, _id: &IndexingAgreementId) -> Result<()> {
+        unimplemented!("mark_indexing_agreement_as_abandoning")
+    }
+
     async fn reopen_indexing_agreement_cancel(&self, _id: &IndexingAgreementId) -> Result<()> {
         unimplemented!("reopen_indexing_agreement_cancel")
     }
@@ -239,13 +243,6 @@ pub trait StubAgreementRegistry: Send + Sync {
         self.count_active_agreements_by_deployment()
             .await
             .map(|m| !m.is_empty())
-    }
-
-    async fn mark_indexing_agreement_as_abandoned(
-        &self,
-        _id: &IndexingAgreementId,
-    ) -> Result<IndexingAgreement> {
-        unimplemented!("mark_indexing_agreement_as_abandoned")
     }
 
     async fn get_agreement_fee_rates(&self) -> Result<Vec<AgreementFeeRate>> {
@@ -445,6 +442,10 @@ impl<T: StubAgreementRegistry> AgreementRegistry for T {
         StubAgreementRegistry::mark_indexing_agreement_as_cancelling(self, id).await
     }
 
+    async fn mark_indexing_agreement_as_abandoning(&self, id: &IndexingAgreementId) -> Result<()> {
+        StubAgreementRegistry::mark_indexing_agreement_as_abandoning(self, id).await
+    }
+
     async fn reopen_indexing_agreement_cancel(&self, id: &IndexingAgreementId) -> Result<()> {
         StubAgreementRegistry::reopen_indexing_agreement_cancel(self, id).await
     }
@@ -544,13 +545,6 @@ impl<T: StubAgreementRegistry> AgreementRegistry for T {
 
     async fn exists_active_agreements(&self) -> Result<bool> {
         StubAgreementRegistry::exists_active_agreements(self).await
-    }
-
-    async fn mark_indexing_agreement_as_abandoned(
-        &self,
-        id: &IndexingAgreementId,
-    ) -> Result<IndexingAgreement> {
-        StubAgreementRegistry::mark_indexing_agreement_as_abandoned(self, id).await
     }
 
     async fn get_agreement_fee_rates(&self) -> Result<Vec<AgreementFeeRate>> {

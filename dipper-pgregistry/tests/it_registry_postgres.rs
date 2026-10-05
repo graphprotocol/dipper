@@ -1768,41 +1768,74 @@ async fn test_count_active_agreements_by_deployment() {
     );
 }
 
-#[tokio::test]
-async fn test_mark_as_abandoned_transitions_status() {
-    //* Given
+/// Start abandoning fixture 0002's accepted agreement, then end it the way `end` does.
+#[expect(
+    clippy::expect_used,
+    reason = "a test helper fails its test on any error"
+)]
+async fn abandon_then_end<F>(end: F) -> (Result<(), Error>, IndexingAgreementStatus)
+where
+    F: AsyncFnOnce(&PgRegistry, &IndexingAgreementId),
+{
     let (db, _temp_db) = temp_registry_db().await;
     run_fixture(&db, include_str!("fixtures/0002_indexing_agreements.sql"))
         .await
         .expect("Failed to run fixture");
     let registry = PgRegistry::new(db);
-
-    // AcceptedOnChain agreement from fixture 0002
     let agreement_id =
         IndexingAgreementId::from_bytes([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
-
-    //* When
-    let abandoned = registry
-        .mark_indexing_agreement_as_abandoned(&agreement_id)
+    registry
+        .mark_indexing_agreement_as_abandoning(&agreement_id)
         .await
-        .expect("Failed to mark agreement as abandoned");
-
-    //* Then
-    assert_eq!(
-        abandoned.status,
-        IndexingAgreementStatus::AbandonedByIndexer,
-        "Status should be AbandonedByIndexer"
-    );
-
-    // Second call must fail — agreement is no longer AcceptedOnChain
-    let err = registry
-        .mark_indexing_agreement_as_abandoned(&agreement_id)
+        .expect("an accepted agreement can be abandoned");
+    let listed = registry
+        .get_cancelling_agreements(100, 10, 0)
         .await
-        .expect_err("Expected error on second mark_as_abandoned call");
+        .expect("cancelling query");
+    assert!(listed[0].abandoned);
+
+    end(&registry, &agreement_id).await;
+
+    let again = registry
+        .mark_indexing_agreement_as_abandoning(&agreement_id)
+        .await;
+    let ended = registry
+        .get_indexing_agreement_by_id(&agreement_id)
+        .await
+        .expect("agreement query")
+        .expect("agreement");
+    (again, ended.status)
+}
+
+#[tokio::test]
+async fn an_abandoned_agreement_dipper_cancels_ends_abandoned() {
+    let (again, status) = abandon_then_end(async |registry, id| {
+        registry
+            .mark_indexing_agreement_as_canceled_by_requester(id)
+            .await
+            .expect("dipper's cancel confirmed");
+    })
+    .await;
+
+    assert_eq!(status, IndexingAgreementStatus::AbandonedByIndexer);
     assert!(
-        matches!(err, Error::NoRecordsUpdated),
-        "Expected NoRecordsUpdated, got: {err:?}"
+        matches!(again, Err(Error::NoRecordsUpdated)),
+        "got {again:?}"
     );
+}
+
+#[tokio::test]
+async fn an_abandoned_agreement_the_listener_sees_cancelled_ends_abandoned() {
+    let (_, status) = abandon_then_end(async |registry, id| {
+        let outcome = registry
+            .apply_reconciliation(id, false, Some(CancelKind::ByRequester))
+            .await
+            .expect("reconciliation");
+        assert!(outcome.did_cancel);
+    })
+    .await;
+
+    assert_eq!(status, IndexingAgreementStatus::AbandonedByIndexer);
 }
 
 // =============================================================================

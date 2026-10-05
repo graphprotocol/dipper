@@ -607,13 +607,6 @@ mod tests {
             Ok((std::collections::HashMap::new(), 0))
         }
 
-        async fn mark_indexing_agreement_as_abandoned(
-            &self,
-            _id: &IndexingAgreementId,
-        ) -> crate::registry::Result<IndexingAgreement> {
-            Err(crate::registry::Error::NoRecordsUpdated)
-        }
-
         async fn get_agreement_fee_rates(&self) -> crate::registry::Result<Vec<AgreementFeeRate>> {
             Ok(vec![])
         }
