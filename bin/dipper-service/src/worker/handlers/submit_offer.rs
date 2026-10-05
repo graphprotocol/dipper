@@ -23,7 +23,7 @@ use thegraph_core::{DeploymentId, alloy::primitives::ChainId};
 use url::Url;
 
 use crate::{
-    cancel_dispatch::{LiveCancel, cancel_if_live},
+    cancel_dispatch::{LiveCancel, cancel_if_live, log_unconfirmed},
     chain_client::{ChainClient, ChainClientError, decode_revert_reason},
     config::IndexingAgreementConfig,
     indexer_rpc_client::into_sol_rca,
@@ -250,9 +250,13 @@ async fn withdraw_offer_if_stored<R, T: ChainClient>(
             );
             Err(JobError::Fatal(err.into()))
         }
-        LiveCancel::ReadFailed(err)
-        | LiveCancel::CancelFailed(err)
-        | LiveCancel::Unconfirmed { err, .. } => Err(retry_withdraw(agreement, err)),
+        LiveCancel::Unconfirmed { tx_hash, err } => {
+            log_unconfirmed(agreement, tx_hash, &err);
+            Err(retry_withdraw(agreement, err))
+        }
+        LiveCancel::ReadFailed(err) | LiveCancel::CancelFailed(err) => {
+            Err(retry_withdraw(agreement, err))
+        }
     }
 }
 

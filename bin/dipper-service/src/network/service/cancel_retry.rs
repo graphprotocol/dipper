@@ -258,7 +258,7 @@ fn log_failed_cancel(
             agreement_id = %agreement.id,
             attempts,
             error = %err,
-            "Cancel did not end the agreement, will retry"
+            "Cancel failed, never mined, or did not end the agreement; will retry"
         );
         return;
     }
