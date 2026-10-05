@@ -901,12 +901,11 @@ mod lifecycle_event_tests {
 
     // ---- Mock: worker queue --------------------------------------------------
 
-    /// Records every `send_indexing_agreement_proposal` call's indexer URL and every
-    /// queued on-chain cancel. Clone shares the buffers for inspection after `handle`.
+    /// Records every `send_indexing_agreement_proposal` call's indexer URL. Clone shares the
+    /// buffer for inspection after `handle`.
     #[derive(Default, Clone)]
     struct MockQueue {
         proposals: Arc<Mutex<Vec<Url>>>,
-        cancels_queued: Arc<Mutex<Vec<IndexingAgreementId>>>,
     }
 
     #[async_trait]
@@ -1711,9 +1710,8 @@ mod lifecycle_event_tests {
     async fn never_accepted_unpaired_cancel_does_not_emit_terminated() {
         // Both old agreements were never accepted on-chain (Created). One add
         // pairs with the first old agreement; the second, unpaired old agreement
-        // reaches the cancel loop but, being never-accepted
-        // (`!was_accepted`), must NOT emit `terminated`. The add still
-        // emits `proposed`. Net: exactly one event, a `proposed`.
+        // reaches the cancel loop but, never accepted, must NOT emit `terminated`.
+        // The add still emits `proposed`. Net: exactly one event, a `proposed`.
         let new_idx = indexer_id(0x44);
         let old_paired = indexer_id(0x55);
         let old_unpaired = indexer_id(0x56);
@@ -1840,14 +1838,12 @@ mod lifecycle_event_tests {
             ctx.chain_client.fail_cancel = true;
             let cancelling = ctx.registry.marked_cancelling.clone();
             let cancelled = ctx.registry.marked_cancelled.clone();
-            let queue = ctx.queue.clone();
 
             let result = handle(ctx, &test_message(0)).await;
 
             assert!(result.is_ok(), "got {result:?}");
             assert_eq!(*cancelling.lock().unwrap(), vec![leaving.id]);
             assert!(cancelled.lock().unwrap().is_empty());
-            assert!(queue.cancels_queued.lock().unwrap().is_empty());
         }
     }
 

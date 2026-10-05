@@ -2543,14 +2543,12 @@ mod tests {
         }
     }
 
-    /// Minimal `ChainClient` mock for chain_listener tests. Records every
-    /// on-chain cancel attempt. Tests can mark specific agreements as
-    /// already-canceled-on-chain (cancel returns `Ok(None)`); unmarked
-    /// agreements get a successful `Ok(Some(zero))`.
+    /// Minimal `ChainClient` mock for chain_listener tests. Records every on-chain cancel
+    /// attempt. Every agreement reads as not live, so nothing is sent, unless
+    /// `live_until_cancelled` is set.
     #[derive(Clone, Default)]
     struct MockChainClient {
         cancels: Arc<Mutex<Vec<[u8; 16]>>>,
-        already_canceled: Arc<Mutex<Vec<[u8; 16]>>>,
         /// When set, each cancel records whether its agreement was already marked.
         registry: Option<MockRegistry>,
         marked_at_cancel: Arc<Mutex<Vec<bool>>>,
@@ -2570,10 +2568,6 @@ mod tests {
     impl MockChainClient {
         fn was_on_chain_cancel_attempted(&self, id: &IndexingAgreementId) -> bool {
             self.cancels.lock().unwrap().contains(id.as_bytes())
-        }
-
-        fn mark_already_canceled_on_chain(&self, id: &IndexingAgreementId) {
-            self.already_canceled.lock().unwrap().push(*id.as_bytes());
         }
     }
 
@@ -3721,7 +3715,6 @@ mod tests {
         registry.add_agreement(new_id, IndexingAgreementStatus::AcceptedOnChain);
         registry.add_agreement(old_id, IndexingAgreementStatus::AcceptedOnChain);
         registry.add_pending_cancellation(new_id, old_id);
-        chain_client.mark_already_canceled_on_chain(&old_id);
 
         let result = execute_pending_cancellations(
             &new_id,
@@ -3753,7 +3746,6 @@ mod tests {
         registry.add_agreement(new_id, IndexingAgreementStatus::AcceptedOnChain);
         registry.add_agreement(old_id, IndexingAgreementStatus::AcceptedOnChain);
         registry.add_pending_cancellation(new_id, old_id);
-        chain_client.mark_already_canceled_on_chain(&old_id);
 
         sweep_executable_pending_cancellations(
             &registry,
@@ -4532,7 +4524,6 @@ mod tests {
         registry.add_agreement(agreement_id, IndexingAgreementStatus::AcceptedOnChain);
         registry.set_agreement_request_id(agreement_id, request_id);
         registry.mark_request_canceled(request_id);
-        chain_client.mark_already_canceled_on_chain(&agreement_id);
 
         sweep_orphan_canceled_agreements(&registry, &chain_client, test_agreement_conf().as_ref())
             .await;
