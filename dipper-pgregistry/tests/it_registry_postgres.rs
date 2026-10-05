@@ -3362,16 +3362,6 @@ async fn cancelling_agreements_are_listed_until_their_cancel_fails_too_often() {
     .await
     .expect("Failed to run fixture");
     let created = fixture_agreement(0xaa);
-    // An offer still open to acceptance, so only the accepted agreement can be paying.
-    sqlx::query(
-        "UPDATE dipper_reg_indexing_agreements \
-         SET terms = jsonb_set(terms::jsonb, '{deadline}', to_jsonb(4102444800::bigint)) \
-         WHERE id = $1",
-    )
-    .bind(created)
-    .execute(&db)
-    .await
-    .expect("Failed to update deadline");
     let registry = PgRegistry::new(db.clone());
     let accepted =
         IndexingAgreementId::from_bytes([0xaa, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
@@ -3431,64 +3421,10 @@ async fn cancelling_agreements_are_listed_until_their_cancel_fails_too_often() {
         ]
     );
 
-    assert_eq!(
-        registry
-            .record_cancel_check(&created, 0, None)
-            .await
-            .unwrap(),
-        0
-    );
-    assert_eq!(
-        registry
-            .record_cancel_check(&accepted, 0, None)
-            .await
-            .unwrap(),
-        0
-    );
-    let listed = registry
-        .get_cancelling_agreements(100, 2, 0)
-        .await
-        .expect("cancelling query");
-    let ids: Vec<_> = listed.iter().map(|row| row.agreement.id).collect();
-    assert_eq!(
-        ids,
-        vec![accepted, created],
-        "one accepted on-chain may be paying its indexer, so it goes first"
-    );
-
-    sqlx::query(
-        "UPDATE dipper_reg_indexing_agreements \
-         SET cancel_checked_at = cancel_checked_at - INTERVAL '2 hours' WHERE id = $1",
-    )
-    .bind(created)
-    .execute(&db)
-    .await
-    .expect("Failed to age the check");
-    let listed = registry
-        .get_cancelling_agreements(100, 2, 0)
-        .await
-        .expect("cancelling query");
-    let ids: Vec<_> = listed.iter().map(|row| row.agreement.id).collect();
-    assert_eq!(
-        ids,
-        vec![created, accepted],
-        "an offer unchecked for over an hour isn't held back for ever"
-    );
-
-    assert_eq!(
-        registry
-            .record_cancel_check(&created, 1, None)
-            .await
-            .unwrap(),
-        1
-    );
-    assert_eq!(
-        registry
-            .record_cancel_check(&created, 1, None)
-            .await
-            .unwrap(),
-        2
-    );
+    for attempts in [1, 2] {
+        let counted = registry.record_cancel_check(&created, 1, None).await;
+        assert_eq!(counted.unwrap(), attempts);
+    }
     let listed = registry
         .get_cancelling_agreements(100, 2, 0)
         .await
@@ -3521,6 +3457,76 @@ async fn cancelling_agreements_are_listed_until_their_cancel_fails_too_often() {
         .record_cancel_check(&fixture_agreement(0xbb), 1, None)
         .await;
     assert!(matches!(not_cancelling, Err(Error::NoRecordsUpdated)));
+}
+
+#[tokio::test]
+async fn cancelling_agreements_that_may_be_paying_go_first() {
+    let (db, _temp_db) = temp_registry_db().await;
+    run_fixture(
+        &db,
+        include_str!("fixtures/0003_multi_indexer_agreements.sql"),
+    )
+    .await
+    .expect("Failed to run fixture");
+    let offer = fixture_agreement(0xaa);
+    // An offer still open to acceptance, so only the accepted agreement can be paying.
+    sqlx::query(
+        "UPDATE dipper_reg_indexing_agreements \
+         SET terms = jsonb_set(terms::jsonb, '{deadline}', to_jsonb(4102444800::bigint)) \
+         WHERE id = $1",
+    )
+    .bind(offer)
+    .execute(&db)
+    .await
+    .expect("Failed to update deadline");
+    let registry = PgRegistry::new(db.clone());
+    let accepted =
+        IndexingAgreementId::from_bytes([0xaa, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    registry
+        .record_accepted_audit(&accepted, 1_700_000_000, "0xacc")
+        .await
+        .expect("accept record");
+    for id in [accepted, offer] {
+        registry
+            .mark_indexing_agreement_as_cancelling(&id)
+            .await
+            .expect("mark cancelling");
+    }
+    let order = async || -> Vec<IndexingAgreementId> {
+        let listed = registry
+            .get_cancelling_agreements(100, 2, 0)
+            .await
+            .expect("cancelling query");
+        listed.iter().map(|row| row.agreement.id).collect()
+    };
+
+    registry
+        .record_cancel_check(&accepted, 0, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        order().await,
+        vec![accepted, offer],
+        "one accepted on-chain may be paying its indexer, so it goes ahead of an offer newly \
+         marked, which counts as checked when it was marked"
+    );
+
+    registry.record_cancel_check(&offer, 0, None).await.unwrap();
+    assert_eq!(order().await, vec![accepted, offer]);
+
+    sqlx::query(
+        "UPDATE dipper_reg_indexing_agreements \
+         SET cancel_checked_at = cancel_checked_at - INTERVAL '2 hours' WHERE id = $1",
+    )
+    .bind(offer)
+    .execute(&db)
+    .await
+    .expect("Failed to age the check");
+    assert_eq!(
+        order().await,
+        vec![offer, accepted],
+        "an offer unchecked for over an hour isn't held back for ever"
+    );
 }
 
 #[tokio::test]
