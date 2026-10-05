@@ -43,9 +43,6 @@ pub async fn retry_cancelling_agreements<R, T>(
     R: AgreementRegistry + Sync,
     T: ChainClient,
 {
-    let Some(chain_now) = chain_time(chain_client).await else {
-        return;
-    };
     let cancelling = match registry
         .get_cancelling_agreements(BATCH_SIZE, MAX_CANCEL_ATTEMPTS, SETTLE_MINUTES)
         .await
@@ -55,6 +52,12 @@ pub async fn retry_cancelling_agreements<R, T>(
             tracing::warn!(error = %err, "Failed to list agreements still being cancelled");
             return;
         }
+    };
+    if cancelling.is_empty() {
+        return;
+    }
+    let Some(chain_now) = chain_time(chain_client).await else {
+        return;
     };
     let started = std::time::Instant::now();
     for (done, row) in cancelling.iter().enumerate() {
@@ -385,6 +388,7 @@ mod tests {
         reverts_before_sending: bool,
         cancel_has_no_effect: bool,
         clock_fails: bool,
+        clock_reads: AtomicU32,
         now: AtomicU64,
         ended_by_indexer: bool,
         indexer_ends_it_first: bool,
@@ -464,6 +468,7 @@ mod tests {
             })
         }
         async fn latest_block_timestamp(&self) -> Result<u64, ChainClientError> {
+            self.clock_reads.fetch_add(1, Ordering::SeqCst);
             if self.clock_fails {
                 return Err(ChainClientError::RpcError(anyhow::anyhow!("rpc down")));
             }
@@ -508,6 +513,16 @@ mod tests {
 
         assert_eq!(chain.cancels_sent.load(Ordering::SeqCst), 0);
         assert_eq!(registry.checks.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn leaves_the_chain_alone_when_nothing_is_being_cancelled() {
+        let registry = MockRegistry::default();
+        let chain = live_chain();
+
+        retry(&registry, &chain, 0).await;
+
+        assert_eq!(chain.clock_reads.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
