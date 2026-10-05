@@ -6,7 +6,7 @@ use dipper_core::time::now_secs;
 use thegraph_core::alloy::primitives::B256;
 
 use crate::{
-    cancel_dispatch::{LiveCancel, cancel_if_live, confirm_cancelled},
+    cancel_dispatch::{LiveCancel, cancel_if_live, confirm_cancelled, log_unconfirmed},
     chain_client::{ChainClient, ChainClientError},
     config::IndexingAgreementConfig,
     registry::{AgreementRegistry, CancelKind, CancellingAgreement, IndexingAgreement},
@@ -114,6 +114,10 @@ async fn retry_cancel<R, T>(
                 (tx_hash, false, None)
             }
             LiveCancel::CancelFailed(err) => (None, false, Some(err)),
+            LiveCancel::Unconfirmed { tx_hash, err } => {
+                log_unconfirmed(&row.agreement, tx_hash, &err);
+                return note_check(registry, row, None).await;
+            }
         };
     if failure.is_none()
         && confirm_if_over(registry, config, row, tx_hash, by_indexer, chain_now).await
@@ -378,6 +382,7 @@ mod tests {
         now: AtomicU64,
         ended_by_indexer: bool,
         indexer_ends_it_first: bool,
+        read_back_fails: bool,
         cancels_sent: AtomicU32,
         reads: AtomicU32,
     }
@@ -435,8 +440,8 @@ mod tests {
             &self,
             _agreement_id: &[u8; 16],
         ) -> Result<AgreementOnChain, ChainClientError> {
-            self.reads.fetch_add(1, Ordering::SeqCst);
-            if self.read_fails {
+            let earlier_reads = self.reads.fetch_add(1, Ordering::SeqCst);
+            if self.read_fails || (self.read_back_fails && earlier_reads > 0) {
                 return Err(ChainClientError::RpcError(anyhow::anyhow!("rpc down")));
             }
             Ok(if self.live.load(Ordering::SeqCst) {
@@ -607,6 +612,23 @@ mod tests {
         assert!(registry.marked_cancelled.lock().unwrap().is_empty());
         assert!(registry.audits.lock().unwrap().is_empty());
         assert_eq!(registry.attempts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn neither_counts_nor_confirms_a_mined_cancel_it_could_not_read_back() {
+        // It may well have worked; the next check reads the agreement again.
+        let registry = registry_with_one(true);
+        let chain = MockChain {
+            read_back_fails: true,
+            ..live_chain()
+        };
+
+        retry(&registry, &chain, 0).await;
+
+        assert_eq!(chain.cancels_sent.load(Ordering::SeqCst), 1);
+        assert_eq!(registry.attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(registry.checks.load(Ordering::SeqCst), 1);
+        assert!(registry.marked_cancelled.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

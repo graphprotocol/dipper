@@ -250,9 +250,9 @@ async fn withdraw_offer_if_stored<R, T: ChainClient>(
             );
             Err(JobError::Fatal(err.into()))
         }
-        LiveCancel::ReadFailed(err) | LiveCancel::CancelFailed(err) => {
-            Err(retry_withdraw(agreement, err))
-        }
+        LiveCancel::ReadFailed(err)
+        | LiveCancel::CancelFailed(err)
+        | LiveCancel::Unconfirmed { err, .. } => Err(retry_withdraw(agreement, err)),
     }
 }
 

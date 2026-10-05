@@ -542,6 +542,10 @@ async fn cancel_and_reassess<R, W, C>(
                 "chain client not configured, skipping on-chain cancellation"
             );
         }
+        LiveCancel::Unconfirmed { tx_hash, err } => {
+            crate::cancel_dispatch::log_unconfirmed(agreement, tx_hash, &err);
+            return;
+        }
         LiveCancel::ReadFailed(err) | LiveCancel::CancelFailed(err) => {
             tracing::error!(
                 agreement_id = %agreement.id,

@@ -64,7 +64,7 @@ pub async fn cancel_agreement_on_chain<T: ChainClient>(
                 agreement_id: agreement.id.to_string(),
             })
         }
-        Err(err) => LiveCancel::CancelFailed(err),
+        Err(err) => LiveCancel::Unconfirmed { tx_hash, err },
     }
 }
 
@@ -102,6 +102,10 @@ where
                 error = %err,
                 "On-chain cancel failed; the chain listener retries it"
             );
+            return Ok(CancelStarted::Cancelling);
+        }
+        LiveCancel::Unconfirmed { tx_hash, err } => {
+            log_unconfirmed(agreement, tx_hash, &err);
             return Ok(CancelStarted::Cancelling);
         }
     };
@@ -224,6 +228,21 @@ where
     Ok(true)
 }
 
+/// Log a cancel that mined but could not be read back, naming its transaction so it isn't lost;
+/// the cancel retry reads the agreement again, and the chain listener records the end.
+pub fn log_unconfirmed(
+    agreement: &IndexingAgreement,
+    tx_hash: Option<B256>,
+    err: &ChainClientError,
+) {
+    tracing::warn!(
+        agreement_id = %agreement.id,
+        tx_hash = ?tx_hash,
+        error = %err,
+        "On-chain cancel mined, but whether it ended the agreement couldn't be read; will check again"
+    );
+}
+
 /// What [`cancel_if_live`] found and did.
 #[derive(Debug)]
 pub enum LiveCancel {
@@ -234,6 +253,12 @@ pub enum LiveCancel {
     Ended(Option<B256>),
     /// The chain could not be read, so nothing was sent.
     ReadFailed(ChainClientError),
+    /// A cancel mined, but the read after it failed, so whether it ended the agreement, and
+    /// who did, is not known yet.
+    Unconfirmed {
+        tx_hash: Option<B256>,
+        err: ChainClientError,
+    },
     /// The cancel failed or did not end the agreement.
     CancelFailed(ChainClientError),
 }
@@ -295,6 +320,7 @@ pub(crate) mod tests {
         manager_cancels: Mutex<Vec<ManagerCancelArgs>>,
         still_active_after_cancel: bool,
         ended_by_indexer: bool,
+        read_back_fails: bool,
         active_reads: Mutex<u32>,
     }
 
@@ -350,6 +376,9 @@ pub(crate) mod tests {
             _agreement_id: &[u8; 16],
         ) -> Result<AgreementOnChain, ChainClientError> {
             *self.active_reads.lock().unwrap() += 1;
+            if self.read_back_fails {
+                return Err(ChainClientError::RpcError(anyhow::anyhow!("rpc down")));
+            }
             if self.ended_by_indexer {
                 return Ok(AgreementOnChain::EndedByIndexer);
             }
@@ -544,5 +573,27 @@ pub(crate) mod tests {
         let out = cancel_agreement_on_chain(&client, &ag, &manager_conf(Address::ZERO)).await;
 
         assert!(matches!(out, LiveCancel::NotLive { by_indexer: true }));
+    }
+
+    #[tokio::test]
+    async fn a_mined_cancel_that_cannot_be_read_back_keeps_its_transaction() {
+        let client = RecordingChainClient {
+            read_back_fails: true,
+            ..Default::default()
+        };
+        let ag = agreement(
+            IndexingAgreementStatus::AcceptedOnChain,
+            Some(vec![7u8; 32]),
+        );
+
+        let out = cancel_agreement_on_chain(&client, &ag, &manager_conf(Address::ZERO)).await;
+
+        assert!(matches!(
+            out,
+            LiveCancel::Unconfirmed {
+                tx_hash: Some(B256::ZERO),
+                ..
+            }
+        ));
     }
 }
