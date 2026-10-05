@@ -32,7 +32,8 @@ use super::{
 };
 use crate::{
     chain_client::{
-        ChainClient, ChainClientError, EscrowAccount, ManagerEscrowReader, TrackedProviders,
+        AgreementOnChain, ChainClient, ChainClientError, EscrowAccount, ManagerEscrowReader,
+        TrackedProviders,
     },
     config::ChainClientConfig,
     worker::service::PROCESS_JOB_TIMEOUT,
@@ -180,6 +181,16 @@ fn still_live(state: u16) -> bool {
     let accepted = state & STATE_ACCEPTED != 0;
     let pending_offer = state & STATE_REGISTERED != 0 && !accepted && state & STATE_SETTLED == 0;
     pending_offer || (accepted && state & STATE_NOTICE_GIVEN == 0)
+}
+
+fn on_chain(state: u16) -> AgreementOnChain {
+    if still_live(state) {
+        AgreementOnChain::Live
+    } else if state & STATE_BY_PROVIDER != 0 {
+        AgreementOnChain::EndedByIndexer
+    } else {
+        AgreementOnChain::NotLive
+    }
 }
 
 /// Error patterns that indicate a nonce-related issue.
@@ -1002,18 +1013,11 @@ impl ChainClient for AlloyChainClient {
         }
     }
 
-    async fn agreement_still_active(
+    async fn agreement_on_chain(
         &self,
         agreement_id: &[u8; 16],
-    ) -> Result<bool, ChainClientError> {
-        Ok(still_live(self.agreement_state(agreement_id).await?))
-    }
-
-    async fn agreement_ended_by_indexer(
-        &self,
-        agreement_id: &[u8; 16],
-    ) -> Result<bool, ChainClientError> {
-        Ok(self.agreement_state(agreement_id).await? & STATE_BY_PROVIDER != 0)
+    ) -> Result<AgreementOnChain, ChainClientError> {
+        Ok(on_chain(self.agreement_state(agreement_id).await?))
     }
 
     async fn reconcile_provider(
@@ -1237,6 +1241,22 @@ mod tests {
             STATE_REGISTERED | STATE_ACCEPTED | STATE_NOTICE_GIVEN | BY_PAYER | STATE_SETTLED
         ));
         assert!(!still_live(0), "revoked or never offered");
+    }
+
+    #[test]
+    fn tells_an_end_by_the_indexer_from_any_other() {
+        const BY_PAYER: u16 = 16;
+        let ended = STATE_REGISTERED | STATE_ACCEPTED | STATE_NOTICE_GIVEN;
+        assert_eq!(
+            on_chain(ended | STATE_BY_PROVIDER),
+            AgreementOnChain::EndedByIndexer
+        );
+        assert_eq!(on_chain(ended | BY_PAYER), AgreementOnChain::NotLive);
+        assert_eq!(on_chain(0), AgreementOnChain::NotLive);
+        assert_eq!(
+            on_chain(STATE_REGISTERED | STATE_ACCEPTED),
+            AgreementOnChain::Live
+        );
     }
 
     /// Answers a send with a fixed transaction hash, echoing the request id so alloy's
@@ -2307,9 +2327,10 @@ mod tests {
         client.note_block(95);
 
         let live = client
-            .agreement_still_active(&[0xab; 16])
+            .agreement_on_chain(&[0xab; 16])
             .await
-            .expect("read once the endpoint caught up");
+            .expect("read once the endpoint caught up")
+            .is_live();
 
         assert!(live);
     }
@@ -2327,9 +2348,10 @@ mod tests {
         client.note_block(95);
 
         let live = client
-            .agreement_still_active(&[0xab; 16])
+            .agreement_on_chain(&[0xab; 16])
             .await
-            .expect("read");
+            .expect("read")
+            .is_live();
 
         assert!(!live, "read from the endpoint that has reached block 95");
         assert_eq!(client.seen_block().number, 100);
@@ -2341,7 +2363,7 @@ mod tests {
         let client = client_over(vec![lagging.uri().parse().expect("provider URL")]);
         client.note_block(95);
 
-        let read = client.agreement_still_active(&[0xab; 16]).await;
+        let read = client.agreement_on_chain(&[0xab; 16]).await;
 
         assert!(read.is_err(), "got {read:?}");
     }
@@ -2359,9 +2381,10 @@ mod tests {
         client.note_block(100);
 
         let live = client
-            .agreement_still_active(&[0xab; 16])
+            .agreement_on_chain(&[0xab; 16])
             .await
-            .expect("read");
+            .expect("read")
+            .is_live();
 
         assert!(!live, "read from the endpoint at block 150");
         assert_eq!(client.seen_block().number, 150);
@@ -2374,9 +2397,10 @@ mod tests {
         let client = client_over(vec![endpoint.uri().parse().expect("provider URL")]);
 
         client
-            .agreement_still_active(&[0xab; 16])
+            .agreement_on_chain(&[0xab; 16])
             .await
-            .expect("read");
+            .expect("read")
+            .is_live();
 
         assert_eq!(client.seen_block().number, WEEK_OF_BLOCKS * 3);
     }

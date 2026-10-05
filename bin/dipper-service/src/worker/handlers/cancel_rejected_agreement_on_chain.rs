@@ -62,7 +62,7 @@ mod tests {
     use super::*;
     use crate::{
         cancel_dispatch::tests::agreement,
-        chain_client::ChainClientError,
+        chain_client::{AgreementOnChain, ChainClientError},
         registry::{IndexingAgreement, StubAgreementRegistry},
     };
 
@@ -123,17 +123,11 @@ mod tests {
         ) -> Result<Option<B256>, ChainClientError> {
             unimplemented!()
         }
-        async fn agreement_still_active(
+        async fn agreement_on_chain(
             &self,
             _agreement_id: &[u8; 16],
-        ) -> Result<bool, ChainClientError> {
-            Ok(self.live)
-        }
-        async fn agreement_ended_by_indexer(
-            &self,
-            _agreement_id: &[u8; 16],
-        ) -> Result<bool, ChainClientError> {
-            unimplemented!()
+        ) -> Result<AgreementOnChain, ChainClientError> {
+            Ok(AgreementOnChain::live_if(self.live))
         }
         async fn latest_block_timestamp(&self) -> Result<u64, ChainClientError> {
             unimplemented!()

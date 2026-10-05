@@ -5,7 +5,7 @@ use dipper_core::time::now_secs;
 use thegraph_core::alloy::primitives::B256;
 
 use crate::{
-    chain_client::{ChainClient, ChainClientError},
+    chain_client::{AgreementOnChain, ChainClient, ChainClientError},
     config::IndexingAgreementConfig,
     registry::{
         AgreementRegistry, IndexingAgreement, IndexingAgreementStatus, Result as RegistryResult,
@@ -52,8 +52,9 @@ pub async fn cancel_agreement_on_chain<T: ChainClient>(
     // Ok(None) is reserved. Verify only when a cancel actually mined.
     if outcome.is_some()
         && chain_client
-            .agreement_still_active(agreement.id.as_bytes())
+            .agreement_on_chain(agreement.id.as_bytes())
             .await?
+            .is_live()
     {
         return Err(ChainClientError::CancelNotConfirmed {
             agreement_id: agreement.id.to_string(),
@@ -89,7 +90,7 @@ where
         .await?;
     let tx_hash = match cancel_if_live(chain_client, agreement, config).await {
         LiveCancel::Ended(tx_hash) => tx_hash,
-        LiveCancel::NotLive => return Ok(CancelStarted::Cancelling),
+        LiveCancel::NotLive { .. } => return Ok(CancelStarted::Cancelling),
         LiveCancel::ReadFailed(err) | LiveCancel::CancelFailed(err) => {
             tracing::warn!(
                 agreement_id = %agreement.id,
@@ -187,11 +188,11 @@ where
     T: ChainClient,
 {
     match chain_client
-        .agreement_still_active(agreement.id.as_bytes())
+        .agreement_on_chain(agreement.id.as_bytes())
         .await
     {
-        Ok(false) => return Ok(false),
-        Ok(true) => {}
+        Ok(AgreementOnChain::Live) => {}
+        Ok(_) => return Ok(false),
         Err(err) => tracing::warn!(
             agreement_id = %agreement.id,
             error = %err,
@@ -221,8 +222,9 @@ where
 /// What [`cancel_if_live`] found and did.
 #[derive(Debug)]
 pub enum LiveCancel {
-    /// The chain showed nothing live, so no cancel was sent.
-    NotLive,
+    /// The chain showed nothing live, so no cancel was sent; `by_indexer` when the indexer
+    /// ended it.
+    NotLive { by_indexer: bool },
     /// A cancel went out and the chain confirmed the agreement ended.
     Ended(Option<B256>),
     /// The chain could not be read, so nothing was sent.
@@ -240,14 +242,18 @@ pub async fn cancel_if_live<T: ChainClient>(
     config: &IndexingAgreementConfig,
 ) -> LiveCancel {
     match chain_client
-        .agreement_still_active(agreement.id.as_bytes())
+        .agreement_on_chain(agreement.id.as_bytes())
         .await
     {
         Err(err) => LiveCancel::ReadFailed(err),
-        Ok(false) => LiveCancel::NotLive,
-        Ok(true) => match cancel_agreement_on_chain(chain_client, agreement, config).await {
-            Ok(tx_hash) => LiveCancel::Ended(tx_hash),
-            Err(err) => LiveCancel::CancelFailed(err),
+        Ok(AgreementOnChain::Live) => {
+            match cancel_agreement_on_chain(chain_client, agreement, config).await {
+                Ok(tx_hash) => LiveCancel::Ended(tx_hash),
+                Err(err) => LiveCancel::CancelFailed(err),
+            }
+        }
+        Ok(ended) => LiveCancel::NotLive {
+            by_indexer: ended == AgreementOnChain::EndedByIndexer,
         },
     }
 }
@@ -268,7 +274,7 @@ pub(crate) mod tests {
 
     use super::{SCOPE_BOTH, cancel_agreement_on_chain};
     use crate::{
-        chain_client::{ChainClient, ChainClientError},
+        chain_client::{AgreementOnChain, ChainClient, ChainClientError},
         config::IndexingAgreementConfig,
         registry::{
             IndexingAgreement, IndexingAgreementStatus, IndexingAgreementTerms,
@@ -336,18 +342,12 @@ pub(crate) mod tests {
             unimplemented!()
         }
 
-        async fn agreement_still_active(
+        async fn agreement_on_chain(
             &self,
             _agreement_id: &[u8; 16],
-        ) -> Result<bool, ChainClientError> {
+        ) -> Result<AgreementOnChain, ChainClientError> {
             *self.active_reads.lock().unwrap() += 1;
-            Ok(self.still_active_after_cancel)
-        }
-        async fn agreement_ended_by_indexer(
-            &self,
-            _agreement_id: &[u8; 16],
-        ) -> Result<bool, ChainClientError> {
-            Ok(false)
+            Ok(AgreementOnChain::live_if(self.still_active_after_cancel))
         }
     }
 

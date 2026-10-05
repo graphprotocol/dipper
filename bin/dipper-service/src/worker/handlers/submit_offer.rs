@@ -233,7 +233,7 @@ async fn withdraw_offer_if_stored<R, T: ChainClient>(
     agreement: &IndexingAgreement,
 ) -> JobResult<()> {
     match cancel_if_live(&ctx.chain_client, agreement, &ctx.agreement_conf).await {
-        LiveCancel::NotLive => Ok(()),
+        LiveCancel::NotLive { .. } => Ok(()),
         LiveCancel::Ended(tx_hash) => {
             tracing::info!(
                 agreement_id = %agreement.id,
@@ -310,6 +310,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        chain_client::AgreementOnChain,
         indexer_rpc_client::compute_on_chain_id,
         registry::{
             IndexingAgreement, IndexingAgreementTerms, IndexingAgreementTermsMetadata,
@@ -412,17 +413,13 @@ mod tests {
         ) -> Result<Option<B256>, ChainClientError> {
             unimplemented!()
         }
-        async fn agreement_still_active(
+        async fn agreement_on_chain(
             &self,
             _agreement_id: &[u8; 16],
-        ) -> Result<bool, ChainClientError> {
-            Ok(self.on_chain.load(Ordering::SeqCst))
-        }
-        async fn agreement_ended_by_indexer(
-            &self,
-            _agreement_id: &[u8; 16],
-        ) -> Result<bool, ChainClientError> {
-            Ok(false)
+        ) -> Result<AgreementOnChain, ChainClientError> {
+            Ok(AgreementOnChain::live_if(
+                self.on_chain.load(Ordering::SeqCst),
+            ))
         }
         async fn latest_block_timestamp(&self) -> Result<u64, ChainClientError> {
             unimplemented!()

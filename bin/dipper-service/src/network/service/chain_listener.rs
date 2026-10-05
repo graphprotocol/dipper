@@ -1241,10 +1241,10 @@ async fn expired_but_live<T: ChainClient>(
     agreement: &IndexingAgreement,
 ) -> Option<bool> {
     match chain_client
-        .agreement_still_active(agreement.id.as_bytes())
+        .agreement_on_chain(agreement.id.as_bytes())
         .await
     {
-        Ok(live) => Some(live),
+        Ok(on_chain) => Some(on_chain.is_live()),
         Err(err) => {
             tracing::warn!(
                 old_agreement_id = %agreement.id,
@@ -2635,19 +2635,16 @@ mod tests {
             Ok(None)
         }
 
-        async fn agreement_still_active(
+        async fn agreement_on_chain(
             &self,
             agreement_id: &[u8; 16],
-        ) -> Result<bool, crate::chain_client::ChainClientError> {
+        ) -> Result<crate::chain_client::AgreementOnChain, crate::chain_client::ChainClientError>
+        {
             // Cancel dispatch always reads back after a mined cancel; reporting
             // not-active here means "cancel confirmed", which these tests expect.
-            Ok(self.live_until_cancelled && !self.cancels.lock().unwrap().contains(agreement_id))
-        }
-        async fn agreement_ended_by_indexer(
-            &self,
-            _agreement_id: &[u8; 16],
-        ) -> Result<bool, crate::chain_client::ChainClientError> {
-            Ok(false)
+            Ok(crate::chain_client::AgreementOnChain::live_if(
+                self.live_until_cancelled && !self.cancels.lock().unwrap().contains(agreement_id),
+            ))
         }
     }
 

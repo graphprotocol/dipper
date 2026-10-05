@@ -834,7 +834,7 @@ mod tests {
         record_progress, tolerance_duration,
     };
     use crate::{
-        chain_client::{ChainClient, ChainClientError},
+        chain_client::{AgreementOnChain, ChainClient, ChainClientError},
         config::LivenessCheckerConfig,
         registry::{
             AgreementFeeRate, IndexingAgreement, IndexingAgreementStatus, IndexingAgreementTerms,
@@ -1194,19 +1194,13 @@ mod tests {
             unimplemented!()
         }
 
-        async fn agreement_still_active(
+        async fn agreement_on_chain(
             &self,
             _agreement_id: &[u8; 16],
-        ) -> Result<bool, ChainClientError> {
+        ) -> Result<AgreementOnChain, ChainClientError> {
             // Cancel dispatch reads back after a mined cancel; reporting
             // not-active means "cancel confirmed", which these tests expect.
-            Ok(false)
-        }
-        async fn agreement_ended_by_indexer(
-            &self,
-            _agreement_id: &[u8; 16],
-        ) -> Result<bool, ChainClientError> {
-            Ok(false)
+            Ok(AgreementOnChain::NotLive)
         }
     }
 

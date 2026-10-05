@@ -93,29 +93,30 @@ async fn retry_cancel<R, T>(
     T: ChainClient,
 {
     let agreement_id = row.agreement.id;
-    let (tx_hash, failure) = match cancel_if_live(chain_client, &row.agreement, config).await {
-        LiveCancel::ReadFailed(err) => {
-            tracing::warn!(
-                %agreement_id,
-                error = %err,
-                "Failed to read a cancelling agreement on-chain, will retry"
-            );
-            // Unread, it may still be live, so it can't be confirmed ended.
-            return note_check(registry, row, None).await;
-        }
-        LiveCancel::NotLive => (None, None),
-        LiveCancel::Ended(tx_hash) => {
-            tracing::info!(
-                %agreement_id,
-                tx_hash = ?tx_hash,
-                "Cancelled an agreement still live on-chain"
-            );
-            (tx_hash, None)
-        }
-        LiveCancel::CancelFailed(err) => (None, Some(err)),
-    };
+    let (tx_hash, by_indexer, failure) =
+        match cancel_if_live(chain_client, &row.agreement, config).await {
+            LiveCancel::ReadFailed(err) => {
+                tracing::warn!(
+                    %agreement_id,
+                    error = %err,
+                    "Failed to read a cancelling agreement on-chain, will retry"
+                );
+                // Unread, it may still be live, so it can't be confirmed ended.
+                return note_check(registry, row, None).await;
+            }
+            LiveCancel::NotLive { by_indexer } => (None, by_indexer, None),
+            LiveCancel::Ended(tx_hash) => {
+                tracing::info!(
+                    %agreement_id,
+                    tx_hash = ?tx_hash,
+                    "Cancelled an agreement still live on-chain"
+                );
+                (tx_hash, false, None)
+            }
+            LiveCancel::CancelFailed(err) => (None, false, Some(err)),
+        };
     if failure.is_none()
-        && confirm_if_over(registry, chain_client, config, row, tx_hash, chain_now).await
+        && confirm_if_over(registry, config, row, tx_hash, by_indexer, chain_now).await
     {
         return;
     }
@@ -125,18 +126,14 @@ async fn retry_cancel<R, T>(
 /// Mark the agreement `CanceledByRequester` once it can't go live again: this sweep's cancel
 /// ended it, or nobody accepted its offer before the deadline to. One ended otherwise is left
 /// to the chain listener for a while; one the indexer ended then becomes `CanceledByIndexer`.
-async fn confirm_if_over<R, T>(
+async fn confirm_if_over<R: AgreementRegistry + Sync>(
     registry: &R,
-    chain_client: &T,
     config: &IndexingAgreementConfig,
     row: &CancellingAgreement,
     tx_hash: Option<B256>,
+    by_indexer: bool,
     chain_now: u64,
-) -> bool
-where
-    R: AgreementRegistry + Sync,
-    T: ChainClient,
-{
+) -> bool {
     let agreement = &row.agreement;
     let past_grace = agreement.updated_at < time::OffsetDateTime::now_utc() - LISTENER_GRACE;
     let can_confirm = if row.accepted_on_chain {
@@ -147,44 +144,14 @@ where
     if !can_confirm {
         return false;
     }
-    if tx_hash.is_none() {
-        match ended_by_indexer(chain_client, agreement).await {
-            None => return false,
-            Some(true) => return past_grace && record_end_by_indexer(registry, agreement).await,
-            Some(false) => {}
-        }
+    if by_indexer {
+        tracing::info!(
+            agreement_id = %agreement.id,
+            "The indexer ended an agreement dipper was cancelling"
+        );
+        return past_grace && record_end_by_indexer(registry, agreement).await;
     }
     confirm_cancelled(registry, agreement, tx_hash, config).await
-}
-
-/// Whether the chain shows the indexer ended the agreement, or `None` when it can't be read,
-/// so an end is never wrongly put down to dipper.
-async fn ended_by_indexer<T: ChainClient>(
-    chain_client: &T,
-    agreement: &IndexingAgreement,
-) -> Option<bool> {
-    match chain_client
-        .agreement_ended_by_indexer(agreement.id.as_bytes())
-        .await
-    {
-        Ok(by_indexer) => {
-            if by_indexer {
-                tracing::info!(
-                    agreement_id = %agreement.id,
-                    "The indexer ended an agreement dipper was cancelling"
-                );
-            }
-            Some(by_indexer)
-        }
-        Err(err) => {
-            tracing::warn!(
-                agreement_id = %agreement.id,
-                error = %err,
-                "Failed to read who ended a cancelling agreement, will retry"
-            );
-            None
-        }
-    }
 }
 
 /// Mark an agreement the indexer ended `CanceledByIndexer` when the chain listener hasn't in
@@ -327,6 +294,7 @@ mod tests {
     use super::*;
     use crate::{
         cancel_dispatch::tests::agreement,
+        chain_client::AgreementOnChain,
         registry::{IndexingAgreementStatus, StubAgreementRegistry},
     };
 
@@ -409,8 +377,8 @@ mod tests {
         clock_fails: bool,
         now: AtomicU64,
         ended_by_indexer: bool,
-        who_read_fails: bool,
         cancels_sent: AtomicU32,
+        reads: AtomicU32,
     }
 
     #[async_trait]
@@ -462,23 +430,21 @@ mod tests {
         ) -> Result<Option<B256>, ChainClientError> {
             unimplemented!()
         }
-        async fn agreement_still_active(
+        async fn agreement_on_chain(
             &self,
             _agreement_id: &[u8; 16],
-        ) -> Result<bool, ChainClientError> {
+        ) -> Result<AgreementOnChain, ChainClientError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
             if self.read_fails {
                 return Err(ChainClientError::RpcError(anyhow::anyhow!("rpc down")));
             }
-            Ok(self.live.load(Ordering::SeqCst))
-        }
-        async fn agreement_ended_by_indexer(
-            &self,
-            _agreement_id: &[u8; 16],
-        ) -> Result<bool, ChainClientError> {
-            if self.who_read_fails {
-                return Err(ChainClientError::RpcError(anyhow::anyhow!("rpc down")));
-            }
-            Ok(self.ended_by_indexer)
+            Ok(if self.live.load(Ordering::SeqCst) {
+                AgreementOnChain::Live
+            } else if self.ended_by_indexer {
+                AgreementOnChain::EndedByIndexer
+            } else {
+                AgreementOnChain::NotLive
+            })
         }
         async fn latest_block_timestamp(&self) -> Result<u64, ChainClientError> {
             if self.clock_fails {
@@ -609,19 +575,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn does_not_confirm_an_end_when_who_ended_it_cannot_be_read() {
+    async fn reads_an_ended_agreement_once_to_learn_who_ended_it() {
         let mut registry = registry_with_one(true);
         registry.cancelling[0].agreement.updated_at =
             time::OffsetDateTime::now_utc() - LISTENER_GRACE - time::Duration::MINUTE;
         let chain = MockChain {
-            who_read_fails: true,
+            ended_by_indexer: true,
             ..MockChain::default()
         };
 
         retry(&registry, &chain, 0).await;
 
-        assert!(registry.marked_cancelled.lock().unwrap().is_empty());
-        assert!(registry.marked_by_indexer.lock().unwrap().is_empty());
+        assert_eq!(chain.reads.load(Ordering::SeqCst), 1);
+        assert_eq!(registry.marked_by_indexer.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

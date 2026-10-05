@@ -80,6 +80,28 @@ pub enum ChainClientError {
     ContractRevert { selector: [u8; 4], data: Bytes },
 }
 
+/// What the chain shows of an agreement's current terms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgreementOnChain {
+    /// Accepted with no cancellation notice, or an offer still waiting to be accepted.
+    Live,
+    /// The indexer ended it.
+    EndedByIndexer,
+    /// Neither: never offered, withdrawn, past its offer deadline, or ended by dipper.
+    NotLive,
+}
+
+impl AgreementOnChain {
+    pub fn is_live(self) -> bool {
+        self == Self::Live
+    }
+
+    #[cfg(test)]
+    pub fn live_if(live: bool) -> Self {
+        if live { Self::Live } else { Self::NotLive }
+    }
+}
+
 /// Trait for sending on-chain transactions related to indexing agreements
 #[async_trait]
 pub trait ChainClient {
@@ -120,20 +142,12 @@ pub trait ChainClient {
         agreement_id: &[u8; 16],
     ) -> Result<Option<B256>, ChainClientError>;
 
-    /// Read whether the agreement is still live on-chain (terms accepted and no
-    /// cancellation notice given, or an offer still waiting to be accepted) via
-    /// the RecurringCollector's `getAgreementDetails(id, VERSION_CURRENT)`.
-    async fn agreement_still_active(
+    /// Read what the chain shows of the agreement, via the RecurringCollector's
+    /// `getAgreementDetails(id, VERSION_CURRENT)`.
+    async fn agreement_on_chain(
         &self,
         agreement_id: &[u8; 16],
-    ) -> Result<bool, ChainClientError>;
-
-    /// Read whether the indexer ended the agreement on-chain, which `getAgreementDetails`
-    /// reports with its BY_PROVIDER flag. False for one still live or ended by dipper.
-    async fn agreement_ended_by_indexer(
-        &self,
-        agreement_id: &[u8; 16],
-    ) -> Result<bool, ChainClientError>;
+    ) -> Result<AgreementOnChain, ChainClientError>;
 
     /// Read the latest block's unix timestamp from the chain. Lets agreement
     /// deadlines be stamped from live chain time when the chain-clock bypass is
@@ -182,18 +196,11 @@ impl<T: ChainClient + Send + Sync + ?Sized> ChainClient for Arc<T> {
         (**self).reconcile_agreement(collector, agreement_id).await
     }
 
-    async fn agreement_still_active(
+    async fn agreement_on_chain(
         &self,
         agreement_id: &[u8; 16],
-    ) -> Result<bool, ChainClientError> {
-        (**self).agreement_still_active(agreement_id).await
-    }
-
-    async fn agreement_ended_by_indexer(
-        &self,
-        agreement_id: &[u8; 16],
-    ) -> Result<bool, ChainClientError> {
-        (**self).agreement_ended_by_indexer(agreement_id).await
+    ) -> Result<AgreementOnChain, ChainClientError> {
+        (**self).agreement_on_chain(agreement_id).await
     }
 
     async fn latest_block_timestamp(&self) -> Result<u64, ChainClientError> {
