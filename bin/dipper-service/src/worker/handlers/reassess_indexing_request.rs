@@ -638,9 +638,13 @@ where
     let mut directly_cancelled = 0u32;
     let mut cancel_failures = 0u32;
     for old_agreement in old_iter {
-        let Some(new_status) = cancel_unpaired(&ctx, old_agreement).await else {
-            cancel_failures += 1;
-            continue;
+        let new_status = match cancel_unpaired(&ctx, old_agreement).await {
+            Unpaired::Moved(new_status) => new_status,
+            Unpaired::AlreadyEnding => continue,
+            Unpaired::Failed => {
+                cancel_failures += 1;
+                continue;
+            }
         };
         tracing::info!(
             agreement_id = %old_agreement.id,
@@ -1876,15 +1880,45 @@ mod lifecycle_event_tests {
 
         assert_eq!(*chain_client.cancelled.lock().unwrap(), vec![leaving_id]);
     }
+
+    #[test]
+    fn an_agreement_that_ended_since_it_was_listed_is_not_a_failure() {
+        let agreement = crate::cancel_dispatch::tests::agreement(
+            crate::registry::IndexingAgreementStatus::AcceptedOnChain,
+            None,
+        );
+        let backend_down = crate::registry::Error::BackendError(dipper_pgregistry::Error::DbError(
+            sqlx::Error::PoolTimedOut,
+        ));
+
+        assert_eq!(
+            super::unmarked(&agreement, &crate::registry::Error::NoRecordsUpdated),
+            super::Unpaired::AlreadyEnding
+        );
+        assert_eq!(
+            super::unmarked(&agreement, &backend_down),
+            super::Unpaired::Failed
+        );
+    }
 }
 
-/// Take an old agreement out of the target group, returning its new status, or `None`
-/// (logged) when it couldn't be marked. One that may be live on-chain is cancelled there
-/// too, which the chain listener retries until it ends.
+/// What became of an old agreement taken out of the target group.
+#[derive(Debug, PartialEq, Eq)]
+enum Unpaired {
+    /// Moved to the status named.
+    Moved(&'static str),
+    /// Already ended or being cancelled, as a race with another path can leave it.
+    AlreadyEnding,
+    /// Couldn't be marked; logged.
+    Failed,
+}
+
+/// Take an old agreement out of the target group. One that may be live on-chain is cancelled
+/// there too, which the chain listener retries until it ends.
 async fn cancel_unpaired<R, W, I, T>(
     ctx: &Ctx<R, W, I, T>,
     agreement: &crate::registry::IndexingAgreement,
-) -> Option<&'static str>
+) -> Unpaired
 where
     R: AgreementRegistry + Sync,
     T: ChainClient,
@@ -1893,9 +1927,14 @@ where
         || (agreement.status == crate::registry::IndexingAgreementStatus::Created
             && agreement.terms_version_hash.is_some());
     if !may_be_live {
-        return mark_unpaired_cancelled(&ctx.registry, agreement)
+        return match ctx
+            .registry
+            .mark_indexing_agreement_as_canceled_by_requester(&agreement.id)
             .await
-            .then_some("CANCELED_BY_REQUESTER");
+        {
+            Ok(()) => Unpaired::Moved("CANCELED_BY_REQUESTER"),
+            Err(err) => unmarked(agreement, &err),
+        };
     }
     match crate::cancel_dispatch::start_cancel(
         &ctx.registry,
@@ -1906,38 +1945,33 @@ where
     )
     .await
     {
-        Ok(crate::cancel_dispatch::CancelStarted::Ended) => Some("CANCELED_BY_REQUESTER"),
-        Ok(crate::cancel_dispatch::CancelStarted::Cancelling) => Some("CANCELLING"),
-        Err(err) => {
-            tracing::error!(
-                error = %err,
-                agreement_id = %agreement.id,
-                "Failed to mark unpaired old agreement as cancelling in local DB"
-            );
-            None
+        Ok(crate::cancel_dispatch::CancelStarted::Ended) => {
+            Unpaired::Moved("CANCELED_BY_REQUESTER")
         }
+        Ok(crate::cancel_dispatch::CancelStarted::Cancelling) => Unpaired::Moved("CANCELLING"),
+        Err(err) => unmarked(agreement, &err),
     }
 }
 
-/// Mark an unpaired old agreement CanceledByRequester; false, logged, if that fails.
-async fn mark_unpaired_cancelled<R: AgreementRegistry + Sync>(
-    registry: &R,
+/// Why an unpaired old agreement couldn't be marked, logged at the level it deserves: one that
+/// ended, or started cancelling, since it was listed is expected and needs nothing more.
+fn unmarked(
     agreement: &crate::registry::IndexingAgreement,
-) -> bool {
-    match registry
-        .mark_indexing_agreement_as_canceled_by_requester(&agreement.id)
-        .await
-    {
-        Ok(()) => true,
-        Err(err) => {
-            tracing::error!(
-                error = %err,
-                agreement_id = %agreement.id,
-                "Failed to mark unpaired old agreement as canceled in local DB"
-            );
-            false
-        }
+    err: &crate::registry::Error,
+) -> Unpaired {
+    if matches!(err, crate::registry::Error::NoRecordsUpdated) {
+        tracing::debug!(
+            agreement_id = %agreement.id,
+            "Unpaired old agreement already ended or being cancelled"
+        );
+        return Unpaired::AlreadyEnding;
     }
+    tracing::error!(
+        error = %err,
+        agreement_id = %agreement.id,
+        "Failed to mark unpaired old agreement as ended in local DB"
+    );
+    Unpaired::Failed
 }
 
 /// Olds reserved from cancellation: one per add-cancel pairing lost to a

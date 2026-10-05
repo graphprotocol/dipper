@@ -1348,6 +1348,10 @@ fn log_orphan_cancel(
             reason = "request_canceled",
             "Cancelling orphan agreement"
         ),
+        Err(crate::registry::Error::NoRecordsUpdated) => tracing::debug!(
+            agreement_id = %agreement.id,
+            "Orphan agreement already ended or being cancelled"
+        ),
         Err(err) => tracing::warn!(
             error = %err,
             agreement_id = %agreement.id,
