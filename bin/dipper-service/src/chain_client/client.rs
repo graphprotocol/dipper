@@ -2600,9 +2600,10 @@ mod tests {
         ]);
 
         let live = client
-            .agreement_still_active(&[0xab; 16])
+            .agreement_on_chain(&[0xab; 16])
             .await
-            .expect("read");
+            .expect("read")
+            .is_live();
 
         assert!(!live, "read from an endpoint that is right");
         assert!(client.seen_block().confirmed);
