@@ -65,7 +65,12 @@ pub enum ChainClientError {
     /// tx claimed the nonce with a higher fee. Callers re-sync the nonce and
     /// resubmit; there is no idempotency guard, so a replay re-sends the call.
     #[error("tx {tx_hash} did not mine within the receipt-poll window")]
-    TxDropped { tx_hash: B256 },
+    TxDropped {
+        tx_hash: B256,
+        /// Whether any receipt check got an answer. When none did, an outage may have hidden a
+        /// transaction that mined, rather than the chain not mining it.
+        receipt_checked: bool,
+    },
 
     /// Tx was mined but reverted on-chain (receipt status = 0).
     #[error("tx {tx_hash} reverted on-chain")]
