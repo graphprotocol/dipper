@@ -195,6 +195,8 @@ pub struct CancellingAgreement {
     pub accepted_on_chain: bool,
     /// When a check first found it no longer live on-chain, if one has.
     pub ended_seen_at: Option<time::OffsetDateTime>,
+    /// Whether it is being cancelled because its indexer stopped serving it.
+    pub abandoned: bool,
 }
 
 impl sqlx::FromRow<'_, sqlx::postgres::PgRow> for CancellingAgreement {
@@ -205,6 +207,7 @@ impl sqlx::FromRow<'_, sqlx::postgres::PgRow> for CancellingAgreement {
             agreement: IndexingAgreement::from_row(row)?,
             accepted_on_chain: accepted_at.is_some(),
             ended_seen_at: row.try_get("ended_seen_at")?,
+            abandoned: row.try_get("abandoned")?,
         })
     }
 }
@@ -943,6 +946,7 @@ impl PgRegistry {
         Ok(())
     }
 
+    /// One being cancelled because its indexer stopped serving it ends `AbandonedByIndexer`.
     pub async fn mark_indexing_agreement_as_canceled_by_requester(
         &self,
         agreement_id: &IndexingAgreementId,
@@ -972,6 +976,33 @@ impl PgRegistry {
             ],
         )
         .await
+    }
+
+    /// Start ending an accepted agreement whose indexer stopped serving it: `Cancelling`, and
+    /// noted as abandoned, so the chain confirming dipper's cancel ends it `AbandonedByIndexer`.
+    pub async fn mark_indexing_agreement_as_abandoning(
+        &self,
+        agreement_id: &IndexingAgreementId,
+    ) -> Result<(), Error> {
+        let updated = sqlx::query(
+            r#"
+            UPDATE dipper_reg_indexing_agreements
+            SET
+                status = $1,
+                abandoned = true,
+                updated_at = timezone('UTC', now())
+            WHERE id = $2 AND status = $3
+            "#,
+        )
+        .bind(IndexingAgreementStatus::Cancelling)
+        .bind(agreement_id)
+        .bind(IndexingAgreementStatus::AcceptedOnChain)
+        .execute(&self.pool)
+        .await?;
+        if updated.rows_affected() == 0 {
+            return Err(Error::NoRecordsUpdated);
+        }
+        Ok(())
     }
 
     /// Move an agreement dipper had already ended, cancelled or rejected, back to `Cancelling`
@@ -1036,7 +1067,8 @@ impl PgRegistry {
                 rejection_reason,
                 terms_version_hash,
                 accepted_at,
-                ended_seen_at
+                ended_seen_at,
+                abandoned
             FROM dipper_reg_indexing_agreements
             WHERE status = $1
               AND (
@@ -1933,50 +1965,6 @@ impl PgRegistry {
         Ok(exists)
     }
 
-    /// Mark an agreement as `AbandonedByIndexer`.
-    ///
-    /// Transitions `AcceptedOnChain → AbandonedByIndexer`. Returns the full
-    /// agreement for use in the subsequent reassessment call.
-    ///
-    /// Returns [`NoRecordsUpdated`](Error::NoRecordsUpdated) if the agreement
-    /// doesn't exist or isn't in `AcceptedOnChain` status.
-    pub async fn mark_indexing_agreement_as_abandoned(
-        &self,
-        agreement_id: &IndexingAgreementId,
-    ) -> Result<IndexingAgreement, Error> {
-        let record: Option<IndexingAgreement> = sqlx::query_as(
-            r#"
-            UPDATE dipper_reg_indexing_agreements
-            SET
-                status = $1,
-                updated_at = timezone('UTC', now())
-            WHERE id = $2 AND status = $3
-            RETURNING
-                id,
-                nonce_uuid,
-                created_at,
-                updated_at,
-                status,
-                indexing_request_id,
-                deployment_id,
-                indexer_id,
-                indexer_url,
-                terms,
-                last_block_height,
-                last_progress_at,
-                rejection_reason,
-                terms_version_hash
-            "#,
-        )
-        .bind(IndexingAgreementStatus::AbandonedByIndexer)
-        .bind(agreement_id)
-        .bind(IndexingAgreementStatus::AcceptedOnChain)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        record.ok_or(Error::NoRecordsUpdated)
-    }
-
     // =========================================================================
     // Indexer denylist operations
     // =========================================================================
@@ -2308,20 +2296,25 @@ async fn batch_update_status_from(
         return Ok(Vec::new());
     }
     let placeholders = (0..allowed_from.len())
-        .map(|i| format!("${}", i + 3))
+        .map(|i| format!("${}", i + 5))
         .collect::<Vec<_>>()
         .join(", ");
+    // An agreement dipper ended because its indexer stopped serving it ends as abandoned.
     let sql = format!(
         r#"
         UPDATE dipper_reg_indexing_agreements
-        SET status = $1, updated_at = timezone('UTC', now())
+        SET
+            status = CASE WHEN abandoned AND $1 = $3 THEN $4 ELSE $1 END,
+            updated_at = timezone('UTC', now())
         WHERE id = ANY($2) AND status IN ({placeholders})
         RETURNING id
         "#
     );
     let mut query = sqlx::query_as::<_, (IndexingAgreementId,)>(&sql)
         .bind(new_status)
-        .bind(agreement_ids);
+        .bind(agreement_ids)
+        .bind(IndexingAgreementStatus::CanceledByRequester)
+        .bind(IndexingAgreementStatus::AbandonedByIndexer);
     for status in allowed_from {
         query = query.bind(*status);
     }

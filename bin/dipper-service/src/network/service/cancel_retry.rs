@@ -6,7 +6,9 @@ use dipper_core::time::now_secs;
 use thegraph_core::alloy::primitives::B256;
 
 use crate::{
-    cancel_dispatch::{LiveCancel, cancel_if_live, confirm_cancelled, log_unconfirmed},
+    cancel_dispatch::{
+        CancelReason, LiveCancel, cancel_if_live, confirm_cancelled, log_unconfirmed,
+    },
     chain_client::{ChainClient, ChainClientError},
     config::IndexingAgreementConfig,
     registry::{AgreementRegistry, CancelKind, CancellingAgreement, IndexingAgreement},
@@ -162,7 +164,12 @@ async fn confirm_if_over<R: AgreementRegistry + Sync>(
         );
         return past_grace && record_end_by_indexer(registry, agreement).await;
     }
-    confirm_cancelled(registry, agreement, tx_hash, config).await
+    let reason = if row.abandoned {
+        CancelReason::Abandoned
+    } else {
+        CancelReason::NotWanted
+    };
+    confirm_cancelled(registry, agreement, reason, tx_hash, config).await
 }
 
 /// Mark an agreement the indexer ended `CanceledByIndexer` when the chain listener hasn't in
@@ -492,6 +499,7 @@ mod tests {
                 agreement: cancelling,
                 accepted_on_chain,
                 ended_seen_at: None,
+                abandoned: false,
             }],
             ..MockRegistry::default()
         }

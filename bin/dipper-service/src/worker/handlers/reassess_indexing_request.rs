@@ -1901,6 +1901,7 @@ where
         &ctx.registry,
         &ctx.chain_client,
         agreement,
+        crate::cancel_dispatch::CancelReason::NotWanted,
         &ctx.agreement_conf,
     )
     .await
