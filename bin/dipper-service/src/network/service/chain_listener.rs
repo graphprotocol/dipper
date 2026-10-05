@@ -999,7 +999,8 @@ fn created_after_events_started(agreement: &IndexingAgreement) -> bool {
 /// Safety net for an agreement dipper cancelled whose offer the indexer accepted
 /// anyway, such as one that landed after dipper's cancel. Nothing else would end
 /// it: reconciliation ignores an accept on a cancelled row. It goes back to
-/// `Cancelling` for the cancel retry, unless the chain shows it already ended. True if it was.
+/// `Cancelling` for the cancel retry, unless the chain shows it already ended. Returns whether it
+/// moved it back.
 async fn reopen_if_cancelled_but_accepted<R, T>(
     snapshot: &AgreementStateSnapshot,
     agreement: &IndexingAgreement,
