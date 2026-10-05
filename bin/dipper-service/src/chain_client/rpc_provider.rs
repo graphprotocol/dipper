@@ -10,7 +10,7 @@ use std::{
 
 use thegraph_core::alloy::{
     providers::{
-        ProviderBuilder, RootProvider,
+        Provider, ProviderBuilder, RootProvider,
         fillers::{BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller},
     },
     transports::{RpcError, TransportError, TransportErrorKind},
@@ -159,6 +159,35 @@ impl RpcProviderPool {
     /// schedule allows, on every endpoint, with the backoff between them all waited out.
     pub fn worst_case_walk(&self) -> Duration {
         self.worst_case_walk
+    }
+
+    /// How many endpoints the pool has.
+    pub fn endpoint_count(&self) -> usize {
+        self.providers.len()
+    }
+
+    /// Each endpoint's latest block, all asked at once with no retries. Endpoints that fail are
+    /// left out, so dipper can see whether the ones that answer agree.
+    pub async fn latest_blocks(&self) -> Vec<u64> {
+        let mut asks = tokio::task::JoinSet::new();
+        for url in &self.providers {
+            let provider = ProviderBuilder::new().connect_reqwest(self.http.clone(), url.clone());
+            let endpoint = endpoint_name(url);
+            asks.spawn(async move { (endpoint, provider.get_block_number().await) });
+        }
+        let mut heads = Vec::with_capacity(self.providers.len());
+        while let Some(answer) = asks.join_next().await {
+            match answer {
+                Ok((_, Ok(head))) => heads.push(head),
+                Ok((endpoint, Err(err))) => tracing::debug!(
+                    provider = %endpoint,
+                    error = %err,
+                    "RPC endpoint didn't give its latest block for a cross-check"
+                ),
+                Err(err) => tracing::warn!(error = %err, "Latest-block cross-check task failed"),
+            }
+        }
+        heads
     }
 
     /// Rotate to the next provider.
