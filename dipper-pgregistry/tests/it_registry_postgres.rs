@@ -3431,8 +3431,20 @@ async fn cancelling_agreements_are_listed_until_their_cancel_fails_too_often() {
         ]
     );
 
-    assert_eq!(registry.record_cancel_check(&created, 0).await.unwrap(), 0);
-    assert_eq!(registry.record_cancel_check(&accepted, 0).await.unwrap(), 0);
+    assert_eq!(
+        registry
+            .record_cancel_check(&created, 0, None)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        registry
+            .record_cancel_check(&accepted, 0, None)
+            .await
+            .unwrap(),
+        0
+    );
     let listed = registry
         .get_cancelling_agreements(100, 2, 0)
         .await
@@ -3463,8 +3475,20 @@ async fn cancelling_agreements_are_listed_until_their_cancel_fails_too_often() {
         "an offer unchecked for over an hour isn't held back for ever"
     );
 
-    assert_eq!(registry.record_cancel_check(&created, 1).await.unwrap(), 1);
-    assert_eq!(registry.record_cancel_check(&created, 1).await.unwrap(), 2);
+    assert_eq!(
+        registry
+            .record_cancel_check(&created, 1, None)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        registry
+            .record_cancel_check(&created, 1, None)
+            .await
+            .unwrap(),
+        2
+    );
     let listed = registry
         .get_cancelling_agreements(100, 2, 0)
         .await
@@ -3494,9 +3518,55 @@ async fn cancelling_agreements_are_listed_until_their_cancel_fails_too_often() {
     );
 
     let not_cancelling = registry
-        .record_cancel_check(&fixture_agreement(0xbb), 1)
+        .record_cancel_check(&fixture_agreement(0xbb), 1, None)
         .await;
     assert!(matches!(not_cancelling, Err(Error::NoRecordsUpdated)));
+}
+
+#[tokio::test]
+async fn a_cancelling_agreement_keeps_when_it_was_first_found_ended() {
+    let (db, _temp_db) = temp_registry_db().await;
+    run_fixture(
+        &db,
+        include_str!("fixtures/0003_multi_indexer_agreements.sql"),
+    )
+    .await
+    .expect("Failed to run fixture");
+    let registry = PgRegistry::new(db);
+    let id = fixture_agreement(0xaa);
+    registry
+        .mark_indexing_agreement_as_cancelling(&id)
+        .await
+        .expect("mark cancelling");
+    let ended_seen_at = async || {
+        registry
+            .get_cancelling_agreements(100, 10, 0)
+            .await
+            .expect("cancelling query")[0]
+            .ended_seen_at
+    };
+
+    registry
+        .record_cancel_check(&id, 0, Some(true))
+        .await
+        .unwrap();
+    let first = ended_seen_at().await.expect("found ended");
+    registry
+        .record_cancel_check(&id, 0, Some(true))
+        .await
+        .unwrap();
+    registry.record_cancel_check(&id, 0, None).await.unwrap();
+    assert_eq!(
+        ended_seen_at().await,
+        Some(first),
+        "kept from the first time"
+    );
+
+    registry
+        .record_cancel_check(&id, 0, Some(false))
+        .await
+        .unwrap();
+    assert_eq!(ended_seen_at().await, None, "found live again");
 }
 
 #[tokio::test]
@@ -3516,7 +3586,10 @@ async fn an_ended_agreement_found_live_on_chain_goes_back_to_cancelling() {
         .mark_indexing_agreement_as_cancelling(&ended)
         .await
         .expect("mark cancelling");
-    assert_eq!(registry.record_cancel_check(&ended, 2).await.unwrap(), 2);
+    assert_eq!(
+        registry.record_cancel_check(&ended, 2, None).await.unwrap(),
+        2
+    );
     registry
         .mark_indexing_agreement_as_canceled_by_requester(&ended)
         .await

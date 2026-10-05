@@ -193,6 +193,8 @@ pub struct CancellingAgreement {
     pub agreement: IndexingAgreement,
     /// Whether dipper saw it accepted on-chain, so its end is announced.
     pub accepted_on_chain: bool,
+    /// When a check first found it no longer live on-chain, if one has.
+    pub ended_seen_at: Option<time::OffsetDateTime>,
 }
 
 impl sqlx::FromRow<'_, sqlx::postgres::PgRow> for CancellingAgreement {
@@ -202,6 +204,7 @@ impl sqlx::FromRow<'_, sqlx::postgres::PgRow> for CancellingAgreement {
         Ok(Self {
             agreement: IndexingAgreement::from_row(row)?,
             accepted_on_chain: accepted_at.is_some(),
+            ended_seen_at: row.try_get("ended_seen_at")?,
         })
     }
 }
@@ -984,6 +987,7 @@ impl PgRegistry {
                 status = $1,
                 cancel_attempts = 0,
                 cancel_checked_at = NULL,
+                ended_seen_at = NULL,
                 updated_at = timezone('UTC', now())
             WHERE id = $2 AND status IN ($3, $4)
             "#,
@@ -1027,7 +1031,8 @@ impl PgRegistry {
                 last_progress_at,
                 rejection_reason,
                 terms_version_hash,
-                accepted_at
+                accepted_at,
+                ended_seen_at
             FROM dipper_reg_indexing_agreements
             WHERE status = $1
               AND (
@@ -1056,18 +1061,26 @@ impl PgRegistry {
     }
 
     /// Record a check of a `Cancelling` agreement that left it cancelling, adding
-    /// `failed_attempts` to its failed cancels and returning the new count.
+    /// `failed_attempts` to its failed cancels and returning the new count. `ended` says whether
+    /// the check found it no longer live on-chain, or `None` when the chain couldn't tell; the
+    /// first time it is found ended is kept until it is found live again.
     pub async fn record_cancel_check(
         &self,
         agreement_id: &IndexingAgreementId,
         failed_attempts: u32,
+        ended: Option<bool>,
     ) -> Result<u32, Error> {
         let record: Option<(i32,)> = sqlx::query_as(
             r#"
             UPDATE dipper_reg_indexing_agreements
             SET
                 cancel_attempts = LEAST(cancel_attempts::BIGINT + $3, 2147483647)::INTEGER,
-                cancel_checked_at = timezone('UTC', now())
+                cancel_checked_at = timezone('UTC', now()),
+                ended_seen_at = CASE
+                    WHEN $4::BOOLEAN IS NULL THEN ended_seen_at
+                    WHEN $4 THEN COALESCE(ended_seen_at, timezone('UTC', now()))
+                    ELSE NULL
+                END
             WHERE id = $1 AND status = $2
             RETURNING cancel_attempts
             "#,
@@ -1075,6 +1088,7 @@ impl PgRegistry {
         .bind(agreement_id)
         .bind(IndexingAgreementStatus::Cancelling)
         .bind(i64::from(failed_attempts))
+        .bind(ended)
         .fetch_optional(&self.pool)
         .await?;
         let (attempts,) = record.ok_or(Error::NoRecordsUpdated)?;

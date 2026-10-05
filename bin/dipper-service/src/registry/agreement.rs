@@ -293,11 +293,13 @@ pub trait AgreementRegistry {
     ) -> RegistryResult<Vec<CancellingAgreement>>;
 
     /// Record a check of a `CANCELLING` agreement that left it cancelling, adding
-    /// `failed_attempts` to its failed cancels and returning the new count.
+    /// `failed_attempts` to its failed cancels and returning the new count. `ended` says whether
+    /// the check found it no longer live on-chain, or `None` when the chain couldn't tell.
     async fn record_cancel_check(
         &self,
         id: &IndexingAgreementId,
         failed_attempts: u32,
+        ended: Option<bool>,
     ) -> RegistryResult<u32>;
 
     /// Apply a reconciliation-driven state transition atomically.
@@ -562,6 +564,8 @@ pub struct CancellingAgreement {
     pub agreement: IndexingAgreement,
     /// Whether dipper saw it accepted on-chain, so its end is announced.
     pub accepted_on_chain: bool,
+    /// When a check first found it no longer live on-chain, if one has.
+    pub ended_seen_at: Option<OffsetDateTime>,
 }
 
 impl TryFrom<dipper_pgregistry::CancellingAgreement> for CancellingAgreement {
@@ -571,6 +575,7 @@ impl TryFrom<dipper_pgregistry::CancellingAgreement> for CancellingAgreement {
         Ok(Self {
             agreement: value.agreement.try_into()?,
             accepted_on_chain: value.accepted_on_chain,
+            ended_seen_at: value.ended_seen_at,
         })
     }
 }

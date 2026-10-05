@@ -154,6 +154,7 @@ pub trait StubAgreementRegistry: Send + Sync {
         &self,
         _id: &IndexingAgreementId,
         failed_attempts: u32,
+        _ended: Option<bool>,
     ) -> Result<u32> {
         Ok(failed_attempts)
     }
@@ -467,8 +468,9 @@ impl<T: StubAgreementRegistry> AgreementRegistry for T {
         &self,
         id: &IndexingAgreementId,
         failed_attempts: u32,
+        ended: Option<bool>,
     ) -> Result<u32> {
-        StubAgreementRegistry::record_cancel_check(self, id, failed_attempts).await
+        StubAgreementRegistry::record_cancel_check(self, id, failed_attempts, ended).await
     }
 
     async fn apply_reconciliation(
