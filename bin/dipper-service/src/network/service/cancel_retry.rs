@@ -271,12 +271,14 @@ fn log_failed_cancel(
 }
 
 /// How many of an agreement's cancel attempts a failure uses up. A cancel the contract
-/// refused, before sending or once mined, or that mined without ending the agreement counts,
-/// and one that can never be sent uses them all. An unreachable chain is retried freely.
+/// refused, before sending or once mined, that mined without ending the agreement, or that an
+/// endpoint took but never mined counts, and one that can never be sent uses them all. An
+/// unreachable chain is retried freely.
 fn failed_attempts(err: &ChainClientError) -> u32 {
     match err {
         ChainClientError::CancelNotConfirmed { .. }
         | ChainClientError::TxReverted { .. }
+        | ChainClientError::TxDropped { .. }
         | ChainClientError::ContractRevert { .. } => 1,
         ChainClientError::MissingTermsVersionHash { .. } => MAX_CANCEL_ATTEMPTS,
         _ => 0,
@@ -379,6 +381,7 @@ mod tests {
         read_fails: bool,
         send_fails: bool,
         mined_cancel_reverts: bool,
+        never_mines: bool,
         reverts_before_sending: bool,
         cancel_has_no_effect: bool,
         clock_fails: bool,
@@ -417,6 +420,11 @@ mod tests {
             if self.mined_cancel_reverts {
                 return Err(ChainClientError::TxReverted {
                     tx_hash: B256::repeat_byte(0xee),
+                });
+            }
+            if self.never_mines {
+                return Err(ChainClientError::TxDropped {
+                    tx_hash: B256::repeat_byte(0xdd),
                 });
             }
             self.cancels_sent.fetch_add(1, Ordering::SeqCst);
@@ -745,6 +753,20 @@ mod tests {
         let registry = registry_with_one(true);
         let chain = MockChain {
             mined_cancel_reverts: true,
+            ..live_chain()
+        };
+
+        retry(&registry, &chain, 0).await;
+
+        assert_eq!(registry.attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn counts_a_cancel_that_never_mines() {
+        // Otherwise one that keeps being dropped is sent every sweep for ever, never alerting.
+        let registry = registry_with_one(true);
+        let chain = MockChain {
+            never_mines: true,
             ..live_chain()
         };
 
