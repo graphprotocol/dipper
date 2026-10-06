@@ -738,9 +738,10 @@ impl PgRegistry {
             .collect())
     }
 
-    /// Get declined `CanceledByIndexer`/`Expired`/`Rejected` indexers grouped by
-    /// deployment (deployment id -> indexer ids). Each rejection reason gets its own
-    /// exclusion window, as does an expiry that never had an offer transaction.
+    /// Get declined `CanceledByIndexer`/`Expired`/`Rejected` indexers, and those whose agreement
+    /// dipper ended `AbandonedByIndexer`, grouped by deployment (deployment id -> indexer ids).
+    /// Each rejection reason gets its own exclusion window, as does an expiry that never had an
+    /// offer transaction.
     pub async fn get_declined_indexers_by_deployment(
         &self,
         default_lookback_days: i32,
@@ -761,7 +762,7 @@ impl PgRegistry {
                 deployment_id,
                 array_agg(DISTINCT indexer_id) as indexer_ids
             FROM dipper_reg_indexing_agreements
-            WHERE status IN ($1, $2, $3)
+            WHERE status IN ($1, $2, $3, $20)
               AND (
                 -- PRICE_TOO_LOW: shorter lookback (until next IISA refresh)
                 (rejection_reason = $6
@@ -816,6 +817,7 @@ impl PgRegistry {
         .bind(uncertain_lookback_days) // $17
         .bind(SENDER_NOT_TRUSTED) // $18
         .bind(UNSPECIFIED) // $19
+        .bind(IndexingAgreementStatus::AbandonedByIndexer) // $20
         .fetch_all(&self.pool)
         .await?;
 

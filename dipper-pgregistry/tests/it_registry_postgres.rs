@@ -678,6 +678,52 @@ async fn get_declined_indexers_by_deployment_returns_rejected() {
 }
 
 #[tokio::test]
+async fn get_declined_indexers_by_deployment_includes_an_indexer_that_abandoned_it() {
+    // Otherwise the reassessment that replaces it could pick the same indexer straight back.
+    let (db, _temp_db) = temp_registry_db().await;
+    run_fixture(&db, include_str!("fixtures/0002_indexing_agreements.sql"))
+        .await
+        .expect("Failed to run fixture");
+    let registry = PgRegistry::new(db);
+    // Fixture 0002's accepted agreement.
+    let agreement_id =
+        IndexingAgreementId::from_bytes([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
+    let deployment: DeploymentId = "QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv"
+        .parse()
+        .unwrap();
+    let indexer = indexer_id!("d609e9fdd6ce53e5a26278c50486dd6791d4d705");
+    registry
+        .mark_indexing_agreement_as_abandoning(&agreement_id)
+        .await
+        .expect("abandon");
+    registry
+        .mark_indexing_agreement_as_canceled_by_requester(&agreement_id)
+        .await
+        .expect("ended abandoned");
+
+    let within = registry
+        .get_declined_indexers_by_deployment(30, 1, 5, 1)
+        .await
+        .expect("Failed to get declined indexers");
+    let past = registry
+        .get_declined_indexers_by_deployment(0, 1, 5, 1)
+        .await
+        .expect("Failed to get declined indexers");
+
+    assert!(
+        within
+            .get(&deployment)
+            .is_some_and(|ids| ids.contains(&indexer))
+    );
+    assert!(
+        !past
+            .get(&deployment)
+            .is_some_and(|ids| ids.contains(&indexer)),
+        "only for the standard lookback"
+    );
+}
+
+#[tokio::test]
 async fn get_declined_indexers_by_deployment_empty_when_no_declines() {
     //* Given
     let (db, _temp_db) = temp_registry_db().await;
