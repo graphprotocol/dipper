@@ -739,8 +739,9 @@ impl PgRegistry {
     }
 
     /// Get declined `CanceledByIndexer`/`Expired`/`Rejected` indexers, and those whose agreement
-    /// dipper ended `AbandonedByIndexer`, grouped by deployment (deployment id -> indexer ids). Each rejection reason gets its own
-    /// exclusion window, as does an expiry that never had an offer transaction.
+    /// dipper ended `AbandonedByIndexer`, grouped by deployment (deployment id -> indexer ids).
+    /// Each rejection reason gets its own exclusion window, as does an expiry that never had an
+    /// offer transaction.
     pub async fn get_declined_indexers_by_deployment(
         &self,
         default_lookback_days: i32,
