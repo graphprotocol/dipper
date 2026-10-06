@@ -414,9 +414,10 @@ impl AgreementRegistry for RegistryProvider {
     async fn reopen_indexing_agreement_cancel(
         &self,
         id: &IndexingAgreementId,
+        seen_live: bool,
     ) -> RegistryResult<()> {
         self.inner
-            .reopen_indexing_agreement_cancel(id)
+            .reopen_indexing_agreement_cancel(id, seen_live)
             .await
             .map_err(Into::into)
     }

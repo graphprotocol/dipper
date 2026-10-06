@@ -163,7 +163,8 @@ where
 
 /// Mark an agreement the chain shows dipper ended as ended, recording the cancel when its
 /// transaction is known, so the `terminated` sweep announces it. False, logged, when the mark
-/// fails; it stays `Cancelling` for the cancel retry.
+/// fails; it stays `Cancelling` for the cancel retry. One the chain listener already marked
+/// ended counts as ended.
 pub async fn confirm_cancelled<R: AgreementRegistry + Sync>(
     registry: &R,
     agreement: &IndexingAgreement,
@@ -175,16 +176,26 @@ pub async fn confirm_cancelled<R: AgreementRegistry + Sync>(
     if tx_hash.is_some() {
         record_cancel(registry, agreement, tx_hash, config).await;
     }
-    if let Err(err) = registry
+    match registry
         .mark_indexing_agreement_as_canceled_by_requester(&agreement.id)
         .await
     {
-        tracing::warn!(
-            agreement_id = %agreement.id,
-            error = %err,
-            "Failed to mark an ended agreement cancelled; the cancel retry tries again"
-        );
-        return false;
+        Ok(()) => {}
+        Err(crate::registry::Error::NoRecordsUpdated) => {
+            tracing::debug!(
+                agreement_id = %agreement.id,
+                "Agreement already marked ended, as the chain listener can do first"
+            );
+            return true;
+        }
+        Err(err) => {
+            tracing::warn!(
+                agreement_id = %agreement.id,
+                error = %err,
+                "Failed to mark an ended agreement cancelled; the cancel retry tries again"
+            );
+            return false;
+        }
     }
     tracing::info!(
         agreement_id = %agreement.id,
@@ -232,20 +243,23 @@ where
     R: AgreementRegistry + Sync,
     T: ChainClient,
 {
-    match chain_client
+    let seen_live = match chain_client
         .agreement_on_chain(agreement.id.as_bytes())
         .await
     {
-        Ok(AgreementOnChain::Live) => {}
+        Ok(AgreementOnChain::Live) => true,
         Ok(_) => return Ok(false),
-        Err(err) => tracing::warn!(
-            agreement_id = %agreement.id,
-            error = %err,
-            "Failed to read an ended agreement reported live; the cancel retry checks it"
-        ),
-    }
+        Err(err) => {
+            tracing::warn!(
+                agreement_id = %agreement.id,
+                error = %err,
+                "Failed to read an ended agreement reported live; the cancel retry checks it"
+            );
+            false
+        }
+    };
     match registry
-        .reopen_indexing_agreement_cancel(&agreement.id)
+        .reopen_indexing_agreement_cancel(&agreement.id, seen_live)
         .await
     {
         Ok(()) => {}
@@ -631,5 +645,51 @@ pub(crate) mod tests {
                 ..
             }
         ));
+    }
+
+    /// Records what each reopen was told about the chain.
+    #[derive(Default)]
+    struct ReopenRegistry {
+        seen_live: Mutex<Vec<bool>>,
+    }
+
+    #[async_trait]
+    impl crate::registry::StubAgreementRegistry for ReopenRegistry {
+        async fn reopen_indexing_agreement_cancel(
+            &self,
+            _id: &IndexingAgreementId,
+            seen_live: bool,
+        ) -> crate::registry::Result<()> {
+            self.seen_live.lock().unwrap().push(seen_live);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reopen_clears_the_end_on_record_only_when_the_chain_shows_it_live() {
+        // An unread chain reopens it all the same, but it may have ended, so its record stays.
+        let ag = agreement(
+            IndexingAgreementStatus::CanceledByRequester,
+            Some(vec![7u8; 32]),
+        );
+        let live = RecordingChainClient {
+            still_active_after_cancel: true,
+            ..Default::default()
+        };
+        let unread = RecordingChainClient {
+            read_back_fails: true,
+            ..Default::default()
+        };
+
+        for (client, seen_live) in [(live, true), (unread, false)] {
+            let registry = ReopenRegistry::default();
+
+            let reopened = super::reopen_if_live(&registry, &client, &ag)
+                .await
+                .expect("reopen");
+
+            assert!(reopened);
+            assert_eq!(*registry.seen_live.lock().unwrap(), vec![seen_live]);
+        }
     }
 }

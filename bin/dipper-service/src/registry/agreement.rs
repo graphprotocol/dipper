@@ -284,10 +284,12 @@ pub trait AgreementRegistry {
 
     /// Move a `CANCELED_BY_REQUESTER` or `REJECTED` agreement the chain shows live back to
     /// `CANCELLING`, its cancel attempts reset; [`NoRecordUpdated`](Error::NoRecordsUpdated)
-    /// otherwise.
+    /// otherwise. `seen_live` when the chain was read and showed it live, which clears the end
+    /// on record and any announcement of it.
     async fn reopen_indexing_agreement_cancel(
         &self,
         id: &IndexingAgreementId,
+        seen_live: bool,
     ) -> RegistryResult<()>;
 
     /// `CANCELLING` agreements marked over `min_age_minutes` ago, those checked longest ago

@@ -2217,6 +2217,7 @@ mod tests {
         async fn reopen_indexing_agreement_cancel(
             &self,
             id: &IndexingAgreementId,
+            _seen_live: bool,
         ) -> RegistryResult<()> {
             self.state.lock().unwrap().reopened.push(*id);
             Ok(())

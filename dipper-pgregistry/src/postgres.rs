@@ -1008,10 +1008,13 @@ impl PgRegistry {
     /// Move an agreement dipper had already ended, cancelled or rejected, back to `Cancelling`
     /// once the chain shows it live after all, with its cancel attempts started afresh. It counts
     /// as checked, since no cancel is sent with it, so the retry takes it on its next sweep rather
-    /// than waiting for one to be mined.
+    /// than waiting for one to be mined. When the chain was read and showed it live (`seen_live`),
+    /// the end on record, and any announcement of it, no longer stands, so both are cleared for
+    /// the end still to come; an unread chain leaves them, as the agreement may have ended.
     pub async fn reopen_indexing_agreement_cancel(
         &self,
         agreement_id: &IndexingAgreementId,
+        seen_live: bool,
     ) -> Result<(), Error> {
         let updated = sqlx::query(
             r#"
@@ -1021,6 +1024,11 @@ impl PgRegistry {
                 cancel_attempts = 0,
                 cancel_checked_at = timezone('UTC', now()),
                 ended_seen_at = NULL,
+                canceled_at = CASE WHEN $5::BOOLEAN THEN NULL ELSE canceled_at END,
+                canceled_by = CASE WHEN $5 THEN NULL ELSE canceled_by END,
+                canceled_tx = CASE WHEN $5 THEN NULL ELSE canceled_tx END,
+                terminated_event_emitted_at =
+                    CASE WHEN $5 THEN NULL ELSE terminated_event_emitted_at END,
                 updated_at = timezone('UTC', now())
             WHERE id = $2 AND status IN ($3, $4)
             "#,
@@ -1029,6 +1037,7 @@ impl PgRegistry {
         .bind(agreement_id)
         .bind(IndexingAgreementStatus::CanceledByRequester)
         .bind(IndexingAgreementStatus::Rejected)
+        .bind(seen_live)
         .execute(&self.pool)
         .await?;
         if updated.rows_affected() == 0 {
@@ -1544,6 +1553,8 @@ impl PgRegistry {
     /// emission sweep can populate the `terminated` event's tx/by/at fields.
     /// `COALESCE` keeps any value already observed on-chain. Best-effort
     /// enrichment: the event still emits (with fallbacks) if never recorded.
+    /// An end recorded before the agreement's accept, such as its offer's withdrawal before the
+    /// offer landed after all, can't be its end, so a later one replaces it and is announced.
     #[expect(
         clippy::cast_possible_wrap,
         reason = "predates this lint; fix when next touched"
@@ -1558,9 +1569,16 @@ impl PgRegistry {
         sqlx::query(
             r#"
             UPDATE dipper_reg_indexing_agreements
-            SET canceled_at = COALESCE(canceled_at, $2),
-                canceled_by = COALESCE(canceled_by, $3),
-                canceled_tx = COALESCE(canceled_tx, $4)
+            SET canceled_at = CASE WHEN canceled_at < accepted_at AND $2 >= accepted_at
+                    THEN $2 ELSE COALESCE(canceled_at, $2) END,
+                canceled_by = CASE WHEN canceled_at < accepted_at AND $2 >= accepted_at
+                    THEN $3 ELSE COALESCE(canceled_by, $3) END,
+                canceled_tx = CASE WHEN canceled_at < accepted_at AND $2 >= accepted_at
+                    THEN $4 ELSE COALESCE(canceled_tx, $4) END,
+                terminated_event_emitted_at = CASE
+                    WHEN canceled_at < accepted_at AND $2 >= accepted_at THEN NULL
+                    ELSE terminated_event_emitted_at
+                END
             WHERE id = $1
             "#,
         )
