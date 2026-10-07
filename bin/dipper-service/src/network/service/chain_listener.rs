@@ -949,7 +949,9 @@ where
 /// Record the accept and cancel of an agreement dipper had already marked
 /// cancelled that went live on-chain first, so its accepted and terminated
 /// events go out. Cancel first: the terminated sweep waits only for the accept.
-/// Existing values win, so an agreement dipper already recorded is unchanged.
+/// Existing values win, so an agreement dipper already recorded is unchanged,
+/// except an end recorded before the accept, such as its offer's withdrawal: the
+/// cancel is recorded again once the accept is, so that end gives way to this one.
 async fn record_accept_and_cancel_from_chain<R: AgreementRegistry + Sync>(
     snapshot: &AgreementStateSnapshot,
     agreement: &IndexingAgreement,
@@ -971,6 +973,19 @@ async fn record_accept_and_cancel_from_chain<R: AgreementRegistry + Sync>(
         Ok(()) => {
             registry
                 .record_accepted_audit(&agreement.id, snapshot.accepted_at, &snapshot.accepted_tx)
+                .await
+        }
+        Err(err) => Err(err),
+    };
+    let recorded = match recorded {
+        Ok(()) => {
+            registry
+                .record_cancel_audit(
+                    &agreement.id,
+                    snapshot.canceled_at,
+                    &canceled_by,
+                    Some(&snapshot.canceled_tx),
+                )
                 .await
         }
         Err(err) => Err(err),
@@ -3131,7 +3146,7 @@ mod tests {
         // Dipper had marked the agreement cancelled, but it was accepted on-chain
         // before being ended there. Recording both lets the accepted and terminated
         // events go out; the cancel goes first because the terminated sweep only
-        // waits for the accept.
+        // waits for the accept, and again after it, to replace an end from before it.
         let registry = MockRegistry::new();
         let chain_client = MockChainClient::default();
         let agreement_id = IndexingAgreementId::from_bytes(rand::random());
@@ -3152,7 +3167,11 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(
             registry.audit_writes(),
-            vec![("cancel", agreement_id), ("accept", agreement_id)]
+            vec![
+                ("cancel", agreement_id),
+                ("accept", agreement_id),
+                ("cancel", agreement_id)
+            ]
         );
     }
 
