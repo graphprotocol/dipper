@@ -1595,7 +1595,7 @@ where
 /// confirmed send.
 ///
 /// Eligibility (`get_agreements_pending_accepted_emission`) requires
-/// `accepted_at IS NOT NULL` (so pre-feature rows are never backfilled) but is
+/// `accepted_at IS NOT NULL` (only rows whose accept was recorded) but is
 /// NOT gated on current status: an agreement accepted and then cancelled in a
 /// single snapshot is already terminal yet must still emit its `accepted` (which
 /// is why this sweep runs before the terminated sweep).
