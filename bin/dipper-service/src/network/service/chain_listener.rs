@@ -1252,12 +1252,22 @@ async fn cancel_unmarked<T: ChainClient>(
     log_unmarked_cancel(new_agreement_id, old_agreement, &outcome);
     match outcome {
         LiveCancel::NotLive { .. } | LiveCancel::Ended(_) => true,
-        // No cancel can ever be sent for it, so trying again would only repeat the error.
-        LiveCancel::CancelFailed(ChainClientError::MissingTermsVersionHash { .. }) => true,
-        LiveCancel::ReadFailed(_)
-        | LiveCancel::CancelFailed(_)
-        | LiveCancel::Unconfirmed { .. } => false,
+        LiveCancel::CancelFailed(err) => is_refused(&err),
+        LiveCancel::ReadFailed(_) | LiveCancel::Unconfirmed { .. } => false,
     }
+}
+
+/// Whether a cancel failed in a way sending it again won't change: no terms hash to send it
+/// with, the contract refused it, or it mined without ending the agreement. Resending one that
+/// mined costs gas each time.
+fn is_refused(err: &ChainClientError) -> bool {
+    matches!(
+        err,
+        ChainClientError::MissingTermsVersionHash { .. }
+            | ChainClientError::ContractRevert { .. }
+            | ChainClientError::TxReverted { .. }
+            | ChainClientError::CancelNotConfirmed { .. }
+    )
 }
 
 fn log_unmarked_cancel(
@@ -1276,13 +1286,14 @@ fn log_unmarked_cancel(
             reason = "replacement_accepted",
             "Cancelled a replaced agreement still live on-chain"
         ),
-        LiveCancel::CancelFailed(err @ ChainClientError::MissingTermsVersionHash { .. }) => {
-            tracing::error!(
-                %old_agreement_id,
-                error = %err,
-                "Replaced agreement is live on-chain but can never be cancelled"
-            );
-        }
+        LiveCancel::CancelFailed(err) if is_refused(err) => tracing::error!(
+            event = "agreement_cancel_stuck",
+            agreement_id = %old_agreement_id,
+            indexer_id = %old_agreement.indexer.id,
+            indexing_request_id = %old_agreement.indexing_request_id,
+            error = %err,
+            "A replaced agreement live on-chain refuses its cancel; an operator must end it"
+        ),
         LiveCancel::ReadFailed(err)
         | LiveCancel::CancelFailed(err)
         | LiveCancel::Unconfirmed { err, .. } => tracing::warn!(
@@ -2612,6 +2623,8 @@ mod tests {
         fail_cancels: bool,
         /// When set, every agreement reads as live until a cancel is sent for it.
         live_until_cancelled: bool,
+        /// When set, a cancel mines but leaves the agreement live.
+        cancels_do_nothing: bool,
     }
 
     /// A chain on which every agreement is live until a cancel is sent for it.
@@ -2708,7 +2721,9 @@ mod tests {
             // Cancel dispatch always reads back after a mined cancel; reporting
             // not-active here means "cancel confirmed", which these tests expect.
             Ok(crate::chain_client::AgreementOnChain::live_if(
-                self.live_until_cancelled && !self.cancels.lock().unwrap().contains(agreement_id),
+                self.live_until_cancelled
+                    && (self.cancels_do_nothing
+                        || !self.cancels.lock().unwrap().contains(agreement_id)),
             ))
         }
     }
@@ -3803,6 +3818,23 @@ mod tests {
 
         assert!(result.is_err());
         assert!(!deleted);
+    }
+
+    #[tokio::test]
+    async fn test_pending_cancellations_give_up_on_an_unmarkable_agreement_refusing_its_cancel() {
+        // Each resend of a cancel that mines without ending it costs gas, so it goes to an
+        // operator instead.
+        let chain_client = MockChainClient {
+            cancels_do_nothing: true,
+            ..live_chain()
+        };
+
+        let (result, old_id, deleted) =
+            replace_agreement_in(IndexingAgreementStatus::Unresponsive, &chain_client).await;
+
+        assert!(result.is_ok(), "got {result:?}");
+        assert!(chain_client.was_on_chain_cancel_attempted(&old_id));
+        assert!(deleted);
     }
 
     #[tokio::test]
