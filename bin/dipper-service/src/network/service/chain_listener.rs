@@ -50,7 +50,8 @@ use tokio::{
 
 use super::chain_events::{AgreementState, AgreementStateSnapshot, ChainEventSource, Cursor};
 use crate::{
-    chain_client::ChainClient,
+    cancel_dispatch::LiveCancel,
+    chain_client::{ChainClient, ChainClientError},
     config::ChainListenerConfig,
     registry::{
         AgreementRegistry, CancelKind, IndexingAgreement, IndexingAgreementStatus,
@@ -1224,11 +1225,72 @@ where
         config,
     )
     .await;
+    // One already cancelling is the cancel retry's; any other status that can't be marked
+    // gets no retry, so its cancel goes out now.
+    if matches!(started, Err(crate::registry::Error::NoRecordsUpdated))
+        && old_agreement.status != IndexingAgreementStatus::Cancelling
+    {
+        return Ok(cancel_unmarked(new_agreement_id, &old_agreement, chain_client, config).await);
+    }
     Ok(note_replaced_cancel(
         new_agreement_id,
         &old_agreement,
         started,
     ))
+}
+
+/// Cancel a replaced agreement that couldn't be marked `Cancelling` if the chain shows it live,
+/// such as an `Unresponsive` one whose offer is still open. False, keeping its pending
+/// cancellation for the next sweep, when the chain can't settle it yet.
+async fn cancel_unmarked<T: ChainClient>(
+    new_agreement_id: &IndexingAgreementId,
+    old_agreement: &IndexingAgreement,
+    chain_client: &T,
+    config: &crate::config::IndexingAgreementConfig,
+) -> bool {
+    let outcome = crate::cancel_dispatch::cancel_if_live(chain_client, old_agreement, config).await;
+    log_unmarked_cancel(new_agreement_id, old_agreement, &outcome);
+    match outcome {
+        LiveCancel::NotLive { .. } | LiveCancel::Ended(_) => true,
+        // No cancel can ever be sent for it, so trying again would only repeat the error.
+        LiveCancel::CancelFailed(ChainClientError::MissingTermsVersionHash { .. }) => true,
+        LiveCancel::ReadFailed(_)
+        | LiveCancel::CancelFailed(_)
+        | LiveCancel::Unconfirmed { .. } => false,
+    }
+}
+
+fn log_unmarked_cancel(
+    new_agreement_id: &IndexingAgreementId,
+    old_agreement: &IndexingAgreement,
+    outcome: &LiveCancel,
+) {
+    let old_agreement_id = old_agreement.id;
+    match outcome {
+        LiveCancel::NotLive { .. } => {}
+        LiveCancel::Ended(tx_hash) => tracing::info!(
+            %new_agreement_id,
+            %old_agreement_id,
+            old_status = %old_agreement.status,
+            tx_hash = ?tx_hash,
+            reason = "replacement_accepted",
+            "Cancelled a replaced agreement still live on-chain"
+        ),
+        LiveCancel::CancelFailed(err @ ChainClientError::MissingTermsVersionHash { .. }) => {
+            tracing::error!(
+                %old_agreement_id,
+                error = %err,
+                "Replaced agreement is live on-chain but can never be cancelled"
+            );
+        }
+        LiveCancel::ReadFailed(err)
+        | LiveCancel::CancelFailed(err)
+        | LiveCancel::Unconfirmed { err, .. } => tracing::warn!(
+            %old_agreement_id,
+            error = %err,
+            "Failed to cancel a replaced agreement that may be live, retaining pending row"
+        ),
+    }
 }
 
 /// Whether an agreement marked `Expired` is live on-chain after all, accepted unseen by a
@@ -2189,6 +2251,19 @@ mod tests {
                         "simulated transient failure".into(),
                     )),
                 ));
+            }
+            // As the database does, refuse an agreement it couldn't be cancelling from.
+            let markable = state.agreements.get(id).is_none_or(|agreement| {
+                matches!(
+                    agreement.status,
+                    IndexingAgreementStatus::Created
+                        | IndexingAgreementStatus::AcceptedOnChain
+                        | IndexingAgreementStatus::Rejected
+                        | IndexingAgreementStatus::Expired
+                )
+            });
+            if !markable {
+                return Err(crate::registry::Error::NoRecordsUpdated);
             }
             state.marked_cancelling.push(*id);
             Ok(())
@@ -3673,6 +3748,73 @@ mod tests {
         assert!(!chain_client.was_on_chain_cancel_attempted(&old_id));
         assert!(registry.was_marked_cancelling(&old_id));
         assert!(registry.was_pending_cancellation_deleted(&new_id, &old_id));
+    }
+
+    /// Pending cancellations for an old agreement in `status`, run against `chain_client`;
+    /// returns the result and whether its pending row was deleted.
+    async fn replace_agreement_in(
+        status: IndexingAgreementStatus,
+        chain_client: &MockChainClient,
+    ) -> (anyhow::Result<()>, IndexingAgreementId, bool) {
+        let registry = MockRegistry::new();
+        let new_id = IndexingAgreementId::from_bytes(rand::random());
+        let old_id = IndexingAgreementId::from_bytes(rand::random());
+        registry.add_agreement(new_id, IndexingAgreementStatus::AcceptedOnChain);
+        registry.add_agreement(old_id, status);
+        registry.add_pending_cancellation(new_id, old_id);
+
+        let result = execute_pending_cancellations(
+            &new_id,
+            &registry,
+            chain_client,
+            test_agreement_conf().as_ref(),
+        )
+        .await;
+
+        assert!(!registry.was_marked_cancelling(&old_id));
+        let deleted = registry.was_pending_cancellation_deleted(&new_id, &old_id);
+        (result, old_id, deleted)
+    }
+
+    #[tokio::test]
+    async fn test_pending_cancellations_cancel_an_unmarkable_agreement_still_live() {
+        // An `Unresponsive` agreement can't be marked cancelling, yet its offer may still be
+        // open on-chain for the indexer to accept alongside its replacement.
+        let chain_client = live_chain();
+
+        let (result, old_id, deleted) =
+            replace_agreement_in(IndexingAgreementStatus::Unresponsive, &chain_client).await;
+
+        assert!(result.is_ok(), "got {result:?}");
+        assert!(chain_client.was_on_chain_cancel_attempted(&old_id));
+        assert!(deleted);
+    }
+
+    #[tokio::test]
+    async fn test_pending_cancellations_retain_an_unmarkable_agreement_whose_cancel_fails() {
+        // No cancel retry tracks it, so the next sweep tries again.
+        let chain_client = MockChainClient {
+            fail_cancels: true,
+            ..live_chain()
+        };
+
+        let (result, _, deleted) =
+            replace_agreement_in(IndexingAgreementStatus::Unresponsive, &chain_client).await;
+
+        assert!(result.is_err());
+        assert!(!deleted);
+    }
+
+    #[tokio::test]
+    async fn test_pending_cancellations_leave_a_cancelling_agreement_to_the_cancel_retry() {
+        let chain_client = live_chain();
+
+        let (result, old_id, deleted) =
+            replace_agreement_in(IndexingAgreementStatus::Cancelling, &chain_client).await;
+
+        assert!(result.is_ok(), "got {result:?}");
+        assert!(!chain_client.was_on_chain_cancel_attempted(&old_id));
+        assert!(deleted);
     }
 
     #[tokio::test]
