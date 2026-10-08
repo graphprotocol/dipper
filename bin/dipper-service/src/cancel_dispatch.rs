@@ -92,13 +92,17 @@ impl CancelReason {
     }
 }
 
-/// What [`start_cancel`] left an agreement as.
+/// What [`start_cancel`] left an agreement as. Unless `Ended`, it stays `Cancelling` for the
+/// cancel retry to finish.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelStarted {
     /// It was accepted and its cancel landed: now ended, as its [`CancelReason`] says.
     Ended,
-    /// Still `Cancelling`; the chain listener finishes it once it can't go live.
-    Cancelling,
+    /// The chain shows nothing live, so nobody is being paid for it.
+    NotLive,
+    /// The chain couldn't be read, or its cancel failed or couldn't be confirmed, so it may
+    /// still be live and paid.
+    MayBeLive,
 }
 
 /// Start ending an agreement that may be live on-chain. It is marked `Cancelling` first, so an
@@ -129,18 +133,18 @@ where
     }
     let tx_hash = match cancel_if_live(chain_client, agreement, config).await {
         LiveCancel::Ended(tx_hash) => tx_hash,
-        LiveCancel::NotLive { .. } => return Ok(CancelStarted::Cancelling),
+        LiveCancel::NotLive { .. } => return Ok(CancelStarted::NotLive),
         LiveCancel::ReadFailed(err) | LiveCancel::CancelFailed(err) => {
             tracing::warn!(
                 agreement_id = %agreement.id,
                 error = %err,
                 "On-chain cancel failed; the cancel retry sends it again"
             );
-            return Ok(CancelStarted::Cancelling);
+            return Ok(CancelStarted::MayBeLive);
         }
         LiveCancel::Unconfirmed { tx_hash, err } => {
             log_unconfirmed(agreement, tx_hash, &err);
-            return Ok(CancelStarted::Cancelling);
+            return Ok(CancelStarted::MayBeLive);
         }
     };
     tracing::info!(
@@ -150,13 +154,13 @@ where
     );
     // An offer never accepted could still land and be accepted until its deadline.
     if agreement.status != IndexingAgreementStatus::AcceptedOnChain {
-        return Ok(CancelStarted::Cancelling);
+        return Ok(CancelStarted::NotLive);
     }
     Ok(
         if confirm_cancelled(registry, agreement, reason, tx_hash, config).await {
             CancelStarted::Ended
         } else {
-            CancelStarted::Cancelling
+            CancelStarted::NotLive
         },
     )
 }

@@ -14,7 +14,11 @@ use crate::{
     },
     chain_client::{ChainClient, ChainClientError},
     config::IndexingAgreementConfig,
-    registry::{AgreementRegistry, CancelKind, CancellingAgreement, IndexingAgreement},
+    registry::{
+        AgreementRegistry, CancelKind, CancellingAgreement, IndexingAgreement,
+        IndexingRequestRegistry,
+    },
+    worker::service::WorkerQueue,
 };
 
 /// Failed cancels before dipper alerts an operator and retries the agreement only hourly, so a
@@ -31,6 +35,10 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(300);
 /// Time a sweep may take before leaving the rest to the next one, as each cancel can wait up
 /// to 15 s to be mined.
 const SWEEP_BUDGET: Duration = Duration::from_secs(30);
+
+/// Time allowed to read an ended agreement's request, and to queue its replacement.
+const DB_TIMEOUT: Duration = Duration::from_secs(30);
+const QUEUE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Minutes an agreement stays out of the retry after it is marked, so the cancel sent
 /// when it was marked can be mined first instead of being sent again. One moved back to
@@ -59,24 +67,28 @@ impl Handle {
 }
 
 /// What the cancel retry needs.
-pub struct Ctx<R, T> {
+pub struct Ctx<R, T, W> {
     pub registry: R,
     pub chain_client: T,
     pub agreement_conf: Arc<IndexingAgreementConfig>,
+    /// Queues the replacement of an agreement ended because its indexer stopped serving it.
+    pub worker_queue: W,
 }
 
 /// Create the cancel retry. Returns a handle plus a future to spawn, which sweeps at once and
 /// then every [`SWEEP_INTERVAL`].
-pub fn new<R, T>(ctx: Ctx<R, T>) -> (Handle, impl Future<Output = anyhow::Result<()>>)
+pub fn new<R, T, W>(ctx: Ctx<R, T, W>) -> (Handle, impl Future<Output = anyhow::Result<()>>)
 where
-    R: AgreementRegistry + Send + Sync,
+    R: AgreementRegistry + IndexingRequestRegistry + Send + Sync,
     T: ChainClient + Send + Sync,
+    W: WorkerQueue + Send + Sync,
 {
     let (tx_stop, mut rx_stop) = mpsc::channel(1);
     let Ctx {
         registry,
         chain_client,
         agreement_conf,
+        worker_queue,
     } = ctx;
     let service = async move {
         tracing::info!(
@@ -90,9 +102,19 @@ where
                 _ = rx_stop.recv() => break,
                 _ = timer.tick() => {},
             }
-            tokio::select! {
+            let abandoned = tokio::select! {
                 _ = rx_stop.recv() => break,
-                () = retry_cancelling_agreements(&registry, &chain_client, &agreement_conf) => {},
+                ended = retry_cancelling_agreements(&registry, &chain_client, &agreement_conf) => ended,
+            };
+            for agreement in &abandoned {
+                super::liveness_checker::queue_replacement(
+                    agreement,
+                    &registry,
+                    &worker_queue,
+                    DB_TIMEOUT,
+                    QUEUE_TIMEOUT,
+                )
+                .await;
             }
         }
         tracing::debug!("cancel retry service stopped");
@@ -101,14 +123,15 @@ where
     (Handle { tx_stop }, service)
 }
 
-/// Retry the cancel of agreements still `Cancelling`. The chain's own latest block time
-/// decides when an offer that was never accepted no longer can be, so a subgraph that has
-/// fallen behind doesn't hold that up.
+/// Retry the cancel of agreements still `Cancelling`, returning those it ended that were
+/// abandoned by their indexer, to be replaced. The chain's own latest block time decides when
+/// an offer that was never accepted no longer can be, so a lagging subgraph doesn't hold it up.
 pub async fn retry_cancelling_agreements<R, T>(
     registry: &R,
     chain_client: &T,
     config: &IndexingAgreementConfig,
-) where
+) -> Vec<IndexingAgreement>
+where
     R: AgreementRegistry + Sync,
     T: ChainClient,
 {
@@ -119,16 +142,17 @@ pub async fn retry_cancelling_agreements<R, T>(
         Ok(cancelling) => cancelling,
         Err(err) => {
             tracing::warn!(error = %err, "Failed to list agreements still being cancelled");
-            return;
+            return Vec::new();
         }
     };
     if cancelling.is_empty() {
-        return;
+        return Vec::new();
     }
     let Some(chain_now) = chain_time(chain_client).await else {
-        return;
+        return Vec::new();
     };
     let started = std::time::Instant::now();
+    let mut abandoned = Vec::new();
     for (done, row) in cancelling.iter().enumerate() {
         if started.elapsed() >= SWEEP_BUDGET {
             tracing::info!(
@@ -137,8 +161,11 @@ pub async fn retry_cancelling_agreements<R, T>(
             );
             break;
         }
-        retry_cancel(registry, chain_client, config, row, chain_now).await;
+        if retry_cancel(registry, chain_client, config, row, chain_now).await && row.abandoned {
+            abandoned.push(row.agreement.clone());
+        }
     }
+    abandoned
 }
 
 async fn chain_time<T: ChainClient>(chain_client: &T) -> Option<u64> {
@@ -154,13 +181,15 @@ async fn chain_time<T: ChainClient>(chain_client: &T) -> Option<u64> {
     }
 }
 
+/// Retry 1 agreement's cancel; true once it is marked ended.
 async fn retry_cancel<R, T>(
     registry: &R,
     chain_client: &T,
     config: &IndexingAgreementConfig,
     row: &CancellingAgreement,
     chain_now: u64,
-) where
+) -> bool
+where
     R: AgreementRegistry + Sync,
     T: ChainClient,
 {
@@ -174,7 +203,8 @@ async fn retry_cancel<R, T>(
                     "Failed to read a cancelling agreement on-chain, will retry"
                 );
                 // Unread, it may still be live, so it can't be confirmed ended.
-                return note_check(registry, row, None, None).await;
+                note_check(registry, row, None, None).await;
+                return false;
             }
             LiveCancel::NotLive { by_indexer } => (None, by_indexer, None),
             LiveCancel::Ended(tx_hash) => {
@@ -188,16 +218,18 @@ async fn retry_cancel<R, T>(
             LiveCancel::CancelFailed(err) => (None, false, Some(err)),
             LiveCancel::Unconfirmed { tx_hash, err } => {
                 log_unconfirmed(&row.agreement, tx_hash, &err);
-                return note_check(registry, row, None, None).await;
+                note_check(registry, row, None, None).await;
+                return false;
             }
         };
     if failure.is_none()
         && confirm_if_over(registry, config, row, tx_hash, by_indexer, chain_now).await
     {
-        return;
+        return true;
     }
     // A cancel that failed found it live; otherwise it is over, or withdrawn until its deadline.
     note_check(registry, row, failure.as_ref(), Some(failure.is_none())).await;
+    false
 }
 
 /// Mark the agreement ended by dipper once it can't go live again: this sweep's cancel
@@ -375,7 +407,7 @@ mod tests {
     };
 
     use async_trait::async_trait;
-    use dipper_core::ids::IndexingAgreementId;
+    use dipper_core::ids::{IndexingAgreementId, IndexingRequestId};
     use dipper_rpc::indexer::indexer_client::sol::RecurringCollectionAgreement;
     use thegraph_core::alloy::primitives::Address;
 
@@ -384,6 +416,7 @@ mod tests {
         cancel_dispatch::tests::agreement,
         chain_client::AgreementOnChain,
         registry::{IndexingAgreementStatus, StubAgreementRegistry},
+        worker::service::JobPriority,
     };
 
     const DEADLINE: u64 = 1_000;
@@ -593,31 +626,114 @@ mod tests {
         retry_cancelling_agreements(registry, chain, &config).await;
     }
 
-    /// Counts the sweeps that ask for agreements being cancelled, and has none.
-    struct CountsSweeps(Arc<AtomicU32>);
+    #[async_trait]
+    impl IndexingRequestRegistry for MockRegistry {
+        async fn set_indexing_target_candidates(
+            &self,
+            _requested_by: Address,
+            _deployment_id: thegraph_core::DeploymentId,
+            _deployment_chain_id: u64,
+            _num_candidates: usize,
+        ) -> crate::registry::Result<crate::registry::SetTargetOutcome> {
+            unimplemented!()
+        }
+        async fn get_all_indexing_requests(
+            &self,
+        ) -> crate::registry::Result<Vec<crate::registry::IndexingRequest>> {
+            unimplemented!()
+        }
+        async fn get_indexing_request_by_id(
+            &self,
+            id: &IndexingRequestId,
+        ) -> crate::registry::Result<Option<crate::registry::IndexingRequest>> {
+            let agreement = &self.cancelling[0].agreement;
+            Ok(Some(crate::registry::IndexingRequest {
+                id: *id,
+                created_at: time::OffsetDateTime::now_utc(),
+                updated_at: time::OffsetDateTime::now_utc(),
+                status: crate::registry::IndexingRequestStatus::Open,
+                requested_by: Address::ZERO,
+                deployment_id: agreement.terms.metadata.subgraph_deployment_id,
+                deployment_chain_id: agreement.terms.metadata.chain_id,
+                num_candidates: 3,
+            }))
+        }
+        async fn get_indexing_requests_by_deployment_id(
+            &self,
+            _deployment_id: &thegraph_core::DeploymentId,
+        ) -> crate::registry::Result<Vec<crate::registry::IndexingRequest>> {
+            unimplemented!()
+        }
+        async fn get_open_indexing_requests_for_reassessment(
+            &self,
+            _min_age_seconds: i64,
+            _batch_size: i64,
+        ) -> crate::registry::Result<Vec<crate::registry::IndexingRequest>> {
+            unimplemented!()
+        }
+    }
+
+    /// Records the requests it is asked to reassess.
+    #[derive(Default)]
+    struct MockQueue(Arc<Mutex<Vec<IndexingRequestId>>>);
 
     #[async_trait]
-    impl StubAgreementRegistry for CountsSweeps {
-        async fn get_cancelling_agreements(
+    impl WorkerQueue for MockQueue {
+        async fn send_indexing_agreement_proposal(
             &self,
-            _batch_size: i64,
-            _max_attempts: u32,
-            _min_age_minutes: i32,
-        ) -> crate::registry::Result<Vec<CancellingAgreement>> {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            Ok(Vec::new())
+            _candidate_url: url::Url,
+            _agreement_id: IndexingAgreementId,
+            _indexing_request_id: IndexingRequestId,
+            _deployment_id: thegraph_core::DeploymentId,
+            _deployment_chain_id: u64,
+            _priority: JobPriority,
+        ) -> anyhow::Result<dipper_pgmq::JobId> {
+            unimplemented!()
         }
+        async fn reassess_indexing_request(
+            &self,
+            indexing_request_id: IndexingRequestId,
+            _deployment_id: thegraph_core::DeploymentId,
+            _deployment_chain_id: u64,
+            _num_candidates: usize,
+            _priority: JobPriority,
+        ) -> anyhow::Result<dipper_pgmq::JobId> {
+            self.0.lock().unwrap().push(indexing_request_id);
+            Ok(dipper_pgmq::JobId::default())
+        }
+        async fn submit_offer(
+            &self,
+            _agreement_id: IndexingAgreementId,
+            _indexing_request_id: IndexingRequestId,
+            _indexer_url: url::Url,
+            _deployment_id: thegraph_core::DeploymentId,
+            _deployment_chain_id: u64,
+            _priority: JobPriority,
+        ) -> anyhow::Result<dipper_pgmq::JobId> {
+            unimplemented!()
+        }
+    }
+
+    fn registry_with_one_abandoned() -> MockRegistry {
+        let mut registry = registry_with_one(true);
+        registry.cancelling[0].abandoned = true;
+        registry
     }
 
     /// Nothing else finishes a cancel, so the retry can't wait on the chain listener, which
     /// config can turn off.
     #[tokio::test(start_paused = true)]
-    async fn sweeps_on_its_own_at_start_and_then_every_interval_until_stopped() {
-        let sweeps = Arc::new(AtomicU32::new(0));
+    async fn sweeps_on_its_own_and_queues_the_replacement_of_an_abandoned_agreement_it_ends() {
+        let registry = registry_with_one_abandoned();
+        let request = registry.cancelling[0].agreement.indexing_request_id;
+        let chain = Arc::new(live_chain());
+        let queue = MockQueue::default();
+        let reassessed = Arc::clone(&queue.0);
         let (handle, service) = new(Ctx {
-            registry: CountsSweeps(Arc::clone(&sweeps)),
-            chain_client: MockChain::default(),
+            registry,
+            chain_client: Arc::clone(&chain),
             agreement_conf: Arc::new(IndexingAgreementConfig::for_tests()),
+            worker_queue: queue,
         });
         let service = tokio::spawn(service);
 
@@ -625,7 +741,41 @@ mod tests {
         handle.stop().await;
 
         service.await.unwrap().unwrap();
-        assert_eq!(sweeps.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            chain.clock_reads.load(Ordering::SeqCst),
+            2,
+            "1 sweep at start, 1 later"
+        );
+        assert_eq!(*reassessed.lock().unwrap(), vec![request]);
+    }
+
+    /// The liveness checker leaves replacing an abandoned agreement to whoever ends it, when
+    /// its own cancel failed and the agreement may still be paid.
+    #[tokio::test]
+    async fn reports_only_the_abandoned_agreements_it_ends() {
+        let config = IndexingAgreementConfig::for_tests();
+        for (registry, chain, replaced) in [
+            (registry_with_one_abandoned(), live_chain(), true),
+            (registry_with_one(true), live_chain(), false),
+            (
+                registry_with_one_abandoned(),
+                MockChain {
+                    read_fails: true,
+                    ..live_chain()
+                },
+                false,
+            ),
+        ] {
+            let ended = retry_cancelling_agreements(&registry, &chain, &config).await;
+
+            let ids: Vec<_> = ended.iter().map(|agreement| agreement.id).collect();
+            let expected = if replaced {
+                vec![registry.cancelling[0].agreement.id]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(ids, expected);
+        }
     }
 
     #[tokio::test]

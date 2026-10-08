@@ -552,6 +552,7 @@ pub async fn main() -> anyhow::Result<()> {
             registry: registry.clone(),
             chain_client: chain_client.clone(),
             agreement_conf: cancel_retry_agreement_conf,
+            worker_queue: worker_handle.queue().clone(),
         });
 
     //- The liveness checker service (optional, enabled by config)
@@ -775,6 +776,7 @@ pub async fn main() -> anyhow::Result<()> {
             all_stopped &= stop_service("Chain listener", handle.stop()).await;
         }
 
+        // Stop the cancel retry before worker (it queues replacements)
         all_stopped &= stop_service("Cancel retry", cancel_retry_handle.stop()).await;
 
         // Stop escrow reconciler service before the DB pool closes

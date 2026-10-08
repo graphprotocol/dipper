@@ -1944,7 +1944,10 @@ where
         Ok(crate::cancel_dispatch::CancelStarted::Ended) => {
             Unpaired::Moved("CANCELED_BY_REQUESTER")
         }
-        Ok(crate::cancel_dispatch::CancelStarted::Cancelling) => Unpaired::Moved("CANCELLING"),
+        Ok(
+            crate::cancel_dispatch::CancelStarted::NotLive
+            | crate::cancel_dispatch::CancelStarted::MayBeLive,
+        ) => Unpaired::Moved("CANCELLING"),
         Err(err) => unmarked(agreement, &err),
     }
 }
