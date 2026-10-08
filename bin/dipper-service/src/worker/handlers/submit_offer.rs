@@ -121,19 +121,24 @@ where
                 tx_hash = %tx_hash,
                 "Offer submitted on-chain successfully"
             );
-            // Observability only: record which tx hash actually mined.
             // Any failure here is non-fatal to the overall flow.
-            if let Err(err) = ctx
+            match ctx
                 .registry
                 .update_offer_tx_hash(agreement_id, tx_hash.as_ref())
                 .await
             {
-                tracing::warn!(
+                Ok(()) => {}
+                Err(crate::registry::Error::NoRecordsUpdated) => tracing::debug!(
+                    agreement_id = %agreement_id,
+                    tx_hash = %tx_hash,
+                    "Agreement ended while its offer was mining, so its offer_tx_hash isn't stored"
+                ),
+                Err(err) => tracing::warn!(
                     agreement_id = %agreement_id,
                     tx_hash = %tx_hash,
                     error = %err,
                     "Failed to persist offer_tx_hash; continuing"
-                );
+                ),
             }
         }
         Err(err @ ChainClientError::TxDropped { .. }) => {

@@ -914,37 +914,34 @@ impl PgRegistry {
         Ok(())
     }
 
-    /// Persist the on-chain tx hash of the most recent `offer()` submission
-    /// for this agreement. Overwrites any prior value, so a resubmit after
-    /// mempool eviction records the live hash rather than the dropped one.
-    /// Observability-only: no status transition is performed here.
-    ///
-    /// Guarded on `status IN (Created, AcceptedOnChain)` so a delayed
-    /// receipt-confirmation cannot stamp `offer_tx_hash` onto a row that
-    /// has since transitioned to `Expired`, `Unresponsive`, `Rejected`,
-    /// or one of the cancel states. The caller treats any failure here
-    /// as non-fatal and just logs; a no-match result is also non-fatal
-    /// and silently skipped.
+    /// Record the hash of the latest `offer()` transaction, unless the agreement has ended. A
+    /// `Cancelling` row keeps its `updated_at`, which says when it was marked and paces its
+    /// cancel retry. Returns [`Error::NoRecordsUpdated`] when no row took the hash.
     pub async fn update_offer_tx_hash(
         &self,
         agreement_id: &IndexingAgreementId,
         tx_hash: &[u8; 32],
     ) -> Result<(), Error> {
-        sqlx::query(
+        let updated = sqlx::query(
             r#"
             UPDATE dipper_reg_indexing_agreements
             SET
                 offer_tx_hash = $1,
-                updated_at = timezone('UTC', now())
-            WHERE id = $2 AND status IN ($3, $4)
+                updated_at = CASE WHEN status = $5 THEN updated_at
+                                  ELSE timezone('UTC', now()) END
+            WHERE id = $2 AND status IN ($3, $4, $5)
             "#,
         )
         .bind(&tx_hash[..])
         .bind(agreement_id)
         .bind(IndexingAgreementStatus::Created)
         .bind(IndexingAgreementStatus::AcceptedOnChain)
+        .bind(IndexingAgreementStatus::Cancelling)
         .execute(&self.pool)
         .await?;
+        if updated.rows_affected() == 0 {
+            return Err(Error::NoRecordsUpdated);
+        }
         Ok(())
     }
 

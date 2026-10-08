@@ -3834,3 +3834,53 @@ async fn a_cancelling_agreement_stays_live_and_unannounced_until_it_ends() {
         .expect("terminated query");
     assert!(terminated.iter().any(|p| p.agreement_id == cancelling));
 }
+
+/// Reassess can mark an agreement `Cancelling` while its offer is mining, and the offer can
+/// still land, so its hash is worth keeping. Once the agreement has ended it isn't.
+#[tokio::test]
+async fn an_offer_mined_after_the_cancel_began_keeps_its_hash() {
+    let (db, _temp_db) = temp_registry_db().await;
+    run_fixture(
+        &db,
+        include_str!("fixtures/0003_multi_indexer_agreements.sql"),
+    )
+    .await
+    .expect("Failed to run fixture");
+    let registry = PgRegistry::new(db.clone());
+    let id = fixture_agreement(0xaa);
+    registry
+        .mark_indexing_agreement_as_cancelling(&id)
+        .await
+        .expect("mark cancelling");
+    let stored = async || {
+        sqlx::query_as::<_, (Option<Vec<u8>>, time::OffsetDateTime)>(
+            "SELECT offer_tx_hash, updated_at FROM dipper_reg_indexing_agreements WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&db)
+        .await
+        .expect("read the agreement")
+    };
+    let (_, marked_at) = stored().await;
+
+    registry
+        .update_offer_tx_hash(&id, &[0x11; 32])
+        .await
+        .expect("a cancelling agreement takes the hash");
+    assert_eq!(
+        stored().await,
+        (Some(vec![0x11; 32]), marked_at),
+        "hash stored, and the time it was marked kept"
+    );
+
+    sqlx::query("UPDATE dipper_reg_indexing_agreements SET status = 5 WHERE id = $1")
+        .bind(id)
+        .execute(&db)
+        .await
+        .expect("expire the agreement");
+    let err = registry
+        .update_offer_tx_hash(&id, &[0x22; 32])
+        .await
+        .expect_err("an ended agreement doesn't take the hash");
+    assert!(matches!(err, Error::NoRecordsUpdated));
+}

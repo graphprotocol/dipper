@@ -247,10 +247,9 @@ pub trait AgreementRegistry {
         id: &IndexingAgreementId,
     ) -> RegistryResult<()>;
 
-    /// Record the on-chain tx hash of the most recent `offer()` submission
-    /// for this agreement. Observability-only; does not transition status.
-    /// Called once per submit (including resubmits after a dropped tx) so
-    /// the DB reflects the live hash rather than an evicted one.
+    /// Record the hash of the latest `offer()` transaction, unless the agreement has ended, so
+    /// a resubmit replaces a dropped one. [`NoRecordUpdated`](Error::NoRecordsUpdated) when no
+    /// row took it.
     async fn update_offer_tx_hash(
         &self,
         id: &IndexingAgreementId,
