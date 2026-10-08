@@ -1827,8 +1827,8 @@ mod lifecycle_event_tests {
     }
 
     #[tokio::test]
-    async fn an_agreement_whose_cancel_fails_is_left_cancelling_for_the_listener() {
-        // The chain listener retries the cancel of every cancelling agreement until
+    async fn an_agreement_whose_cancel_fails_is_left_cancelling_for_the_retry() {
+        // The cancel retry re-sends the cancel of every cancelling agreement until
         // the chain shows it ended, so nothing is queued here.
         for status in [
             IndexingAgreementStatus::Created,
@@ -1910,7 +1910,7 @@ enum Unpaired {
 }
 
 /// Take an old agreement out of the target group. One that may be live on-chain is cancelled
-/// there too, which the chain listener retries until it ends.
+/// there too, which the cancel retry re-sends until it ends.
 async fn cancel_unpaired<R, W, I, T>(
     ctx: &Ctx<R, W, I, T>,
     agreement: &crate::registry::IndexingAgreement,

@@ -1,10 +1,12 @@
-//! Finishes the cancels dipper starts. An agreement dipper wants ended is marked
-//! `Cancelling` before its on-chain cancel goes out; this sweep re-sends the cancel while
-//! the chain shows it live, and marks it ended once it can no longer be: `CanceledByRequester`,
-//! or `AbandonedByIndexer` for one dipper ended because its indexer stopped serving it.
+//! Finishes the cancels dipper starts, marked `Cancelling` before they go out: re-sends each
+//! while the chain shows it live, then marks it ended, `AbandonedByIndexer` if its indexer
+//! stopped serving it. Runs on its own, as nothing else finishes them.
+
+use std::{future::Future, sync::Arc, time::Duration};
 
 use dipper_core::time::now_secs;
 use thegraph_core::alloy::primitives::B256;
+use tokio::{sync::mpsc, time::MissedTickBehavior};
 
 use crate::{
     cancel_dispatch::{
@@ -23,9 +25,12 @@ pub const MAX_CANCEL_ATTEMPTS: u32 = 10;
 /// below decides how many it gets through.
 const BATCH_SIZE: i64 = 50;
 
-/// Time a sweep may take before leaving the rest to the next one: it holds up the chain
-/// listener while it runs, and each cancel can wait up to 15 s to be mined.
-const SWEEP_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+/// How often agreements still being cancelled get their cancel retried.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Time a sweep may take before leaving the rest to the next one, as each cancel can wait up
+/// to 15 s to be mined.
+const SWEEP_BUDGET: Duration = Duration::from_secs(30);
 
 /// Minutes an agreement stays out of the retry after it is marked, so the cancel sent
 /// when it was marked can be mined first instead of being sent again. One moved back to
@@ -35,6 +40,66 @@ const SETTLE_MINUTES: i32 = 2;
 /// How long the chain listener gets, from when a check first finds an agreement ended, to
 /// record when and in which transaction it ended, before the retry marks it without them.
 const LISTENER_GRACE: time::Duration = time::Duration::HOUR;
+
+/// Handle for stopping the cancel retry.
+#[derive(Clone)]
+pub struct Handle {
+    tx_stop: mpsc::Sender<()>,
+}
+
+impl Handle {
+    /// Stop the cancel retry, cutting short a sweep in progress.
+    pub async fn stop(&self) {
+        if self.tx_stop.is_closed() {
+            return;
+        }
+        let _ = self.tx_stop.send(()).await;
+        self.tx_stop.closed().await;
+    }
+}
+
+/// What the cancel retry needs.
+pub struct Ctx<R, T> {
+    pub registry: R,
+    pub chain_client: T,
+    pub agreement_conf: Arc<IndexingAgreementConfig>,
+}
+
+/// Create the cancel retry. Returns a handle plus a future to spawn, which sweeps at once and
+/// then every [`SWEEP_INTERVAL`].
+pub fn new<R, T>(ctx: Ctx<R, T>) -> (Handle, impl Future<Output = anyhow::Result<()>>)
+where
+    R: AgreementRegistry + Send + Sync,
+    T: ChainClient + Send + Sync,
+{
+    let (tx_stop, mut rx_stop) = mpsc::channel(1);
+    let Ctx {
+        registry,
+        chain_client,
+        agreement_conf,
+    } = ctx;
+    let service = async move {
+        tracing::info!(
+            interval_secs = SWEEP_INTERVAL.as_secs(),
+            "cancel retry service started"
+        );
+        let mut timer = tokio::time::interval(SWEEP_INTERVAL);
+        timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = rx_stop.recv() => break,
+                _ = timer.tick() => {},
+            }
+            tokio::select! {
+                _ = rx_stop.recv() => break,
+                () = retry_cancelling_agreements(&registry, &chain_client, &agreement_conf) => {},
+            }
+        }
+        tracing::debug!("cancel retry service stopped");
+        Ok(())
+    };
+    (Handle { tx_stop }, service)
+}
 
 /// Retry the cancel of agreements still `Cancelling`. The chain's own latest block time
 /// decides when an offer that was never accepted no longer can be, so a subgraph that has
@@ -526,6 +591,41 @@ mod tests {
         let config = IndexingAgreementConfig::for_tests();
         chain.now.store(chain_now, Ordering::SeqCst);
         retry_cancelling_agreements(registry, chain, &config).await;
+    }
+
+    /// Counts the sweeps that ask for agreements being cancelled, and has none.
+    struct CountsSweeps(Arc<AtomicU32>);
+
+    #[async_trait]
+    impl StubAgreementRegistry for CountsSweeps {
+        async fn get_cancelling_agreements(
+            &self,
+            _batch_size: i64,
+            _max_attempts: u32,
+            _min_age_minutes: i32,
+        ) -> crate::registry::Result<Vec<CancellingAgreement>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+    }
+
+    /// Nothing else finishes a cancel, so the retry can't wait on the chain listener, which
+    /// config can turn off.
+    #[tokio::test(start_paused = true)]
+    async fn sweeps_on_its_own_at_start_and_then_every_interval_until_stopped() {
+        let sweeps = Arc::new(AtomicU32::new(0));
+        let (handle, service) = new(Ctx {
+            registry: CountsSweeps(Arc::clone(&sweeps)),
+            chain_client: MockChain::default(),
+            agreement_conf: Arc::new(IndexingAgreementConfig::for_tests()),
+        });
+        let service = tokio::spawn(service);
+
+        tokio::time::sleep(SWEEP_INTERVAL + Duration::from_secs(1)).await;
+        handle.stop().await;
+
+        service.await.unwrap().unwrap();
+        assert_eq!(sweeps.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

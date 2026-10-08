@@ -134,7 +134,7 @@ where
             tracing::warn!(
                 agreement_id = %agreement.id,
                 error = %err,
-                "On-chain cancel failed; the chain listener retries it"
+                "On-chain cancel failed; the cancel retry sends it again"
             );
             return Ok(CancelStarted::Cancelling);
         }
