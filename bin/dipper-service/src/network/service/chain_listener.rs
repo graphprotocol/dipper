@@ -946,21 +946,18 @@ where
     }
 }
 
-/// When v0.1.10, the first release that announces lifecycle events, came out (2026-08-11
-/// UTC). Agreements dipper created before then are never announced, even when a replay of
-/// the chain reads them again.
-const LIFECYCLE_EVENTS_START: i64 = 1_786_406_400;
-
 /// Record the accept and cancel of an agreement dipper had already marked
 /// cancelled that went live on-chain first, so its accepted and terminated
 /// events go out. Cancel first: the terminated sweep waits only for the accept.
-/// Existing values win, so an agreement dipper already recorded is unchanged.
+/// Existing values win, so an agreement dipper already recorded is unchanged,
+/// except an end recorded before the accept, such as its offer's withdrawal: the
+/// cancel is recorded again once the accept is, so that end gives way to this one.
 async fn record_accept_and_cancel_from_chain<R: AgreementRegistry + Sync>(
     snapshot: &AgreementStateSnapshot,
     agreement: &IndexingAgreement,
     registry: &R,
 ) {
-    if snapshot.accepted_at == 0 || !created_after_events_started(agreement) {
+    if snapshot.accepted_at == 0 {
         return;
     }
     let canceled_by = snapshot.canceled_by.to_string();
@@ -980,6 +977,19 @@ async fn record_accept_and_cancel_from_chain<R: AgreementRegistry + Sync>(
         }
         Err(err) => Err(err),
     };
+    let recorded = match recorded {
+        Ok(()) => {
+            registry
+                .record_cancel_audit(
+                    &agreement.id,
+                    snapshot.canceled_at,
+                    &canceled_by,
+                    Some(&snapshot.canceled_tx),
+                )
+                .await
+        }
+        Err(err) => Err(err),
+    };
     if let Err(err) = recorded {
         tracing::warn!(
             agreement_id = %agreement.id,
@@ -988,12 +998,6 @@ async fn record_accept_and_cancel_from_chain<R: AgreementRegistry + Sync>(
              its events go out only if the listener reads this agreement again"
         );
     }
-}
-
-/// Whether dipper created the agreement once it announced lifecycle events. Its own clock
-/// at creation, unlike any read of the chain, doesn't depend on how far the listener lags.
-fn created_after_events_started(agreement: &IndexingAgreement) -> bool {
-    agreement.created_at.unix_timestamp() >= LIFECYCLE_EVENTS_START
 }
 
 /// Safety net for an agreement dipper cancelled whose offer the indexer accepted
@@ -1035,7 +1039,6 @@ async fn record_accept_of_cancelling<R: AgreementRegistry + Sync>(
     if (agreement.status != IndexingAgreementStatus::Cancelling && !reopened)
         || !snapshot.state.reached_accepted()
         || snapshot.accepted_at == 0
-        || !created_after_events_started(agreement)
     {
         return;
     }
@@ -1592,7 +1595,7 @@ where
 /// confirmed send.
 ///
 /// Eligibility (`get_agreements_pending_accepted_emission`) requires
-/// `accepted_at IS NOT NULL` (so pre-feature rows are never backfilled) but is
+/// `accepted_at IS NOT NULL` (only rows whose accept was recorded) but is
 /// NOT gated on current status: an agreement accepted and then cancelled in a
 /// single snapshot is already terminal yet must still emit its `accepted` (which
 /// is why this sweep runs before the terminated sweep).
@@ -1988,12 +1991,6 @@ mod tests {
             if let Some(a) = self.state.lock().unwrap().agreements.get_mut(&agreement_id) {
                 let deadline = OffsetDateTime::now_utc().unix_timestamp() + secs;
                 a.terms.deadline = u64::try_from(deadline).unwrap();
-            }
-        }
-
-        fn set_agreement_created_at(&self, agreement_id: IndexingAgreementId, unix: i64) {
-            if let Some(a) = self.state.lock().unwrap().agreements.get_mut(&agreement_id) {
-                a.created_at = OffsetDateTime::from_unix_timestamp(unix).unwrap();
             }
         }
 
@@ -2706,27 +2703,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_records_no_accept_of_an_agreement_from_before_events_existed() {
-        let registry = MockRegistry::new();
-        let chain_client = MockChainClient::default();
-        let agreement_id = IndexingAgreementId::from_bytes(rand::random());
-        registry.add_agreement(agreement_id, IndexingAgreementStatus::Cancelling);
-        registry.set_agreement_created_at(agreement_id, LIFECYCLE_EVENTS_START - 1);
-
-        let snapshot = make_snapshot(agreement_id, AgreementState::Accepted, Address::ZERO);
-        reconcile_agreement(
-            &snapshot,
-            &registry,
-            &chain_client,
-            test_agreement_conf().as_ref(),
-        )
-        .await
-        .expect("reconcile ok");
-
-        assert!(registry.audit_writes().is_empty());
-    }
-
-    #[tokio::test]
     async fn reconcile_records_no_accept_for_a_withdrawn_offer() {
         // The subgraph reports a withdrawn offer as cancelled by the payer with no accept
         // time; recording it would announce an agreement that was never live.
@@ -3170,7 +3146,7 @@ mod tests {
         // Dipper had marked the agreement cancelled, but it was accepted on-chain
         // before being ended there. Recording both lets the accepted and terminated
         // events go out; the cancel goes first because the terminated sweep only
-        // waits for the accept.
+        // waits for the accept, and again after it, to replace an end from before it.
         let registry = MockRegistry::new();
         let chain_client = MockChainClient::default();
         let agreement_id = IndexingAgreementId::from_bytes(rand::random());
@@ -3191,7 +3167,11 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(
             registry.audit_writes(),
-            vec![("cancel", agreement_id), ("accept", agreement_id)]
+            vec![
+                ("cancel", agreement_id),
+                ("accept", agreement_id),
+                ("cancel", agreement_id)
+            ]
         );
     }
 
@@ -3215,29 +3195,6 @@ mod tests {
         .await;
 
         assert!(result.is_ok(), "a failed record must not fail the snapshot");
-        assert!(registry.audit_writes().is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_reconcile_does_not_announce_an_agreement_accepted_before_events_existed() {
-        // Agreements created before lifecycle events existed have no recorded accept
-        // and are never announced, even when a replay of the chain reads them again.
-        let registry = MockRegistry::new();
-        let chain_client = MockChainClient::default();
-        let agreement_id = IndexingAgreementId::from_bytes(rand::random());
-        registry.add_agreement(agreement_id, IndexingAgreementStatus::CanceledByRequester);
-        registry.set_agreement_created_at(agreement_id, LIFECYCLE_EVENTS_START - 1);
-
-        let snapshot = make_snapshot(agreement_id, AgreementState::CanceledByPayer, Address::ZERO);
-        let result = reconcile_agreement(
-            &snapshot,
-            &registry,
-            &chain_client,
-            test_agreement_conf().as_ref(),
-        )
-        .await;
-
-        assert!(result.is_ok());
         assert!(registry.audit_writes().is_empty());
     }
 
