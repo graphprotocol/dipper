@@ -61,9 +61,10 @@ const STOP_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5)
     reason = "predates this lint; fix when next touched"
 )]
 pub async fn main() -> anyhow::Result<()> {
-    // Set up logging
+    // Set up logging. Plain text, with no colour codes, so log stores can search it.
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
+        .with_ansi(false)
         .init();
 
     // Load the configuration
