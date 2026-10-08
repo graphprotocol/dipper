@@ -8,7 +8,10 @@ use dipper_producer::events::{
 use futures_lite::StreamExt;
 use thegraph_core::alloy::signers::local::PrivateKeySigner;
 use tokio::task::JoinSet;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{
+    EnvFilter, Layer as _, filter::LevelFilter, layer::SubscriberExt as _,
+    util::SubscriberInitExt as _,
+};
 
 use self::{
     config::DEFAULT_MAX_CANDIDATES, registry::RegistryProvider, signing::eip712::Eip712Signer,
@@ -17,6 +20,7 @@ use self::{
 use crate::config::EventStreamingConfig;
 
 mod admin_rpc_server;
+mod alerts;
 mod cancel_dispatch;
 mod chain_client;
 mod config;
@@ -61,19 +65,24 @@ const STOP_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5)
     reason = "predates this lint; fix when next touched"
 )]
 pub async fn main() -> anyhow::Result<()> {
-    // Set up logging
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
-
-    // Load the configuration
-    tracing::debug!("loading configuration");
+    // Load the configuration first, since logging needs it to know where to send alerts
     let conf_path = env::args()
         .nth(1)
         .expect("Missing argument for config path")
         .parse::<PathBuf>()
         .expect("Invalid path");
     let conf = config::load_from_file(&conf_path).expect("Failed to load config");
+
+    // Set up logging. Plain text, with no colour codes, so log stores can search it. Alerts see
+    // warnings and errors whatever the log level is set to.
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_filter(EnvFilter::from_default_env()),
+        )
+        .with(alerts::layer(&conf.alerts).map(|layer| layer.with_filter(LevelFilter::WARN)))
+        .init();
     tracing::debug!(conf=?conf, "configuration loaded");
 
     // Reject a config the protocol-managed path can't run with before building

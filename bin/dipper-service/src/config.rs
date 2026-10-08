@@ -97,6 +97,42 @@ pub struct Config {
     /// the server off.
     #[serde(default)]
     pub health: HealthConfig,
+    /// Where to send alerts for the log lines an operator has to act on. Without a webhook,
+    /// none are sent.
+    #[serde(default)]
+    pub alerts: AlertsConfig,
+}
+
+/// Alerts for the log lines an operator has to act on, picked out by their `event` tag and
+/// posted to Slack, at most once per event in each throttle window.
+#[serde_as]
+#[derive(Debug, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AlertsConfig {
+    /// The Slack incoming-webhook URL to post alerts to. Without one, none are sent.
+    pub slack_webhook_url: Option<Hidden<Url>>,
+    /// The `event` tags of the log lines to alert on.
+    pub events: Vec<String>,
+    /// Least time, in seconds, between 2 messages for the same event; alerts in between are
+    /// counted into the next one.
+    #[serde_as(as = "serde_with::DurationSeconds")]
+    pub throttle: Duration,
+}
+
+impl Default for AlertsConfig {
+    fn default() -> Self {
+        Self {
+            slack_webhook_url: None,
+            events: [
+                "agreement_cancel_stuck",
+                "rpc_blocks_refused",
+                "nonce_gap_fill_failed",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            throttle: Duration::from_secs(15 * 60),
+        }
+    }
 }
 
 /// Configuration for the HTTP health endpoint used by orchestrator liveness probes. Omitting the
@@ -2079,6 +2115,22 @@ mod tests {
             health.threshold,
             crate::health::DEFAULT_HEALTH_THRESHOLD,
             "the remaining fields keep their defaults"
+        );
+    }
+
+    #[test]
+    fn alerts_config_takes_a_webhook_and_keeps_the_default_events() {
+        let alerts = serde_json::from_str::<AlertsConfig>(
+            r#"{"slack_webhook_url": "https://hooks.slack.com/services/T/B/x", "throttle": 60}"#,
+        )
+        .expect("alerts config");
+
+        assert!(alerts.slack_webhook_url.is_some());
+        assert_eq!(alerts.throttle, Duration::from_secs(60));
+        assert_eq!(alerts.events, AlertsConfig::default().events);
+        assert!(
+            !format!("{alerts:?}").contains("hooks.slack.com"),
+            "the webhook is a secret, kept out of logs"
         );
     }
 
