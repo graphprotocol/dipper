@@ -4,10 +4,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex, PoisonError},
     time::Duration,
 };
 
@@ -21,8 +18,8 @@ use url::Url;
 
 use crate::config::AlertsConfig;
 
-/// Alerts that can wait to be posted. More are dropped and counted, since a burst that size
-/// is mostly held back by the throttle anyway.
+/// Alerts that can wait to be posted. More are dropped, as a burst that size is mostly held back
+/// by the throttle anyway, and counted into the held-back figure for their event.
 const QUEUE: usize = 64;
 
 /// How long a single post to Slack may take.
@@ -44,15 +41,18 @@ struct Alert {
 pub struct AlertLayer {
     events: HashSet<String>,
     queue: mpsc::Sender<Alert>,
-    dropped: Arc<AtomicU64>,
+    dropped: Dropped,
 }
+
+/// Alerts dropped because the queue was full, counted by event.
+type Dropped = Arc<Mutex<HashMap<String, u64>>>;
 
 /// The alert layer for dipper's logging, with its poster running in the background, or `None`
 /// when no Slack webhook is configured.
 pub fn layer(config: &AlertsConfig) -> Option<AlertLayer> {
     let url = config.slack_webhook_url.as_ref()?.as_ref().clone();
     let (queue, alerts) = mpsc::channel(QUEUE);
-    let dropped = Arc::new(AtomicU64::new(0));
+    let dropped = Dropped::default();
     tokio::spawn(post_alerts(
         alerts,
         url,
@@ -80,9 +80,14 @@ impl<S: Subscriber> Layer<S> for AlertLayer {
             fields: line.fields,
         };
         // Waiting here would hold up the code that logged it, so a full queue drops the alert;
-        // the poster reports how many.
-        if self.queue.try_send(alert).is_err() {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+        // the poster counts it into the next message for its event.
+        if let Err(full) = self.queue.try_send(alert) {
+            *self
+                .dropped
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(full.into_inner().event)
+                .or_default() += 1;
         }
     }
 }
@@ -125,7 +130,7 @@ async fn post_alerts(
     mut alerts: mpsc::Receiver<Alert>,
     url: Url,
     window: Duration,
-    dropped: Arc<AtomicU64>,
+    dropped: Dropped,
 ) {
     let http = match reqwest::Client::builder().timeout(POST_TIMEOUT).build() {
         Ok(http) => http,
@@ -154,12 +159,9 @@ async fn post_alerts(
                 }
             }
         }
-        let lost = dropped.swap(0, Ordering::Relaxed);
-        if lost > 0 {
-            tracing::warn!(
-                dropped = lost,
-                "Alerts arrived faster than they could be posted to Slack; some were dropped"
-            );
+        let lost = std::mem::take(&mut *dropped.lock().unwrap_or_else(PoisonError::into_inner));
+        for (event, count) in lost {
+            throttle.hold_back(&event, count, Instant::now());
         }
         for text in texts {
             post(&http, &url, &text).await;
@@ -206,6 +208,19 @@ impl Throttle {
             )
             .map_or(0, |window| window.held_back);
         Some(held_back)
+    }
+
+    /// Count alerts that never reached the throttle into its held-back figure for their event;
+    /// one with no window yet is reported at the next check.
+    fn hold_back(&mut self, event: &str, count: u64, now: Instant) {
+        let window = self.window;
+        self.events
+            .entry(event.to_owned())
+            .or_insert_with(|| Window {
+                started: now.checked_sub(window).unwrap_or(now),
+                held_back: 0,
+            })
+            .held_back += count;
     }
 
     /// Events whose window has ended with alerts held back, each with how many; the message
@@ -296,7 +311,7 @@ mod tests {
         let layer = AlertLayer {
             events: events.iter().map(|event| (*event).to_owned()).collect(),
             queue,
-            dropped: Arc::new(AtomicU64::new(0)),
+            dropped: Dropped::default(),
         };
         (layer, alerts)
     }
@@ -346,7 +361,7 @@ mod tests {
         let layer = AlertLayer {
             events: HashSet::from(["rpc_blocks_refused".to_owned()]),
             queue,
-            dropped: Arc::new(AtomicU64::new(0)),
+            dropped: Dropped::default(),
         };
         let dropped = Arc::clone(&layer.dropped);
         let subscriber = tracing_subscriber::registry().with(layer);
@@ -357,7 +372,10 @@ mod tests {
             }
         });
 
-        assert_eq!(dropped.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            *dropped.lock().unwrap(),
+            HashMap::from([("rpc_blocks_refused".to_owned(), 2)])
+        );
     }
 
     #[test]
@@ -380,6 +398,21 @@ mod tests {
             "the count starts the next window"
         );
         assert_eq!(throttle.admit("a", after + window), Some(1));
+    }
+
+    #[test]
+    fn counts_dropped_alerts_into_the_held_back_figure() {
+        let window = Duration::from_secs(900);
+        let mut throttle = Throttle::new(window);
+        let start = Instant::now();
+        assert_eq!(throttle.admit("a", start), Some(0));
+
+        throttle.hold_back("a", 5, start + Duration::from_secs(60));
+        throttle.hold_back("b", 2, start + Duration::from_secs(60));
+
+        let mut due = throttle.due(start + window);
+        due.sort();
+        assert_eq!(due, vec![("a".to_owned(), 5), ("b".to_owned(), 2)]);
     }
 
     #[test]
