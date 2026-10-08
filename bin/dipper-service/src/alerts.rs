@@ -135,7 +135,8 @@ async fn post_alerts(
         }
     };
     let mut throttle = Throttle::new(window);
-    let mut check = tokio::time::interval(HELD_BACK_CHECK);
+    // A window shorter than the usual check is checked as often as it ends.
+    let mut check = tokio::time::interval(HELD_BACK_CHECK.min(window).max(Duration::from_secs(1)));
     loop {
         let mut texts = Vec::new();
         tokio::select! {
@@ -250,9 +251,20 @@ fn slack_escape(text: &str) -> String {
 
 fn held_back_text(event: &str, held_back: u64, window: Duration) -> String {
     format!(
-        "dipper `{event}`: {held_back} more in the last {} minutes",
-        window.as_secs() / 60
+        "dipper `{event}`: {held_back} more in the last {}",
+        describe(window)
     )
+}
+
+/// A throttle window in words: whole minutes where it divides into them, seconds otherwise.
+fn describe(window: Duration) -> String {
+    let seconds = window.as_secs();
+    match (seconds / 60, seconds % 60) {
+        (1, 0) => "minute".to_owned(),
+        (minutes, 0) if minutes > 0 => format!("{minutes} minutes"),
+        _ if seconds == 1 => "second".to_owned(),
+        _ => format!("{seconds} seconds"),
+    }
 }
 
 /// Post a message to the Slack webhook, logging a failure without the webhook's URL, which is a
@@ -400,6 +412,9 @@ mod tests {
             held_back_text("rpc_blocks_refused", 5, Duration::from_secs(900)),
             "dipper `rpc_blocks_refused`: 5 more in the last 15 minutes"
         );
+        assert_eq!(describe(Duration::from_secs(60)), "minute");
+        assert_eq!(describe(Duration::from_secs(90)), "90 seconds");
+        assert_eq!(describe(Duration::from_secs(30)), "30 seconds");
     }
 
     #[tokio::test]
