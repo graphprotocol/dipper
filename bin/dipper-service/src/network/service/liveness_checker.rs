@@ -482,8 +482,8 @@ async fn record_progress<R>(
 }
 
 /// End a stale agreement and queue a reassessment to replace it once it can't be paid. It is
-/// marked `Cancelling` before any cancel is sent, so the cancel retry finishes one that fails
-/// here, queueing the replacement then; it ends `AbandonedByIndexer`.
+/// marked `Cancelling`, and as awaiting replacement, before any cancel is sent, so the cancel
+/// retry finishes one that fails here and queues its replacement once it has ended.
 #[allow(clippy::too_many_arguments)]
 async fn cancel_and_reassess<R, W, C>(
     agreement: &IndexingAgreement,
@@ -516,11 +516,35 @@ async fn cancel_and_reassess<R, W, C>(
     if started == CancelStarted::MayBeLive {
         tracing::info!(
             agreement_id = %agreement.id,
-            "Stale agreement may still be paid; it is replaced once the cancel retry ends it"
+            "Stale agreement may still be paid; the cancel retry replaces it once it has ended"
         );
         return;
     }
-    queue_replacement(agreement, registry, worker_queue, db_timeout, queue_timeout).await;
+    replace_abandoned(agreement, registry, worker_queue, db_timeout, queue_timeout).await;
+}
+
+/// Queue the replacement of an agreement whose indexer stopped serving it, and note it queued
+/// so it isn't queued again.
+pub(crate) async fn replace_abandoned<R, W>(
+    agreement: &IndexingAgreement,
+    registry: &R,
+    worker_queue: &W,
+    db_timeout: Duration,
+    queue_timeout: Duration,
+) where
+    R: AgreementRegistry + IndexingRequestRegistry + Sync,
+    W: WorkerQueue + Sync,
+{
+    if !queue_replacement(agreement, registry, worker_queue, db_timeout, queue_timeout).await {
+        return;
+    }
+    if let Err(err) = registry.mark_replacement_queued(&agreement.id).await {
+        tracing::warn!(
+            agreement_id = %agreement.id,
+            error = %err,
+            "Failed to note an abandoned agreement's replacement queued; it may be queued again"
+        );
+    }
 }
 
 /// Mark a stale agreement abandoned and send its cancel; `None`, logged, when it isn't marked.
@@ -588,19 +612,23 @@ async fn forget_replaced_agreement<R: PendingCancellationRegistry + Sync>(
     }
 }
 
-/// Queue a reassessment of an abandoned agreement's request, which replaces its indexer.
-pub(crate) async fn queue_replacement<R, W>(
+/// Queue a reassessment of an abandoned agreement's request, which replaces its indexer. True
+/// once nothing is left to do: queued, or its request is gone.
+async fn queue_replacement<R, W>(
     agreement: &IndexingAgreement,
     registry: &R,
     worker_queue: &W,
     db_timeout: Duration,
     queue_timeout: Duration,
-) where
+) -> bool
+where
     R: IndexingRequestRegistry + Sync,
     W: WorkerQueue + Sync,
 {
-    let Some(request) = abandoned_request(agreement, registry, db_timeout).await else {
-        return;
+    let request = match abandoned_request(agreement, registry, db_timeout).await {
+        Ok(Some(request)) => request,
+        Ok(None) => return true,
+        Err(()) => return false,
     };
     let push_result = tokio::time::timeout(
         queue_timeout,
@@ -622,6 +650,7 @@ pub(crate) async fn queue_replacement<R, W>(
                 indexing_request_id = %agreement.indexing_request_id,
                 "queued reassessment for abandoned agreement"
             );
+            true
         }
         Ok(Err(err)) => {
             tracing::warn!(
@@ -629,36 +658,39 @@ pub(crate) async fn queue_replacement<R, W>(
                 error = %err,
                 "failed to queue reassessment for abandoned agreement"
             );
+            false
         }
         Err(_) => {
             tracing::warn!(
                 agreement_id = %agreement.id,
                 "timeout queuing reassessment for abandoned agreement"
             );
+            false
         }
     }
 }
 
-/// The request an abandoned agreement served; `None`, logged, when it can't be read.
+/// The request an abandoned agreement served, `None` when it is gone; `Err`, logged, when it
+/// can't be read.
 async fn abandoned_request<R: IndexingRequestRegistry + Sync>(
     agreement: &IndexingAgreement,
     registry: &R,
     db_timeout: Duration,
-) -> Option<crate::registry::IndexingRequest> {
+) -> Result<Option<crate::registry::IndexingRequest>, ()> {
     match tokio::time::timeout(
         db_timeout,
         registry.get_indexing_request_by_id(&agreement.indexing_request_id),
     )
     .await
     {
-        Ok(Ok(Some(r))) => Some(r),
+        Ok(Ok(Some(r))) => Ok(Some(r)),
         Ok(Ok(None)) => {
             tracing::warn!(
                 agreement_id = %agreement.id,
                 indexing_request_id = %agreement.indexing_request_id,
                 "indexing request not found for abandoned agreement"
             );
-            None
+            Ok(None)
         }
         Ok(Err(err)) => {
             tracing::warn!(
@@ -666,14 +698,14 @@ async fn abandoned_request<R: IndexingRequestRegistry + Sync>(
                 error = %err,
                 "failed to fetch indexing request for abandoned agreement"
             );
-            None
+            Err(())
         }
         Err(_) => {
             tracing::warn!(
                 agreement_id = %agreement.id,
                 "timeout fetching indexing request for abandoned agreement"
             );
-            None
+            Err(())
         }
     }
 }
@@ -921,6 +953,8 @@ mod tests {
         /// Ids passed to `record_cancel_audit` -- the signal the handler drives
         /// the terminated event (the chain_listener sweep emits from this audit).
         cancel_audits: Arc<Mutex<Vec<IndexingAgreementId>>>,
+        /// Ids noted as having their replacement queued.
+        replacements_noted: Arc<Mutex<Vec<IndexingAgreementId>>>,
     }
 
     struct MockRegistry {
@@ -970,6 +1004,11 @@ mod tests {
                 return Err(crate::registry::Error::NoRecordsUpdated);
             }
             self.calls.abandoning.lock().unwrap().push(*id);
+            Ok(())
+        }
+
+        async fn mark_replacement_queued(&self, id: &IndexingAgreementId) -> RegistryResult<()> {
+            self.calls.replacements_noted.lock().unwrap().push(*id);
             Ok(())
         }
 
@@ -1493,6 +1532,11 @@ mod tests {
             calls.reassessments.lock().unwrap().as_slice(),
             &[agreement.indexing_request_id]
         );
+        assert_eq!(
+            calls.replacements_noted.lock().unwrap().as_slice(),
+            &[agreement.id],
+            "so the cancel retry doesn't queue it again"
+        );
     }
 
     #[tokio::test]
@@ -1510,6 +1554,7 @@ mod tests {
         assert!(calls.ended.lock().unwrap().is_empty());
         assert!(calls.cancel_audits.lock().unwrap().is_empty());
         assert!(calls.reassessments.lock().unwrap().is_empty());
+        assert!(calls.replacements_noted.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1526,6 +1571,10 @@ mod tests {
         assert_eq!(
             calls.reassessments.lock().unwrap().as_slice(),
             &[agreement.indexing_request_id]
+        );
+        assert_eq!(
+            calls.replacements_noted.lock().unwrap().as_slice(),
+            &[agreement.id]
         );
     }
 

@@ -497,6 +497,16 @@ pub trait AgreementRegistry {
         batch_size: i64,
     ) -> RegistryResult<Vec<IndexingAgreement>>;
 
+    /// Agreements whose indexer stopped serving them that have ended, longest ended first,
+    /// whose replacement is yet to be queued.
+    async fn get_ended_agreements_awaiting_replacement(
+        &self,
+        batch_size: i64,
+    ) -> RegistryResult<Vec<IndexingAgreement>>;
+
+    /// Note that an agreement's replacement has been queued.
+    async fn mark_replacement_queued(&self, id: &IndexingAgreementId) -> RegistryResult<()>;
+
     /// Update the sync progress for an agreement.
     ///
     /// Called when the liveness checker observes the block height has changed

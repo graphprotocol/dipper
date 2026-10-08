@@ -225,6 +225,17 @@ pub trait StubAgreementRegistry: Send + Sync {
         unimplemented!("get_agreements_pending_chain_cancel")
     }
 
+    async fn get_ended_agreements_awaiting_replacement(
+        &self,
+        _batch_size: i64,
+    ) -> Result<Vec<IndexingAgreement>> {
+        unimplemented!("get_ended_agreements_awaiting_replacement")
+    }
+
+    async fn mark_replacement_queued(&self, _id: &IndexingAgreementId) -> Result<()> {
+        unimplemented!("mark_replacement_queued")
+    }
+
     async fn update_agreement_sync_progress(
         &self,
         _id: &IndexingAgreementId,
@@ -531,6 +542,17 @@ impl<T: StubAgreementRegistry> AgreementRegistry for T {
         batch_size: i64,
     ) -> Result<Vec<IndexingAgreement>> {
         StubAgreementRegistry::get_agreements_pending_chain_cancel(self, batch_size).await
+    }
+
+    async fn get_ended_agreements_awaiting_replacement(
+        &self,
+        batch_size: i64,
+    ) -> Result<Vec<IndexingAgreement>> {
+        StubAgreementRegistry::get_ended_agreements_awaiting_replacement(self, batch_size).await
+    }
+
+    async fn mark_replacement_queued(&self, id: &IndexingAgreementId) -> Result<()> {
+        StubAgreementRegistry::mark_replacement_queued(self, id).await
     }
 
     async fn update_agreement_sync_progress(
