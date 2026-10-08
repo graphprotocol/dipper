@@ -227,15 +227,25 @@ impl Throttle {
 fn alert_text(alert: &Alert, held_back: u64) -> String {
     let mut text = format!(
         "dipper {} `{}`: {}",
-        alert.level, alert.event, alert.message
+        alert.level,
+        slack_escape(&alert.event),
+        slack_escape(&alert.message)
     );
     if !alert.fields.is_empty() {
-        text.push_str(&format!("\n{}", alert.fields));
+        text.push_str(&format!("\n{}", slack_escape(&alert.fields)));
     }
     if held_back > 0 {
         text.push_str(&format!("\n{held_back} more since the last alert"));
     }
     text
+}
+
+/// Escape the 3 characters Slack reads as markup, so text like an HTML error page shows as written
+/// instead of turning into links or mentions.
+fn slack_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn held_back_text(event: &str, held_back: u64, window: Duration) -> String {
@@ -358,6 +368,18 @@ mod tests {
             "the count starts the next window"
         );
         assert_eq!(throttle.admit("a", after + window), Some(1));
+    }
+
+    #[test]
+    fn escapes_what_slack_reads_as_markup() {
+        let alert = Alert {
+            event: "nonce_gap_fill_failed".to_owned(),
+            level: Level::WARN,
+            message: "Gap fill failed".to_owned(),
+            fields: "error=<html>502 & more</html>".to_owned(),
+        };
+
+        assert!(alert_text(&alert, 0).ends_with("error=&lt;html&gt;502 &amp; more&lt;/html&gt;"));
     }
 
     #[test]
