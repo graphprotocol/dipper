@@ -288,21 +288,17 @@ fn log_failed_cancel(
     );
 }
 
-/// How many of an agreement's cancel attempts a failure uses up. A cancel the contract
-/// refused, before sending or once mined, that mined without ending the agreement, or that
-/// endpoints answered had no receipt counts, and one that can never be sent uses them all. An
-/// unreachable chain, including one whose receipt checks all failed, is retried freely.
+/// How many of an agreement's cancel attempts a failed cancel uses up. The chain was read just
+/// before, so any failure counts, a refusal to send (gas over the cap, signer out of funds)
+/// included, except a cancel whose receipt checks all failed, which may have mined unseen.
 fn failed_attempts(err: &ChainClientError) -> u32 {
     match err {
-        ChainClientError::CancelNotConfirmed { .. }
-        | ChainClientError::TxReverted { .. }
-        | ChainClientError::TxDropped {
-            receipt_checked: true,
+        ChainClientError::TxDropped {
+            receipt_checked: false,
             ..
-        }
-        | ChainClientError::ContractRevert { .. } => 1,
+        } => 0,
         ChainClientError::MissingTermsVersionHash { .. } => MAX_CANCEL_ATTEMPTS,
-        _ => 0,
+        _ => 1,
     }
 }
 
@@ -408,7 +404,8 @@ mod tests {
     struct MockChain {
         live: AtomicBool,
         read_fails: bool,
-        send_fails: bool,
+        /// What every send fails with, when set.
+        send_error: Option<fn() -> ChainClientError>,
         mined_cancel_reverts: bool,
         never_mines: bool,
         receipt_unreadable: bool,
@@ -439,8 +436,8 @@ mod tests {
             _version_hash: B256,
             _options: u16,
         ) -> Result<Option<B256>, ChainClientError> {
-            if self.send_fails {
-                return Err(ChainClientError::RpcError(anyhow::anyhow!("rpc down")));
+            if let Some(send_error) = self.send_error {
+                return Err(send_error());
             }
             if self.reverts_before_sending {
                 return Err(ChainClientError::ContractRevert {
@@ -804,23 +801,42 @@ mod tests {
 
     #[tokio::test]
     async fn an_unreachable_chain_neither_sends_nor_counts_an_attempt() {
-        for chain in [
-            MockChain {
-                read_fails: true,
-                ..live_chain()
+        let registry = registry_with_one(true);
+        let chain = MockChain {
+            read_fails: true,
+            ..live_chain()
+        };
+
+        retry(&registry, &chain, 0).await;
+
+        assert_eq!(chain.cancels_sent.load(Ordering::SeqCst), 0);
+        assert_eq!(registry.attempts.load(Ordering::SeqCst), 0);
+        assert!(registry.marked_cancelled.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn counts_a_cancel_that_could_not_be_sent() {
+        // The chain was just read, so a send that fails every time (gas over the cap, signer
+        // out of funds) is no outage, and only counting it reaches the alert.
+        let refusals: [fn() -> ChainClientError; 2] = [
+            || ChainClientError::SubmitFailed(anyhow::anyhow!("Gas price exceeds maximum")),
+            || {
+                ChainClientError::RpcError(anyhow::anyhow!(
+                    "Gas estimation failed: insufficient funds"
+                ))
             },
-            MockChain {
-                send_fails: true,
-                ..live_chain()
-            },
-        ] {
+        ];
+        for err in refusals {
             let registry = registry_with_one(true);
+            let chain = MockChain {
+                send_error: Some(err),
+                ..live_chain()
+            };
 
             retry(&registry, &chain, 0).await;
 
             assert_eq!(chain.cancels_sent.load(Ordering::SeqCst), 0);
-            assert_eq!(registry.attempts.load(Ordering::SeqCst), 0);
-            assert!(registry.marked_cancelled.lock().unwrap().is_empty());
+            assert_eq!(registry.attempts.load(Ordering::SeqCst), 1);
         }
     }
 
