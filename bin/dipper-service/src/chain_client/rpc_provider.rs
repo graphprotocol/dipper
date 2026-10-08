@@ -53,6 +53,16 @@ fn describe_failure(url: &Url, error: &TransportError) -> String {
         .replace(url.as_str().trim_end_matches('/'), &name)
 }
 
+/// 1 endpoint's latest block, asked once. A failure is described without the URL, since
+/// hosted endpoints carry their API key in it.
+async fn latest_block(http: reqwest::Client, url: &Url) -> Result<u64, String> {
+    let provider = ProviderBuilder::new().connect_reqwest(http, url.clone());
+    provider
+        .get_block_number()
+        .await
+        .map_err(|err| describe_failure(url, &err))
+}
+
 /// Error text that indicates a transient failure worth retrying, used only for faults
 /// that arrive as prose rather than as a status code or JSON-RPC error object.
 const RETRYABLE_ERROR_PATTERNS: &[&str] = &[
@@ -171,17 +181,16 @@ impl RpcProviderPool {
     pub async fn latest_blocks(&self) -> Vec<u64> {
         let mut asks = tokio::task::JoinSet::new();
         for url in &self.providers {
-            let provider = ProviderBuilder::new().connect_reqwest(self.http.clone(), url.clone());
-            let endpoint = endpoint_name(url);
-            asks.spawn(async move { (endpoint, provider.get_block_number().await) });
+            let (http, url) = (self.http.clone(), url.clone());
+            asks.spawn(async move { (endpoint_name(&url), latest_block(http, &url).await) });
         }
         let mut heads = Vec::with_capacity(self.providers.len());
         while let Some(answer) = asks.join_next().await {
             match answer {
                 Ok((_, Ok(head))) => heads.push(head),
-                Ok((endpoint, Err(err))) => tracing::debug!(
+                Ok((endpoint, Err(reason))) => tracing::debug!(
                     provider = %endpoint,
-                    error = %err,
+                    error = %reason,
                     "RPC endpoint didn't give its latest block for a cross-check"
                 ),
                 Err(err) => tracing::warn!(error = %err, "Latest-block cross-check task failed"),
@@ -589,6 +598,23 @@ mod tests {
         assert!(
             matches!(err, ChainClientError::ContractRevert { .. }),
             "the contract's refusal should have survived, got {err}"
+        );
+    }
+
+    /// The latest-block cross-check logs each endpoint's failure, so it must hide the key too.
+    #[tokio::test]
+    async fn a_cross_check_failure_hides_the_api_key() {
+        let keyed: Url = "http://127.0.0.1:1/v2/super-secret-key"
+            .parse()
+            .expect("keyed endpoint URL");
+
+        let reason = latest_block(reqwest::Client::new(), &keyed)
+            .await
+            .expect_err("nothing is listening, so the ask fails");
+
+        assert!(
+            !reason.contains("super-secret-key"),
+            "the API key must not appear in the failure: {reason}"
         );
     }
 
