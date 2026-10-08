@@ -118,5 +118,10 @@ data:
         "enabled": true,
         "listen_addr": "0.0.0.0:8546",
         "threshold": 840
+      },
+      "alerts": {
+        "slack_webhook_url": "REPLACE_ME_OR_REMOVE_FOR_NO_ALERTS",
+        "events": ["agreement_cancel_stuck", "rpc_blocks_refused", "nonce_gap_fill_failed"],
+        "throttle": 900
       }
     }
