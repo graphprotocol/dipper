@@ -236,6 +236,13 @@ pub trait StubAgreementRegistry: Send + Sync {
         unimplemented!("mark_replacement_queued")
     }
 
+    async fn count_abandoned_agreements_holding_slots(
+        &self,
+        _request_id: &IndexingRequestId,
+    ) -> Result<usize> {
+        unimplemented!("count_abandoned_agreements_holding_slots")
+    }
+
     async fn update_agreement_sync_progress(
         &self,
         _id: &IndexingAgreementId,
@@ -566,6 +573,13 @@ impl<T: StubAgreementRegistry> AgreementRegistry for T {
 
     async fn mark_replacement_queued(&self, id: &IndexingAgreementId) -> Result<()> {
         StubAgreementRegistry::mark_replacement_queued(self, id).await
+    }
+
+    async fn count_abandoned_agreements_holding_slots(
+        &self,
+        request_id: &IndexingRequestId,
+    ) -> Result<usize> {
+        StubAgreementRegistry::count_abandoned_agreements_holding_slots(self, request_id).await
     }
 
     async fn update_agreement_sync_progress(

@@ -733,6 +733,16 @@ impl AgreementRegistry for RegistryProvider {
             .map_err(Into::into)
     }
 
+    async fn count_abandoned_agreements_holding_slots(
+        &self,
+        request_id: &IndexingRequestId,
+    ) -> RegistryResult<usize> {
+        self.inner
+            .count_abandoned_agreements_holding_slots(request_id)
+            .await
+            .map_err(Into::into)
+    }
+
     async fn update_agreement_sync_progress(
         &self,
         id: &IndexingAgreementId,

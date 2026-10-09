@@ -497,6 +497,13 @@ pub trait AgreementRegistry {
     /// Note that an agreement's replacement has been queued.
     async fn mark_replacement_queued(&self, id: &IndexingAgreementId) -> RegistryResult<()>;
 
+    /// How many of a request's slots are held by agreements whose indexer stopped serving them
+    /// but that may still be paid, so a reassessment fills only the rest.
+    async fn count_abandoned_agreements_holding_slots(
+        &self,
+        request_id: &IndexingRequestId,
+    ) -> RegistryResult<usize>;
+
     /// Update the sync progress for an agreement.
     ///
     /// Called when the liveness checker observes the block height has changed

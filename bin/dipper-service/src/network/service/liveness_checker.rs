@@ -520,7 +520,23 @@ async fn cancel_and_reassess<R, W, C>(
         );
         return;
     }
+    if started == CancelStarted::NotLive {
+        note_seen_ended(agreement, registry).await;
+    }
     replace_abandoned(agreement, registry, worker_queue, db_timeout, queue_timeout).await;
+}
+
+/// Note that the chain shows a stale agreement still cancelling has ended, so it no longer
+/// holds its slot in the request and the reassessment queued next fills it.
+async fn note_seen_ended<R: AgreementRegistry + Sync>(agreement: &IndexingAgreement, registry: &R) {
+    match registry.record_cancel_check(&agreement.id, 0, Some(true)).await {
+        Ok(_) | Err(crate::registry::Error::NoRecordsUpdated) => {}
+        Err(err) => tracing::warn!(
+            agreement_id = %agreement.id,
+            error = %err,
+            "Failed to note a stale agreement ended; its replacement may wait for a later reassessment"
+        ),
+    }
 }
 
 /// Queue the replacement of an agreement whose indexer stopped serving it, and note it queued
@@ -969,6 +985,8 @@ mod tests {
         cancel_audits: Arc<Mutex<Vec<IndexingAgreementId>>>,
         /// Ids noted as having their replacement queued.
         replacements_noted: Arc<Mutex<Vec<IndexingAgreementId>>>,
+        /// Ids noted as seen ended on-chain while still cancelling.
+        seen_ended: Arc<Mutex<Vec<IndexingAgreementId>>>,
     }
 
     struct MockRegistry {
@@ -1029,6 +1047,18 @@ mod tests {
         async fn mark_replacement_queued(&self, id: &IndexingAgreementId) -> RegistryResult<()> {
             self.calls.replacements_noted.lock().unwrap().push(*id);
             Ok(())
+        }
+
+        async fn record_cancel_check(
+            &self,
+            id: &IndexingAgreementId,
+            _failed_attempts: u32,
+            ended: Option<bool>,
+        ) -> RegistryResult<u32> {
+            if ended == Some(true) {
+                self.calls.seen_ended.lock().unwrap().push(*id);
+            }
+            Ok(0)
         }
 
         async fn mark_indexing_agreement_as_canceled_by_requester(
@@ -1587,6 +1617,11 @@ mod tests {
         end_stale(&agreement, &registry, &chain).await;
 
         assert!(calls.chain_cancels.lock().unwrap().is_empty());
+        assert_eq!(
+            calls.seen_ended.lock().unwrap().as_slice(),
+            &[agreement.id],
+            "so it no longer holds the slot its replacement fills"
+        );
         assert_eq!(
             calls.reassessments.lock().unwrap().as_slice(),
             &[agreement.indexing_request_id]
