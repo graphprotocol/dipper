@@ -41,9 +41,11 @@ const DB_TIMEOUT: Duration = Duration::from_secs(30);
 const QUEUE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Minutes an agreement stays out of the retry after it is marked, so the cancel sent
-/// when it was marked can be mined first instead of being sent again. One moved back to
-/// cancelling had none sent, so it doesn't wait.
-const SETTLE_MINUTES: i32 = 2;
+/// when it was marked can be mined first instead of being sent again. That cancel can wait
+/// behind another submission for its whole submit deadline, which stays under the 7-minute
+/// worker job limit, so this outlasts that limit. One moved back to cancelling had none sent,
+/// so it doesn't wait.
+const SETTLE_MINUTES: i32 = 8;
 
 /// How long the chain listener gets, from when a check first finds an agreement ended, to
 /// record when and in which transaction it ended, before the retry marks it without them.
@@ -432,6 +434,12 @@ mod tests {
     };
 
     const DEADLINE: u64 = 1_000;
+
+    #[test]
+    fn a_marked_agreement_waits_out_a_whole_submit_deadline_before_a_retry() {
+        let settle = Duration::from_secs(u64::from(SETTLE_MINUTES.unsigned_abs()) * 60);
+        assert!(settle > crate::worker::service::PROCESS_JOB_TIMEOUT);
+    }
 
     #[derive(Default)]
     struct MockRegistry {
