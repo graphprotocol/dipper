@@ -626,6 +626,28 @@ impl AgreementRegistry for RegistryProvider {
         Ok(())
     }
 
+    async fn record_accept_and_cancel_audit(
+        &self,
+        agreement_id: &IndexingAgreementId,
+        accepted_at: u64,
+        accepted_tx: &str,
+        canceled_at: u64,
+        canceled_by: &str,
+        canceled_tx: Option<&str>,
+    ) -> RegistryResult<()> {
+        self.inner
+            .record_accept_and_cancel_audit(
+                agreement_id,
+                accepted_at,
+                accepted_tx,
+                canceled_at,
+                canceled_by,
+                canceled_tx,
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn get_expired_created_agreements(
         &self,
         batch_size: i64,

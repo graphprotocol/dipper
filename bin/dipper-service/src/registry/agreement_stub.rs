@@ -327,6 +327,19 @@ pub trait StubAgreementRegistry: Send + Sync {
     ) -> Result<()> {
         Ok(())
     }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn record_accept_and_cancel_audit(
+        &self,
+        _agreement_id: &IndexingAgreementId,
+        _accepted_at: u64,
+        _accepted_tx: &str,
+        _canceled_at: u64,
+        _canceled_by: &str,
+        _canceled_tx: Option<&str>,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 // Every stub is a full AgreementRegistry: each method delegates to the stub
@@ -644,6 +657,27 @@ impl<T: StubAgreementRegistry> AgreementRegistry for T {
         StubAgreementRegistry::record_cancel_audit(
             self,
             agreement_id,
+            canceled_at,
+            canceled_by,
+            canceled_tx,
+        )
+        .await
+    }
+
+    async fn record_accept_and_cancel_audit(
+        &self,
+        agreement_id: &IndexingAgreementId,
+        accepted_at: u64,
+        accepted_tx: &str,
+        canceled_at: u64,
+        canceled_by: &str,
+        canceled_tx: Option<&str>,
+    ) -> Result<()> {
+        StubAgreementRegistry::record_accept_and_cancel_audit(
+            self,
+            agreement_id,
+            accepted_at,
+            accepted_tx,
             canceled_at,
             canceled_by,
             canceled_tx,

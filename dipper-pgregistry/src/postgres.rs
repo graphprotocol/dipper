@@ -1591,6 +1591,53 @@ impl PgRegistry {
         Ok(())
     }
 
+    /// Record an agreement's accept and its end together, as the chain shows them, in 1 write,
+    /// with the rules of [`Self::record_accepted_audit`] and [`Self::record_cancel_audit`]. An
+    /// end recorded before the accept is judged against the accept being recorded with it.
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "chain timestamps are far below i64::MAX"
+    )]
+    pub async fn record_accept_and_cancel_audit(
+        &self,
+        agreement_id: &IndexingAgreementId,
+        accepted_at: u64,
+        accepted_tx: &str,
+        canceled_at: u64,
+        canceled_by: &str,
+        canceled_tx: Option<&str>,
+    ) -> Result<(), Error> {
+        sqlx::query(
+            r#"
+            UPDATE dipper_reg_indexing_agreements
+            SET accepted_at = COALESCE(accepted_at, $2),
+                accepted_tx = COALESCE(accepted_tx, $3),
+                canceled_at = CASE
+                    WHEN canceled_at < COALESCE(accepted_at, $2) AND $4 >= COALESCE(accepted_at, $2)
+                    THEN $4 ELSE COALESCE(canceled_at, $4) END,
+                canceled_by = CASE
+                    WHEN canceled_at < COALESCE(accepted_at, $2) AND $4 >= COALESCE(accepted_at, $2)
+                    THEN $5 ELSE COALESCE(canceled_by, $5) END,
+                canceled_tx = CASE
+                    WHEN canceled_at < COALESCE(accepted_at, $2) AND $4 >= COALESCE(accepted_at, $2)
+                    THEN $6 ELSE COALESCE(canceled_tx, $6) END,
+                terminated_event_emitted_at = CASE
+                    WHEN canceled_at < COALESCE(accepted_at, $2) AND $4 >= COALESCE(accepted_at, $2)
+                    THEN NULL ELSE terminated_event_emitted_at END
+            WHERE id = $1
+            "#,
+        )
+        .bind(agreement_id)
+        .bind(accepted_at as i64)
+        .bind(accepted_tx)
+        .bind(canceled_at as i64)
+        .bind(canceled_by)
+        .bind(canceled_tx)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     // =========================================================================
     // Reassignment operations
     // =========================================================================
