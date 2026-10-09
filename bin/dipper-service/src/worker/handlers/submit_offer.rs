@@ -283,8 +283,8 @@ fn dipper_cancelled(status: IndexingAgreementStatus) -> bool {
 }
 
 /// The agreement, if it was cancelled after this job's status check. After a failed read
-/// the job still finishes: retrying would send the offer again, and the chain listener's
-/// cancel retry withdraws the offer of an agreement left cancelling.
+/// the job still finishes: retrying would send the offer again, and the cancel retry
+/// withdraws the offer of an agreement left cancelling.
 async fn cancelled_meanwhile<R: AgreementRegistry>(
     registry: &R,
     agreement_id: &IndexingAgreementId,

@@ -1,10 +1,12 @@
-//! Finishes the cancels dipper starts. An agreement dipper wants ended is marked
-//! `Cancelling` before its on-chain cancel goes out; this sweep re-sends the cancel while
-//! the chain shows it live, and marks it ended once it can no longer be: `CanceledByRequester`,
-//! or `AbandonedByIndexer` for one dipper ended because its indexer stopped serving it.
+//! Finishes the cancels dipper starts, marked `Cancelling` before they go out: re-sends each
+//! while the chain shows it live, then marks it ended, `AbandonedByIndexer` if its indexer
+//! stopped serving it. Runs on its own, as nothing else finishes them.
+
+use std::{future::Future, sync::Arc, time::Duration};
 
 use dipper_core::time::now_secs;
 use thegraph_core::alloy::primitives::B256;
+use tokio::{sync::mpsc, time::MissedTickBehavior};
 
 use crate::{
     cancel_dispatch::{
@@ -12,7 +14,11 @@ use crate::{
     },
     chain_client::{ChainClient, ChainClientError},
     config::IndexingAgreementConfig,
-    registry::{AgreementRegistry, CancelKind, CancellingAgreement, IndexingAgreement},
+    registry::{
+        AgreementRegistry, CancelKind, CancellingAgreement, IndexingAgreement,
+        IndexingRequestRegistry,
+    },
+    worker::service::WorkerQueue,
 };
 
 /// Failed cancels before dipper alerts an operator and retries the agreement only hourly, so a
@@ -23,9 +29,16 @@ pub const MAX_CANCEL_ATTEMPTS: u32 = 10;
 /// below decides how many it gets through.
 const BATCH_SIZE: i64 = 50;
 
-/// Time a sweep may take before leaving the rest to the next one: it holds up the chain
-/// listener while it runs, and each cancel can wait up to 15 s to be mined.
-const SWEEP_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+/// How often agreements still being cancelled get their cancel retried.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Time a sweep may take before leaving the rest to the next one, as each cancel can wait up
+/// to 15 s to be mined.
+const SWEEP_BUDGET: Duration = Duration::from_secs(30);
+
+/// Time allowed to read an ended agreement's request, and to queue its replacement.
+const DB_TIMEOUT: Duration = Duration::from_secs(30);
+const QUEUE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Minutes an agreement stays out of the retry after it is marked, so the cancel sent
 /// when it was marked can be mined first instead of being sent again. One moved back to
@@ -35,6 +48,102 @@ const SETTLE_MINUTES: i32 = 2;
 /// How long the chain listener gets, from when a check first finds an agreement ended, to
 /// record when and in which transaction it ended, before the retry marks it without them.
 const LISTENER_GRACE: time::Duration = time::Duration::HOUR;
+
+/// Handle for stopping the cancel retry.
+#[derive(Clone)]
+pub struct Handle {
+    tx_stop: mpsc::Sender<()>,
+}
+
+impl Handle {
+    /// Stop the cancel retry, cutting short a sweep in progress.
+    pub async fn stop(&self) {
+        if self.tx_stop.is_closed() {
+            return;
+        }
+        let _ = self.tx_stop.send(()).await;
+        self.tx_stop.closed().await;
+    }
+}
+
+/// What the cancel retry needs.
+pub struct Ctx<R, T, W> {
+    pub registry: R,
+    pub chain_client: T,
+    pub agreement_conf: Arc<IndexingAgreementConfig>,
+    /// Queues the replacement of an agreement ended because its indexer stopped serving it.
+    pub worker_queue: W,
+}
+
+/// Create the cancel retry. Returns a handle plus a future to spawn, which sweeps at once and
+/// then every [`SWEEP_INTERVAL`].
+pub fn new<R, T, W>(ctx: Ctx<R, T, W>) -> (Handle, impl Future<Output = anyhow::Result<()>>)
+where
+    R: AgreementRegistry + IndexingRequestRegistry + Send + Sync,
+    T: ChainClient + Send + Sync,
+    W: WorkerQueue + Send + Sync,
+{
+    let (tx_stop, mut rx_stop) = mpsc::channel(1);
+    let Ctx {
+        registry,
+        chain_client,
+        agreement_conf,
+        worker_queue,
+    } = ctx;
+    let service = async move {
+        tracing::info!(
+            interval_secs = SWEEP_INTERVAL.as_secs(),
+            "cancel retry service started"
+        );
+        let mut timer = tokio::time::interval(SWEEP_INTERVAL);
+        timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = rx_stop.recv() => break,
+                _ = timer.tick() => {},
+            }
+            tokio::select! {
+                _ = rx_stop.recv() => break,
+                () = async {
+                    retry_cancelling_agreements(&registry, &chain_client, &agreement_conf).await;
+                    replace_ended_abandoned(&registry, &worker_queue).await;
+                } => {},
+            }
+        }
+        tracing::debug!("cancel retry service stopped");
+        Ok(())
+    };
+    (Handle { tx_stop }, service)
+}
+
+/// Queue the replacement of each agreement whose indexer stopped serving it once it has ended,
+/// whatever ended it: this retry, the chain listener or the indexer.
+async fn replace_ended_abandoned<R, W>(registry: &R, worker_queue: &W)
+where
+    R: AgreementRegistry + IndexingRequestRegistry + Sync,
+    W: WorkerQueue + Sync,
+{
+    let ended = match registry
+        .get_ended_agreements_awaiting_replacement(BATCH_SIZE)
+        .await
+    {
+        Ok(ended) => ended,
+        Err(err) => {
+            tracing::warn!(error = %err, "Failed to list ended agreements awaiting replacement");
+            return;
+        }
+    };
+    for agreement in &ended {
+        super::liveness_checker::replace_abandoned(
+            agreement,
+            registry,
+            worker_queue,
+            DB_TIMEOUT,
+            QUEUE_TIMEOUT,
+        )
+        .await;
+    }
+}
 
 /// Retry the cancel of agreements still `Cancelling`. The chain's own latest block time
 /// decides when an offer that was never accepted no longer can be, so a subgraph that has
@@ -288,21 +397,17 @@ fn log_failed_cancel(
     );
 }
 
-/// How many of an agreement's cancel attempts a failure uses up. A cancel the contract
-/// refused, before sending or once mined, that mined without ending the agreement, or that
-/// endpoints answered had no receipt counts, and one that can never be sent uses them all. An
-/// unreachable chain, including one whose receipt checks all failed, is retried freely.
+/// How many of an agreement's cancel attempts a failed cancel uses up. The chain was read just
+/// before, so any failure counts, a refusal to send (gas over the cap, signer out of funds)
+/// included, except a cancel whose receipt checks all failed, which may have mined unseen.
 fn failed_attempts(err: &ChainClientError) -> u32 {
     match err {
-        ChainClientError::CancelNotConfirmed { .. }
-        | ChainClientError::TxReverted { .. }
-        | ChainClientError::TxDropped {
-            receipt_checked: true,
+        ChainClientError::TxDropped {
+            receipt_checked: false,
             ..
-        }
-        | ChainClientError::ContractRevert { .. } => 1,
+        } => 0,
         ChainClientError::MissingTermsVersionHash { .. } => MAX_CANCEL_ATTEMPTS,
-        _ => 0,
+        _ => 1,
     }
 }
 
@@ -314,7 +419,7 @@ mod tests {
     };
 
     use async_trait::async_trait;
-    use dipper_core::ids::IndexingAgreementId;
+    use dipper_core::ids::{IndexingAgreementId, IndexingRequestId};
     use dipper_rpc::indexer::indexer_client::sol::RecurringCollectionAgreement;
     use thegraph_core::alloy::primitives::Address;
 
@@ -323,6 +428,7 @@ mod tests {
         cancel_dispatch::tests::agreement,
         chain_client::AgreementOnChain,
         registry::{IndexingAgreementStatus, StubAgreementRegistry},
+        worker::service::JobPriority,
     };
 
     const DEADLINE: u64 = 1_000;
@@ -340,6 +446,9 @@ mod tests {
         /// The chain listener marks it ended before the retry's own mark lands.
         listener_ended_it: bool,
         writes: Mutex<Vec<&'static str>>,
+        /// Ended agreements awaiting replacement, until noted as replaced.
+        awaiting_replacement: Vec<IndexingAgreement>,
+        replacements_noted: Mutex<Vec<IndexingAgreementId>>,
     }
 
     #[async_trait]
@@ -351,6 +460,25 @@ mod tests {
             _min_age_minutes: i32,
         ) -> crate::registry::Result<Vec<CancellingAgreement>> {
             Ok(self.cancelling.clone())
+        }
+        async fn get_ended_agreements_awaiting_replacement(
+            &self,
+            _batch_size: i64,
+        ) -> crate::registry::Result<Vec<IndexingAgreement>> {
+            let noted = self.replacements_noted.lock().unwrap();
+            Ok(self
+                .awaiting_replacement
+                .iter()
+                .filter(|agreement| !noted.contains(&agreement.id))
+                .cloned()
+                .collect())
+        }
+        async fn mark_replacement_queued(
+            &self,
+            id: &IndexingAgreementId,
+        ) -> crate::registry::Result<()> {
+            self.replacements_noted.lock().unwrap().push(*id);
+            Ok(())
         }
         async fn mark_indexing_agreement_as_canceled_by_requester(
             &self,
@@ -408,7 +536,8 @@ mod tests {
     struct MockChain {
         live: AtomicBool,
         read_fails: bool,
-        send_fails: bool,
+        /// What every send fails with, when set.
+        send_error: Option<fn() -> ChainClientError>,
         mined_cancel_reverts: bool,
         never_mines: bool,
         receipt_unreadable: bool,
@@ -439,8 +568,8 @@ mod tests {
             _version_hash: B256,
             _options: u16,
         ) -> Result<Option<B256>, ChainClientError> {
-            if self.send_fails {
-                return Err(ChainClientError::RpcError(anyhow::anyhow!("rpc down")));
+            if let Some(send_error) = self.send_error {
+                return Err(send_error());
             }
             if self.reverts_before_sending {
                 return Err(ChainClientError::ContractRevert {
@@ -529,6 +658,137 @@ mod tests {
         let config = IndexingAgreementConfig::for_tests();
         chain.now.store(chain_now, Ordering::SeqCst);
         retry_cancelling_agreements(registry, chain, &config).await;
+    }
+
+    #[async_trait]
+    impl IndexingRequestRegistry for MockRegistry {
+        async fn set_indexing_target_candidates(
+            &self,
+            _requested_by: Address,
+            _deployment_id: thegraph_core::DeploymentId,
+            _deployment_chain_id: u64,
+            _num_candidates: usize,
+        ) -> crate::registry::Result<crate::registry::SetTargetOutcome> {
+            unimplemented!()
+        }
+        async fn get_all_indexing_requests(
+            &self,
+        ) -> crate::registry::Result<Vec<crate::registry::IndexingRequest>> {
+            unimplemented!()
+        }
+        async fn get_indexing_request_by_id(
+            &self,
+            id: &IndexingRequestId,
+        ) -> crate::registry::Result<Option<crate::registry::IndexingRequest>> {
+            let agreement = ended_abandoned();
+            Ok(Some(crate::registry::IndexingRequest {
+                id: *id,
+                created_at: time::OffsetDateTime::now_utc(),
+                updated_at: time::OffsetDateTime::now_utc(),
+                status: crate::registry::IndexingRequestStatus::Open,
+                requested_by: Address::ZERO,
+                deployment_id: agreement.terms.metadata.subgraph_deployment_id,
+                deployment_chain_id: agreement.terms.metadata.chain_id,
+                num_candidates: 3,
+            }))
+        }
+        async fn get_indexing_requests_by_deployment_id(
+            &self,
+            _deployment_id: &thegraph_core::DeploymentId,
+        ) -> crate::registry::Result<Vec<crate::registry::IndexingRequest>> {
+            unimplemented!()
+        }
+        async fn get_open_indexing_requests_for_reassessment(
+            &self,
+            _min_age_seconds: i64,
+            _batch_size: i64,
+        ) -> crate::registry::Result<Vec<crate::registry::IndexingRequest>> {
+            unimplemented!()
+        }
+    }
+
+    /// Records the requests it is asked to reassess.
+    #[derive(Default)]
+    struct MockQueue(Arc<Mutex<Vec<IndexingRequestId>>>);
+
+    #[async_trait]
+    impl WorkerQueue for MockQueue {
+        async fn send_indexing_agreement_proposal(
+            &self,
+            _candidate_url: url::Url,
+            _agreement_id: IndexingAgreementId,
+            _indexing_request_id: IndexingRequestId,
+            _deployment_id: thegraph_core::DeploymentId,
+            _deployment_chain_id: u64,
+            _priority: JobPriority,
+        ) -> anyhow::Result<dipper_pgmq::JobId> {
+            unimplemented!()
+        }
+        async fn reassess_indexing_request(
+            &self,
+            indexing_request_id: IndexingRequestId,
+            _deployment_id: thegraph_core::DeploymentId,
+            _deployment_chain_id: u64,
+            _num_candidates: usize,
+            _priority: JobPriority,
+        ) -> anyhow::Result<dipper_pgmq::JobId> {
+            self.0.lock().unwrap().push(indexing_request_id);
+            Ok(dipper_pgmq::JobId::default())
+        }
+        async fn submit_offer(
+            &self,
+            _agreement_id: IndexingAgreementId,
+            _indexing_request_id: IndexingRequestId,
+            _indexer_url: url::Url,
+            _deployment_id: thegraph_core::DeploymentId,
+            _deployment_chain_id: u64,
+            _priority: JobPriority,
+        ) -> anyhow::Result<dipper_pgmq::JobId> {
+            unimplemented!()
+        }
+    }
+
+    fn ended_abandoned() -> IndexingAgreement {
+        agreement(
+            IndexingAgreementStatus::AbandonedByIndexer,
+            Some(vec![7u8; 32]),
+        )
+    }
+
+    /// Nothing else finishes a cancel, so the retry can't wait on the chain listener, which
+    /// config can turn off.
+    #[tokio::test(start_paused = true)]
+    async fn sweeps_on_its_own_and_replaces_an_abandoned_agreement_once_it_has_ended() {
+        let ended = ended_abandoned();
+        let registry = MockRegistry {
+            awaiting_replacement: vec![ended.clone()],
+            ..registry_with_one(true)
+        };
+        let chain = Arc::new(live_chain());
+        let queue = MockQueue::default();
+        let reassessed = Arc::clone(&queue.0);
+        let (handle, service) = new(Ctx {
+            registry,
+            chain_client: Arc::clone(&chain),
+            agreement_conf: Arc::new(IndexingAgreementConfig::for_tests()),
+            worker_queue: queue,
+        });
+        let service = tokio::spawn(service);
+
+        tokio::time::sleep(SWEEP_INTERVAL + Duration::from_secs(1)).await;
+        handle.stop().await;
+
+        service.await.unwrap().unwrap();
+        assert_eq!(
+            chain.clock_reads.load(Ordering::SeqCst),
+            2,
+            "1 sweep at start, 1 later"
+        );
+        assert_eq!(
+            *reassessed.lock().unwrap(),
+            vec![ended.indexing_request_id],
+            "queued once, then noted as replaced"
+        );
     }
 
     #[tokio::test]
@@ -804,23 +1064,42 @@ mod tests {
 
     #[tokio::test]
     async fn an_unreachable_chain_neither_sends_nor_counts_an_attempt() {
-        for chain in [
-            MockChain {
-                read_fails: true,
-                ..live_chain()
+        let registry = registry_with_one(true);
+        let chain = MockChain {
+            read_fails: true,
+            ..live_chain()
+        };
+
+        retry(&registry, &chain, 0).await;
+
+        assert_eq!(chain.cancels_sent.load(Ordering::SeqCst), 0);
+        assert_eq!(registry.attempts.load(Ordering::SeqCst), 0);
+        assert!(registry.marked_cancelled.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn counts_a_cancel_that_could_not_be_sent() {
+        // The chain was just read, so a send that fails every time (gas over the cap, signer
+        // out of funds) is no outage, and only counting it reaches the alert.
+        let refusals: [fn() -> ChainClientError; 2] = [
+            || ChainClientError::SubmitFailed(anyhow::anyhow!("Gas price exceeds maximum")),
+            || {
+                ChainClientError::RpcError(anyhow::anyhow!(
+                    "Gas estimation failed: insufficient funds"
+                ))
             },
-            MockChain {
-                send_fails: true,
-                ..live_chain()
-            },
-        ] {
+        ];
+        for err in refusals {
             let registry = registry_with_one(true);
+            let chain = MockChain {
+                send_error: Some(err),
+                ..live_chain()
+            };
 
             retry(&registry, &chain, 0).await;
 
             assert_eq!(chain.cancels_sent.load(Ordering::SeqCst), 0);
-            assert_eq!(registry.attempts.load(Ordering::SeqCst), 0);
-            assert!(registry.marked_cancelled.lock().unwrap().is_empty());
+            assert_eq!(registry.attempts.load(Ordering::SeqCst), 1);
         }
     }
 

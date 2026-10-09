@@ -690,6 +690,27 @@ impl AgreementRegistry for RegistryProvider {
             .collect())
     }
 
+    async fn get_ended_agreements_awaiting_replacement(
+        &self,
+        batch_size: i64,
+    ) -> RegistryResult<Vec<IndexingAgreement>> {
+        Ok(self
+            .inner
+            .get_ended_agreements_awaiting_replacement(batch_size)
+            .await?
+            .into_iter()
+            .map(IndexingAgreement::try_from)
+            .filter_map(filter_map_with_logging)
+            .collect())
+    }
+
+    async fn mark_replacement_queued(&self, id: &IndexingAgreementId) -> RegistryResult<()> {
+        self.inner
+            .mark_replacement_queued(id)
+            .await
+            .map_err(Into::into)
+    }
+
     async fn update_agreement_sync_progress(
         &self,
         id: &IndexingAgreementId,

@@ -989,6 +989,7 @@ impl PgRegistry {
             SET
                 status = $1,
                 abandoned = true,
+                replacement_pending = true,
                 updated_at = timezone('UTC', now())
             WHERE id = $2 AND status = $3
             "#,
@@ -1856,6 +1857,56 @@ impl PgRegistry {
         .fetch_all(&self.pool)
         .await
         .map_err(Into::into)
+    }
+
+    /// Agreements whose indexer stopped serving them that have ended, longest ended first,
+    /// whose replacement is yet to be queued.
+    pub async fn get_ended_agreements_awaiting_replacement(
+        &self,
+        batch_size: i64,
+    ) -> Result<Vec<IndexingAgreement>, Error> {
+        sqlx::query_as(
+            r#"
+            SELECT
+                id,
+                nonce_uuid,
+                created_at,
+                updated_at,
+                status,
+                indexing_request_id,
+                deployment_id,
+                indexer_id,
+                indexer_url,
+                terms,
+                last_block_height,
+                last_progress_at,
+                rejection_reason,
+                terms_version_hash
+            FROM dipper_reg_indexing_agreements
+            WHERE replacement_pending AND status <> $1
+            ORDER BY updated_at ASC
+            LIMIT $2
+            "#,
+        )
+        .bind(IndexingAgreementStatus::Cancelling)
+        .bind(batch_size)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Note that an agreement's replacement has been queued.
+    pub async fn mark_replacement_queued(
+        &self,
+        agreement_id: &IndexingAgreementId,
+    ) -> Result<(), Error> {
+        sqlx::query(
+            "UPDATE dipper_reg_indexing_agreements SET replacement_pending = false WHERE id = $1",
+        )
+        .bind(agreement_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Update the sync progress for an agreement.

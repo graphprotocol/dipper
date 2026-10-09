@@ -82,10 +82,6 @@ const SWEEP_BATCH_SIZE: i64 = 1000;
 /// crash-recovery; the steady-state fan-out fires from finalize on a
 /// fresh accept, so per-poll execution is wasted DB work.
 const SWEEP_POLLS: u64 = 60;
-/// How often agreements still being cancelled get their cancel retried, whichever rate the
-/// listener polls at: just under the slow poll interval, so every slow poll retries.
-const CANCEL_RETRY_INTERVAL: Duration = Duration::from_secs(290);
-
 /// Handle for controlling the chain listener service lifecycle
 #[derive(Clone)]
 pub struct Handle {
@@ -226,7 +222,6 @@ where
         // Starts at SWEEP_POLLS so the first poll runs the sweep,
         // recovering any pre-startup orphans.
         let mut polls_since_sweep: u64 = SWEEP_POLLS;
-        let mut last_cancel_retry: Option<Instant> = None;
         // Pause the event sweeps after a Kafka send failure, backing off from one
         // poll interval up to the idle interval, so a hung broker cannot stall the
         // poll loop on every iteration.
@@ -290,18 +285,6 @@ where
                     "Applying failure backoff"
                 );
                 tokio::time::sleep(backoff).await;
-            }
-
-            // Ahead of the drain, which ends the poll early while the subgraph is down:
-            // finishing a cancel needs only the chain.
-            if last_cancel_retry.is_none_or(|at| at.elapsed() >= CANCEL_RETRY_INTERVAL) {
-                last_cancel_retry = Some(Instant::now());
-                super::cancel_retry::retry_cancelling_agreements(
-                    &registry,
-                    &chain_client,
-                    &agreement_conf,
-                )
-                .await;
             }
 
             let outcome = match drain_once(
@@ -1156,7 +1139,7 @@ where
 ///
 /// Called from the Created -> AcceptedOnChain and Expired -> AcceptedOnChain
 /// transitions. Each replaced agreement is marked `Cancelling` and its on-chain cancel
-/// sent once; the cancel retry in this listener finishes any that don't end at once.
+/// sent once; the cancel retry finishes any that don't end at once.
 /// A pending row is deleted once its agreement is marked; a failed mark keeps it for retry.
 async fn execute_pending_cancellations<R, T>(
     agreement_id: &IndexingAgreementId,

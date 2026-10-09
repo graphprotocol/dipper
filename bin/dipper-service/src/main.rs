@@ -107,6 +107,7 @@ pub async fn main() -> anyhow::Result<()> {
     let chain_listener_agreement_conf = agreement_conf.clone();
     let liveness_agreement_conf = agreement_conf.clone();
     let escrow_reconciler_agreement_conf = agreement_conf.clone();
+    let cancel_retry_agreement_conf = agreement_conf.clone();
 
     // Canonical chain id and RecurringCollector address, read once and shared by the
     // admin signer, the gRPC proposal signer, and the on-chain chain client so their
@@ -545,6 +546,15 @@ pub async fn main() -> anyhow::Result<()> {
         _ => None,
     };
 
+    //- The cancel retry, always on: it alone finishes the cancels dipper starts
+    let (cancel_retry_handle, cancel_retry_service) =
+        network::service::cancel_retry::new(network::service::cancel_retry::Ctx {
+            registry: registry.clone(),
+            chain_client: chain_client.clone(),
+            agreement_conf: cancel_retry_agreement_conf,
+            worker_queue: worker_handle.queue().clone(),
+        });
+
     //- The liveness checker service (optional, enabled by config)
     // Detects indexers who silently stop indexing active AcceptedOnChain agreements
     let liveness_checker_handle = match conf.liveness_checker {
@@ -683,6 +693,9 @@ pub async fn main() -> anyhow::Result<()> {
         None
     };
 
+    let cancel_retry_task_handle = task_tree.spawn(cancel_retry_service);
+    tracing::debug!(task_id=%cancel_retry_task_handle.id(), "Cancel retry service started");
+
     // Spawn the escrow reconciler service if enabled
     let escrow_reconciler_stop_handle = if let Some((handle, service)) = escrow_reconciler_handle {
         let task_handle = task_tree.spawn(service);
@@ -762,6 +775,9 @@ pub async fn main() -> anyhow::Result<()> {
         if let Some(handle) = chain_listener_stop_handle {
             all_stopped &= stop_service("Chain listener", handle.stop()).await;
         }
+
+        // Stop the cancel retry before worker (it queues replacements)
+        all_stopped &= stop_service("Cancel retry", cancel_retry_handle.stop()).await;
 
         // Stop escrow reconciler service before the DB pool closes
         if let Some(handle) = escrow_reconciler_stop_handle {

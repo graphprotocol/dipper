@@ -3884,3 +3884,53 @@ async fn an_offer_mined_after_the_cancel_began_keeps_its_hash() {
         .expect_err("an ended agreement doesn't take the hash");
     assert!(matches!(err, Error::NoRecordsUpdated));
 }
+
+/// An agreement whose indexer stopped serving it is replaced only once it can't be paid, and
+/// only once, whatever ended it.
+#[tokio::test]
+async fn an_abandoned_agreement_awaits_replacement_once_ended_until_queued() {
+    let (db, _temp_db) = temp_registry_db().await;
+    run_fixture(
+        &db,
+        include_str!("fixtures/0003_multi_indexer_agreements.sql"),
+    )
+    .await
+    .expect("Failed to run fixture");
+    let id = fixture_agreement(0xaa);
+    sqlx::query("UPDATE dipper_reg_indexing_agreements SET status = $1 WHERE id = $2")
+        .bind(IndexingAgreementStatus::AcceptedOnChain)
+        .bind(id)
+        .execute(&db)
+        .await
+        .expect("accept the agreement");
+    let registry = PgRegistry::new(db);
+    registry
+        .mark_indexing_agreement_as_abandoning(&id)
+        .await
+        .expect("mark abandoning");
+    let awaiting = async || {
+        registry
+            .get_ended_agreements_awaiting_replacement(10)
+            .await
+            .expect("awaiting query")
+            .into_iter()
+            .map(|agreement| agreement.id)
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        awaiting().await.is_empty(),
+        "still cancelling, so maybe paid"
+    );
+
+    registry
+        .mark_indexing_agreement_as_canceled_by_requester(&id)
+        .await
+        .expect("end it");
+    assert_eq!(awaiting().await, vec![id]);
+
+    registry
+        .mark_replacement_queued(&id)
+        .await
+        .expect("note it queued");
+    assert!(awaiting().await.is_empty());
+}
