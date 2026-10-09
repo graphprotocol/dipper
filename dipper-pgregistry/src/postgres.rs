@@ -2029,9 +2029,10 @@ impl PgRegistry {
             .collect())
     }
 
-    /// Count `Created` (in-flight, not yet accepted) agreements per indexer,
-    /// returning the per-indexer map and global total in one round-trip. Offer
-    /// pacing reads both to gauge spare acceptance capacity before creating more.
+    /// Count in-flight offers per indexer, returning the per-indexer map and global total in
+    /// one round-trip. Offer pacing reads both to gauge spare acceptance capacity before
+    /// creating more. Besides `Created` agreements, a `Cancelling` one never accepted counts
+    /// until its offer deadline, since its offer may be accepted before its cancel lands.
     #[expect(
         clippy::cast_sign_loss,
         reason = "predates this lint; fix when next touched"
@@ -2046,10 +2047,14 @@ impl PgRegistry {
             SELECT indexer_id, COUNT(*) as count
             FROM dipper_reg_indexing_agreements
             WHERE status = $1
+               OR (status = $2
+                   AND accepted_at IS NULL
+                   AND CAST(terms->>'deadline' AS bigint) > EXTRACT(EPOCH FROM now()))
             GROUP BY GROUPING SETS ((indexer_id), ())
             "#,
         )
         .bind(IndexingAgreementStatus::Created)
+        .bind(IndexingAgreementStatus::Cancelling)
         .fetch_all(&self.pool)
         .await?;
 

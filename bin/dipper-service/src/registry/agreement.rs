@@ -517,9 +517,9 @@ pub trait AgreementRegistry {
         &self,
     ) -> RegistryResult<std::collections::HashMap<DeploymentId, usize>>;
 
-    /// Count `Created` (in-flight, not yet accepted) agreements per indexer,
-    /// plus the global total. Offer pacing reads both to decide whether an
-    /// indexer or the network has spare acceptance capacity.
+    /// Count in-flight offers per indexer, plus the global total: `Created` agreements, and
+    /// `Cancelling` ones never accepted until their offer deadline. Offer pacing reads both to
+    /// decide whether an indexer or the network has spare acceptance capacity.
     async fn count_created_agreements_by_indexer(
         &self,
     ) -> RegistryResult<(std::collections::HashMap<IndexerId, u64>, u64)>;
