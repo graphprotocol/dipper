@@ -172,9 +172,10 @@ pub trait AgreementRegistry {
         indexer_ids: &[IndexerId],
     ) -> RegistryResult<std::collections::HashMap<DeploymentId, Vec<IndexerId>>>;
 
-    /// Get declined `CanceledByIndexer`/`Expired`/`Rejected` indexers grouped by
-    /// deployment. Each rejection reason gets its own exclusion window, as does an
-    /// expiry that never had an offer transaction; see the query for the details.
+    /// Get declined `CanceledByIndexer`/`Expired`/`Rejected` indexers, and those whose agreement
+    /// dipper ended `AbandonedByIndexer`, grouped by deployment. Each rejection reason gets its
+    /// own exclusion window, as does an expiry that never had an offer transaction; see the query
+    /// for the details.
     async fn get_declined_indexers_by_deployment(
         &self,
         default_lookback_days: i32,
@@ -246,10 +247,9 @@ pub trait AgreementRegistry {
         id: &IndexingAgreementId,
     ) -> RegistryResult<()>;
 
-    /// Record the on-chain tx hash of the most recent `offer()` submission
-    /// for this agreement. Observability-only; does not transition status.
-    /// Called once per submit (including resubmits after a dropped tx) so
-    /// the DB reflects the live hash rather than an evicted one.
+    /// Record the hash of the latest `offer()` transaction, unless the agreement has ended, so
+    /// a resubmit replaces a dropped one. [`NoRecordUpdated`](Error::NoRecordsUpdated) when no
+    /// row took it.
     async fn update_offer_tx_hash(
         &self,
         id: &IndexingAgreementId,
@@ -259,12 +259,59 @@ pub trait AgreementRegistry {
     /// Mark an indexing agreement as `CANCELED_BY_REQUESTER`.
     ///
     /// If there is no indexing agreement with the given ID, or if the agreement is not in the
-    /// `CREATED` or `ACCEPTED_ON_CHAIN` state, this method returns a
-    /// [`NoRecordUpdated`](Error::NoRecordsUpdated) error.
+    /// `CREATED`, `ACCEPTED_ON_CHAIN`, `REJECTED` or `CANCELLING` state, this method returns a
+    /// [`NoRecordUpdated`](Error::NoRecordsUpdated) error. One dipper was cancelling because its
+    /// indexer stopped serving it becomes `ABANDONED_BY_INDEXER` instead.
     async fn mark_indexing_agreement_as_canceled_by_requester(
         &self,
         id: &IndexingAgreementId,
     ) -> RegistryResult<()>;
+
+    /// Mark a `CREATED`, `ACCEPTED_ON_CHAIN`, `REJECTED` or `EXPIRED` agreement `CANCELLING`,
+    /// before its cancel is sent; [`NoRecordUpdated`](Error::NoRecordsUpdated) otherwise.
+    async fn mark_indexing_agreement_as_cancelling(
+        &self,
+        id: &IndexingAgreementId,
+    ) -> RegistryResult<()>;
+
+    /// Mark an `ACCEPTED_ON_CHAIN` agreement whose indexer stopped serving it `CANCELLING`,
+    /// before its cancel is sent, so it ends `ABANDONED_BY_INDEXER` once the chain confirms it;
+    /// [`NoRecordUpdated`](Error::NoRecordsUpdated) otherwise.
+    async fn mark_indexing_agreement_as_abandoning(
+        &self,
+        id: &IndexingAgreementId,
+    ) -> RegistryResult<()>;
+
+    /// Move a `CANCELED_BY_REQUESTER` or `REJECTED` agreement the chain shows live back to
+    /// `CANCELLING`, its cancel attempts reset; [`NoRecordUpdated`](Error::NoRecordsUpdated)
+    /// otherwise. `seen_live` when the chain was read and showed it live, which clears the end
+    /// on record and any announcement of it.
+    async fn reopen_indexing_agreement_cancel(
+        &self,
+        id: &IndexingAgreementId,
+        seen_live: bool,
+    ) -> RegistryResult<()>;
+
+    /// `CANCELLING` agreements marked over `min_age_minutes` ago, those checked longest ago
+    /// first; one whose cancel has failed `max_attempts` times only once an hour. One that may be paying
+    /// an indexer (accepted, or past the offer deadline, which only an accepted one outlives)
+    /// counts as checked an hour earlier, so it goes first without holding the rest back.
+    async fn get_cancelling_agreements(
+        &self,
+        batch_size: i64,
+        max_attempts: u32,
+        min_age_minutes: i32,
+    ) -> RegistryResult<Vec<CancellingAgreement>>;
+
+    /// Record a check of a `CANCELLING` agreement that left it cancelling, adding
+    /// `failed_attempts` to its failed cancels and returning the new count. `ended` says whether
+    /// the check found it no longer live on-chain, or `None` when the chain couldn't tell.
+    async fn record_cancel_check(
+        &self,
+        id: &IndexingAgreementId,
+        failed_attempts: u32,
+        ended: Option<bool>,
+    ) -> RegistryResult<u32>;
 
     /// Apply a reconciliation-driven state transition atomically.
     ///
@@ -380,6 +427,21 @@ pub trait AgreementRegistry {
         Ok(())
     }
 
+    /// Record an agreement's accept and its end together, in 1 write, so nothing reads one
+    /// without the other. Default no-op so mocks need not override.
+    #[allow(clippy::too_many_arguments)]
+    async fn record_accept_and_cancel_audit(
+        &self,
+        _agreement_id: &IndexingAgreementId,
+        _accepted_at: u64,
+        _accepted_tx: &str,
+        _canceled_at: u64,
+        _canceled_by: &str,
+        _canceled_tx: Option<&str>,
+    ) -> RegistryResult<()> {
+        Ok(())
+    }
+
     /// Record the cancel audit payload for a dipper-initiated cancel so the
     /// emission sweep can populate the `terminated` event fields. Default no-op
     /// so mocks need not override.
@@ -450,6 +512,16 @@ pub trait AgreementRegistry {
         batch_size: i64,
     ) -> RegistryResult<Vec<IndexingAgreement>>;
 
+    /// Agreements whose indexer stopped serving them that have ended, longest ended first,
+    /// whose replacement is yet to be queued.
+    async fn get_ended_agreements_awaiting_replacement(
+        &self,
+        batch_size: i64,
+    ) -> RegistryResult<Vec<IndexingAgreement>>;
+
+    /// Note that an agreement's replacement has been queued.
+    async fn mark_replacement_queued(&self, id: &IndexingAgreementId) -> RegistryResult<()>;
+
     /// Update the sync progress for an agreement.
     ///
     /// Called when the liveness checker observes the block height has changed
@@ -491,17 +563,6 @@ pub trait AgreementRegistry {
             .map(|m| !m.is_empty())
     }
 
-    /// Mark an indexing agreement as `ABANDONED_BY_INDEXER`.
-    ///
-    /// Transitions `AcceptedOnChain → AbandonedByIndexer`. Returns the full agreement
-    /// for use in the subsequent reassessment call.
-    /// Returns [`NoRecordsUpdated`](Error::NoRecordsUpdated) if the agreement doesn't
-    /// exist or isn't in `AcceptedOnChain` status.
-    async fn mark_indexing_agreement_as_abandoned(
-        &self,
-        id: &IndexingAgreementId,
-    ) -> RegistryResult<IndexingAgreement>;
-
     /// Get per-agreement rate fields from active agreements.
     ///
     /// Returns base rate, entity rate, and deployment ID for each active
@@ -520,6 +581,32 @@ pub struct AgreementFeeRate {
     pub tokens_per_second: f64,
     /// Entity rate in wei GRT per entity per second.
     pub tokens_per_entity_per_second: f64,
+}
+
+/// An agreement dipper is still cancelling on-chain.
+#[derive(Debug, Clone)]
+pub struct CancellingAgreement {
+    pub agreement: IndexingAgreement,
+    /// Whether dipper saw it accepted on-chain, so its end is announced.
+    pub accepted_on_chain: bool,
+    /// When a check first found it no longer live on-chain, if one has.
+    pub ended_seen_at: Option<OffsetDateTime>,
+    /// Whether it is being cancelled because its indexer stopped serving it, so it ends
+    /// `ABANDONED_BY_INDEXER`.
+    pub abandoned: bool,
+}
+
+impl TryFrom<dipper_pgregistry::CancellingAgreement> for CancellingAgreement {
+    type Error = anyhow::Error;
+
+    fn try_from(value: dipper_pgregistry::CancellingAgreement) -> Result<Self, Self::Error> {
+        Ok(Self {
+            agreement: value.agreement.try_into()?,
+            accepted_on_chain: value.accepted_on_chain,
+            ended_seen_at: value.ended_seen_at,
+            abandoned: value.abandoned,
+        })
+    }
 }
 
 /// An Indexing Agreement represents the contract between the DIPs Gateway (Dipper) and the indexer
@@ -684,11 +771,16 @@ pub enum Status {
 
     /// The liveness checker detected no indexing progress within the tolerance window.
     ///
-    /// Dipper canceled the agreement via `cancelIndexingAgreementByPayer` and will
-    /// trigger reassignment to find a replacement indexer.
+    /// Dipper cancelled the agreement on-chain, passing through `Cancelling` until the chain
+    /// confirmed it, and triggered reassignment to find a replacement indexer.
     ///
     /// This is a terminal state.
     AbandonedByIndexer,
+
+    /// Dipper decided to end the agreement and is cancelling it on-chain, where it may
+    /// still be live. It becomes `CanceledByRequester`, or `AbandonedByIndexer` when its
+    /// indexer stopped serving it, announced as ended, only once the chain confirms the end.
+    Cancelling,
 }
 
 impl std::fmt::Display for Status {
@@ -702,6 +794,7 @@ impl std::fmt::Display for Status {
             Status::AcceptedOnChain => "ACCEPTED_ON_CHAIN",
             Status::Rejected => "REJECTED",
             Status::AbandonedByIndexer => "ABANDONED_BY_INDEXER",
+            Status::Cancelling => "CANCELLING",
         };
         f.write_str(status)
     }
@@ -733,6 +826,7 @@ impl TryFrom<dipper_pgregistry::IndexingAgreement> for IndexingAgreement {
                 dipper_pgregistry::IndexingAgreementStatus::AbandonedByIndexer => {
                     Status::AbandonedByIndexer
                 }
+                dipper_pgregistry::IndexingAgreementStatus::Cancelling => Status::Cancelling,
                 _ => {
                     return Err(anyhow::anyhow!("Invalid status: {:?}", value.status));
                 }

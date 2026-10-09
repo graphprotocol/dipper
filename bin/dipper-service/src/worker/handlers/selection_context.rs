@@ -7,7 +7,9 @@ use thegraph_core::{DeploymentId, IndexerId, alloy::primitives::ChainId};
 
 use crate::{
     network::service::entity_count_cache::EntityCountCache,
-    registry::{AgreementRegistry, IndexerDenylistRegistry, IndexingAgreementStatus},
+    registry::{
+        AgreementRegistry, IndexerDenylistRegistry, IndexingAgreement, IndexingAgreementStatus,
+    },
     worker::result::{JobError, JobResult},
 };
 
@@ -42,11 +44,12 @@ where
     R: AgreementRegistry + IndexerDenylistRegistry,
 {
     // Get indexers that already have active agreements for this deployment
-    let existing_indexers = registry
+    let agreements = registry
         .get_indexing_agreements_by_deployment_id(deployment_id)
         .await
-        .map_err(|err| JobError::Fatal(err.into()))?
-        .into_iter()
+        .map_err(|err| JobError::Fatal(err.into()))?;
+    let existing_indexers = agreements
+        .iter()
         .filter(|a| is_active_agreement(&a.status))
         .map(|a| a.indexer.id)
         .collect::<Vec<_>>();
@@ -58,7 +61,7 @@ where
         .map_err(|err| JobError::Fatal(err.into()))?;
 
     // Get indexers that declined within their respective lookback periods
-    let declined_indexers = registry
+    let mut declined_indexers = registry
         .get_declined_indexers_by_deployment(
             declined_indexer_lookback_days,
             price_rejection_lookback_days,
@@ -67,6 +70,7 @@ where
         )
         .await
         .map_err(|err| JobError::Fatal(err.into()))?;
+    exclude_cancelling_indexers(&mut declined_indexers, *deployment_id, &agreements);
 
     // Get denied indexers that should be excluded from selection
     let indexer_denylist = registry
@@ -173,6 +177,30 @@ fn wei_per_second_to_grt_per_28d(wei_per_second: f64) -> f64 {
     wei_per_second * SECONDS_PER_28_DAYS / WEI_PER_GRT
 }
 
+/// Add to the deployment's declined list the indexers whose agreement dipper is still
+/// cancelling. That agreement may still be live and paid on-chain, so its indexer must not
+/// be picked again, but it no longer counts towards the group IISA sizes.
+fn exclude_cancelling_indexers(
+    declined: &mut HashMap<DeploymentId, Vec<IndexerId>>,
+    deployment_id: DeploymentId,
+    agreements: &[IndexingAgreement],
+) {
+    let cancelling = agreements
+        .iter()
+        .filter(|a| a.status == IndexingAgreementStatus::Cancelling)
+        .map(|a| a.indexer.id)
+        .collect::<Vec<_>>();
+    if cancelling.is_empty() {
+        return;
+    }
+    let excluded = declined.entry(deployment_id).or_default();
+    for indexer in cancelling {
+        if !excluded.contains(&indexer) {
+            excluded.push(indexer);
+        }
+    }
+}
+
 /// Check if an agreement status represents an active agreement.
 fn is_active_agreement(status: &IndexingAgreementStatus) -> bool {
     matches!(
@@ -184,7 +212,46 @@ fn is_active_agreement(status: &IndexingAgreementStatus) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::AgreementFeeRate;
+    use crate::{cancel_dispatch::tests::agreement, registry::AgreementFeeRate};
+
+    fn indexer(hex_digit: char) -> IndexerId {
+        format!("0x{}", hex_digit.to_string().repeat(40))
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn an_indexer_still_being_cancelled_cannot_be_picked_again_for_the_deployment() {
+        let deployment: DeploymentId = "QmTXzATwNfgGVukV1fX2T6xw9f6LAYRVWpsdXyRWzUR2H9"
+            .parse()
+            .unwrap();
+        let mut cancelling = agreement(IndexingAgreementStatus::Cancelling, None);
+        cancelling.indexer.id = indexer('b');
+        let mut accepted = agreement(IndexingAgreementStatus::AcceptedOnChain, None);
+        accepted.indexer.id = indexer('c');
+        let mut declined = HashMap::from([(deployment, vec![indexer('a')])]);
+
+        exclude_cancelling_indexers(&mut declined, deployment, &[cancelling, accepted]);
+
+        assert_eq!(declined[&deployment], vec![indexer('a'), indexer('b')]);
+    }
+
+    #[test]
+    fn a_cancelling_indexer_already_declined_is_listed_once_and_none_adds_no_entry() {
+        let deployment: DeploymentId = "QmTXzATwNfgGVukV1fX2T6xw9f6LAYRVWpsdXyRWzUR2H9"
+            .parse()
+            .unwrap();
+        let mut cancelling = agreement(IndexingAgreementStatus::Cancelling, None);
+        cancelling.indexer.id = indexer('a');
+        let mut declined = HashMap::from([(deployment, vec![indexer('a')])]);
+        exclude_cancelling_indexers(&mut declined, deployment, &[cancelling]);
+        assert_eq!(declined[&deployment], vec![indexer('a')]);
+
+        let mut none_declined = HashMap::new();
+        let accepted = agreement(IndexingAgreementStatus::AcceptedOnChain, None);
+        exclude_cancelling_indexers(&mut none_declined, deployment, &[accepted]);
+        assert!(none_declined.is_empty());
+    }
 
     #[test]
     fn test_wei_per_second_to_grt_per_28d() {

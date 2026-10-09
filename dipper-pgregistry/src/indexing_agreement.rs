@@ -200,11 +200,16 @@ pub enum Status {
 
     /// The liveness checker detected no indexing progress within the tolerance window.
     ///
-    /// Dipper canceled the agreement via `cancelIndexingAgreementByPayer` and will
-    /// trigger reassignment to find a replacement indexer.
+    /// Dipper cancelled the agreement on-chain, passing through `Cancelling` until the chain
+    /// confirmed it, and triggered reassignment to find a replacement indexer.
     ///
     /// This is a terminal state.
     AbandonedByIndexer = 8,
+
+    /// Dipper decided to end the agreement and is cancelling it on-chain, where it may
+    /// still be live. It becomes `CanceledByRequester`, or `AbandonedByIndexer` when its
+    /// indexer stopped serving it, announced as ended, only once the chain confirms the end.
+    Cancelling = 9,
 
     /// A fallback for unknown status values.
     Unknown = i32::MAX,
@@ -221,6 +226,7 @@ impl std::fmt::Display for Status {
             Status::AcceptedOnChain => "ACCEPTED_ON_CHAIN",
             Status::Rejected => "REJECTED",
             Status::AbandonedByIndexer => "ABANDONED_BY_INDEXER",
+            Status::Cancelling => "CANCELLING",
             Status::Unknown => "UNKNOWN",
         };
         f.write_str(status)

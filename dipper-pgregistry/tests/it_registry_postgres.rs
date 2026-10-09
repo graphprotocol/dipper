@@ -678,6 +678,52 @@ async fn get_declined_indexers_by_deployment_returns_rejected() {
 }
 
 #[tokio::test]
+async fn get_declined_indexers_by_deployment_includes_an_indexer_that_abandoned_it() {
+    // Otherwise the reassessment that replaces it could pick the same indexer straight back.
+    let (db, _temp_db) = temp_registry_db().await;
+    run_fixture(&db, include_str!("fixtures/0002_indexing_agreements.sql"))
+        .await
+        .expect("Failed to run fixture");
+    let registry = PgRegistry::new(db);
+    // Fixture 0002's accepted agreement.
+    let agreement_id =
+        IndexingAgreementId::from_bytes([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
+    let deployment: DeploymentId = "QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv"
+        .parse()
+        .unwrap();
+    let indexer = indexer_id!("d609e9fdd6ce53e5a26278c50486dd6791d4d705");
+    registry
+        .mark_indexing_agreement_as_abandoning(&agreement_id)
+        .await
+        .expect("abandon");
+    registry
+        .mark_indexing_agreement_as_canceled_by_requester(&agreement_id)
+        .await
+        .expect("ended abandoned");
+
+    let within = registry
+        .get_declined_indexers_by_deployment(30, 1, 5, 1)
+        .await
+        .expect("Failed to get declined indexers");
+    let past = registry
+        .get_declined_indexers_by_deployment(0, 1, 5, 1)
+        .await
+        .expect("Failed to get declined indexers");
+
+    assert!(
+        within
+            .get(&deployment)
+            .is_some_and(|ids| ids.contains(&indexer))
+    );
+    assert!(
+        !past
+            .get(&deployment)
+            .is_some_and(|ids| ids.contains(&indexer)),
+        "only for the standard lookback"
+    );
+}
+
+#[tokio::test]
 async fn get_declined_indexers_by_deployment_empty_when_no_declines() {
     //* Given
     let (db, _temp_db) = temp_registry_db().await;
@@ -1768,41 +1814,74 @@ async fn test_count_active_agreements_by_deployment() {
     );
 }
 
-#[tokio::test]
-async fn test_mark_as_abandoned_transitions_status() {
-    //* Given
+/// Start abandoning fixture 0002's accepted agreement, then end it the way `end` does.
+#[expect(
+    clippy::expect_used,
+    reason = "a test helper fails its test on any error"
+)]
+async fn abandon_then_end<F>(end: F) -> (Result<(), Error>, IndexingAgreementStatus)
+where
+    F: AsyncFnOnce(&PgRegistry, &IndexingAgreementId),
+{
     let (db, _temp_db) = temp_registry_db().await;
     run_fixture(&db, include_str!("fixtures/0002_indexing_agreements.sql"))
         .await
         .expect("Failed to run fixture");
     let registry = PgRegistry::new(db);
-
-    // AcceptedOnChain agreement from fixture 0002
     let agreement_id =
         IndexingAgreementId::from_bytes([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
-
-    //* When
-    let abandoned = registry
-        .mark_indexing_agreement_as_abandoned(&agreement_id)
+    registry
+        .mark_indexing_agreement_as_abandoning(&agreement_id)
         .await
-        .expect("Failed to mark agreement as abandoned");
-
-    //* Then
-    assert_eq!(
-        abandoned.status,
-        IndexingAgreementStatus::AbandonedByIndexer,
-        "Status should be AbandonedByIndexer"
-    );
-
-    // Second call must fail — agreement is no longer AcceptedOnChain
-    let err = registry
-        .mark_indexing_agreement_as_abandoned(&agreement_id)
+        .expect("an accepted agreement can be abandoned");
+    let listed = registry
+        .get_cancelling_agreements(100, 10, 0)
         .await
-        .expect_err("Expected error on second mark_as_abandoned call");
+        .expect("cancelling query");
+    assert!(listed[0].abandoned);
+
+    end(&registry, &agreement_id).await;
+
+    let again = registry
+        .mark_indexing_agreement_as_abandoning(&agreement_id)
+        .await;
+    let ended = registry
+        .get_indexing_agreement_by_id(&agreement_id)
+        .await
+        .expect("agreement query")
+        .expect("agreement");
+    (again, ended.status)
+}
+
+#[tokio::test]
+async fn an_abandoned_agreement_dipper_cancels_ends_abandoned() {
+    let (again, status) = abandon_then_end(async |registry, id| {
+        registry
+            .mark_indexing_agreement_as_canceled_by_requester(id)
+            .await
+            .expect("dipper's cancel confirmed");
+    })
+    .await;
+
+    assert_eq!(status, IndexingAgreementStatus::AbandonedByIndexer);
     assert!(
-        matches!(err, Error::NoRecordsUpdated),
-        "Expected NoRecordsUpdated, got: {err:?}"
+        matches!(again, Err(Error::NoRecordsUpdated)),
+        "got {again:?}"
     );
+}
+
+#[tokio::test]
+async fn an_abandoned_agreement_the_listener_sees_cancelled_ends_abandoned() {
+    let (_, status) = abandon_then_end(async |registry, id| {
+        let outcome = registry
+            .apply_reconciliation(id, false, Some(CancelKind::ByRequester))
+            .await
+            .expect("reconciliation");
+        assert!(outcome.did_cancel);
+    })
+    .await;
+
+    assert_eq!(status, IndexingAgreementStatus::AbandonedByIndexer);
 }
 
 // =============================================================================
@@ -2932,6 +3011,86 @@ async fn apply_reconciliation_batch_handles_all_four_item_shapes() {
 }
 
 #[tokio::test]
+async fn recording_a_missed_accept_announces_the_agreement_once() {
+    // The chain listener records the accept and cancel of an agreement dipper had
+    // already cancelled locally, on every read of its cancelled snapshot. The first
+    // values must stick and, once announced, a later read must not announce again.
+    let (db, _temp_db) = temp_registry_db().await;
+    run_fixture(
+        &db,
+        include_str!("fixtures/0003_multi_indexer_agreements.sql"),
+    )
+    .await
+    .expect("Failed to run fixture");
+    let registry = PgRegistry::new(db);
+    let id = IndexingAgreementId::from_bytes([0xbb, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    registry
+        .mark_indexing_agreement_as_canceled_by_requester(&id)
+        .await
+        .expect("dipper cancels it locally");
+
+    for (at, by) in [(1_700_000_002, "0xchain"), (1_800_000_000, "0xlater")] {
+        registry
+            .record_cancel_audit(&id, at, by, Some("0xcxltx"))
+            .await
+            .expect("cancel record");
+        registry
+            .record_accepted_audit(&id, at - 1, "0xacc")
+            .await
+            .expect("accept record");
+    }
+
+    let accepted = registry
+        .get_agreements_pending_accepted_emission(100)
+        .await
+        .expect("accepted query");
+    let accepted: Vec<_> = accepted.iter().filter(|p| p.agreement_id == id).collect();
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(accepted[0].accepted_at, 1_700_000_001);
+    let terminated = registry
+        .get_agreements_pending_terminated_emission(100)
+        .await
+        .expect("terminated query");
+    let terminated: Vec<_> = terminated.iter().filter(|p| p.agreement_id == id).collect();
+    assert_eq!(terminated.len(), 1);
+    assert_eq!(terminated[0].canceled_at, Some(1_700_000_002));
+    assert_eq!(terminated[0].canceled_by.as_deref(), Some("0xchain"));
+
+    registry
+        .mark_accepted_event_emitted(&id)
+        .await
+        .expect("mark accepted");
+    registry
+        .mark_terminated_event_emitted(&id)
+        .await
+        .expect("mark terminated");
+    registry
+        .record_cancel_audit(&id, 1_900_000_000, "0xagain", Some("0xcxltx"))
+        .await
+        .expect("cancel record");
+    registry
+        .record_accepted_audit(&id, 1_899_999_999, "0xacc")
+        .await
+        .expect("accept record");
+    assert!(
+        !registry
+            .get_agreements_pending_accepted_emission(100)
+            .await
+            .expect("accepted query")
+            .iter()
+            .any(|p| p.agreement_id == id)
+    );
+    assert!(
+        !registry
+            .get_agreements_pending_terminated_emission(100)
+            .await
+            .expect("terminated query")
+            .iter()
+            .any(|p| p.agreement_id == id)
+    );
+}
+
+#[tokio::test]
 async fn pending_emission_queries_cover_the_paired_accept_then_cancel() {
     // Regression guard: an agreement accepted and then cancelled in a single
     // snapshot (paired accept+cancel -- dipper was behind) ends up terminal, but
@@ -3263,4 +3422,634 @@ async fn count_created_agreements_by_indexer_counts_only_created() {
         "C's only row is Expired, so it should be absent"
     );
     assert_eq!(global, 3, "global counts only the 3 Created rows");
+}
+
+fn fixture_agreement(prefix: u8) -> IndexingAgreementId {
+    let mut bytes = [0u8; 16];
+    bytes[0] = prefix;
+    bytes[15] = 1;
+    IndexingAgreementId::from_bytes(bytes)
+}
+
+#[tokio::test]
+async fn cancelling_agreements_are_listed_until_their_cancel_fails_too_often() {
+    let (db, _temp_db) = temp_registry_db().await;
+    run_fixture(
+        &db,
+        include_str!("fixtures/0003_multi_indexer_agreements.sql"),
+    )
+    .await
+    .expect("Failed to run fixture");
+    let created = fixture_agreement(0xaa);
+    let registry = PgRegistry::new(db.clone());
+    let accepted =
+        IndexingAgreementId::from_bytes([0xaa, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    let ended =
+        IndexingAgreementId::from_bytes([0xaa, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
+    let expired = fixture_agreement(0xcc);
+
+    for id in [created, accepted, expired] {
+        registry
+            .mark_indexing_agreement_as_cancelling(&id)
+            .await
+            .expect("an agreement that may be live can be marked cancelling");
+    }
+    let result = registry.mark_indexing_agreement_as_cancelling(&ended).await;
+    assert!(
+        matches!(result, Err(Error::NoRecordsUpdated)),
+        "got {result:?}"
+    );
+    registry
+        .mark_indexing_agreement_as_canceled_by_requester(&expired)
+        .await
+        .expect("leave 2 cancelling");
+    registry
+        .record_accepted_audit(&accepted, 1_700_000_000, "0xacc")
+        .await
+        .expect("accept record");
+
+    let just_marked = registry
+        .get_cancelling_agreements(100, 2, 5)
+        .await
+        .expect("cancelling query");
+    assert!(
+        just_marked.is_empty(),
+        "one just marked waits for the cancel sent with the mark to be mined"
+    );
+
+    let listed = registry
+        .get_cancelling_agreements(100, 2, 0)
+        .await
+        .expect("cancelling query");
+    let mut seen: Vec<_> = listed
+        .iter()
+        .map(|row| {
+            (
+                row.agreement.id,
+                row.accepted_on_chain,
+                row.agreement.status,
+            )
+        })
+        .collect();
+    seen.sort_by_key(|(id, ..)| *id);
+    assert_eq!(
+        seen,
+        vec![
+            (created, false, IndexingAgreementStatus::Cancelling),
+            (accepted, true, IndexingAgreementStatus::Cancelling),
+        ]
+    );
+
+    for attempts in [1, 2] {
+        let counted = registry.record_cancel_check(&created, 1, None).await;
+        assert_eq!(counted.unwrap(), attempts);
+    }
+    let listed = registry
+        .get_cancelling_agreements(100, 2, 0)
+        .await
+        .expect("cancelling query");
+    let ids: Vec<_> = listed.iter().map(|row| row.agreement.id).collect();
+    assert_eq!(
+        ids,
+        vec![accepted],
+        "one that failed too often waits an hour between checks"
+    );
+
+    sqlx::query(
+        "UPDATE dipper_reg_indexing_agreements \
+         SET cancel_checked_at = cancel_checked_at - INTERVAL '2 hours' WHERE id = $1",
+    )
+    .bind(created)
+    .execute(&db)
+    .await
+    .expect("Failed to age the check");
+    let listed = registry
+        .get_cancelling_agreements(100, 2, 0)
+        .await
+        .expect("cancelling query");
+    assert!(
+        listed.iter().any(|row| row.agreement.id == created),
+        "and is tried again after it"
+    );
+
+    let not_cancelling = registry
+        .record_cancel_check(&fixture_agreement(0xbb), 1, None)
+        .await;
+    assert!(matches!(not_cancelling, Err(Error::NoRecordsUpdated)));
+}
+
+#[tokio::test]
+async fn cancelling_agreements_that_may_be_paying_go_first() {
+    let (db, _temp_db) = temp_registry_db().await;
+    run_fixture(
+        &db,
+        include_str!("fixtures/0003_multi_indexer_agreements.sql"),
+    )
+    .await
+    .expect("Failed to run fixture");
+    let offer = fixture_agreement(0xaa);
+    // An offer still open to acceptance, so only the accepted agreement can be paying.
+    sqlx::query(
+        "UPDATE dipper_reg_indexing_agreements \
+         SET terms = jsonb_set(terms::jsonb, '{deadline}', to_jsonb(4102444800::bigint)) \
+         WHERE id = $1",
+    )
+    .bind(offer)
+    .execute(&db)
+    .await
+    .expect("Failed to update deadline");
+    let registry = PgRegistry::new(db.clone());
+    let accepted =
+        IndexingAgreementId::from_bytes([0xaa, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    registry
+        .record_accepted_audit(&accepted, 1_700_000_000, "0xacc")
+        .await
+        .expect("accept record");
+    for id in [accepted, offer] {
+        registry
+            .mark_indexing_agreement_as_cancelling(&id)
+            .await
+            .expect("mark cancelling");
+    }
+    let order = async || -> Vec<IndexingAgreementId> {
+        let listed = registry
+            .get_cancelling_agreements(100, 2, 0)
+            .await
+            .expect("cancelling query");
+        listed.iter().map(|row| row.agreement.id).collect()
+    };
+
+    registry
+        .record_cancel_check(&accepted, 0, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        order().await,
+        vec![accepted, offer],
+        "one accepted on-chain may be paying its indexer, so it goes ahead of an offer newly \
+         marked, which counts as checked when it was marked"
+    );
+
+    registry.record_cancel_check(&offer, 0, None).await.unwrap();
+    assert_eq!(order().await, vec![accepted, offer]);
+
+    sqlx::query(
+        "UPDATE dipper_reg_indexing_agreements \
+         SET cancel_checked_at = cancel_checked_at - INTERVAL '2 hours' WHERE id = $1",
+    )
+    .bind(offer)
+    .execute(&db)
+    .await
+    .expect("Failed to age the check");
+    assert_eq!(
+        order().await,
+        vec![offer, accepted],
+        "an offer unchecked for over an hour isn't held back for ever"
+    );
+}
+
+#[tokio::test]
+async fn a_cancelling_agreement_keeps_when_it_was_first_found_ended() {
+    let (db, _temp_db) = temp_registry_db().await;
+    run_fixture(
+        &db,
+        include_str!("fixtures/0003_multi_indexer_agreements.sql"),
+    )
+    .await
+    .expect("Failed to run fixture");
+    let registry = PgRegistry::new(db);
+    let id = fixture_agreement(0xaa);
+    registry
+        .mark_indexing_agreement_as_cancelling(&id)
+        .await
+        .expect("mark cancelling");
+    let ended_seen_at = async || {
+        registry
+            .get_cancelling_agreements(100, 10, 0)
+            .await
+            .expect("cancelling query")[0]
+            .ended_seen_at
+    };
+
+    registry
+        .record_cancel_check(&id, 0, Some(true))
+        .await
+        .unwrap();
+    let first = ended_seen_at().await.expect("found ended");
+    registry
+        .record_cancel_check(&id, 0, Some(true))
+        .await
+        .unwrap();
+    registry.record_cancel_check(&id, 0, None).await.unwrap();
+    assert_eq!(
+        ended_seen_at().await,
+        Some(first),
+        "kept from the first time"
+    );
+
+    registry
+        .record_cancel_check(&id, 0, Some(false))
+        .await
+        .unwrap();
+    assert_eq!(ended_seen_at().await, None, "found live again");
+}
+
+#[tokio::test]
+async fn an_ended_agreement_found_live_on_chain_goes_back_to_cancelling() {
+    let (db, _temp_db) = temp_registry_db().await;
+    run_fixture(
+        &db,
+        include_str!("fixtures/0003_multi_indexer_agreements.sql"),
+    )
+    .await
+    .expect("Failed to run fixture");
+    let registry = PgRegistry::new(db.clone());
+    let ended = fixture_agreement(0xaa);
+    let accepted =
+        IndexingAgreementId::from_bytes([0xaa, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    registry
+        .mark_indexing_agreement_as_cancelling(&ended)
+        .await
+        .expect("mark cancelling");
+    // The withdrawal of its offer, recorded as its end before the offer landed after all.
+    registry
+        .record_cancel_audit(&ended, 1_700_000_000, "0xpayer", Some("0xwithdrawal"))
+        .await
+        .expect("cancel record");
+    assert_eq!(
+        registry.record_cancel_check(&ended, 2, None).await.unwrap(),
+        2
+    );
+    registry
+        .mark_indexing_agreement_as_canceled_by_requester(&ended)
+        .await
+        .expect("mark ended");
+
+    registry
+        .reopen_indexing_agreement_cancel(&ended, true)
+        .await
+        .expect("an ended agreement can be reopened");
+    let (canceled_tx,): (Option<String>,) =
+        sqlx::query_as("SELECT canceled_tx FROM dipper_reg_indexing_agreements WHERE id = $1")
+            .bind(ended)
+            .fetch_one(&db)
+            .await
+            .expect("cancel record query");
+    assert_eq!(
+        canceled_tx, None,
+        "the end on record no longer stands once the chain shows it live"
+    );
+
+    // Reopening sends no cancel, so there is none to wait on being mined.
+    let listed = registry
+        .get_cancelling_agreements(100, 1, 5)
+        .await
+        .expect("cancelling query");
+    let ids: Vec<_> = listed.iter().map(|row| row.agreement.id).collect();
+    assert_eq!(ids, vec![ended], "its cancel attempts start afresh");
+    let still_wanted = registry
+        .reopen_indexing_agreement_cancel(&accepted, true)
+        .await;
+    assert!(
+        matches!(still_wanted, Err(Error::NoRecordsUpdated)),
+        "got {still_wanted:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_end_recorded_before_the_accept_gives_way_to_the_real_one() {
+    // An offer withdrawn, then accepted when it landed after all: the withdrawal can't be the
+    // end of an agreement accepted later, however the agreement came back to be cancelled.
+    let (db, _temp_db) = temp_registry_db().await;
+    run_fixture(
+        &db,
+        include_str!("fixtures/0003_multi_indexer_agreements.sql"),
+    )
+    .await
+    .expect("Failed to run fixture");
+    let registry = PgRegistry::new(db.clone());
+    let id = fixture_agreement(0xaa);
+    let canceled_tx = async || -> Option<String> {
+        let (tx,): (Option<String>,) =
+            sqlx::query_as("SELECT canceled_tx FROM dipper_reg_indexing_agreements WHERE id = $1")
+                .bind(id)
+                .fetch_one(&db)
+                .await
+                .expect("cancel record query");
+        tx
+    };
+    registry
+        .record_cancel_audit(&id, 1_000, "0xpayer", Some("0xwithdrawal"))
+        .await
+        .expect("cancel record");
+    registry
+        .record_accepted_audit(&id, 2_000, "0xaccept")
+        .await
+        .expect("accept record");
+
+    registry
+        .record_cancel_audit(&id, 3_000, "0xpayer", Some("0xcancel"))
+        .await
+        .expect("cancel record");
+    assert_eq!(canceled_tx().await.as_deref(), Some("0xcancel"));
+
+    registry
+        .record_cancel_audit(&id, 4_000, "0xpayer", Some("0xlater"))
+        .await
+        .expect("cancel record");
+    assert_eq!(
+        canceled_tx().await.as_deref(),
+        Some("0xcancel"),
+        "a real end, after the accept, is kept"
+    );
+}
+
+#[tokio::test]
+async fn a_cancelling_agreement_stays_live_and_unannounced_until_it_ends() {
+    let (db, _temp_db) = temp_registry_db().await;
+    run_fixture(
+        &db,
+        include_str!("fixtures/0003_multi_indexer_agreements.sql"),
+    )
+    .await
+    .expect("Failed to run fixture");
+    let registry = PgRegistry::new(db);
+    let cancelling =
+        IndexingAgreementId::from_bytes([0xaa, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    let by_indexer = fixture_agreement(0xbb);
+    registry
+        .mark_indexing_agreement_as_canceled_by_requester(&fixture_agreement(0xaa))
+        .await
+        .expect("cancel the other live agreement");
+    for id in [cancelling, by_indexer] {
+        registry
+            .mark_indexing_agreement_as_cancelling(&id)
+            .await
+            .expect("mark cancelling");
+    }
+    registry
+        .record_accepted_audit(&cancelling, 1_700_000_000, "0xacc")
+        .await
+        .expect("accept record");
+    registry
+        .record_cancel_audit(&cancelling, 1_700_000_001, "0xmgr", Some("0xcxl"))
+        .await
+        .expect("cancel record");
+
+    assert!(
+        !registry.exists_active_agreements().await.unwrap(),
+        "agreements being cancelled don't keep the listener polling fast; their retry \
+         runs on its own timer"
+    );
+    let fee_rates = registry
+        .get_agreement_fee_rates()
+        .await
+        .expect("fee rates query");
+    assert!(
+        fee_rates.iter().any(|(id, ..)| *id == cancelling),
+        "its fees still count until the cancel lands"
+    );
+    let terminated = registry
+        .get_agreements_pending_terminated_emission(100)
+        .await
+        .expect("terminated query");
+    assert!(
+        terminated.iter().all(|p| p.agreement_id != cancelling),
+        "not announced as ended while still cancelling"
+    );
+
+    let outcome = registry
+        .apply_reconciliation(&by_indexer, false, Some(CancelKind::ByIndexer))
+        .await
+        .expect("indexer's cancel read from the chain");
+    assert!(outcome.did_cancel);
+    registry
+        .mark_indexing_agreement_as_canceled_by_requester(&cancelling)
+        .await
+        .expect("dipper's cancel confirmed");
+
+    let terminated = registry
+        .get_agreements_pending_terminated_emission(100)
+        .await
+        .expect("terminated query");
+    assert!(terminated.iter().any(|p| p.agreement_id == cancelling));
+}
+
+/// Reassess can mark an agreement `Cancelling` while its offer is mining, and the offer can
+/// still land, so its hash is worth keeping. Once the agreement has ended it isn't.
+#[tokio::test]
+async fn an_offer_mined_after_the_cancel_began_keeps_its_hash() {
+    let (db, _temp_db) = temp_registry_db().await;
+    run_fixture(
+        &db,
+        include_str!("fixtures/0003_multi_indexer_agreements.sql"),
+    )
+    .await
+    .expect("Failed to run fixture");
+    let registry = PgRegistry::new(db.clone());
+    let id = fixture_agreement(0xaa);
+    registry
+        .mark_indexing_agreement_as_cancelling(&id)
+        .await
+        .expect("mark cancelling");
+    let stored = async || {
+        sqlx::query_as::<_, (Option<Vec<u8>>, time::OffsetDateTime)>(
+            "SELECT offer_tx_hash, updated_at FROM dipper_reg_indexing_agreements WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&db)
+        .await
+        .expect("read the agreement")
+    };
+    let (_, marked_at) = stored().await;
+
+    registry
+        .update_offer_tx_hash(&id, &[0x11; 32])
+        .await
+        .expect("a cancelling agreement takes the hash");
+    assert_eq!(
+        stored().await,
+        (Some(vec![0x11; 32]), marked_at),
+        "hash stored, and the time it was marked kept"
+    );
+
+    sqlx::query("UPDATE dipper_reg_indexing_agreements SET status = 5 WHERE id = $1")
+        .bind(id)
+        .execute(&db)
+        .await
+        .expect("expire the agreement");
+    let err = registry
+        .update_offer_tx_hash(&id, &[0x22; 32])
+        .await
+        .expect_err("an ended agreement doesn't take the hash");
+    assert!(matches!(err, Error::NoRecordsUpdated));
+}
+
+/// An agreement whose indexer stopped serving it is replaced only once it can't be paid, and
+/// only once, whatever ended it.
+#[tokio::test]
+async fn an_abandoned_agreement_awaits_replacement_once_ended_until_queued() {
+    let (db, _temp_db) = temp_registry_db().await;
+    run_fixture(
+        &db,
+        include_str!("fixtures/0003_multi_indexer_agreements.sql"),
+    )
+    .await
+    .expect("Failed to run fixture");
+    let id = fixture_agreement(0xaa);
+    sqlx::query("UPDATE dipper_reg_indexing_agreements SET status = $1 WHERE id = $2")
+        .bind(IndexingAgreementStatus::AcceptedOnChain)
+        .bind(id)
+        .execute(&db)
+        .await
+        .expect("accept the agreement");
+    let registry = PgRegistry::new(db);
+    registry
+        .mark_indexing_agreement_as_abandoning(&id)
+        .await
+        .expect("mark abandoning");
+    let awaiting = async || {
+        registry
+            .get_ended_agreements_awaiting_replacement(10)
+            .await
+            .expect("awaiting query")
+            .into_iter()
+            .map(|agreement| agreement.id)
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        awaiting().await.is_empty(),
+        "still cancelling, so maybe paid"
+    );
+
+    registry
+        .mark_indexing_agreement_as_canceled_by_requester(&id)
+        .await
+        .expect("end it");
+    assert_eq!(awaiting().await, vec![id]);
+
+    registry
+        .mark_replacement_queued(&id)
+        .await
+        .expect("note it queued");
+    assert!(awaiting().await.is_empty());
+}
+
+/// The accept and end of an agreement replayed from the chain go in together: an end already
+/// known stays, unless it came before the accept, and then the replayed end is announced.
+#[tokio::test]
+async fn an_accept_and_end_from_the_chain_are_recorded_in_1_write() {
+    let (db, _temp_db) = temp_registry_db().await;
+    run_fixture(
+        &db,
+        include_str!("fixtures/0003_multi_indexer_agreements.sql"),
+    )
+    .await
+    .expect("Failed to run fixture");
+    let id = fixture_agreement(0xaa);
+    let registry = PgRegistry::new(db.clone());
+    let record = async |accepted_at: u64, canceled_at: u64, tx: &str| {
+        registry
+            .record_accept_and_cancel_audit(
+                &id,
+                accepted_at,
+                "0xacc",
+                canceled_at,
+                "payer",
+                Some(tx),
+            )
+            .await
+            .expect("record");
+    };
+    let recorded = async || {
+        sqlx::query_as::<_, (Option<i64>, Option<i64>, Option<String>, bool)>(
+            "SELECT accepted_at, canceled_at, canceled_tx, terminated_event_emitted_at IS NULL \
+             FROM dipper_reg_indexing_agreements WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&db)
+        .await
+        .expect("read")
+    };
+
+    // Its offer was withdrawn at 50, already announced, before an accept at 100 came to light.
+    sqlx::query(
+        "UPDATE dipper_reg_indexing_agreements SET canceled_at = 50, canceled_tx = '0xwd', \
+         terminated_event_emitted_at = now() WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&db)
+    .await
+    .expect("withdraw");
+    record(100, 200, "0xend").await;
+    assert_eq!(
+        recorded().await,
+        (Some(100), Some(200), Some("0xend".to_owned()), true),
+        "the end before the accept gives way, to be announced again"
+    );
+
+    record(300, 400, "0xlater").await;
+    assert_eq!(
+        recorded().await,
+        (Some(100), Some(200), Some("0xend".to_owned()), true),
+        "what is already known stays"
+    );
+}
+
+/// An ended agreement's `terminated` event waits for the transaction that ended it, which the
+/// chain listener can record after dipper marks it ended, but not for ever.
+#[tokio::test]
+async fn an_end_is_announced_once_its_transaction_is_known_or_after_an_hour() {
+    let (db, _temp_db) = temp_registry_db().await;
+    run_fixture(
+        &db,
+        include_str!("fixtures/0003_multi_indexer_agreements.sql"),
+    )
+    .await
+    .expect("Failed to run fixture");
+    let id = fixture_agreement(0xaa);
+    let registry = PgRegistry::new(db.clone());
+    registry
+        .mark_indexing_agreement_as_canceled_by_requester(&id)
+        .await
+        .expect("dipper ends it");
+    registry
+        .record_accepted_audit(&id, 1_700_000_000, "0xacc")
+        .await
+        .expect("its accept is known");
+    let pending = async || {
+        registry
+            .get_agreements_pending_terminated_emission(100)
+            .await
+            .expect("terminated query")
+            .iter()
+            .any(|p| p.agreement_id == id)
+    };
+    assert!(!pending().await, "waits for its transaction");
+
+    sqlx::query(
+        "UPDATE dipper_reg_indexing_agreements \
+         SET updated_at = timezone('UTC', now()) - interval '61 minutes' WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&db)
+    .await
+    .expect("age it");
+    assert!(pending().await, "goes out without one after an hour");
+
+    sqlx::query(
+        "UPDATE dipper_reg_indexing_agreements SET updated_at = timezone('UTC', now()) WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&db)
+    .await
+    .expect("make it recent again");
+    registry
+        .record_cancel_audit(&id, 1_700_000_100, "0xmgr", Some("0xend"))
+        .await
+        .expect("its transaction is recorded");
+    assert!(
+        pending().await,
+        "goes out as soon as its transaction is known"
+    );
 }

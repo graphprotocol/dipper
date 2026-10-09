@@ -4,10 +4,7 @@ use thegraph_core::{DeploymentId, alloy::primitives::ChainId};
 use url::Url;
 
 use super::{
-    handlers::{
-        CancelRejectedAgreementOnChain, ReassessIndexingRequest, SendIndexingAgreementProposal,
-        SubmitOffer,
-    },
+    handlers::{ReassessIndexingRequest, SendIndexingAgreementProposal, SubmitOffer},
     messages::Message,
     queue::{JobId, JobPriority, Queue},
 };
@@ -30,15 +27,6 @@ pub trait WorkerQueue {
         deployment_id: DeploymentId,
         deployment_chain_id: ChainId,
         num_candidates: usize,
-        priority: JobPriority,
-    ) -> anyhow::Result<JobId>;
-
-    /// Cancel a rejected agreement on-chain. When an indexer rejected off-chain
-    /// but accepted on-chain, this cancels the agreement via
-    /// `cancelIndexingAgreementByPayer`.
-    async fn cancel_rejected_agreement_on_chain(
-        &self,
-        agreement_id: IndexingAgreementId,
         priority: JobPriority,
     ) -> anyhow::Result<JobId>;
 
@@ -118,21 +106,6 @@ where
                     deployment_id,
                     deployment_chain_id,
                     num_candidates,
-                }),
-                priority,
-            )
-            .await
-    }
-
-    async fn cancel_rejected_agreement_on_chain(
-        &self,
-        agreement_id: IndexingAgreementId,
-        priority: JobPriority,
-    ) -> anyhow::Result<JobId> {
-        self.queue
-            .push(
-                Message::CancelRejectedAgreementOnChain(CancelRejectedAgreementOnChain {
-                    agreement_id,
                 }),
                 priority,
             )
@@ -246,10 +219,10 @@ mod tests {
         assert_eq!(*queue.queue.pushes.lock().unwrap(), vec![Some(4)]);
     }
 
-    /// Only the offer submission has a deadline to spend its retries against,
-    /// so every other job keeps the queue-wide budget.
+    /// A proposal has no deadline of its own to spend retries against, so it
+    /// keeps the queue-wide budget.
     #[tokio::test]
-    async fn other_jobs_keep_the_queue_default_retry_budget() {
+    async fn a_proposal_keeps_the_queue_default_retry_budget() {
         //* Arrange
         let queue = handle(4);
 
@@ -265,15 +238,8 @@ mod tests {
             )
             .await
             .unwrap();
-        queue
-            .cancel_rejected_agreement_on_chain(
-                IndexingAgreementId::from_bytes([0; 16]),
-                JobPriority::Background,
-            )
-            .await
-            .unwrap();
 
         //* Assert
-        assert_eq!(*queue.queue.pushes.lock().unwrap(), vec![None, None]);
+        assert_eq!(*queue.queue.pushes.lock().unwrap(), vec![None]);
     }
 }

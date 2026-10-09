@@ -540,6 +540,7 @@ mod tests {
     use thegraph_core::alloy::primitives::B256;
 
     use super::*;
+    use crate::chain_client::AgreementOnChain;
 
     const NOW: u64 = 1_800_000_000;
 
@@ -692,10 +693,10 @@ mod tests {
             }
             Ok(Some(B256::ZERO))
         }
-        async fn agreement_still_active(
+        async fn agreement_on_chain(
             &self,
             _agreement_id: &[u8; 16],
-        ) -> Result<bool, ChainClientError> {
+        ) -> Result<AgreementOnChain, ChainClientError> {
             unimplemented!()
         }
         async fn reconcile_agreement(

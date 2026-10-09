@@ -10,7 +10,7 @@ use std::{
 
 use thegraph_core::alloy::{
     providers::{
-        ProviderBuilder, RootProvider,
+        Provider, ProviderBuilder, RootProvider,
         fillers::{BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller},
     },
     transports::{RpcError, TransportError, TransportErrorKind},
@@ -53,9 +53,22 @@ fn describe_failure(url: &Url, error: &TransportError) -> String {
         .replace(url.as_str().trim_end_matches('/'), &name)
 }
 
+/// 1 endpoint's latest block, asked once. A failure is described without the URL, since
+/// hosted endpoints carry their API key in it.
+async fn latest_block(http: reqwest::Client, url: &Url) -> Result<u64, String> {
+    let provider = ProviderBuilder::new().connect_reqwest(http, url.clone());
+    provider
+        .get_block_number()
+        .await
+        .map_err(|err| describe_failure(url, &err))
+}
+
 /// Error text that indicates a transient failure worth retrying, used only for faults
 /// that arrive as prose rather than as a status code or JSON-RPC error object.
 const RETRYABLE_ERROR_PATTERNS: &[&str] = &[
+    // A node behind the rest of its provider's fleet, asked for a block it hasn't reached.
+    "header not found",
+    "unknown block",
     "connection refused",
     "connection reset",
     "connection closed",
@@ -67,6 +80,18 @@ const RETRYABLE_ERROR_PATTERNS: &[&str] = &[
     "bad gateway",
     "temporary internal error",
 ];
+
+/// How a read refused by an endpoint behind a block dipper has already seen describes it. It
+/// gets quick retries, since an endpoint a few blocks behind catches up within a second, then
+/// the next endpoint, rather than the backoff for a failing one.
+pub(super) const BEHIND_A_SEEN_BLOCK: &str = "behind a block already seen";
+
+/// How long a read waits before asking an endpoint behind a block already seen again: 2 blocks.
+const LAG_PAUSE: Duration = Duration::from_millis(500);
+
+/// How many times an endpoint behind a block already seen is asked again: about 4 blocks of
+/// lag in all, so the read just after a transaction mines can wait out a node a little behind.
+const LAG_RETRIES: u32 = 2;
 
 /// Type alias for the provider with default fillers.
 pub type HttpProvider = FillProvider<
@@ -146,6 +171,39 @@ impl RpcProviderPool {
         self.worst_case_walk
     }
 
+    /// How many endpoints the pool has.
+    pub fn endpoint_count(&self) -> usize {
+        self.providers.len()
+    }
+
+    /// Each endpoint's latest block, all asked at once with no retries. Endpoints that fail, or
+    /// don't answer within `deadline`, are left out, so dipper can see whether the rest agree.
+    pub async fn latest_blocks(&self, deadline: Duration) -> Vec<u64> {
+        let mut asks = tokio::task::JoinSet::new();
+        for url in &self.providers {
+            let (http, url) = (self.http.clone(), url.clone());
+            asks.spawn(async move {
+                let head = tokio::time::timeout(deadline, latest_block(http, &url))
+                    .await
+                    .unwrap_or_else(|_| Err(format!("no answer within {deadline:?}")));
+                (endpoint_name(&url), head)
+            });
+        }
+        let mut heads = Vec::with_capacity(self.providers.len());
+        while let Some(answer) = asks.join_next().await {
+            match answer {
+                Ok((_, Ok(head))) => heads.push(head),
+                Ok((endpoint, Err(reason))) => tracing::debug!(
+                    provider = %endpoint,
+                    error = %reason,
+                    "RPC endpoint didn't give its latest block for a cross-check"
+                ),
+                Err(err) => tracing::warn!(error = %err, "Latest-block cross-check task failed"),
+            }
+        }
+        heads
+    }
+
     /// Rotate to the next provider.
     ///
     /// Returns the new provider URL after rotation.
@@ -199,41 +257,15 @@ impl RpcProviderPool {
             let current_url = self.url_at(start + providers_tried).clone();
             let endpoint = endpoint_name(&current_url);
 
-            // Reused across this endpoint's attempts, so a retry does not pay for a fresh
-            // TLS handshake on the path that is already running out of time.
-            let provider =
-                ProviderBuilder::new().connect_reqwest(self.http.clone(), current_url.clone());
+            let endpoint_error = match self
+                .ask_endpoint(operation, &current_url, max_retries, &f)
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(err) => err,
+            };
 
-            // Retry loop for current provider
-            let mut endpoint_error: Option<TransportError> = None;
-            for attempt in 0..=max_retries {
-                match f(provider.clone()).await {
-                    Ok(result) => return Ok(result),
-                    Err(e) if Self::is_retryable(&e) && attempt < max_retries => {
-                        let delay = Self::backoff_delay(attempt);
-                        tracing::warn!(
-                            operation,
-                            provider = %endpoint,
-                            attempt = attempt + 1,
-                            max_retries,
-                            delay_ms = delay.as_millis(),
-                            error = %describe_failure(&current_url, &e),
-                            "Retryable RPC error, backing off"
-                        );
-                        tokio::time::sleep(delay).await;
-                        endpoint_error = Some(e);
-                    }
-                    Err(e) => {
-                        endpoint_error = Some(e);
-                        break;
-                    }
-                }
-            }
-            // Every attempt records why it failed before stopping, so the fallback only
-            // covers a configuration that somehow allows no attempt at all.
-            let endpoint_error = endpoint_error
-                .unwrap_or_else(|| TransportErrorKind::custom_str("no attempt was made"));
-
+            let lagging = Self::is_behind(&endpoint_error);
             let reason = describe_failure(&current_url, &endpoint_error);
             reasons.push(format!("{endpoint}: {reason}"));
             providers_tried += 1;
@@ -261,16 +293,89 @@ impl RpcProviderPool {
             // back round to a failing endpoint, costing them the one wasted first ask.
             self.rotate();
             let next_url = self.url_at(start + providers_tried);
-            tracing::warn!(
-                operation,
-                old_provider = %endpoint,
-                new_provider = %endpoint_name(next_url),
-                providers_tried,
-                total_providers = self.providers.len(),
-                error = %reason,
-                "Rotating RPC provider after failures"
-            );
+            if lagging {
+                tracing::debug!(
+                    operation,
+                    old_provider = %endpoint,
+                    new_provider = %endpoint_name(next_url),
+                    error = %reason,
+                    "Rotating RPC provider past one behind a block already seen"
+                );
+            } else {
+                tracing::warn!(
+                    operation,
+                    old_provider = %endpoint,
+                    new_provider = %endpoint_name(next_url),
+                    providers_tried,
+                    total_providers = self.providers.len(),
+                    error = %reason,
+                    "Rotating RPC provider after failures"
+                );
+            }
         }
+    }
+
+    /// Run a call against one endpoint, retrying a fault worth another go, and return what it
+    /// answered or why it last failed.
+    async fn ask_endpoint<F, Fut, T>(
+        &self,
+        operation: &str,
+        url: &Url,
+        max_retries: u32,
+        f: &F,
+    ) -> Result<T, TransportError>
+    where
+        F: Fn(HttpProvider) -> Fut,
+        Fut: Future<Output = Result<T, TransportError>>,
+    {
+        let endpoint = endpoint_name(url);
+        // Reused across this endpoint's attempts, so a retry does not pay for a fresh
+        // TLS handshake on the path that is already running out of time.
+        let provider = ProviderBuilder::new().connect_reqwest(self.http.clone(), url.clone());
+        let mut endpoint_error: Option<TransportError> = None;
+        let mut lag_retries = 0;
+        for attempt in 0..=max_retries {
+            match f(provider.clone()).await {
+                Ok(result) => return Ok(result),
+                Err(e)
+                    if Self::is_behind(&e)
+                        && lag_retries < LAG_RETRIES
+                        && attempt < max_retries =>
+                {
+                    tracing::debug!(
+                        operation,
+                        provider = %endpoint,
+                        error = %describe_failure(url, &e),
+                        "RPC endpoint behind a block already seen, asking again"
+                    );
+                    lag_retries += 1;
+                    tokio::time::sleep(LAG_PAUSE).await;
+                    endpoint_error = Some(e);
+                }
+                Err(e) if Self::is_retryable(&e) && attempt < max_retries => {
+                    let delay = Self::backoff_delay(attempt);
+                    tracing::warn!(
+                        operation,
+                        provider = %endpoint,
+                        attempt = attempt + 1,
+                        max_retries,
+                        delay_ms = delay.as_millis(),
+                        error = %describe_failure(url, &e),
+                        "Retryable RPC error, backing off"
+                    );
+                    tokio::time::sleep(delay).await;
+                    endpoint_error = Some(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        // Every attempt records why it failed before stopping, so the fallback only
+        // covers a configuration that somehow allows no attempt at all.
+        Err(endpoint_error.unwrap_or_else(|| TransportErrorKind::custom_str("no attempt was made")))
+    }
+
+    fn is_behind(error: &TransportError) -> bool {
+        error.to_string().contains(BEHIND_A_SEEN_BLOCK)
     }
 
     /// Whether an error is worth trying again rather than giving up on. Each check can only
@@ -501,6 +606,53 @@ mod tests {
         );
     }
 
+    /// The latest-block cross-check logs each endpoint's failure, so it must hide the key too.
+    #[tokio::test]
+    async fn a_cross_check_failure_hides_the_api_key() {
+        let keyed: Url = "http://127.0.0.1:1/v2/super-secret-key"
+            .parse()
+            .expect("keyed endpoint URL");
+
+        let reason = latest_block(reqwest::Client::new(), &keyed)
+            .await
+            .expect_err("nothing is listening, so the ask fails");
+
+        assert!(
+            !reason.contains("super-secret-key"),
+            "the API key must not appear in the failure: {reason}"
+        );
+    }
+
+    /// Reads wait on the cross-check, so 1 endpoint that never answers must not hold it for the
+    /// whole request timeout. The healthy endpoint's head still counts.
+    #[tokio::test]
+    async fn a_cross_check_stops_waiting_for_a_hung_endpoint() {
+        let healthy = server_answering_block(0x2a).await;
+        let hung = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
+            .mount(&hung)
+            .await;
+        let pool = RpcProviderPool::new(
+            vec![
+                healthy.uri().parse().expect("healthy URL"),
+                hung.uri().parse().expect("hung URL"),
+            ],
+            Duration::from_secs(60),
+            0,
+        )
+        .expect("pool");
+
+        let heads = tokio::time::timeout(
+            Duration::from_secs(2),
+            pool.latest_blocks(Duration::from_millis(200)),
+        )
+        .await
+        .expect("the cross-check should give up on the hung endpoint at its deadline");
+
+        assert_eq!(heads, vec![0x2a]);
+    }
+
     /// An endpoint that answers can only describe its own refusal, so it never repeats the
     /// URL. One that never answers is described by the HTTP client instead, which says which
     /// URL it was reaching for, and that is where the key sits. Nothing listens on port 1.
@@ -631,6 +783,50 @@ mod tests {
             RpcProviderPool::is_retryable(&err),
             "the fault behind the outage should be retryable however it is reported"
         );
+    }
+
+    /// Hosted endpoints spread calls across nodes, so one a block behind is routine: it is
+    /// asked again after short pauses, then passed over, never backed off from.
+    #[tokio::test]
+    async fn an_endpoint_behind_a_block_already_seen_gets_quick_retries() {
+        let lagging = server_answering_block(1).await;
+        let current = server_answering_block(2).await;
+        let pool = RpcProviderPool::new(
+            vec![
+                lagging.uri().parse().expect("lagging URL"),
+                current.uri().parse().expect("current URL"),
+            ],
+            Duration::from_secs(5),
+            3,
+        )
+        .expect("pool");
+        let started = std::time::Instant::now();
+
+        let block = pool
+            .execute("get_block_number", |provider| async move {
+                let block = provider.get_block_number().await?;
+                if block < 2 {
+                    return Err(TransportErrorKind::custom_str(BEHIND_A_SEEN_BLOCK));
+                }
+                Ok(block)
+            })
+            .await
+            .expect("read from the endpoint that has the block");
+
+        assert_eq!(block, 2);
+        assert_eq!(
+            lagging.received_requests().await.unwrap_or_default().len(),
+            3
+        );
+        assert!(started.elapsed() < Duration::from_secs(2), "no backoff");
+    }
+
+    #[test]
+    fn a_node_that_has_not_reached_a_block_yet_is_retryable() {
+        let payload = serde_json::from_str(r#"{"code":-32000,"message":"header not found"}"#)
+            .expect("JSON-RPC error payload");
+        let err: TransportError = RpcError::ErrorResp(payload);
+        assert!(RpcProviderPool::is_retryable(&err));
     }
 
     #[test]
