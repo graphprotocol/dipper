@@ -881,7 +881,9 @@ where
 
     let already_terminal_cancel = matches!(
         agreement.status,
-        IndexingAgreementStatus::CanceledByRequester | IndexingAgreementStatus::CanceledByIndexer,
+        IndexingAgreementStatus::CanceledByRequester
+            | IndexingAgreementStatus::CanceledByIndexer
+            | IndexingAgreementStatus::AbandonedByIndexer,
     );
     // Classify off the on-chain state, which carries the contract's own
     // "canceled by" flag. The canceler address is the payer, not dipper's
@@ -3145,6 +3147,31 @@ mod tests {
         .await;
 
         assert!(result.is_ok());
+        assert_eq!(
+            registry.audit_writes(),
+            vec![("accept and cancel", agreement_id)]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_records_the_end_of_an_abandoned_agreement() {
+        // Dipper can mark it ended without the transaction that ended it, and its terminated
+        // event waits for that transaction, which only this record supplies.
+        let registry = MockRegistry::new();
+        let chain_client = MockChainClient::default();
+        let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+        registry.add_agreement(agreement_id, IndexingAgreementStatus::AbandonedByIndexer);
+
+        let snapshot = make_snapshot(agreement_id, AgreementState::CanceledByPayer, Address::ZERO);
+        reconcile_agreement(
+            &snapshot,
+            &registry,
+            &chain_client,
+            test_agreement_conf().as_ref(),
+        )
+        .await
+        .expect("reconcile ok");
+
         assert_eq!(
             registry.audit_writes(),
             vec![("accept and cancel", agreement_id)]
