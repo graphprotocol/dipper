@@ -3934,3 +3934,64 @@ async fn an_abandoned_agreement_awaits_replacement_once_ended_until_queued() {
         .expect("note it queued");
     assert!(awaiting().await.is_empty());
 }
+
+/// The accept and end of an agreement replayed from the chain go in together: an end already
+/// known stays, unless it came before the accept, and then the replayed end is announced.
+#[tokio::test]
+async fn an_accept_and_end_from_the_chain_are_recorded_in_1_write() {
+    let (db, _temp_db) = temp_registry_db().await;
+    run_fixture(
+        &db,
+        include_str!("fixtures/0003_multi_indexer_agreements.sql"),
+    )
+    .await
+    .expect("Failed to run fixture");
+    let id = fixture_agreement(0xaa);
+    let registry = PgRegistry::new(db.clone());
+    let record = async |accepted_at: u64, canceled_at: u64, tx: &str| {
+        registry
+            .record_accept_and_cancel_audit(
+                &id,
+                accepted_at,
+                "0xacc",
+                canceled_at,
+                "payer",
+                Some(tx),
+            )
+            .await
+            .expect("record");
+    };
+    let recorded = async || {
+        sqlx::query_as::<_, (Option<i64>, Option<i64>, Option<String>, bool)>(
+            "SELECT accepted_at, canceled_at, canceled_tx, terminated_event_emitted_at IS NULL \
+             FROM dipper_reg_indexing_agreements WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&db)
+        .await
+        .expect("read")
+    };
+
+    // Its offer was withdrawn at 50, already announced, before an accept at 100 came to light.
+    sqlx::query(
+        "UPDATE dipper_reg_indexing_agreements SET canceled_at = 50, canceled_tx = '0xwd', \
+         terminated_event_emitted_at = now() WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&db)
+    .await
+    .expect("withdraw");
+    record(100, 200, "0xend").await;
+    assert_eq!(
+        recorded().await,
+        (Some(100), Some(200), Some("0xend".to_owned()), true),
+        "the end before the accept gives way, to be announced again"
+    );
+
+    record(300, 400, "0xlater").await;
+    assert_eq!(
+        recorded().await,
+        (Some(100), Some(200), Some("0xend".to_owned()), true),
+        "what is already known stays"
+    );
+}

@@ -427,6 +427,21 @@ pub trait AgreementRegistry {
         Ok(())
     }
 
+    /// Record an agreement's accept and its end together, in 1 write, so nothing reads one
+    /// without the other. Default no-op so mocks need not override.
+    #[allow(clippy::too_many_arguments)]
+    async fn record_accept_and_cancel_audit(
+        &self,
+        _agreement_id: &IndexingAgreementId,
+        _accepted_at: u64,
+        _accepted_tx: &str,
+        _canceled_at: u64,
+        _canceled_by: &str,
+        _canceled_tx: Option<&str>,
+    ) -> RegistryResult<()> {
+        Ok(())
+    }
+
     /// Record the cancel audit payload for a dipper-initiated cancel so the
     /// emission sweep can populate the `terminated` event fields. Default no-op
     /// so mocks need not override.
