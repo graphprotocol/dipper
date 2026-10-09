@@ -530,9 +530,8 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn manager_cancel_missing_hash_is_distinct_error_and_sends_nothing() {
-        // eh-1: a missing hash must be the distinct MissingTermsVersionHash, not
-        // a ConfigError the liveness checker reads as "chain client disabled"
-        // and would silently abandon while the agreement stays live on-chain.
+        // A missing hash must be the distinct MissingTermsVersionHash: no cancel can be sent
+        // without it, so the cancel retry spends every attempt at once and raises the alert.
         let client = RecordingChainClient::default();
         let ag = agreement(IndexingAgreementStatus::AcceptedOnChain, None);
 

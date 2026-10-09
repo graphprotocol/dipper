@@ -68,11 +68,13 @@ pub fn layer(config: &AlertsConfig) -> Option<AlertLayer> {
 
 impl<S: Subscriber> Layer<S> for AlertLayer {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
-        let mut line = LogLine::default();
-        event.record(&mut line);
-        let Some(tag) = line.event.filter(|tag| self.events.contains(tag)) else {
+        let mut tag = EventTag::default();
+        event.record(&mut tag);
+        let Some(tag) = tag.0.filter(|tag| self.events.contains(tag)) else {
             return;
         };
+        let mut line = LogLine::default();
+        event.record(&mut line);
         let alert = Alert {
             event: tag,
             level: *event.metadata().level(),
@@ -92,10 +94,27 @@ impl<S: Subscriber> Layer<S> for AlertLayer {
     }
 }
 
-/// A log line's `event` tag, message and other fields.
+/// Only a log line's `event` tag, read first so a line no alert is set up for costs no more.
+#[derive(Default)]
+struct EventTag(Option<String>);
+
+impl Visit for EventTag {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "event" {
+            self.0 = Some(value.to_owned());
+        }
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "event" {
+            self.0 = Some(format!("{value:?}"));
+        }
+    }
+}
+
+/// A log line's message and its fields other than the `event` tag.
 #[derive(Default)]
 struct LogLine {
-    event: Option<String>,
     message: String,
     fields: String,
 }
@@ -103,7 +122,7 @@ struct LogLine {
 impl LogLine {
     fn record(&mut self, field: &Field, value: String) {
         match field.name() {
-            "event" => self.event = Some(value),
+            "event" => {}
             "message" => self.message = value,
             name => {
                 if !self.fields.is_empty() {
@@ -353,6 +372,29 @@ mod tests {
             "nonce_gap_fill_failed"
         );
         assert!(alerts.try_recv().is_err(), "nothing else");
+    }
+
+    /// Every warning in dipper passes through this layer, so 1 it won't post shouldn't cost
+    /// formatting its fields.
+    #[test]
+    fn leaves_the_fields_of_lines_it_wont_post_unformatted() {
+        struct Counted<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl std::fmt::Debug for Counted<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                f.write_str("counted")
+            }
+        }
+        let formatted = std::sync::atomic::AtomicUsize::new(0);
+        let (layer, _alerts) = test_layer(&["agreement_cancel_stuck"]);
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(event = "something_else", value = ?Counted(&formatted), "Not listed");
+            tracing::warn!(value = ?Counted(&formatted), "Not tagged");
+        });
+
+        assert_eq!(formatted.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     #[test]

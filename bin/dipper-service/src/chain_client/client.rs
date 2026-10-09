@@ -734,9 +734,8 @@ impl AlloyChainClient {
     /// already does. Signing happens once, up front, so every endpoint is offered the same
     /// bytes under one hash and the hash is known before anyone is asked to accept them.
     async fn send_transaction(&self, tx: &TransactionRequest) -> Result<B256, ChainClientError> {
-        // Nothing fills a field in on this path any more, and a request that names no chain is
-        // signed for chain 1 rather than refused, so check before the signature exists. Not a
-        // `ConfigError`: the cancel path reads that as the chain client being switched off.
+        // Nothing fills a field in on this path, and a request that names no chain is signed
+        // for chain 1 rather than refused, so check before the signature exists.
         if tx.chain_id() != Some(self.inner.chain_id) {
             return Err(ChainClientError::SubmitFailed(anyhow::anyhow!(
                 "refusing to sign for chain {:?} while configured for chain {}",
