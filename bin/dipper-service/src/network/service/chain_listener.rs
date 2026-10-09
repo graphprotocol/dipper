@@ -75,6 +75,39 @@ const STALL_ERROR_THRESHOLD: u32 = 15;
 /// Sanity bound on a single tick's drain — not an operating point;
 /// steady-state drains are 0–1 pages.
 const MAX_PAGES_PER_DRAIN: u32 = 1000;
+/// How long the listener keeps re-reading a page whose changes fail to apply before moving past
+/// it: long enough to ride out a database failover, short enough that a change that can never
+/// apply doesn't hold up every later accept and cancel.
+const MAX_CURSOR_HOLD: Duration = Duration::from_secs(600);
+
+/// Where the cursor has been held, and since when, before a page whose changes failed to apply.
+#[derive(Debug)]
+struct CursorHold {
+    cursor: Cursor,
+    since: std::time::Instant,
+}
+
+/// Whether to move past a page at `cursor` whose changes failed to apply: once the cursor has
+/// been held before it for [`MAX_CURSOR_HOLD`]. Until then the hold is noted, so the page is
+/// read again.
+fn hold_expired(hold: &mut Option<CursorHold>, cursor: &Cursor, now: std::time::Instant) -> bool {
+    match hold {
+        Some(held) if held.cursor == *cursor => {
+            if now.saturating_duration_since(held.since) < MAX_CURSOR_HOLD {
+                return false;
+            }
+            *hold = None;
+            true
+        }
+        _ => {
+            *hold = Some(CursorHold {
+                cursor: cursor.clone(),
+                since: now,
+            });
+            false
+        }
+    }
+}
 /// Cap on the cancellation-sweep batch so a backlog drains across polls
 /// instead of blocking one tick.
 const SWEEP_BATCH_SIZE: i64 = 1000;
@@ -213,6 +246,7 @@ where
 
         // Track consecutive failures for adaptive backoff
         let mut consecutive_failures: u32 = 0;
+        let mut cursor_hold: Option<CursorHold> = None;
 
         // Observability: heartbeat and stall detection
         let mut polls_since_last_event: u64 = 0;
@@ -289,6 +323,7 @@ where
 
             let outcome = match drain_once(
                 &mut cursor,
+                &mut cursor_hold,
                 &mut last_persisted_timestamp,
                 &mut last_chain_ts_persist_wall,
                 &mut last_subgraph_head,
@@ -419,6 +454,7 @@ struct DrainOutcome {
 )]
 async fn drain_once<R, E, T>(
     cursor: &mut Cursor,
+    cursor_hold: &mut Option<CursorHold>,
     last_persisted_timestamp: &mut Option<u64>,
     last_chain_ts_persist_wall: &mut std::time::Instant,
     last_subgraph_head: &mut u64,
@@ -678,8 +714,20 @@ where
         // Persist per-page so a crash mid-drain replays at most
         // one page. Skip the write when neither cursor nor
         // ratcheted timestamp moved.
-        let advance_cursor = unapplied.is_empty() && *cursor < new_cursor;
-        if !unapplied.is_empty() {
+        let skip = !unapplied.is_empty() && hold_expired(cursor_hold, cursor, now_instant);
+        if unapplied.is_empty() {
+            *cursor_hold = None;
+        }
+        let advance_cursor = (unapplied.is_empty() || skip) && *cursor < new_cursor;
+        if skip {
+            tracing::error!(
+                event = "chain_listener_changes_skipped",
+                cursor_block = cursor.block,
+                agreement_ids = ?unapplied,
+                "Skipped on-chain changes to agreements that kept failing to apply; they won't \
+                 be read again until their next change"
+            );
+        } else if !unapplied.is_empty() {
             tracing::error!(
                 event = "chain_listener_cursor_held",
                 cursor_block = cursor.block,
@@ -4165,6 +4213,7 @@ mod tests {
 
         let outcome = drain_once(
             &mut cursor,
+            &mut None,
             &mut last_persisted_timestamp,
             &mut last_chain_ts_persist_wall,
             &mut last_subgraph_head,
@@ -4201,13 +4250,15 @@ mod tests {
         }
     }
 
-    /// A page whose changes fail to apply keeps the cursor before it, so the next poll
-    /// re-reads it: no later change to those agreements may come to apply it instead.
-    #[tokio::test]
-    async fn test_drain_holds_the_cursor_until_a_failed_page_applies() {
+    /// Drain 1 page holding a change that accepts an agreement, its apply failing or not, with
+    /// the cursor held before it since `held_since` if given; the cursor it leaves, and whether
+    /// the agreement was accepted.
+    async fn drain_a_page(
+        apply_fails: &[bool],
+        held_since: Option<std::time::Instant>,
+    ) -> (Cursor, Option<CursorHold>, bool) {
         let registry = MockRegistry::new();
         let chain_client = MockChainClient::default();
-        registry.set_fail_batch(true);
         let event_source = super::super::chain_events::mock::MockEventSource::new();
         event_source.set_latest_block(100);
         event_source.set_latest_block_timestamp(Some(1_700_000_000));
@@ -4225,6 +4276,10 @@ mod tests {
             canceled_tx: String::new(),
         }]);
         let mut cursor = Cursor::genesis();
+        let mut cursor_hold = held_since.map(|since| CursorHold {
+            cursor: Cursor::genesis(),
+            since,
+        });
         let mut last_persisted_timestamp: Option<u64> = None;
         let mut last_chain_ts_persist_wall = std::time::Instant::now();
         let mut last_subgraph_head: u64 = 0;
@@ -4232,10 +4287,11 @@ mod tests {
         let mut consecutive_failures: u32 = 0;
         let (_tx_stop, mut rx_stop) = mpsc::channel::<()>(1);
 
-        for fails in [true, false] {
-            registry.set_fail_batch(fails);
+        for fails in apply_fails {
+            registry.set_fail_batch(*fails);
             drain_once(
                 &mut cursor,
+                &mut cursor_hold,
                 &mut last_persisted_timestamp,
                 &mut last_chain_ts_persist_wall,
                 &mut last_subgraph_head,
@@ -4253,13 +4309,57 @@ mod tests {
             )
             .await
             .expect("subgraph fetch succeeded");
-            if fails {
-                assert_eq!(cursor, Cursor::genesis(), "held before the failed page");
-            }
         }
+        let accepted = registry.was_marked_accepted_on_chain(&agreement_id);
+        (cursor, cursor_hold, accepted)
+    }
 
-        assert!(registry.was_marked_accepted_on_chain(&agreement_id));
+    /// A page whose changes fail to apply keeps the cursor before it, so the next poll
+    /// re-reads it: no later change to those agreements may come to apply it instead.
+    #[tokio::test]
+    async fn test_drain_holds_the_cursor_until_a_failed_page_applies() {
+        let (cursor, hold, _) = drain_a_page(&[true], None).await;
+        assert_eq!(cursor, Cursor::genesis(), "held before the failed page");
+        assert!(hold.is_some());
+
+        let (cursor, hold, accepted) = drain_a_page(&[true, false], None).await;
+        assert!(accepted);
         assert!(cursor > Cursor::genesis());
+        assert!(hold.is_none());
+    }
+
+    /// A page that keeps failing is passed over once the cursor has been held long enough, so
+    /// it can't hold up every later change.
+    #[tokio::test]
+    async fn test_drain_moves_past_a_page_that_keeps_failing() {
+        let long_ago = std::time::Instant::now()
+            .checked_sub(MAX_CURSOR_HOLD + Duration::from_secs(1))
+            .expect("instant");
+
+        let (cursor, hold, accepted) = drain_a_page(&[true], Some(long_ago)).await;
+
+        assert!(!accepted);
+        assert!(cursor > Cursor::genesis());
+        assert!(hold.is_none());
+    }
+
+    #[test]
+    fn holds_the_cursor_before_a_failing_page_for_a_while() {
+        let now = std::time::Instant::now();
+        let page = Cursor::genesis();
+        let mut hold = None;
+
+        assert!(
+            !hold_expired(&mut hold, &page, now),
+            "the first failure holds"
+        );
+        assert!(!hold_expired(
+            &mut hold,
+            &page,
+            now + MAX_CURSOR_HOLD - Duration::from_secs(1)
+        ));
+        assert!(hold_expired(&mut hold, &page, now + MAX_CURSOR_HOLD));
+        assert!(hold.is_none());
     }
 
     /// Drives a hostile timestamp drift through `drain_once` and asserts
@@ -4290,6 +4390,7 @@ mod tests {
 
         drain_once(
             &mut cursor,
+            &mut None,
             &mut last_persisted_timestamp,
             &mut last_chain_ts_persist_wall,
             &mut last_subgraph_head,
@@ -4317,6 +4418,7 @@ mod tests {
 
         drain_once(
             &mut cursor,
+            &mut None,
             &mut last_persisted_timestamp,
             &mut last_chain_ts_persist_wall,
             &mut last_subgraph_head,
@@ -4420,6 +4522,7 @@ mod tests {
 
         drain_once(
             &mut cursor,
+            &mut None,
             &mut last_persisted_timestamp,
             &mut last_chain_ts_persist_wall,
             &mut last_subgraph_head,
