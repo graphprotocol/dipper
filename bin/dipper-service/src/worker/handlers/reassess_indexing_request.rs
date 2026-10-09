@@ -168,12 +168,7 @@ where
     // When the in-flight window is known-full a top-up can't proceed, so defer
     // before paying for selection context and an IISA call. Anything else runs:
     // shrinks free slots and satisfied requests finish instead of polling.
-    if should_defer_saturated(
-        global_in_flight,
-        global_cap,
-        slots,
-        active_agreements.len(),
-    ) {
+    if should_defer_saturated(global_in_flight, global_cap, slots, active_agreements.len()) {
         tracing::debug!(
             event = "offer_pacing_saturated",
             indexing_request_id = %indexing_request_id,

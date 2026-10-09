@@ -950,7 +950,10 @@ impl AlloyChainClient {
         let only_endpoint = self.inner.rpc_pool.endpoint_count() < 2;
         let (noted, seen) = {
             let mut seen = self.seen_block();
-            (seen.advance(block, Instant::now(), only_endpoint), seen.number)
+            (
+                seen.advance(block, Instant::now(), only_endpoint),
+                seen.number,
+            )
         };
         match noted {
             Noted::Taken => {}

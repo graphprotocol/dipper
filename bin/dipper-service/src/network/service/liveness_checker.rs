@@ -507,8 +507,14 @@ async fn cancel_and_reassess<R, W, C>(
         );
         return;
     }
-    let Some(started) =
-        start_abandoned_cancel(agreement, registry, chain_client, agreement_conf, db_timeout).await
+    let Some(started) = start_abandoned_cancel(
+        agreement,
+        registry,
+        chain_client,
+        agreement_conf,
+        db_timeout,
+    )
+    .await
     else {
         return;
     };
@@ -529,7 +535,10 @@ async fn cancel_and_reassess<R, W, C>(
 /// Note that the chain shows a stale agreement still cancelling has ended, so it no longer
 /// holds its slot in the request and the reassessment queued next fills it.
 async fn note_seen_ended<R: AgreementRegistry + Sync>(agreement: &IndexingAgreement, registry: &R) {
-    match registry.record_cancel_check(&agreement.id, 0, Some(true)).await {
+    match registry
+        .record_cancel_check(&agreement.id, 0, Some(true))
+        .await
+    {
         Ok(_) | Err(crate::registry::Error::NoRecordsUpdated) => {}
         Err(err) => tracing::warn!(
             agreement_id = %agreement.id,
