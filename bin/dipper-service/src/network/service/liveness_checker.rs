@@ -564,8 +564,6 @@ pub(crate) async fn replace_abandoned<R, W>(
 }
 
 /// Mark a stale agreement abandoned and send its cancel; `None`, logged, when it isn't marked.
-/// Only the mark is bounded by `db_timeout`, so a hung database can't stall the liveness cycle;
-/// a mark that lands after the timeout leaves the agreement for the cancel retry.
 async fn start_abandoned_cancel<R, C>(
     agreement: &IndexingAgreement,
     registry: &R,
@@ -577,35 +575,8 @@ where
     R: AgreementRegistry + Sync,
     C: ChainClient,
 {
-    let marked = tokio::time::timeout(
-        db_timeout,
-        crate::cancel_dispatch::mark_cancelling(registry, agreement, CancelReason::Abandoned),
-    )
-    .await;
-    match marked {
-        Ok(Ok(())) => {}
-        Ok(Err(crate::registry::Error::NoRecordsUpdated)) => {
-            tracing::debug!(
-                agreement_id = %agreement.id,
-                "Stale agreement already ended or being cancelled"
-            );
-            return None;
-        }
-        Ok(Err(err)) => {
-            tracing::error!(
-                agreement_id = %agreement.id,
-                error = %err,
-                "failed to mark stale agreement cancelling, will retry next cycle"
-            );
-            return None;
-        }
-        Err(_) => {
-            tracing::error!(
-                agreement_id = %agreement.id,
-                "timeout marking stale agreement cancelling, will retry next cycle"
-            );
-            return None;
-        }
+    if !mark_abandoning(agreement, registry, db_timeout).await {
+        return None;
     }
     let started = crate::cancel_dispatch::send_marked_cancel(
         registry,
@@ -622,6 +593,38 @@ where
         "Cancelling stale agreement"
     );
     Some(started)
+}
+
+/// Mark a stale agreement cancelling as abandoned; false, logged, when it isn't marked. Bounded
+/// by `db_timeout`, so a hung database can't stall the liveness cycle; a mark that lands after
+/// the timeout leaves the agreement for the cancel retry.
+async fn mark_abandoning<R: AgreementRegistry + Sync>(
+    agreement: &IndexingAgreement,
+    registry: &R,
+    db_timeout: Duration,
+) -> bool {
+    let marked = tokio::time::timeout(
+        db_timeout,
+        crate::cancel_dispatch::mark_cancelling(registry, agreement, CancelReason::Abandoned),
+    )
+    .await;
+    match marked {
+        Ok(Ok(())) => return true,
+        Ok(Err(crate::registry::Error::NoRecordsUpdated)) => tracing::debug!(
+            agreement_id = %agreement.id,
+            "Stale agreement already ended or being cancelled"
+        ),
+        Ok(Err(err)) => tracing::error!(
+            agreement_id = %agreement.id,
+            error = %err,
+            "failed to mark stale agreement cancelling, will retry next cycle"
+        ),
+        Err(_) => tracing::error!(
+            agreement_id = %agreement.id,
+            "timeout marking stale agreement cancelling, will retry next cycle"
+        ),
+    }
+    false
 }
 
 /// Drop the pending cancellations an abandoned agreement holds as a replacement, so the
