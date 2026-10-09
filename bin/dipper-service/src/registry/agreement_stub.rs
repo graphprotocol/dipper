@@ -271,8 +271,8 @@ pub trait StubAgreementRegistry: Send + Sync {
         unimplemented!("count_accepted_agreements_by_deployment")
     }
 
-    // The emission-sweep and audit methods mirror the real trait's defaults
-    // (empty batch / no-op) so only emission-focused mocks override them.
+    // The emission-sweep and audit methods default to an empty batch or a
+    // no-op, here only, so only emission-focused mocks override them.
     async fn get_agreements_pending_terminated_emission(
         &self,
         _limit: i64,
