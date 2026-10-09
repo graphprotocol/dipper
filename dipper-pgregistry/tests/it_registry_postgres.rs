@@ -3995,3 +3995,61 @@ async fn an_accept_and_end_from_the_chain_are_recorded_in_1_write() {
         "what is already known stays"
     );
 }
+
+/// An ended agreement's `terminated` event waits for the transaction that ended it, which the
+/// chain listener can record after dipper marks it ended, but not for ever.
+#[tokio::test]
+async fn an_end_is_announced_once_its_transaction_is_known_or_after_an_hour() {
+    let (db, _temp_db) = temp_registry_db().await;
+    run_fixture(
+        &db,
+        include_str!("fixtures/0003_multi_indexer_agreements.sql"),
+    )
+    .await
+    .expect("Failed to run fixture");
+    let id = fixture_agreement(0xaa);
+    let registry = PgRegistry::new(db.clone());
+    registry
+        .mark_indexing_agreement_as_canceled_by_requester(&id)
+        .await
+        .expect("dipper ends it");
+    registry
+        .record_accepted_audit(&id, 1_700_000_000, "0xacc")
+        .await
+        .expect("its accept is known");
+    let pending = async || {
+        registry
+            .get_agreements_pending_terminated_emission(100)
+            .await
+            .expect("terminated query")
+            .iter()
+            .any(|p| p.agreement_id == id)
+    };
+    assert!(!pending().await, "waits for its transaction");
+
+    sqlx::query(
+        "UPDATE dipper_reg_indexing_agreements \
+         SET updated_at = timezone('UTC', now()) - interval '61 minutes' WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&db)
+    .await
+    .expect("age it");
+    assert!(pending().await, "goes out without one after an hour");
+
+    sqlx::query(
+        "UPDATE dipper_reg_indexing_agreements SET updated_at = timezone('UTC', now()) WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&db)
+    .await
+    .expect("make it recent again");
+    registry
+        .record_cancel_audit(&id, 1_700_000_100, "0xmgr", Some("0xend"))
+        .await
+        .expect("its transaction is recorded");
+    assert!(
+        pending().await,
+        "goes out as soon as its transaction is known"
+    );
+}
