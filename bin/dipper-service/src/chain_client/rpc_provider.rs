@@ -176,13 +176,18 @@ impl RpcProviderPool {
         self.providers.len()
     }
 
-    /// Each endpoint's latest block, all asked at once with no retries. Endpoints that fail are
-    /// left out, so dipper can see whether the ones that answer agree.
-    pub async fn latest_blocks(&self) -> Vec<u64> {
+    /// Each endpoint's latest block, all asked at once with no retries. Endpoints that fail, or
+    /// don't answer within `deadline`, are left out, so dipper can see whether the rest agree.
+    pub async fn latest_blocks(&self, deadline: Duration) -> Vec<u64> {
         let mut asks = tokio::task::JoinSet::new();
         for url in &self.providers {
             let (http, url) = (self.http.clone(), url.clone());
-            asks.spawn(async move { (endpoint_name(&url), latest_block(http, &url).await) });
+            asks.spawn(async move {
+                let head = tokio::time::timeout(deadline, latest_block(http, &url))
+                    .await
+                    .unwrap_or_else(|_| Err(format!("no answer within {deadline:?}")));
+                (endpoint_name(&url), head)
+            });
         }
         let mut heads = Vec::with_capacity(self.providers.len());
         while let Some(answer) = asks.join_next().await {
@@ -616,6 +621,36 @@ mod tests {
             !reason.contains("super-secret-key"),
             "the API key must not appear in the failure: {reason}"
         );
+    }
+
+    /// Reads wait on the cross-check, so 1 endpoint that never answers must not hold it for the
+    /// whole request timeout. The healthy endpoint's head still counts.
+    #[tokio::test]
+    async fn a_cross_check_stops_waiting_for_a_hung_endpoint() {
+        let healthy = server_answering_block(0x2a).await;
+        let hung = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
+            .mount(&hung)
+            .await;
+        let pool = RpcProviderPool::new(
+            vec![
+                healthy.uri().parse().expect("healthy URL"),
+                hung.uri().parse().expect("hung URL"),
+            ],
+            Duration::from_secs(60),
+            0,
+        )
+        .expect("pool");
+
+        let heads = tokio::time::timeout(
+            Duration::from_secs(2),
+            pool.latest_blocks(Duration::from_millis(200)),
+        )
+        .await
+        .expect("the cross-check should give up on the hung endpoint at its deadline");
+
+        assert_eq!(heads, vec![0x2a]);
     }
 
     /// An endpoint that answers can only describe its own refusal, so it never repeats the

@@ -84,6 +84,9 @@ const FAR_AHEAD_OF_A_SEEN_BLOCK: &str = "too far ahead of the newest block seen"
 /// block it has seen, while that block is unconfirmed.
 const CROSS_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
+/// An answer takes well under a second, so this only bounds how long a hung endpoint holds a read.
+const CROSS_CHECK_DEADLINE: Duration = Duration::from_secs(3);
+
 /// The newest block dipper has seen, from reads, receipts and latest-block lookups, and when it
 /// last moved. It never goes backwards, so a lagging endpoint can't show state from before it.
 /// Blocks too far ahead of it are refused only once it is confirmed, by the receipt for one of
@@ -892,7 +895,7 @@ impl AlloyChainClient {
         if pool.endpoint_count() < 2 || !self.seen_block().cross_check_due(Instant::now()) {
             return;
         }
-        match agreed_head(pool.latest_blocks().await) {
+        match agreed_head(pool.latest_blocks(CROSS_CHECK_DEADLINE).await) {
             Some(head) => self.seen_block().confirm(head, Instant::now()),
             None => tracing::warn!(
                 "No 2 RPC endpoints agree on the chain's latest block; reads aren't checked \
