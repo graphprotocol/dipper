@@ -359,101 +359,76 @@ pub trait AgreementRegistry {
     }
 
     /// Fetch agreements awaiting a `terminated` event: terminal-cancel status,
-    /// genuinely accepted on-chain, marker unset. Default returns empty so mocks
-    /// need not override; the production registry runs the real query.
+    /// genuinely accepted on-chain, marker unset.
     async fn get_agreements_pending_terminated_emission(
         &self,
-        _limit: i64,
-    ) -> RegistryResult<Vec<PendingTerminatedEvent>> {
-        Ok(Vec::new())
-    }
+        limit: i64,
+    ) -> RegistryResult<Vec<PendingTerminatedEvent>>;
 
     /// Stamp the `terminated` emission marker after a confirmed broker send.
-    /// Default no-op so mocks need not override.
     async fn mark_terminated_event_emitted(
         &self,
-        _agreement_id: &IndexingAgreementId,
-    ) -> RegistryResult<()> {
-        Ok(())
-    }
+        agreement_id: &IndexingAgreementId,
+    ) -> RegistryResult<()>;
 
     /// Fetch agreements awaiting an `accepted` event: `AcceptedOnChain`, accept
-    /// observed by the new reconcile path, marker unset. Default returns empty so
-    /// mocks need not override; the production registry runs the real query.
+    /// observed by the new reconcile path, marker unset.
     async fn get_agreements_pending_accepted_emission(
         &self,
-        _limit: i64,
-    ) -> RegistryResult<Vec<PendingAcceptedEvent>> {
-        Ok(Vec::new())
-    }
+        limit: i64,
+    ) -> RegistryResult<Vec<PendingAcceptedEvent>>;
 
     /// Stamp the `accepted` emission marker after a confirmed broker send.
-    /// Default no-op so mocks need not override.
     async fn mark_accepted_event_emitted(
         &self,
-        _agreement_id: &IndexingAgreementId,
-    ) -> RegistryResult<()> {
-        Ok(())
-    }
+        agreement_id: &IndexingAgreementId,
+    ) -> RegistryResult<()>;
 
     /// Fetch agreements awaiting a `request.expired` event: `Expired`, marker
-    /// unset. Default returns empty so mocks need not override; the production
-    /// registry runs the real query.
+    /// unset.
     async fn get_agreements_pending_expired_emission(
         &self,
-        _limit: i64,
-    ) -> RegistryResult<Vec<PendingExpiredEvent>> {
-        Ok(Vec::new())
-    }
+        limit: i64,
+    ) -> RegistryResult<Vec<PendingExpiredEvent>>;
 
     /// Stamp the `request.expired` emission marker after a confirmed broker send.
-    /// Default no-op so mocks need not override.
     async fn mark_expired_event_emitted(
         &self,
-        _agreement_id: &IndexingAgreementId,
-    ) -> RegistryResult<()> {
-        Ok(())
-    }
+        agreement_id: &IndexingAgreementId,
+    ) -> RegistryResult<()>;
 
     /// Record the accepted audit payload out-of-band (rejected-then-accepted
     /// anomaly), marking the row as genuinely accepted so its eventual
-    /// `terminated` is sweep-eligible. Default no-op so mocks need not override.
+    /// `terminated` is sweep-eligible.
     async fn record_accepted_audit(
         &self,
-        _agreement_id: &IndexingAgreementId,
-        _accepted_at: u64,
-        _accepted_tx: &str,
-    ) -> RegistryResult<()> {
-        Ok(())
-    }
+        agreement_id: &IndexingAgreementId,
+        accepted_at: u64,
+        accepted_tx: &str,
+    ) -> RegistryResult<()>;
 
     /// Record an agreement's accept and its end together, in 1 write, so nothing reads one
-    /// without the other. Default no-op so mocks need not override.
+    /// without the other.
     #[allow(clippy::too_many_arguments)]
     async fn record_accept_and_cancel_audit(
         &self,
-        _agreement_id: &IndexingAgreementId,
-        _accepted_at: u64,
-        _accepted_tx: &str,
-        _canceled_at: u64,
-        _canceled_by: &str,
-        _canceled_tx: Option<&str>,
-    ) -> RegistryResult<()> {
-        Ok(())
-    }
+        agreement_id: &IndexingAgreementId,
+        accepted_at: u64,
+        accepted_tx: &str,
+        canceled_at: u64,
+        canceled_by: &str,
+        canceled_tx: Option<&str>,
+    ) -> RegistryResult<()>;
 
     /// Record the cancel audit payload for a dipper-initiated cancel so the
-    /// emission sweep can populate the `terminated` event fields. Default no-op
-    /// so mocks need not override.
+    /// emission sweep can populate the `terminated` event fields.
     async fn record_cancel_audit(
         &self,
-        _agreement_id: &IndexingAgreementId,
-        _canceled_at: u64,
-        _canceled_by: &str,
-        _canceled_tx: Option<&str>,
-    ) -> RegistryResult<()> {
-        Ok(())
-    }
+        agreement_id: &IndexingAgreementId,
+        canceled_at: u64,
+        canceled_by: &str,
+        canceled_tx: Option<&str>,
+    ) -> RegistryResult<()>;
 
     /// Get `Created` agreements whose deadline has passed (by block timestamp).
     async fn get_expired_created_agreements(
