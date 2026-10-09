@@ -845,16 +845,18 @@ where
             indexer = %snapshot.indexer,
             "Rejected agreement accepted on-chain, cancelling it"
         );
-        crate::cancel_dispatch::reopen_if_live(registry, chain_client, &agreement).await?;
-
         // This row goes Rejected -> Canceled without ever transiting
         // AcceptedOnChain, so `apply_reconciliation` never records the accept.
         // Persist it from the snapshot so the eventual `terminated` (emitted by
         // the sweep after the cancel) is eligible (`accepted_at IS NOT NULL`) and
-        // carries accurate accept data.
-        if let Err(err) = registry
-            .record_accepted_audit(&agreement.id, snapshot.accepted_at, &snapshot.accepted_tx)
-            .await
+        // carries accurate accept data. One left Rejected, as the chain shows it
+        // already ended, gets no accept on record, so none is announced.
+        let reopened =
+            crate::cancel_dispatch::reopen_if_live(registry, chain_client, &agreement).await?;
+        if reopened
+            && let Err(err) = registry
+                .record_accepted_audit(&agreement.id, snapshot.accepted_at, &snapshot.accepted_tx)
+                .await
         {
             tracing::warn!(
                 agreement_id = %agreement.id,
@@ -2877,6 +2879,30 @@ mod tests {
         assert!(result.is_ok());
         assert!(!registry.was_marked_accepted_on_chain(&agreement_id));
         assert!(registry.was_reopened(&agreement_id));
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_records_no_accept_for_a_rejected_agreement_already_ended() {
+        // The snapshot shows it accepted, but by the time dipper reads the chain the indexer
+        // has ended it. It stays Rejected, so an accept on record would be announced with no
+        // end ever following it.
+        let registry = MockRegistry::new();
+        let chain_client = MockChainClient::default();
+        let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+        registry.add_agreement(agreement_id, IndexingAgreementStatus::Rejected);
+
+        let snapshot = make_snapshot(agreement_id, AgreementState::Accepted, Address::ZERO);
+        let result = reconcile_agreement(
+            &snapshot,
+            &registry,
+            &chain_client,
+            test_agreement_conf().as_ref(),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert!(!registry.was_reopened(&agreement_id));
+        assert!(registry.audit_writes().is_empty());
     }
 
     #[tokio::test]
