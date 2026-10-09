@@ -1951,16 +1951,16 @@ impl PgRegistry {
         .map_err(Into::into)
     }
 
-    /// Count a request's agreements whose indexer stopped serving them that may still be paid:
-    /// being cancelled, not yet seen ended on-chain, and with no replacement queued. Each keeps
-    /// its slot in the request until then, so it isn't replaced while both are paid.
-    pub async fn count_abandoned_agreements_holding_slots(
+    /// The indexers of a request's agreements whose indexer stopped serving them that may still
+    /// be paid: being cancelled, not yet seen ended on-chain, and with no replacement queued.
+    /// Each keeps its slot in the request until then, so it isn't replaced while both are paid.
+    pub async fn get_abandoned_indexers_holding_slots(
         &self,
         request_id: &IndexingRequestId,
-    ) -> Result<usize, Error> {
-        let (count,): (i64,) = sqlx::query_as(
+    ) -> Result<Vec<IndexerId>, Error> {
+        let rows: Vec<(PgIndexerId,)> = sqlx::query_as(
             r#"
-            SELECT COUNT(*)
+            SELECT indexer_id
             FROM dipper_reg_indexing_agreements
             WHERE indexing_request_id = $1
               AND status = $2
@@ -1970,9 +1970,9 @@ impl PgRegistry {
         )
         .bind(request_id)
         .bind(IndexingAgreementStatus::Cancelling)
-        .fetch_one(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
-        Ok(usize::try_from(count).unwrap_or_default())
+        Ok(rows.into_iter().map(|(id,)| id.0).collect())
     }
 
     /// Note that an agreement's replacement has been queued.

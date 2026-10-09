@@ -149,12 +149,14 @@ where
 
     // An agreement whose indexer stopped serving it keeps its slot while it may still be paid,
     // so it isn't replaced while both are paid; once it can't be, its replacement is queued.
-    let held_slots = ctx
+    // Held slots only limit what is added, never what is cancelled.
+    let held: HashSet<IndexerId> = ctx
         .registry
-        .count_abandoned_agreements_holding_slots(indexing_request_id)
+        .get_abandoned_indexers_holding_slots(indexing_request_id)
         .await
-        .map_err(|err| JobError::Fatal(err.into()))?;
-    let slots = num_candidates.saturating_sub(held_slots);
+        .map_err(|err| JobError::Fatal(err.into()))?
+        .into_iter()
+        .collect();
 
     // In-flight offer counts, fetched once and reused by both the saturated
     // short-circuit (global figure only) and the per-indexer cap after IISA.
@@ -168,7 +170,12 @@ where
     // When the in-flight window is known-full a top-up can't proceed, so defer
     // before paying for selection context and an IISA call. Anything else runs:
     // shrinks free slots and satisfied requests finish instead of polling.
-    if should_defer_saturated(global_in_flight, global_cap, slots, active_agreements.len()) {
+    if should_defer_saturated(
+        global_in_flight,
+        global_cap,
+        num_candidates.saturating_sub(held.len()),
+        active_agreements.len(),
+    ) {
         tracing::debug!(
             event = "offer_pacing_saturated",
             indexing_request_id = %indexing_request_id,
@@ -255,7 +262,7 @@ where
     // stall new requests until IISA recovers — see README "IISA dependency".
     let target_selected: Vec<SelectedIndexer> = match ctx
         .iisa
-        .select_indexers(*deployment_id, slots, &context)
+        .select_indexers(*deployment_id, *num_candidates, &context)
         .await
     {
         Ok(indexers) => indexers,
@@ -277,9 +284,18 @@ where
     let target_pricing: HashMap<IndexerId, &SelectedIndexer> =
         target_selected.iter().map(|s| (s.id, s)).collect();
 
-    // Compute the diff
+    // Compute the diff. New offers fill only what the agreements kept and the held slots leave
+    // of the target, in IISA's order, and never for an indexer holding a slot.
     let to_cancel: HashSet<&IndexerId> = current_ids.difference(&target_ids).collect();
-    let to_add: HashSet<&IndexerId> = target_ids.difference(&current_ids).collect();
+    let diff_add_count = target_ids.difference(&current_ids).count();
+    let kept = current_ids.intersection(&target_ids).count();
+    let room = num_candidates.saturating_sub(held.len() + kept);
+    let to_add: HashSet<&IndexerId> = target_selected
+        .iter()
+        .map(|s| &s.id)
+        .filter(|id| !current_ids.contains(*id) && !held.contains(*id))
+        .take(room)
+        .collect();
 
     // Surface the IISA outcome alongside the diff so the operator can tell
     // "everyone is declined" apart from "we're already synced" without
@@ -290,7 +306,7 @@ where
         indexing_request_id=%indexing_request_id,
         deployment_id=%deployment_id,
         requested_num_candidates = num_candidates,
-        held_slots,
+        held_slots = held.len(),
         iisa_returned_count = target_selected.len(),
         current_active_count = current_ids.len(),
         to_add_count = to_add.len(),
@@ -307,7 +323,7 @@ where
     // persistently short request. The atomic latch update makes this retry-safe:
     // a re-run after a later failure sees the latch already set and does not
     // re-emit.
-    let in_shortfall = target_selected.len() < slots;
+    let in_shortfall = target_selected.len() < *num_candidates;
     let shortfall_changed = ctx
         .registry
         .set_indexing_request_shortfall_active(indexing_request_id, in_shortfall)
@@ -326,7 +342,7 @@ where
                 *deployment_id,
                 ctx.signer.chain_id(),
                 proto::SubgraphIndexingAgreementNIndexersUnavailable {
-                    agreements_requested: slots as i32,
+                    agreements_requested: *num_candidates as i32,
                     candidates_returned: target_selected.len() as i32,
                 },
             );
@@ -350,8 +366,11 @@ where
 
     // Offer pacing: only create as many agreements as the network can accept
     // before the deadline, so a burst does not queue offers that expire unaccepted.
+    // Adds left out for held slots count as withheld, so the old agreements they would have
+    // replaced stay until a later pass can replace them.
     let (capped_to_add, offer_pacing_withheld, reserved_cancel_count) = if to_add.is_empty() {
-        (HashSet::new(), 0usize, 0usize)
+        let reserved = reserved_cancel_count(old_to_cancel.len(), diff_add_count, 0);
+        (HashSet::new(), 0usize, reserved)
     } else {
         // Reuse the in-flight counts and global cap fetched at the top of the pass.
         let per_indexer_cap = ctx.agreement_conf.max_in_flight_offers_per_indexer();
@@ -363,7 +382,7 @@ where
             per_indexer_cap,
             global_cap,
         );
-        let reserved = reserved_cancel_count(old_to_cancel.len(), to_add.len(), allowed.len());
+        let reserved = reserved_cancel_count(old_to_cancel.len(), diff_add_count, allowed.len());
         if withheld > 0 {
             tracing::info!(
                 event = "offer_pacing_capped",
@@ -1044,8 +1063,8 @@ mod lifecycle_event_tests {
         /// Ids marked CanceledByRequester locally.
         marked_cancelled: Arc<Mutex<Vec<IndexingAgreementId>>>,
         marked_cancelling: Arc<Mutex<Vec<IndexingAgreementId>>>,
-        /// Slots held by agreements whose indexer stopped serving them.
-        held_slots: usize,
+        /// Indexers holding a slot with an agreement they stopped serving.
+        held: Vec<IndexerId>,
     }
 
     #[async_trait]
@@ -1126,11 +1145,11 @@ mod lifecycle_event_tests {
         ) -> RegistryResult<Vec<IndexingAgreement>> {
             Ok(self.active_agreements.clone())
         }
-        async fn count_abandoned_agreements_holding_slots(
+        async fn get_abandoned_indexers_holding_slots(
             &self,
             _request_id: &IndexingRequestId,
-        ) -> RegistryResult<usize> {
-            Ok(self.held_slots)
+        ) -> RegistryResult<Vec<IndexerId>> {
+            Ok(self.held.clone())
         }
         // Populates the `terminated` event's remaining count.
         async fn count_accepted_agreements_by_deployment(
@@ -1513,7 +1532,7 @@ mod lifecycle_event_tests {
             shortfall_active: std::sync::Mutex::new(true),
             marked_cancelled: Arc::default(),
             marked_cancelling: Arc::default(),
-            held_slots: 0,
+            held: Vec::new(),
         };
         let ctx = build_ctx(
             registry,
@@ -1552,7 +1571,7 @@ mod lifecycle_event_tests {
             shortfall_active: std::sync::Mutex::new(false),
             marked_cancelled: Arc::default(),
             marked_cancelling: Arc::default(),
-            held_slots: 0,
+            held: Vec::new(),
         };
         let ctx = build_ctx(
             registry,
@@ -1613,16 +1632,17 @@ mod lifecycle_event_tests {
     async fn fills_only_the_slots_an_abandoned_agreement_does_not_hold() {
         // The abandoned agreement may still be paid until its cancel lands, so filling its
         // slot now would pay 2 indexers for it; its replacement is queued once it can't be.
-        let candidates = [indexer_id(0x21), indexer_id(0x22), indexer_id(0x23)];
+        let held = indexer_id(0x20);
+        let candidates = [held, indexer_id(0x21), indexer_id(0x22), indexer_id(0x23)];
+        let url = |id: IndexerId| Url::parse(&format!("https://{id}.example")).unwrap();
         let mut snapshot = indexer_urls::Snapshot::new();
         for id in candidates {
-            snapshot.insert(id, indexer_url());
+            snapshot.insert(id, url(id));
         }
-        let events = CapturingEventsProducer::new();
         let queue = MockQueue::default();
         let ctx = build_ctx(
             MockRegistry {
-                held_slots: 1,
+                held: vec![held],
                 ..MockRegistry::default()
             },
             MockIisa {
@@ -1630,20 +1650,49 @@ mod lifecycle_event_tests {
             },
             queue.clone(),
             MockChainClient::default(),
-            events.clone(),
+            CapturingEventsProducer::new(),
             snapshot,
         );
 
         handle(ctx, &test_message(3)).await.expect("handler ok");
 
-        assert_eq!(queue.proposals.lock().unwrap().len(), 2);
-        assert!(
-            !events
-                .events()
-                .iter()
-                .any(|e| matches!(e, CapturedEvent::NIndexersUnavailable { .. })),
-            "the 2 slots to fill are filled"
+        let proposed: std::collections::HashSet<Url> =
+            queue.proposals.lock().unwrap().iter().cloned().collect();
+        assert_eq!(
+            proposed,
+            std::collections::HashSet::from([url(candidates[1]), url(candidates[2])]),
+            "2 offers, the first in IISA's order, none to the indexer holding a slot"
         );
+    }
+
+    #[tokio::test]
+    async fn never_cancels_an_agreement_for_a_slot_another_holds() {
+        // Target of 1: the healthy agreement stays, though an abandoned one holds a slot too.
+        let healthy = indexer_id(0x11);
+        let chain_client = MockChainClient::default();
+        let queue = MockQueue::default();
+        let registry = MockRegistry {
+            active_agreements: vec![agreement(healthy, IndexingAgreementStatus::AcceptedOnChain)],
+            held: vec![indexer_id(0x20)],
+            ..MockRegistry::default()
+        };
+        let marked_cancelling = Arc::clone(&registry.marked_cancelling);
+        let ctx = build_ctx(
+            registry,
+            MockIisa {
+                selected: vec![selected(healthy)],
+            },
+            queue.clone(),
+            chain_client.clone(),
+            CapturingEventsProducer::new(),
+            indexer_urls::Snapshot::new(),
+        );
+
+        handle(ctx, &test_message(1)).await.expect("handler ok");
+
+        assert!(chain_client.cancelled.lock().unwrap().is_empty());
+        assert!(marked_cancelling.lock().unwrap().is_empty());
+        assert!(queue.proposals.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1662,7 +1711,7 @@ mod lifecycle_event_tests {
             shortfall_active: std::sync::Mutex::new(false),
             marked_cancelled: Arc::default(),
             marked_cancelling: Arc::default(),
-            held_slots: 0,
+            held: Vec::new(),
         };
         let ctx = build_ctx(
             registry,
@@ -1718,7 +1767,7 @@ mod lifecycle_event_tests {
             shortfall_active: std::sync::Mutex::new(false),
             marked_cancelled: Arc::default(),
             marked_cancelling: Arc::default(),
-            held_slots: 0,
+            held: Vec::new(),
         };
         let ctx = build_ctx(
             registry,
@@ -1784,7 +1833,7 @@ mod lifecycle_event_tests {
             shortfall_active: std::sync::Mutex::new(false),
             marked_cancelled: Arc::default(),
             marked_cancelling: Arc::default(),
-            held_slots: 0,
+            held: Vec::new(),
         };
         let ctx = build_ctx(
             registry,
@@ -1917,7 +1966,7 @@ mod lifecycle_event_tests {
             shortfall_active: std::sync::Mutex::new(false),
             marked_cancelled: Arc::default(),
             marked_cancelling: Arc::default(),
-            held_slots: 0,
+            held: Vec::new(),
         };
         let ctx = build_ctx(
             registry,

@@ -3557,9 +3557,10 @@ async fn an_abandoned_agreement_holds_its_slot_while_it_may_still_be_paid() {
         .expect("cancel");
     let held = || async {
         registry
-            .count_abandoned_agreements_holding_slots(&request_id)
+            .get_abandoned_indexers_holding_slots(&request_id)
             .await
-            .expect("count held slots")
+            .expect("held slots")
+            .len()
     };
 
     //* Then

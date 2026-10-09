@@ -733,12 +733,12 @@ impl AgreementRegistry for RegistryProvider {
             .map_err(Into::into)
     }
 
-    async fn count_abandoned_agreements_holding_slots(
+    async fn get_abandoned_indexers_holding_slots(
         &self,
         request_id: &IndexingRequestId,
-    ) -> RegistryResult<usize> {
+    ) -> RegistryResult<Vec<IndexerId>> {
         self.inner
-            .count_abandoned_agreements_holding_slots(request_id)
+            .get_abandoned_indexers_holding_slots(request_id)
             .await
             .map_err(Into::into)
     }
