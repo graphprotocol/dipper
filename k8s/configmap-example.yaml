@@ -120,7 +120,7 @@ data:
         "threshold": 840
       },
       "alerts": {
-        "slack_webhook_url": "REPLACE_ME_OR_REMOVE_FOR_NO_ALERTS",
+        "slack_webhook_url": "https://hooks.slack.com/services/REPLACE_ME_OR_REMOVE_FOR_NO_ALERTS",
         "events": ["agreement_cancel_stuck", "rpc_blocks_refused", "nonce_gap_fill_failed"],
         "throttle": 900
       }

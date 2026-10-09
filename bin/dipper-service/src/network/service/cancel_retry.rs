@@ -41,9 +41,11 @@ const DB_TIMEOUT: Duration = Duration::from_secs(30);
 const QUEUE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Minutes an agreement stays out of the retry after it is marked, so the cancel sent
-/// when it was marked can be mined first instead of being sent again. One moved back to
-/// cancelling had none sent, so it doesn't wait.
-const SETTLE_MINUTES: i32 = 2;
+/// when it was marked can be mined first instead of being sent again. That cancel can wait
+/// behind another submission for its whole submit deadline, which stays under the 7-minute
+/// worker job limit, so this outlasts that limit. One moved back to cancelling had none sent,
+/// so it doesn't wait.
+const SETTLE_MINUTES: i32 = 8;
 
 /// How long the chain listener gets, from when a check first finds an agreement ended, to
 /// record when and in which transaction it ended, before the retry marks it without them.
@@ -147,7 +149,8 @@ where
 
 /// Retry the cancel of agreements still `Cancelling`. The chain's own latest block time
 /// decides when an offer that was never accepted no longer can be, so a subgraph that has
-/// fallen behind doesn't hold that up.
+/// fallen behind doesn't hold that up. Without it, such an offer is still withdrawn, but only
+/// accepted agreements can be marked ended.
 pub async fn retry_cancelling_agreements<R, T>(
     registry: &R,
     chain_client: &T,
@@ -169,8 +172,10 @@ pub async fn retry_cancelling_agreements<R, T>(
     if cancelling.is_empty() {
         return;
     }
-    let Some(chain_now) = chain_time(chain_client).await else {
-        return;
+    let chain_now = if cancelling.iter().any(|row| !row.accepted_on_chain) {
+        chain_time(chain_client).await
+    } else {
+        None
     };
     let started = std::time::Instant::now();
     for (done, row) in cancelling.iter().enumerate() {
@@ -191,7 +196,7 @@ async fn chain_time<T: ChainClient>(chain_client: &T) -> Option<u64> {
         Err(err) => {
             tracing::warn!(
                 error = %err,
-                "Failed to read the chain's time; cancels are retried next sweep"
+                "Failed to read the chain's time; offers never accepted stay cancelling until a later sweep"
             );
             None
         }
@@ -203,7 +208,7 @@ async fn retry_cancel<R, T>(
     chain_client: &T,
     config: &IndexingAgreementConfig,
     row: &CancellingAgreement,
-    chain_now: u64,
+    chain_now: Option<u64>,
 ) where
     R: AgreementRegistry + Sync,
     T: ChainClient,
@@ -253,7 +258,7 @@ async fn confirm_if_over<R: AgreementRegistry + Sync>(
     row: &CancellingAgreement,
     tx_hash: Option<B256>,
     by_indexer: bool,
-    chain_now: u64,
+    chain_now: Option<u64>,
 ) -> bool {
     let agreement = &row.agreement;
     let past_grace = row
@@ -262,7 +267,7 @@ async fn confirm_if_over<R: AgreementRegistry + Sync>(
     let can_confirm = if row.accepted_on_chain {
         tx_hash.is_some() || past_grace
     } else {
-        chain_now > agreement.terms.deadline
+        chain_now.is_some_and(|now| now > agreement.terms.deadline)
     };
     if !can_confirm {
         return false;
@@ -432,6 +437,12 @@ mod tests {
     };
 
     const DEADLINE: u64 = 1_000;
+
+    #[test]
+    fn a_marked_agreement_waits_out_a_whole_submit_deadline_before_a_retry() {
+        let settle = Duration::from_secs(u64::from(SETTLE_MINUTES.unsigned_abs()) * 60);
+        assert!(settle > crate::worker::service::PROCESS_JOB_TIMEOUT);
+    }
 
     #[derive(Default)]
     struct MockRegistry {
@@ -762,7 +773,8 @@ mod tests {
         let ended = ended_abandoned();
         let registry = MockRegistry {
             awaiting_replacement: vec![ended.clone()],
-            ..registry_with_one(true)
+            // Never accepted, so each sweep reads the chain's time, which counts the sweeps.
+            ..registry_with_one(false)
         };
         let chain = Arc::new(live_chain());
         let queue = MockQueue::default();
@@ -792,17 +804,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn waits_for_the_next_sweep_when_the_chain_time_cannot_be_read() {
+    async fn cancels_an_accepted_agreement_without_the_chain_time() {
+        // Only an offer never accepted needs the chain's time, to tell if its deadline passed.
         let registry = registry_with_one(true);
+        let chain = live_chain();
+
+        retry(&registry, &chain, 0).await;
+
+        assert_eq!(chain.clock_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.cancels_sent.load(Ordering::SeqCst), 1);
+        assert_eq!(registry.marked_cancelled.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn withdraws_an_offer_but_keeps_it_cancelling_when_the_chain_time_cannot_be_read() {
+        let registry = registry_with_one(false);
         let chain = MockChain {
             clock_fails: true,
             ..live_chain()
         };
 
-        retry(&registry, &chain, 0).await;
+        retry(&registry, &chain, DEADLINE + 1).await;
 
-        assert_eq!(chain.cancels_sent.load(Ordering::SeqCst), 0);
-        assert_eq!(registry.checks.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.cancels_sent.load(Ordering::SeqCst), 1);
+        assert!(registry.marked_cancelled.lock().unwrap().is_empty());
+        assert_eq!(registry.checks.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

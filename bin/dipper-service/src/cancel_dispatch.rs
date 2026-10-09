@@ -119,32 +119,56 @@ where
     R: AgreementRegistry + Sync,
     T: ChainClient,
 {
+    mark_cancelling(registry, agreement, reason).await?;
+    Ok(send_marked_cancel(registry, chain_client, agreement, reason, config).await)
+}
+
+/// The first half of [`start_cancel`]: mark the agreement `Cancelling`, or abandoning.
+pub async fn mark_cancelling<R: AgreementRegistry + Sync>(
+    registry: &R,
+    agreement: &IndexingAgreement,
+    reason: CancelReason,
+) -> RegistryResult<()> {
     match reason {
         CancelReason::NotWanted => {
             registry
                 .mark_indexing_agreement_as_cancelling(&agreement.id)
-                .await?
+                .await
         }
         CancelReason::Abandoned => {
             registry
                 .mark_indexing_agreement_as_abandoning(&agreement.id)
-                .await?
+                .await
         }
     }
+}
+
+/// The second half of [`start_cancel`]: cancel a marked agreement if the chain shows it live.
+pub async fn send_marked_cancel<R, T>(
+    registry: &R,
+    chain_client: &T,
+    agreement: &IndexingAgreement,
+    reason: CancelReason,
+    config: &IndexingAgreementConfig,
+) -> CancelStarted
+where
+    R: AgreementRegistry + Sync,
+    T: ChainClient,
+{
     let tx_hash = match cancel_if_live(chain_client, agreement, config).await {
         LiveCancel::Ended(tx_hash) => tx_hash,
-        LiveCancel::NotLive { .. } => return Ok(CancelStarted::NotLive),
+        LiveCancel::NotLive { .. } => return CancelStarted::NotLive,
         LiveCancel::ReadFailed(err) | LiveCancel::CancelFailed(err) => {
             tracing::warn!(
                 agreement_id = %agreement.id,
                 error = %err,
                 "On-chain cancel failed; the cancel retry sends it again"
             );
-            return Ok(CancelStarted::MayBeLive);
+            return CancelStarted::MayBeLive;
         }
         LiveCancel::Unconfirmed { tx_hash, err } => {
             log_unconfirmed(agreement, tx_hash, &err);
-            return Ok(CancelStarted::MayBeLive);
+            return CancelStarted::MayBeLive;
         }
     };
     tracing::info!(
@@ -154,15 +178,13 @@ where
     );
     // An offer never accepted could still land and be accepted until its deadline.
     if agreement.status != IndexingAgreementStatus::AcceptedOnChain {
-        return Ok(CancelStarted::NotLive);
+        return CancelStarted::NotLive;
     }
-    Ok(
-        if confirm_cancelled(registry, agreement, reason, tx_hash, config).await {
-            CancelStarted::Ended
-        } else {
-            CancelStarted::NotLive
-        },
-    )
+    if confirm_cancelled(registry, agreement, reason, tx_hash, config).await {
+        CancelStarted::Ended
+    } else {
+        CancelStarted::NotLive
+    }
 }
 
 /// Mark an agreement the chain shows dipper ended as ended, recording the cancel when its
