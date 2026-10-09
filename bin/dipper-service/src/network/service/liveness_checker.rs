@@ -527,23 +527,34 @@ async fn cancel_and_reassess<R, W, C>(
         return;
     }
     if started == CancelStarted::NotLive {
-        note_seen_ended(agreement, registry).await;
+        note_seen_ended(agreement, registry, db_timeout).await;
     }
     replace_abandoned(agreement, registry, worker_queue, db_timeout, queue_timeout).await;
 }
 
 /// Note that the chain shows a stale agreement still cancelling has ended, so it no longer
-/// holds its slot in the request and the reassessment queued next fills it.
-async fn note_seen_ended<R: AgreementRegistry + Sync>(agreement: &IndexingAgreement, registry: &R) {
-    match registry
-        .record_cancel_check(&agreement.id, 0, Some(true))
-        .await
-    {
-        Ok(_) | Err(crate::registry::Error::NoRecordsUpdated) => {}
-        Err(err) => tracing::warn!(
+/// holds its slot in the request and the reassessment queued next fills it. Bounded by
+/// `db_timeout`, so a hung database can't stall the liveness cycle.
+async fn note_seen_ended<R: AgreementRegistry + Sync>(
+    agreement: &IndexingAgreement,
+    registry: &R,
+    db_timeout: Duration,
+) {
+    let noted = tokio::time::timeout(
+        db_timeout,
+        registry.record_cancel_check(&agreement.id, 0, Some(true)),
+    )
+    .await;
+    match noted {
+        Ok(Ok(_) | Err(crate::registry::Error::NoRecordsUpdated)) => {}
+        Ok(Err(err)) => tracing::warn!(
             agreement_id = %agreement.id,
             error = %err,
             "Failed to note a stale agreement ended; its replacement may wait for a later reassessment"
+        ),
+        Err(_) => tracing::warn!(
+            agreement_id = %agreement.id,
+            "Timeout noting a stale agreement ended; its replacement may wait for a later reassessment"
         ),
     }
 }
@@ -1005,6 +1016,7 @@ mod tests {
         calls: MockCalls,
         already_ending: bool,
         mark_hangs: bool,
+        check_hangs: bool,
         get_request_result: Arc<Mutex<Option<RegistryResult<Option<IndexingRequest>>>>>,
     }
 
@@ -1015,6 +1027,7 @@ mod tests {
                 calls,
                 already_ending: false,
                 mark_hangs: false,
+                check_hangs: false,
                 get_request_result: Arc::new(Mutex::new(Some(Ok(Some(request))))),
             }
         }
@@ -1067,6 +1080,9 @@ mod tests {
             _failed_attempts: u32,
             ended: Option<bool>,
         ) -> RegistryResult<u32> {
+            if self.check_hangs {
+                std::future::pending::<()>().await;
+            }
             if ended == Some(true) {
                 self.calls.seen_ended.lock().unwrap().push(*id);
             }
@@ -1691,6 +1707,25 @@ mod tests {
 
         assert!(calls.chain_cancels.lock().unwrap().is_empty());
         assert!(calls.reassessments.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn still_replaces_an_ended_stale_agreement_when_noting_its_end_hangs() {
+        let agreement = stale_agreement();
+        let calls = MockCalls::default();
+        let registry = MockRegistry {
+            check_hangs: true,
+            ..MockRegistry::new(calls.clone(), agreement.clone())
+        };
+        let chain = MockChainClient::rpc_error(calls.clone());
+        chain.live.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        end_stale(&agreement, &registry, &chain).await;
+
+        assert_eq!(
+            calls.reassessments.lock().unwrap().as_slice(),
+            &[agreement.indexing_request_id]
+        );
     }
 
     #[tokio::test]
