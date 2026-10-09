@@ -212,6 +212,11 @@ impl sqlx::FromRow<'_, sqlx::postgres::PgRow> for CancellingAgreement {
     }
 }
 
+/// How long an ended agreement's `terminated` event waits for the transaction that ended it.
+/// Dipper can mark an agreement ended before the chain listener records that transaction, so
+/// the wait lets the event carry it; after this the event goes out without one.
+const TERMINATED_TX_WAIT_MINUTES: i32 = 60;
+
 /// Statuses an on-chain cancel by dipper ends.
 const CANCEL_BY_REQUESTER_FROM: &[IndexingAgreementStatus] = &[
     IndexingAgreementStatus::Created,
@@ -1385,7 +1390,8 @@ impl PgRegistry {
     /// Fetch a batch of agreements awaiting a `terminated` event: in a
     /// terminal-cancel state, genuinely accepted on-chain (`accepted_at IS NOT
     /// NULL`, so a never-accepted local cancel is excluded), and not yet
-    /// emitted. Oldest-marked first so the backlog drains in order.
+    /// emitted, once the transaction that ended it is known or
+    /// [`TERMINATED_TX_WAIT_MINUTES`] have passed. Oldest-marked first.
     pub async fn get_agreements_pending_terminated_emission(
         &self,
         limit: i64,
@@ -1397,6 +1403,8 @@ impl PgRegistry {
             WHERE status IN ($1, $2, $3)
               AND accepted_at IS NOT NULL
               AND terminated_event_emitted_at IS NULL
+              AND (canceled_tx IS NOT NULL
+                   OR updated_at < timezone('UTC', now()) - make_interval(mins => $5))
             ORDER BY updated_at ASC
             LIMIT $4
             "#,
@@ -1405,6 +1413,7 @@ impl PgRegistry {
         .bind(IndexingAgreementStatus::CanceledByIndexer)
         .bind(IndexingAgreementStatus::AbandonedByIndexer)
         .bind(limit)
+        .bind(TERMINATED_TX_WAIT_MINUTES)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
