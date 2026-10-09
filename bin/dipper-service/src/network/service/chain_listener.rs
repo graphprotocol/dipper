@@ -555,6 +555,9 @@ where
         // another payer's) drop out as `None` below.
         let snapshot_ids: Vec<IndexingAgreementId> =
             result.snapshots.iter().map(|s| s.agreement_id).collect();
+        // Agreements whose change this page failed to apply. The cursor stays before the page
+        // until none fail, as nothing else would look at them again.
+        let mut unapplied: Vec<IndexingAgreementId> = Vec::new();
         let mut agreements_by_id =
             match registry.get_indexing_agreements_by_ids(&snapshot_ids).await {
                 Ok(m) => m,
@@ -566,6 +569,7 @@ where
                         "Failed to batch-fetch agreements for page; counting snapshots as errors"
                     );
                     drain_errors += snapshot_ids.len() as u64;
+                    unapplied.extend(&snapshot_ids);
                     std::collections::HashMap::new()
                 }
             };
@@ -588,12 +592,13 @@ where
                         "Failed to prepare reconciliation for snapshot"
                     );
                     drain_errors += 1;
+                    unapplied.push(snapshot.agreement_id);
                 }
             }
         }
 
-        // On batch error the tx rolls back; the next tick re-reads
-        // these rows via the reorg buffer. The successful path
+        // On batch error the tx rolls back; the cursor is held so the
+        // next tick re-reads these rows. The successful path
         // pre-fills every input id in `outcomes` (with `default()`
         // for rows whose CAS guard didn't match), so a missing id
         // is an unambiguous signal that the whole batch failed.
@@ -611,6 +616,7 @@ where
                         "Batched apply_reconciliation failed; counting page items as errors"
                     );
                     drain_errors += items.len() as u64;
+                    unapplied.extend(items.iter().map(|item| item.agreement_id));
                     std::collections::HashMap::new()
                 }
             }
@@ -672,7 +678,15 @@ where
         // Persist per-page so a crash mid-drain replays at most
         // one page. Skip the write when neither cursor nor
         // ratcheted timestamp moved.
-        let advance_cursor = *cursor < new_cursor;
+        let advance_cursor = unapplied.is_empty() && *cursor < new_cursor;
+        if !unapplied.is_empty() {
+            tracing::error!(
+                event = "chain_listener_cursor_held",
+                cursor_block = cursor.block,
+                agreement_ids = ?unapplied,
+                "Failed to apply on-chain changes to agreements; re-reading them next poll"
+            );
+        }
         let timestamp_changed = ratchet_timestamp != *last_persisted_timestamp;
         if advance_cursor || timestamp_changed {
             let cursor_to_persist = if advance_cursor {
@@ -701,8 +715,8 @@ where
             // nothing to do this tick.
             break 'drain;
         } else {
-            // Held-back cursor (parse failure path); reconcile
-            // already ran on what we did read, retry next tick.
+            // Held-back cursor (parse failure, or a change that failed to
+            // apply); reconcile already ran on what we did read, retry next tick.
             break 'drain;
         }
 
@@ -4185,6 +4199,67 @@ mod tests {
                 "batch failure must not leave per-row mock side-effects"
             );
         }
+    }
+
+    /// A page whose changes fail to apply keeps the cursor before it, so the next poll
+    /// re-reads it: no later change to those agreements may come to apply it instead.
+    #[tokio::test]
+    async fn test_drain_holds_the_cursor_until_a_failed_page_applies() {
+        let registry = MockRegistry::new();
+        let chain_client = MockChainClient::default();
+        registry.set_fail_batch(true);
+        let event_source = super::super::chain_events::mock::MockEventSource::new();
+        event_source.set_latest_block(100);
+        event_source.set_latest_block_timestamp(Some(1_700_000_000));
+        let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+        registry.add_agreement(agreement_id, IndexingAgreementStatus::Created);
+        event_source.add_snapshots(vec![AgreementStateSnapshot {
+            agreement_id,
+            indexer: Address::ZERO,
+            state: super::super::chain_events::AgreementState::Accepted,
+            canceled_by: Address::ZERO,
+            last_state_change_block: 10,
+            accepted_at: 0,
+            accepted_tx: String::new(),
+            canceled_at: 0,
+            canceled_tx: String::new(),
+        }]);
+        let mut cursor = Cursor::genesis();
+        let mut last_persisted_timestamp: Option<u64> = None;
+        let mut last_chain_ts_persist_wall = std::time::Instant::now();
+        let mut last_subgraph_head: u64 = 0;
+        let mut stall_count: u32 = 0;
+        let mut consecutive_failures: u32 = 0;
+        let (_tx_stop, mut rx_stop) = mpsc::channel::<()>(1);
+
+        for fails in [true, false] {
+            registry.set_fail_batch(fails);
+            drain_once(
+                &mut cursor,
+                &mut last_persisted_timestamp,
+                &mut last_chain_ts_persist_wall,
+                &mut last_subgraph_head,
+                &mut stall_count,
+                &mut consecutive_failures,
+                1337,
+                0,
+                10,
+                false,
+                &registry,
+                &chain_client,
+                &event_source,
+                &mut rx_stop,
+                test_agreement_conf().as_ref(),
+            )
+            .await
+            .expect("subgraph fetch succeeded");
+            if fails {
+                assert_eq!(cursor, Cursor::genesis(), "held before the failed page");
+            }
+        }
+
+        assert!(registry.was_marked_accepted_on_chain(&agreement_id));
+        assert!(cursor > Cursor::genesis());
     }
 
     /// Drives a hostile timestamp drift through `drain_once` and asserts
