@@ -1751,6 +1751,54 @@ async fn test_get_accepted_on_chain_agreements() {
 }
 
 #[tokio::test]
+async fn get_accepted_on_chain_agreements_adds_1_of_each_indexer_the_batch_leaves_out() {
+    //* Given
+    let (db, _temp_db) = temp_registry_db().await;
+    run_fixture(
+        &db,
+        include_str!("fixtures/0003_multi_indexer_agreements.sql"),
+    )
+    .await
+    .expect("Failed to run fixture");
+    // Indexer A holds 2 accepted agreements that stalled days ago; indexer B holds 1 that
+    // progressed a minute ago.
+    run_fixture(
+        &db,
+        r#"
+        UPDATE dipper_reg_indexing_agreements
+        SET status = 6, last_block_height = 1, last_progress_at = now() - interval '3 days'
+        WHERE id = '\xaa000000000000000000000000000001'::bytea;
+        UPDATE dipper_reg_indexing_agreements
+        SET last_block_height = 1, last_progress_at = now() - interval '2 days'
+        WHERE id = '\xaa000000000000000000000000000002'::bytea;
+        UPDATE dipper_reg_indexing_agreements
+        SET status = 6, last_block_height = 1, last_progress_at = now() - interval '1 minute'
+        WHERE id = '\xbb000000000000000000000000000001'::bytea;
+        "#,
+    )
+    .await
+    .expect("Failed to set up accepted agreements");
+    let registry = PgRegistry::new(db);
+
+    //* When
+    let agreements = registry
+        .get_accepted_on_chain_agreements(1)
+        .await
+        .expect("Failed to get AcceptedOnChain agreements");
+
+    //* Then
+    let ids: Vec<IndexingAgreementId> = agreements.iter().map(|a| a.id).collect();
+    assert_eq!(
+        ids,
+        vec![
+            IndexingAgreementId::from_bytes([0xaa, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            IndexingAgreementId::from_bytes([0xbb, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+        ],
+        "the batch of 1 stalest, then 1 of indexer B, which the batch left out"
+    );
+}
+
+#[tokio::test]
 async fn test_update_agreement_sync_progress() {
     //* Given
     let (db, _temp_db) = temp_registry_db().await;

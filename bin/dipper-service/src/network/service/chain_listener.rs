@@ -111,6 +111,24 @@ fn hold_expired(hold: &mut Option<CursorHold>, cursor: &Cursor, now: std::time::
         }
     }
 }
+
+/// Most agreement ids a log line lists, so an alert for a whole page that failed stays readable.
+const MAX_LOGGED_IDS: usize = 20;
+
+/// Agreement ids in the 0x form operators search for, at most [`MAX_LOGGED_IDS`] of them.
+fn listed_ids(ids: &[IndexingAgreementId]) -> String {
+    let shown: Vec<String> = ids
+        .iter()
+        .take(MAX_LOGGED_IDS)
+        .map(ToString::to_string)
+        .collect();
+    let more = ids.len().saturating_sub(MAX_LOGGED_IDS);
+    if more == 0 {
+        shown.join(", ")
+    } else {
+        format!("{} and {more} more", shown.join(", "))
+    }
+}
 /// Cap on the cancellation-sweep batch so a backlog drains across polls
 /// instead of blocking one tick.
 const SWEEP_BATCH_SIZE: i64 = 1000;
@@ -735,7 +753,8 @@ where
             tracing::error!(
                 event = "chain_listener_changes_skipped",
                 cursor_block = cursor.block,
-                agreement_ids = ?unapplied,
+                agreement_count = unapplied.len(),
+                agreement_ids = %listed_ids(&unapplied),
                 "Skipped on-chain changes to agreements that kept failing to apply; they won't \
                  be read again until their next change"
             );
@@ -743,7 +762,8 @@ where
             tracing::error!(
                 event = "chain_listener_cursor_held",
                 cursor_block = cursor.block,
-                agreement_ids = ?unapplied,
+                agreement_count = unapplied.len(),
+                agreement_ids = %listed_ids(&unapplied),
                 "Failed to apply on-chain changes to agreements; re-reading them next poll"
             );
         }
@@ -4547,6 +4567,24 @@ mod tests {
         ));
         assert!(hold_expired(&mut hold, &page, now + MAX_CURSOR_HOLD));
         assert!(hold.is_none());
+    }
+
+    #[test]
+    fn lists_at_most_20_agreement_ids_in_their_0x_form() {
+        let ids: Vec<IndexingAgreementId> = (0..25u8)
+            .map(|n| IndexingAgreementId::from_bytes([n; 16]))
+            .collect();
+
+        assert_eq!(
+            listed_ids(&ids[1..3]),
+            "0x01010101010101010101010101010101, 0x02020202020202020202020202020202"
+        );
+        let many = listed_ids(&ids);
+        assert_eq!(many.matches("0x").count(), 20, "{many}");
+        assert!(
+            many.ends_with("0x13131313131313131313131313131313 and 5 more"),
+            "{many}"
+        );
     }
 
     /// Drives a hostile timestamp drift through `drain_once` and asserts

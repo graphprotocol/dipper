@@ -471,7 +471,8 @@ pub trait AgreementRegistry {
         rejection_reason: Option<&str>,
     ) -> RegistryResult<()>;
 
-    /// Get all `AcceptedOnChain` agreements for liveness checking.
+    /// Get `AcceptedOnChain` agreements for liveness checking: the `batch_size` longest without
+    /// progress, plus 1 of every other indexer holding one, so every such indexer is asked.
     ///
     /// Results are ordered by `last_progress_at` ascending (NULLs first) so agreements
     /// that have never been checked are processed first.
