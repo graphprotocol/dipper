@@ -2559,8 +2559,6 @@ async fn batch_set_status(
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
-/// Transition an agreement's status inside a transaction. Thin wrapper
-/// over `batch_update_status_from` for the single-row case.
 /// Persist the accepted-transition audit payload for a single row. `COALESCE`
 /// keeps any already-stored value rather than clobbering it with `NULL`.
 #[expect(
@@ -2623,6 +2621,8 @@ async fn persist_cancel_audit(
     Ok(())
 }
 
+/// Move an agreement whose status is in `allowed_from` to `new_status` inside a transaction,
+/// returning whether it moved. Thin wrapper over `batch_update_status_from` for 1 row.
 async fn update_status_from(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     agreement_id: &IndexingAgreementId,
