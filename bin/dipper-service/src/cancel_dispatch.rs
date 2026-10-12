@@ -1,4 +1,5 @@
-//! On-chain cancel dispatch. Every cancel starts with [`start_cancel`] and goes out through
+//! On-chain cancel dispatch. Every cancel starts with [`start_cancel`], or
+//! [`start_cancel_seen_live`] when the caller has just read the chain, and goes out through
 //! `cancel_agreement_on_chain`, so the manager-routed path lives in one place.
 
 use dipper_core::time::now_secs;
@@ -123,6 +124,24 @@ where
     Ok(send_marked_cancel(registry, chain_client, agreement, reason, config).await)
 }
 
+/// [`start_cancel`] for an agreement the caller has just read live on-chain, so the chain
+/// isn't read again before the cancel goes out.
+pub async fn start_cancel_seen_live<R, T>(
+    registry: &R,
+    chain_client: &T,
+    agreement: &IndexingAgreement,
+    reason: CancelReason,
+    config: &IndexingAgreementConfig,
+) -> RegistryResult<CancelStarted>
+where
+    R: AgreementRegistry + Sync,
+    T: ChainClient,
+{
+    mark_cancelling(registry, agreement, reason).await?;
+    let cancel = cancel_agreement_on_chain(chain_client, agreement, config).await;
+    Ok(finish_marked_cancel(registry, agreement, reason, config, cancel).await)
+}
+
 /// The first half of [`start_cancel`]: mark the agreement `Cancelling`, or abandoning.
 pub async fn mark_cancelling<R: AgreementRegistry + Sync>(
     registry: &R,
@@ -155,7 +174,20 @@ where
     R: AgreementRegistry + Sync,
     T: ChainClient,
 {
-    let tx_hash = match cancel_if_live(chain_client, agreement, config).await {
+    let cancel = cancel_if_live(chain_client, agreement, config).await;
+    finish_marked_cancel(registry, agreement, reason, config, cancel).await
+}
+
+/// Act on what a marked agreement's cancel found: confirm an accepted one this cancel ended,
+/// and leave the rest `Cancelling` for the cancel retry.
+async fn finish_marked_cancel<R: AgreementRegistry + Sync>(
+    registry: &R,
+    agreement: &IndexingAgreement,
+    reason: CancelReason,
+    config: &IndexingAgreementConfig,
+    cancel: LiveCancel,
+) -> CancelStarted {
+    let tx_hash = match cancel {
         LiveCancel::Ended(tx_hash) => tx_hash,
         LiveCancel::NotLive { .. } => return CancelStarted::NotLive,
         LiveCancel::ReadFailed(err) | LiveCancel::CancelFailed(err) => {

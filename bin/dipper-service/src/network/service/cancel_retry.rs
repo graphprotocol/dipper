@@ -308,15 +308,7 @@ async fn record_end_by_indexer<R: AgreementRegistry + Sync>(
     };
     match marked {
         Ok(outcome) => {
-            tracing::info!(
-                agreement_id = %agreement.id,
-                indexing_request_id = %agreement.indexing_request_id,
-                old_status = "CANCELLING",
-                new_status = "CANCELED_BY_INDEXER",
-                applied = outcome.did_cancel,
-                reason = "indexer_cancel_seen_on_chain",
-                "agreement state transition"
-            );
+            log_end_by_indexer(agreement, outcome.did_cancel);
             true
         }
         Err(err) => {
@@ -327,6 +319,26 @@ async fn record_end_by_indexer<R: AgreementRegistry + Sync>(
             );
             false
         }
+    }
+}
+
+/// Log an agreement the indexer ended as a status change only when this marked it; the chain
+/// listener may have recorded the end first.
+fn log_end_by_indexer(agreement: &IndexingAgreement, changed: bool) {
+    if changed {
+        tracing::info!(
+            agreement_id = %agreement.id,
+            indexing_request_id = %agreement.indexing_request_id,
+            old_status = "CANCELLING",
+            new_status = "CANCELED_BY_INDEXER",
+            reason = "indexer_ended_it_before_dipper_cancelled",
+            "agreement state transition"
+        );
+    } else {
+        tracing::debug!(
+            agreement_id = %agreement.id,
+            "The chain listener already recorded the indexer's end"
+        );
     }
 }
 
@@ -527,7 +539,7 @@ mod tests {
             self.marked_by_indexer.lock().unwrap().push(*id);
             Ok(crate::registry::ReconciliationOutcome {
                 did_accept: false,
-                did_cancel: true,
+                did_cancel: !self.listener_ended_it,
             })
         }
         async fn record_cancel_check(
@@ -981,6 +993,65 @@ mod tests {
             let indexer = registry.cancelling[0].agreement.indexer.id.to_string();
             assert_eq!(*registry.audited_by.lock().unwrap(), vec![indexer]);
             assert_eq!(*registry.audits.lock().unwrap(), vec![None]);
+        }
+    }
+
+    /// What dipper logs, at every level, while `run` runs.
+    async fn logged(run: impl Future<Output = ()>) -> String {
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let writer = Arc::clone(&lines);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || Buffer(Arc::clone(&writer)))
+            .finish();
+        let _logging = tracing::subscriber::set_default(subscriber);
+        run.await;
+        String::from_utf8(lines.lock().unwrap().clone()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn logs_an_end_by_the_indexer_as_a_status_change_only_when_it_made_one() {
+        for listener_ended_it in [false, true] {
+            let mut registry = MockRegistry {
+                listener_ended_it,
+                ..registry_with_one(true)
+            };
+            registry.cancelling[0].ended_seen_at =
+                Some(time::OffsetDateTime::now_utc() - LISTENER_GRACE - time::Duration::MINUTE);
+            let chain = MockChain {
+                ended_by_indexer: true,
+                ..MockChain::default()
+            };
+
+            let logs = logged(retry(&registry, &chain, 0)).await;
+
+            let changed = !listener_ended_it;
+            assert_eq!(
+                logs.contains("agreement state transition"),
+                changed,
+                "{logs}"
+            );
+            assert_eq!(
+                logs.contains("indexer_ended_it_before_dipper_cancelled"),
+                changed,
+                "{logs}"
+            );
+            assert_eq!(
+                logs.contains("already recorded the indexer's end"),
+                !changed,
+                "{logs}"
+            );
         }
     }
 
