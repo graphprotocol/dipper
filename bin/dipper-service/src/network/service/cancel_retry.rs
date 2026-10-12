@@ -366,6 +366,10 @@ async fn note_check<R: AgreementRegistry + Sync>(
                 log_failed_cancel(row, attempts, failed_attempts, err);
             }
         }
+        Err(crate::registry::Error::NoRecordsUpdated) => tracing::debug!(
+            agreement_id = %agreement.id,
+            "Agreement no longer cancelling when its check was recorded, as the chain listener can end it first"
+        ),
         Err(err) => tracing::warn!(
             agreement_id = %agreement.id,
             error = %err,
@@ -469,6 +473,8 @@ mod tests {
         found_ended: Mutex<Vec<Option<bool>>>,
         /// The chain listener marks it ended before the retry's own mark lands.
         listener_ended_it: bool,
+        /// Recording a check fails, as with the database down.
+        check_fails: bool,
         writes: Mutex<Vec<&'static str>>,
         /// Ended agreements awaiting replacement, until noted as replaced.
         awaiting_replacement: Vec<IndexingAgreement>,
@@ -549,6 +555,14 @@ mod tests {
             failed_attempts: u32,
             ended: Option<bool>,
         ) -> crate::registry::Result<u32> {
+            if self.listener_ended_it {
+                return Err(crate::registry::Error::NoRecordsUpdated);
+            }
+            if self.check_fails {
+                return Err(crate::registry::Error::BackendError(
+                    dipper_pgregistry::Error::DbError(sqlx::Error::PoolTimedOut),
+                ));
+            }
             self.checks.fetch_add(1, Ordering::SeqCst);
             self.found_ended.lock().unwrap().push(ended);
             Ok(self.attempts.fetch_add(failed_attempts, Ordering::SeqCst) + failed_attempts)
@@ -1038,6 +1052,38 @@ mod tests {
                 "{logs}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn logs_a_check_the_listener_beat_at_debug_and_a_failed_one_as_a_warning() {
+        // The listener ending the agreement mid-sweep is expected; only a failed write needs a look.
+        let check = async |listener_ended_it, check_fails| {
+            let registry = MockRegistry {
+                listener_ended_it,
+                check_fails,
+                ..registry_with_one(false)
+            };
+            // Withdrawn before its deadline, so the check is recorded and it stays cancelling.
+            logged(retry(&registry, &MockChain::default(), DEADLINE)).await
+        };
+
+        let beaten = check(true, false).await;
+        let failed = check(false, true).await;
+
+        let line = |logs: &str, message: &str| {
+            let line = logs.lines().find(|line| line.contains(message));
+            line.unwrap_or_else(|| panic!("no {message:?} in {logs}"))
+                .to_owned()
+        };
+        assert!(
+            line(&beaten, "no longer cancelling").contains("DEBUG"),
+            "{beaten}"
+        );
+        assert!(!beaten.contains("WARN"), "{beaten}");
+        assert!(
+            line(&failed, "Failed to record a check").contains("WARN"),
+            "{failed}"
+        );
     }
 
     #[tokio::test]
