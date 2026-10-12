@@ -77,6 +77,11 @@ const BLOCKS_PER_SECOND: u64 = 4;
 /// the newest block dipper has seen raises an ERROR; nearer is lag that clears by itself.
 const ALERT_GAP_BLOCKS: u64 = 14_400;
 
+/// A minute of blocks at the chain's fastest: how far apart endpoints may be and still agree.
+/// Ones that are right differ by a few blocks, and the chain's progress is allowed for apart from
+/// this, so it only bounds how far ahead a faulty endpoint can move the newest block seen.
+const AGREE_WITHIN_BLOCKS: u64 = 60 * BLOCKS_PER_SECOND;
+
 /// How a read refused by an endpoint whose latest block is too far ahead to be real says so.
 const FAR_AHEAD_OF_A_SEEN_BLOCK: &str = "too far ahead of the newest block seen";
 
@@ -87,12 +92,9 @@ const CROSS_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 /// An answer takes well under a second, so this only bounds how long a hung endpoint holds a read.
 const CROSS_CHECK_DEADLINE: Duration = Duration::from_secs(3);
 
-/// The newest block dipper has seen, from reads, receipts and latest-block lookups, and when it
-/// last moved. It never goes backwards, so a lagging endpoint can't show state from before it.
-/// Blocks too far ahead of it are refused only once it is confirmed, by the receipt for one of
-/// dipper's transactions or by 2 endpoints agreeing, so an endpoint stuck far behind, or far
-/// ahead, that answers first after a restart can't shut out the endpoints that are right.
-/// Once confirmed, 1 endpoint alone can't move it far ahead either, for the same reason.
+/// The newest block dipper has seen and when it last moved; it never goes back, so a lagging
+/// endpoint can't show state from before it. Nothing ahead is refused until a receipt or 2 agreeing
+/// endpoints confirm it, so a wrong one answering first after a restart can't shut out the rest.
 #[derive(Debug)]
 struct SeenBlock {
     number: u64,
@@ -145,12 +147,12 @@ impl SeenBlock {
         (self.number, highest)
     }
 
-    /// The highest block 1 endpoint alone may move a confirmed newest block to: an hour of
+    /// The highest block 1 endpoint alone may move a confirmed newest block to: a minute of
     /// blocks past it, plus what the chain can have added since.
     fn lone_limit(&self, now: Instant) -> u64 {
         let since = now.saturating_duration_since(self.moved_at).as_secs();
         self.number
-            .saturating_add(ALERT_GAP_BLOCKS)
+            .saturating_add(AGREE_WITHIN_BLOCKS)
             .saturating_add(since.saturating_mul(BLOCKS_PER_SECOND))
     }
 
@@ -179,7 +181,7 @@ impl SeenBlock {
     }
 
     /// Take `block` as one the chain is known to have reached. An unconfirmed newest block more
-    /// than an hour of blocks past it came from a faulty endpoint, so it is replaced.
+    /// than a minute of blocks past it came from a faulty endpoint, so it is replaced.
     fn confirm(&mut self, block: u64, now: Instant) {
         self.jump_reported = false;
         if self.confirmed {
@@ -188,7 +190,7 @@ impl SeenBlock {
             }
             return;
         }
-        if block > self.number || self.number > block.saturating_add(ALERT_GAP_BLOCKS) {
+        if block > self.number || self.number > block.saturating_add(AGREE_WITHIN_BLOCKS) {
             self.number = block;
             self.moved_at = now;
         }
@@ -210,13 +212,13 @@ impl SeenBlock {
 }
 
 /// The newest of the latest blocks that the most endpoints agree on, at least 2 of them within
-/// an hour of blocks of each other, or `None` when no 2 agree.
+/// a minute of blocks of each other, or `None` when no 2 agree.
 fn agreed_head(mut heads: Vec<u64>) -> Option<u64> {
     heads.sort_unstable();
     let mut agreed: Option<(usize, u64)> = None;
     let mut start = 0;
     for (end, &head) in heads.iter().enumerate() {
-        while head - heads[start] > ALERT_GAP_BLOCKS {
+        while head - heads[start] > AGREE_WITHIN_BLOCKS {
             start += 1;
         }
         let agreeing = end - start + 1;
@@ -944,7 +946,7 @@ impl AlloyChainClient {
     }
 
     /// Remember a block dipper has seen, so later reads are never older. One too far ahead to
-    /// be real is ignored, so it can't refuse every read after it, and one over an hour ahead
+    /// be real is ignored, so it can't refuse every read after it, and one over a minute ahead
     /// waits for 2 endpoints to agree on it.
     fn note_block(&self, block: u64) {
         let only_endpoint = self.inner.rpc_pool.endpoint_count() < 2;
@@ -960,7 +962,7 @@ impl AlloyChainClient {
             Noted::Unagreed => tracing::warn!(
                 block,
                 seen_block = seen,
-                "Not moving to a block over an hour ahead of the newest block dipper has seen \
+                "Not moving to a block over a minute ahead of the newest block dipper has seen \
                  until 2 RPC endpoints agree on it"
             ),
             Noted::TooFarAhead => tracing::warn!(
@@ -2679,7 +2681,7 @@ mod tests {
         let mut seen = SeenBlock::new();
         let real = 5_000_000;
         seen.confirm(real, now);
-        let jump = real + ALERT_GAP_BLOCKS + 1_000;
+        let jump = real + AGREE_WITHIN_BLOCKS + 1_000;
 
         assert_eq!(seen.advance(real + 10, now, false), Noted::Taken);
         assert_eq!(seen.advance(jump, now, false), Noted::Unagreed);
@@ -2691,7 +2693,7 @@ mod tests {
         assert_eq!(seen.bounds(now).0, jump, "taken once 2 agree");
         assert!(!seen.cross_check_due(now + CROSS_CHECK_INTERVAL));
         assert_eq!(
-            seen.advance(jump + ALERT_GAP_BLOCKS + 1, now, true),
+            seen.advance(jump + AGREE_WITHIN_BLOCKS + 1, now, true),
             Noted::Taken,
             "the only endpoint has no other to agree with"
         );
@@ -2722,6 +2724,93 @@ mod tests {
         );
         assert_eq!(agreed_head(vec![1_000, real]), None, "2 that disagree");
         assert_eq!(agreed_head(vec![real]), None, "1 can't agree with itself");
+    }
+
+    #[test]
+    fn a_faulty_endpoint_well_ahead_neither_agrees_nor_moves_a_confirmed_block() {
+        // Its block taken as seen would have the endpoints that are right refused as behind
+        // until the chain caught up with it: 10,000 blocks is about 42 minutes.
+        let now = Instant::now();
+        let real = 5_000_000;
+        let faulty = real + 10_000;
+        assert_eq!(agreed_head(vec![real, real + 2, faulty]), Some(real + 2));
+
+        let mut seen = SeenBlock::new();
+        seen.confirm(real, now);
+        assert_eq!(seen.advance(faulty, now, false), Noted::Unagreed);
+        assert_eq!(seen.bounds(now).0, real);
+    }
+
+    #[test]
+    fn a_block_from_a_faulty_endpoint_well_ahead_is_replaced_once_confirmed() {
+        // After a restart the faulty endpoint may answer first, before anything is confirmed.
+        let now = Instant::now();
+        let real = 5_000_000;
+        let mut seen = SeenBlock::new();
+        assert_eq!(seen.advance(real + 10_000, now, false), Noted::Taken);
+
+        seen.confirm(real, now);
+
+        assert_eq!(seen.bounds(now).0, real);
+    }
+
+    #[test]
+    fn takes_the_few_blocks_endpoints_that_are_right_differ_by() {
+        let now = Instant::now();
+        let real = 5_000_000;
+        let minute_ahead = real + AGREE_WITHIN_BLOCKS;
+        assert_eq!(agreed_head(vec![real, real + 3]), Some(real + 3));
+        assert_eq!(agreed_head(vec![real, minute_ahead]), Some(minute_ahead));
+
+        let mut seen = SeenBlock::new();
+        assert_eq!(seen.advance(minute_ahead, now, false), Noted::Taken);
+        seen.confirm(real, now);
+        assert_eq!(
+            seen.bounds(now).0,
+            minute_ahead,
+            "a lead of a minute is kept"
+        );
+
+        let mut seen = SeenBlock::new();
+        seen.confirm(real, now);
+        assert_eq!(seen.advance(real + 40, now, false), Noted::Taken);
+        assert_eq!(seen.advance(minute_ahead + 40, now, false), Noted::Taken);
+
+        // 10 quiet minutes, in which the chain can add 2,400 blocks.
+        let mut quiet = SeenBlock {
+            number: real,
+            moved_at: now.checked_sub(Duration::from_secs(600)).expect("instant"),
+            confirmed: true,
+            cross_checked_at: None,
+            jump_reported: false,
+        };
+        assert_eq!(quiet.advance(real + 2_400 + 40, now, false), Noted::Taken);
+    }
+
+    #[tokio::test]
+    async fn a_faulty_endpoint_well_ahead_does_not_shut_out_the_ones_that_are_right() {
+        let real = 5_000_000;
+        let ended = STATE_REGISTERED | STATE_ACCEPTED | STATE_NOTICE_GIVEN;
+        let right = server_at_block(real, ended).await;
+        let also_right = server_at_block(real, ended).await;
+        let faulty = server_at_block(real + 10_000, STATE_REGISTERED).await;
+        let client = client_over(vec![
+            right.uri().parse().expect("provider URL"),
+            also_right.uri().parse().expect("provider URL"),
+            faulty.uri().parse().expect("provider URL"),
+        ]);
+        // The faulty endpoint answered first after a restart.
+        client.note_block(real + 10_000);
+
+        let live = client
+            .agreement_on_chain(&[0xab; 16])
+            .await
+            .expect("read")
+            .is_live();
+
+        assert!(!live, "read from an endpoint that is right");
+        assert!(client.seen_block().confirmed);
+        assert_eq!(client.seen_block().number, real);
     }
 
     #[tokio::test]
