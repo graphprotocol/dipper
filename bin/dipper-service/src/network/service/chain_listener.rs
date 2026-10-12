@@ -744,6 +744,9 @@ where
         // Persist per-page so a crash mid-drain replays at most
         // one page. Skip the write when neither cursor nor
         // ratcheted timestamp moved.
+        let already_held = cursor_hold
+            .as_ref()
+            .is_some_and(|hold| hold.cursor == *cursor);
         let skip = !unapplied.is_empty() && hold_expired(cursor_hold, cursor, now_instant);
         if unapplied.is_empty() {
             *cursor_hold = None;
@@ -757,6 +760,16 @@ where
                 agreement_ids = %listed_ids(&unapplied),
                 "Skipped on-chain changes to agreements that kept failing to apply; they won't \
                  be read again until their next change"
+            );
+        } else if !unapplied.is_empty() && already_held {
+            // The hold started with an ERROR below; a WARN on each poll it goes on, which can be
+            // every few seconds for 10 minutes.
+            tracing::warn!(
+                event = "chain_listener_cursor_held",
+                cursor_block = cursor.block,
+                agreement_count = unapplied.len(),
+                agreement_ids = %listed_ids(&unapplied),
+                "Still failing to apply on-chain changes to agreements; re-reading them next poll"
             );
         } else if !unapplied.is_empty() {
             tracing::error!(
