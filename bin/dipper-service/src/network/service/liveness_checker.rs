@@ -35,8 +35,14 @@
 //! Indexer URLs are looked up fresh from the network topology on each cycle,
 //! not read from the stored agreement. This ensures URL changes are detected.
 
-use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+    sync::Arc,
+    time::Duration,
+};
 
+use dipper_core::ids::IndexingAgreementId;
 use thegraph_core::{DeploymentId, IndexerId};
 use time::OffsetDateTime;
 use tokio::{sync::mpsc, time::MissedTickBehavior};
@@ -131,6 +137,7 @@ where
             .timeout(config.request_timeout)
             .build()
             .map_err(|e| anyhow::anyhow!("failed to build HTTP client: {e}"))?;
+        let mut uncancellable = Uncancellable::default();
 
         loop {
             tokio::select! {
@@ -214,6 +221,7 @@ where
                             &worker_queue,
                             &chain_client,
                             &agreement_conf,
+                            &mut uncancellable,
                             DB_UPDATE_TIMEOUT,
                             QUEUE_PUSH_TIMEOUT,
                         )
@@ -306,6 +314,7 @@ where
                                 &worker_queue,
                                 &chain_client,
                                 &agreement_conf,
+                                &mut uncancellable,
                                 DB_UPDATE_TIMEOUT,
                                 QUEUE_PUSH_TIMEOUT,
                             )
@@ -368,6 +377,7 @@ async fn process_agreements_with_no_data<R, W, C>(
     worker_queue: &W,
     chain_client: &C,
     agreement_conf: &crate::config::IndexingAgreementConfig,
+    uncancellable: &mut Uncancellable,
     db_timeout: Duration,
     queue_timeout: Duration,
 ) where
@@ -433,6 +443,7 @@ async fn process_agreements_with_no_data<R, W, C>(
                     worker_queue,
                     chain_client,
                     agreement_conf,
+                    uncancellable,
                     db_timeout,
                     queue_timeout,
                 )
@@ -491,6 +502,7 @@ async fn cancel_and_reassess<R, W, C>(
     worker_queue: &W,
     chain_client: &C,
     agreement_conf: &crate::config::IndexingAgreementConfig,
+    uncancellable: &mut Uncancellable,
     db_timeout: Duration,
     queue_timeout: Duration,
 ) where
@@ -501,10 +513,7 @@ async fn cancel_and_reassess<R, W, C>(
     // Without a cancel that can ever be sent, replacing it would pay 2 indexers until an
     // operator ends it, so it stays as it is, active, for one to deal with.
     if crate::cancel_dispatch::cancel_hash(agreement).is_none() {
-        tracing::error!(
-            agreement_id = %agreement.id,
-            "cannot cancel stale agreement: missing terms_version_hash; leaving active for operator action"
-        );
+        uncancellable.report(agreement);
         return;
     }
     let Some(started) = start_abandoned_cancel(
@@ -530,6 +539,33 @@ async fn cancel_and_reassess<R, W, C>(
         note_seen_ended(agreement, registry, db_timeout).await;
     }
     replace_abandoned(agreement, registry, worker_queue, db_timeout, queue_timeout).await;
+}
+
+/// Stale agreements already reported as impossible to cancel. The check repeats every cycle
+/// for as long as one stays live, so this lets an operator hear of each once. Only agreements
+/// stored without a terms hash land here, so it stays small without pruning.
+#[derive(Default)]
+struct Uncancellable(HashSet<IndexingAgreementId>);
+
+impl Uncancellable {
+    /// Log a stale agreement no cancel can be sent for: an ERROR the first time, for an operator
+    /// to act on, and a WARN on every later cycle.
+    fn report(&mut self, agreement: &IndexingAgreement) {
+        if self.0.insert(agreement.id) {
+            tracing::error!(
+                event = "stale_agreement_uncancellable",
+                agreement_id = %agreement.id,
+                indexer_id = %agreement.indexer.id,
+                indexing_request_id = %agreement.indexing_request_id,
+                "cannot cancel stale agreement: missing terms_version_hash; leaving active for operator action"
+            );
+        } else {
+            tracing::warn!(
+                agreement_id = %agreement.id,
+                "stale agreement still cannot be cancelled: missing terms_version_hash"
+            );
+        }
+    }
 }
 
 /// Note that the chain shows a stale agreement still cancelling has ended, so it no longer
@@ -912,8 +948,8 @@ mod tests {
     use url::Url;
 
     use super::{
-        LivenessAction, cancel_and_reassess, decide_liveness_action, group_by_indexer_id,
-        record_progress, tolerance_duration,
+        LivenessAction, Uncancellable, cancel_and_reassess, decide_liveness_action,
+        group_by_indexer_id, record_progress, tolerance_duration,
     };
     use crate::{
         chain_client::{AgreementOnChain, ChainClient, ChainClientError},
@@ -1570,6 +1606,15 @@ mod tests {
         registry: &MockRegistry,
         chain: &MockChainClient,
     ) {
+        end_stale_reporting(agreement, registry, chain, &mut Uncancellable::default()).await;
+    }
+
+    async fn end_stale_reporting(
+        agreement: &IndexingAgreement,
+        registry: &MockRegistry,
+        chain: &MockChainClient,
+        uncancellable: &mut Uncancellable,
+    ) {
         let queue = MockWorkerQueue {
             calls: registry.calls.clone(),
         };
@@ -1579,10 +1624,35 @@ mod tests {
             &queue,
             chain,
             &test_agreement_conf(),
+            uncancellable,
             DB_TIMEOUT,
             QUEUE_TIMEOUT,
         )
         .await;
+    }
+
+    /// What dipper logs, at every level, while `run` runs.
+    async fn logged(run: impl std::future::Future<Output = ()>) -> String {
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let writer = Arc::clone(&lines);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || Buffer(Arc::clone(&writer)))
+            .finish();
+        let _logging = tracing::subscriber::set_default(subscriber);
+        run.await;
+        String::from_utf8(lines.lock().unwrap().clone()).unwrap()
     }
 
     #[tokio::test]
@@ -1674,6 +1744,41 @@ mod tests {
         assert!(calls.abandoning.lock().unwrap().is_empty());
         assert!(calls.chain_cancels.lock().unwrap().is_empty());
         assert!(calls.reassessments.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn alerts_once_on_a_stale_agreement_it_can_never_cancel() {
+        // The check repeats every cycle while the agreement stays live; only the first goes to
+        // Slack, through its event tag.
+        let mut agreement = stale_agreement();
+        agreement.terms_version_hash = None;
+        let calls = MockCalls::default();
+        let registry = MockRegistry::new(calls.clone(), agreement.clone());
+        let chain = MockChainClient::success(calls.clone());
+        let mut uncancellable = Uncancellable::default();
+
+        let first = logged(end_stale_reporting(
+            &agreement,
+            &registry,
+            &chain,
+            &mut uncancellable,
+        ))
+        .await;
+        let second = logged(end_stale_reporting(
+            &agreement,
+            &registry,
+            &chain,
+            &mut uncancellable,
+        ))
+        .await;
+
+        assert!(first.contains(" ERROR "), "{first}");
+        assert!(first.contains("stale_agreement_uncancellable"), "{first}");
+        assert!(second.contains(" WARN "), "{second}");
+        assert!(
+            !second.contains("stale_agreement_uncancellable"),
+            "{second}"
+        );
     }
 
     #[tokio::test]

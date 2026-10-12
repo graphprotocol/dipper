@@ -121,7 +121,13 @@ data:
       },
       "alerts": {
         "slack_webhook_url": "https://hooks.slack.com/services/REPLACE_ME_OR_REMOVE_FOR_NO_ALERTS",
-        "events": ["agreement_cancel_stuck", "rpc_blocks_refused", "nonce_gap_fill_failed"],
+        "events": [
+          "agreement_cancel_stuck",
+          "rpc_blocks_refused",
+          "nonce_gap_fill_failed",
+          "chain_listener_changes_skipped",
+          "stale_agreement_uncancellable"
+        ],
         "throttle": 900
       }
     }

@@ -127,6 +127,8 @@ impl Default for AlertsConfig {
                 "agreement_cancel_stuck",
                 "rpc_blocks_refused",
                 "nonce_gap_fill_failed",
+                "chain_listener_changes_skipped",
+                "stale_agreement_uncancellable",
             ]
             .map(str::to_owned)
             .to_vec(),
@@ -2133,6 +2135,11 @@ mod tests {
         let alerts = serde_json::from_value::<AlertsConfig>(config["alerts"].clone())
             .expect("the example's alerts section is a valid alerts config");
         assert!(alerts.slack_webhook_url.is_some());
+        assert_eq!(
+            alerts.events,
+            AlertsConfig::default().events,
+            "the example lists every event alerted on by default"
+        );
     }
 
     #[test]
