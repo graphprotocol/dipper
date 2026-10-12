@@ -111,12 +111,22 @@ pub struct Config {
 pub struct AlertsConfig {
     /// The Slack incoming-webhook URL to post alerts to. Without one, none are sent.
     pub slack_webhook_url: Option<Hidden<Url>>,
-    /// The `event` tags of the log lines to alert on.
+    /// The `event` tags of the log lines to alert on. Leave it out to alert on the defaults,
+    /// which grow as alerts are added; a list given here replaces them.
     pub events: Vec<String>,
     /// Least time, in seconds, between 2 messages for the same event; alerts in between are
     /// counted into the next one.
     #[serde_as(as = "serde_with::DurationSeconds")]
     pub throttle: Duration,
+}
+
+impl AlertsConfig {
+    /// The events alerted on by default that `events` leaves out.
+    pub fn default_events_left_out(&self) -> Vec<String> {
+        let mut left_out = Self::default().events;
+        left_out.retain(|event| !self.events.contains(event));
+        left_out
+    }
 }
 
 impl Default for AlertsConfig {
@@ -2182,11 +2192,24 @@ mod tests {
         let alerts = serde_json::from_value::<AlertsConfig>(config["alerts"].clone())
             .expect("the example's alerts section is a valid alerts config");
         assert!(alerts.slack_webhook_url.is_some());
-        assert_eq!(
-            alerts.events,
-            AlertsConfig::default().events,
-            "the example lists every event alerted on by default"
+        assert!(
+            config["alerts"].get("events").is_none(),
+            "a deployment copied from the example keeps every event later added to the defaults"
         );
+        assert_eq!(alerts.events, AlertsConfig::default().events);
+    }
+
+    #[test]
+    fn names_the_default_events_a_configured_list_leaves_out() {
+        let alerts = serde_json::from_str::<AlertsConfig>(
+            r#"{"events": ["rpc_blocks_refused", "some_other_event"]}"#,
+        )
+        .expect("alerts config");
+
+        let mut left_out = AlertsConfig::default().events;
+        left_out.retain(|event| event != "rpc_blocks_refused");
+        assert_eq!(alerts.default_events_left_out(), left_out);
+        assert!(AlertsConfig::default().default_events_left_out().is_empty());
     }
 
     #[test]
