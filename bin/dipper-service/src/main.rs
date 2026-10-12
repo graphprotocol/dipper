@@ -84,6 +84,14 @@ pub async fn main() -> anyhow::Result<()> {
         .with(alerts::layer(&conf.alerts).map(|layer| layer.with_filter(LevelFilter::WARN)))
         .init();
     tracing::debug!(conf=?conf, "configuration loaded");
+    let left_out = conf.alerts.default_events_left_out();
+    if conf.alerts.slack_webhook_url.is_some() && !left_out.is_empty() {
+        tracing::warn!(
+            ?left_out,
+            "alerts.events leaves out events alerted on by default; remove it from the config to \
+             alert on every default event"
+        );
+    }
 
     // Reject a config the protocol-managed path can't run with before building
     // anything from it.

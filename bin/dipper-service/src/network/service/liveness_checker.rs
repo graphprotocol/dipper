@@ -34,8 +34,8 @@
 //! reached, the fault is likely dipper's own, so no agreement is abandoned for unreachability
 //! until fewer are, for at most `max_tolerance_days` days; indexers that answered without
 //! progress are still handled as above. Once 3 cycles in a row see fewer, or the hold runs out,
-//! an indexer still unreachable is abandoned only after a full tolerance without progress from
-//! the last cycle that held it, since dipper couldn't see it.
+//! the time held is left out of an unreachable indexer's time without progress, since dipper
+//! couldn't see it then, up to `max_tolerance_days` days across every trip.
 //!
 //! ## URL Refresh
 //!
@@ -61,7 +61,8 @@ use crate::{
     config::LivenessCheckerConfig,
     network::provider::NetworkProviderService,
     registry::{
-        AgreementRegistry, IndexingAgreement, IndexingRequestRegistry, PendingCancellationRegistry,
+        AgreementRegistry, IndexingAgreement, IndexingRequestRegistry, IndexingRequestStatus,
+        PendingCancellationRegistry,
     },
     worker::service::{JobPriority, WorkerQueue},
 };
@@ -242,7 +243,7 @@ where
                     return Ok(());
                 }
                 checker
-                    .check_indexer(&mut uncancellable, group_agreements, &probe, policy)
+                    .check_indexer(&mut uncancellable, group_agreements, &probe, &policy)
                     .await;
             }
 
@@ -352,24 +353,41 @@ fn unreachable_trips(
     checked > 0 && checked >= min_indexers && unreachable as f64 / checked as f64 >= trip_fraction
 }
 
-/// How a cycle treats the agreements of an indexer it couldn't reach.
+/// A stretch of time 1 trip of the breaker held agreements back: from the cycle it tripped to
+/// the last cycle it held.
 #[derive(Clone, Copy, Debug, PartialEq)]
+struct HeldSpan {
+    from: OffsetDateTime,
+    to: OffsetDateTime,
+}
+
+/// How a cycle treats the agreements of an indexer it couldn't reach.
+#[derive(Clone, Debug, PartialEq)]
 enum UnreachablePolicy {
     /// So many indexers can't be reached that the fault is likely dipper's: abandon none of them
     /// for it, and leave their progress clocks alone.
     Hold,
-    /// Judge them as usual, but count their time without progress from no earlier than `since`,
-    /// the last cycle that held them, since dipper couldn't see them while it did.
-    Judge { since: Option<OffsetDateTime> },
+    /// Judge them as usual, but leave the time the breaker held them out of their time without
+    /// progress, since dipper couldn't see them then, up to `max_grace` in all.
+    Judge {
+        held: Vec<HeldSpan>,
+        max_grace: time::Duration,
+    },
 }
 
 impl UnreachablePolicy {
     /// When an unreachable indexer's agreement counts its time without progress from.
-    fn progress_clock(self, last_progress_at: Option<OffsetDateTime>) -> Option<OffsetDateTime> {
-        match self {
-            Self::Judge { since: Some(since) } => last_progress_at.map(|at| at.max(since)),
-            Self::Judge { since: None } | Self::Hold => last_progress_at,
-        }
+    fn progress_clock(&self, last_progress_at: Option<OffsetDateTime>) -> Option<OffsetDateTime> {
+        let Self::Judge { held, max_grace } = self else {
+            return last_progress_at;
+        };
+        last_progress_at.map(|at| {
+            let held_since: time::Duration = held
+                .iter()
+                .map(|span| (span.to - span.from.max(at)).max(time::Duration::ZERO))
+                .sum();
+            at + held_since.min(*max_grace)
+        })
     }
 }
 
@@ -389,8 +407,8 @@ struct UnreachableBreaker {
     tripped_since: Option<OffsetDateTime>,
     /// Cycles in a row, while tripped, with too few indexers unreachable to trip it.
     quiet_cycles: u32,
-    /// The last cycle that held agreements back.
-    last_held: Option<OffsetDateTime>,
+    /// The stretches of time trips held agreements back, while recent enough to matter.
+    held: Vec<HeldSpan>,
     /// When an operator was last alerted to the current trip.
     alerted_at: Option<OffsetDateTime>,
 }
@@ -416,19 +434,30 @@ impl UnreachableBreaker {
         } else if self.tripped_since.is_some() {
             self.note_quiet_cycle(unreachable, checked);
         }
+        let max_hold = time::Duration::days(i64::from(config.max_tolerance_days.max(1)));
+        // A span that ended over a hold plus the longest tolerance ago can't save any agreement:
+        // one whose clock started before it is past tolerance even with the most grace given.
+        self.held
+            .retain(|span| now - span.to <= max_hold + max_hold);
         let judge = UnreachablePolicy::Judge {
-            since: self.last_held,
+            held: self.held.clone(),
+            max_grace: max_hold,
         };
         let Some(since) = self.tripped_since else {
             return judge;
         };
-        let max_hold = time::Duration::days(i64::from(config.max_tolerance_days.max(1)));
         if now - since > max_hold {
             self.give_up(unreachable, checked, now, max_hold);
             return judge;
         }
         self.report_hold(trips, unreachable, checked, now, max_hold);
-        self.last_held = Some(now);
+        match self.held.last_mut() {
+            Some(span) if span.from == since => span.to = now,
+            _ => self.held.push(HeldSpan {
+                from: since,
+                to: now,
+            }),
+        }
         UnreachablePolicy::Hold
     }
 
@@ -459,8 +488,8 @@ impl UnreachableBreaker {
         tracing::info!(
             unreachable,
             checked,
-            "Fewer indexers unreachable; abandoning agreements for unreachability resumes, each \
-             after a full tolerance without progress since the breaker last held it"
+            "Fewer indexers unreachable; abandoning agreements for unreachability resumes, leaving \
+             the time held out of each one's time without progress"
         );
     }
 
@@ -503,7 +532,7 @@ impl UnreachableBreaker {
     }
 
     /// Log, once, a trip that has held agreements back as long as it may: an ERROR, since from
-    /// here each indexer still unreachable is abandoned after a full tolerance without progress.
+    /// here indexers still unreachable are abandoned again, with only the time held as grace.
     fn give_up(
         &mut self,
         unreachable: usize,
@@ -524,8 +553,8 @@ impl UnreachableBreaker {
             checked,
             held_days = max_hold.whole_days(),
             "Too many indexers unreachable for longer than an outage on dipper's side should \
-             last; abandoning agreements for unreachability again, each after a full tolerance \
-             without progress from now"
+             last; abandoning agreements for unreachability again, leaving the time held, up \
+             to held_days, out of each one's time without progress"
         );
     }
 }
@@ -555,7 +584,7 @@ where
         uncancellable: &mut Uncancellable,
         agreements: Vec<IndexingAgreement>,
         probe: &Probe,
-        policy: UnreachablePolicy,
+        policy: &UnreachablePolicy,
     ) {
         let unreachable = matches!(probe, Probe::Unreachable).then_some(policy);
         for agreement in agreements {
@@ -572,7 +601,7 @@ where
         uncancellable: &mut Uncancellable,
         agreement: &IndexingAgreement,
         current_block: Option<u64>,
-        unreachable: Option<UnreachablePolicy>,
+        unreachable: Option<&UnreachablePolicy>,
     ) {
         let now = OffsetDateTime::now_utc();
         let deployment_id = agreement.terms.metadata.subgraph_deployment_id;
@@ -605,7 +634,9 @@ where
                 threshold_hours,
                 "agreement block unchanged but within tolerance"
             ),
-            LivenessAction::CancelAndReassess if unreachable == Some(UnreachablePolicy::Hold) => {
+            LivenessAction::CancelAndReassess
+                if matches!(unreachable, Some(UnreachablePolicy::Hold)) =>
+            {
                 tracing::debug!(
                     agreement_id = %agreement.id,
                     elapsed_hours,
@@ -908,7 +939,7 @@ async fn forget_replaced_agreement<R: PendingCancellationRegistry + Sync>(
 }
 
 /// Queue a reassessment of an abandoned agreement's request, which replaces its indexer. True
-/// once nothing is left to do: queued, or its request is gone.
+/// once nothing is left to do: queued, or its request is gone or cancelled.
 async fn queue_replacement<R, W>(
     agreement: &IndexingAgreement,
     registry: &R,
@@ -965,8 +996,8 @@ where
     }
 }
 
-/// The request an abandoned agreement served, `None` when it is gone; `Err`, logged, when it
-/// can't be read.
+/// The request an abandoned agreement served, `None` when it is gone or cancelled; `Err`,
+/// logged, when it can't be read.
 async fn abandoned_request<R: IndexingRequestRegistry + Sync>(
     agreement: &IndexingAgreement,
     registry: &R,
@@ -978,7 +1009,7 @@ async fn abandoned_request<R: IndexingRequestRegistry + Sync>(
     )
     .await
     {
-        Ok(Ok(Some(r))) => Ok(Some(r)),
+        Ok(Ok(Some(r))) => Ok(open_request(agreement, r)),
         Ok(Ok(None)) => {
             tracing::warn!(
                 agreement_id = %agreement.id,
@@ -1003,6 +1034,23 @@ async fn abandoned_request<R: IndexingRequestRegistry + Sync>(
             Err(())
         }
     }
+}
+
+/// `request` while it is open; `None`, logged, once its requester has cancelled it.
+fn open_request(
+    agreement: &IndexingAgreement,
+    request: crate::registry::IndexingRequest,
+) -> Option<crate::registry::IndexingRequest> {
+    if request.status == IndexingRequestStatus::Open {
+        return Some(request);
+    }
+    tracing::info!(
+        agreement_id = %agreement.id,
+        indexing_request_id = %agreement.indexing_request_id,
+        request_status = %request.status,
+        "Not replacing an abandoned agreement whose request was cancelled"
+    );
+    None
 }
 
 /// The action the liveness checker should take for a single agreement after evaluating its sync state.
@@ -1154,9 +1202,9 @@ mod tests {
     use url::Url;
 
     use super::{
-        Checker, LivenessAction, Probe, Uncancellable, UnreachableBreaker, UnreachablePolicy,
-        cancel_and_reassess, decide_liveness_action, group_by_indexer_id, record_progress,
-        tolerance_duration, unreachable_trips,
+        Checker, HeldSpan, LivenessAction, Probe, Uncancellable, UnreachableBreaker,
+        UnreachablePolicy, cancel_and_reassess, decide_liveness_action, group_by_indexer_id,
+        record_progress, replace_abandoned, tolerance_duration, unreachable_trips,
     };
     use crate::{
         chain_client::{AgreementOnChain, ChainClient, ChainClientError},
@@ -1904,6 +1952,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn does_not_replace_an_abandoned_agreement_whose_request_was_cancelled() {
+        // Its replacement waits for its end, which can come after the requester cancelled.
+        let agreement = stale_agreement();
+        let calls = MockCalls::default();
+        let mut request = make_request(agreement.indexing_request_id, 2);
+        request.status = crate::registry::IndexingRequestStatus::Canceled;
+        let registry = MockRegistry {
+            get_request_result: Arc::new(Mutex::new(Some(Ok(Some(request))))),
+            ..MockRegistry::new(calls.clone(), agreement.clone())
+        };
+        let queue = MockWorkerQueue {
+            calls: calls.clone(),
+        };
+
+        replace_abandoned(&agreement, &registry, &queue, DB_TIMEOUT, QUEUE_TIMEOUT).await;
+
+        assert!(calls.reassessments.lock().unwrap().is_empty());
+        assert_eq!(
+            calls.replacements_noted.lock().unwrap().as_slice(),
+            &[agreement.id],
+            "so it isn't tried again"
+        );
+    }
+
+    #[tokio::test]
     async fn holds_back_the_replacement_while_a_failed_cancel_leaves_it_paid() {
         // Replacing it now would pay both indexers until the retry lands the cancel, which then
         // queues the replacement.
@@ -2062,6 +2135,77 @@ mod tests {
         assert!(!unreachable_trips(0, 0, 0.5, 0), "nothing checked");
     }
 
+    /// The most grace the breaker gives an agreement under `config`.
+    fn max_grace(config: &LivenessCheckerConfig) -> time::Duration {
+        time::Duration::days(i64::from(config.max_tolerance_days))
+    }
+
+    #[test]
+    fn leaves_out_only_the_time_held_after_the_last_progress_up_to_the_most_grace() {
+        let at = OffsetDateTime::now_utc();
+        let hours = |h| at + time::Duration::hours(h);
+        let judge = |max_grace| UnreachablePolicy::Judge {
+            held: vec![
+                HeldSpan {
+                    from: hours(-5),
+                    to: hours(-3),
+                },
+                HeldSpan {
+                    from: hours(-2),
+                    to: hours(1),
+                },
+                HeldSpan {
+                    from: hours(3),
+                    to: hours(5),
+                },
+            ],
+            max_grace,
+        };
+
+        assert_eq!(
+            judge(time::Duration::days(4)).progress_clock(Some(at)),
+            Some(hours(3)),
+            "1 hour of the span it was inside, 2 of the one after, none of the one before"
+        );
+        assert_eq!(
+            judge(time::Duration::hours(2)).progress_clock(Some(at)),
+            Some(hours(2))
+        );
+        assert_eq!(UnreachablePolicy::Hold.progress_clock(Some(at)), Some(at));
+    }
+
+    #[test]
+    fn keeps_each_trip_as_its_own_span_until_too_old_to_matter() {
+        let config = LivenessCheckerConfig::default();
+        let mut breaker = UnreachableBreaker::default();
+        let start = OffsetDateTime::now_utc();
+        let mut evaluate =
+            |n, unreachable| breaker.evaluate(4, unreachable, cycle(start, n), &config);
+        for (n, unreachable) in [(0, 4), (1, 0), (2, 0), (3, 0), (10, 4), (11, 0), (12, 0)] {
+            evaluate(n, unreachable);
+        }
+        let span = |from, to| HeldSpan {
+            from: cycle(start, from),
+            to: cycle(start, to),
+        };
+
+        assert_eq!(
+            evaluate(13, 0),
+            UnreachablePolicy::Judge {
+                held: vec![span(0, 2), span(10, 12)],
+                max_grace: max_grace(&config),
+            }
+        );
+        let much_later = cycle(start, 12) + max_grace(&config) * 2 + time::Duration::minutes(1);
+        assert_eq!(
+            breaker.evaluate(4, 0, much_later, &config),
+            UnreachablePolicy::Judge {
+                held: vec![],
+                max_grace: max_grace(&config),
+            }
+        );
+    }
+
     /// The time of a liveness cycle `n` 5-minute cycles after `start`.
     fn cycle(start: OffsetDateTime, n: i64) -> OffsetDateTime {
         start + time::Duration::minutes(5 * n)
@@ -2114,9 +2258,13 @@ mod tests {
         assert_eq!(evaluate(4, 1), UnreachablePolicy::Hold);
         assert_eq!(evaluate(5, 1), UnreachablePolicy::Hold);
         let cleared = UnreachablePolicy::Judge {
-            since: Some(cycle(start, 5)),
+            held: vec![HeldSpan {
+                from: cycle(start, 0),
+                to: cycle(start, 5),
+            }],
+            max_grace: max_grace(&config),
         };
-        assert_eq!(evaluate(6, 1), cleared, "counting from the last cycle held");
+        assert_eq!(evaluate(6, 1), cleared, "with the time it held");
         assert_eq!(evaluate(7, 0), cleared, "and on every cycle after");
     }
 
@@ -2153,25 +2301,16 @@ mod tests {
             UnreachablePolicy::Hold
         );
 
+        let judge = UnreachablePolicy::Judge {
+            held: vec![HeldSpan {
+                from: start,
+                to: last_held,
+            }],
+            max_grace: max_grace(&config),
+        };
         let mut evaluate = |at| breaker.evaluate(4, 4, at, &config);
-        let gave_up = logged(async {
-            assert_eq!(
-                evaluate(minutes(5)),
-                UnreachablePolicy::Judge {
-                    since: Some(last_held)
-                }
-            );
-        })
-        .await;
-        let after = logged(async {
-            assert_eq!(
-                evaluate(minutes(10)),
-                UnreachablePolicy::Judge {
-                    since: Some(last_held)
-                }
-            );
-        })
-        .await;
+        let gave_up = logged(async { assert_eq!(evaluate(minutes(5)), judge) }).await;
+        let after = logged(async { assert_eq!(evaluate(minutes(10)), judge) }).await;
 
         assert!(gave_up.contains(" ERROR "), "{gave_up}");
         assert!(gave_up.contains("liveness_abandonment_paused"), "{gave_up}");
@@ -2212,7 +2351,7 @@ mod tests {
                 &mut Uncancellable::default(),
                 vec![agreement.clone()],
                 probe,
-                policy,
+                &policy,
             )
             .await;
     }
@@ -2263,7 +2402,10 @@ mod tests {
         let registry = MockRegistry::new(calls.clone(), agreement.clone());
         let chain = MockChainClient::success(calls.clone());
 
-        let judge = UnreachablePolicy::Judge { since: None };
+        let judge = UnreachablePolicy::Judge {
+            held: vec![],
+            max_grace: time::Duration::days(4),
+        };
         check(&agreement, &registry, &chain, &Probe::Unreachable, judge).await;
 
         assert_eq!(calls.abandoning.lock().unwrap().as_slice(), &[agreement.id]);
@@ -2293,13 +2435,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gives_an_indexer_dead_before_a_short_trip_only_the_time_held() {
+        // Otherwise a trip now and then, from 1 other indexer missing a call, would keep a
+        // dead indexer's agreement for good.
+        let agreement = long_stalled_agreement();
+        let calls = MockCalls::default();
+        let registry = MockRegistry::new(calls.clone(), agreement.clone());
+        let chain = MockChainClient::success(calls.clone());
+        let config = LivenessCheckerConfig::default();
+        let mut breaker = UnreachableBreaker::default();
+        let now = OffsetDateTime::now_utc();
+        breaker.evaluate(4, 4, now - time::Duration::minutes(20), &config);
+        breaker.evaluate(4, 1, now - time::Duration::minutes(15), &config);
+        breaker.evaluate(4, 1, now - time::Duration::minutes(10), &config);
+        let cleared = breaker.evaluate(4, 1, now - time::Duration::minutes(5), &config);
+
+        check(&agreement, &registry, &chain, &Probe::Unreachable, cleared).await;
+
+        assert_eq!(calls.abandoning.lock().unwrap().as_slice(), &[agreement.id]);
+    }
+
+    #[tokio::test]
     async fn abandons_an_indexer_still_unreachable_a_full_tolerance_after_the_breaker_cleared() {
         let agreement = long_stalled_agreement();
         let calls = MockCalls::default();
         let registry = MockRegistry::new(calls.clone(), agreement.clone());
         let chain = MockChainClient::success(calls.clone());
+        let now = OffsetDateTime::now_utc();
         let cleared = UnreachablePolicy::Judge {
-            since: Some(OffsetDateTime::now_utc() - time::Duration::hours(25)),
+            held: vec![HeldSpan {
+                from: now - time::Duration::hours(30),
+                to: now - time::Duration::hours(26),
+            }],
+            max_grace: time::Duration::days(4),
         };
 
         check(&agreement, &registry, &chain, &Probe::Unreachable, cleared).await;
@@ -2316,8 +2484,13 @@ mod tests {
         let chain = MockChainClient::success(calls.clone());
         let deployment = agreement.terms.metadata.subgraph_deployment_id.to_string();
         let stalled = Probe::Reached(HashMap::from([(deployment, agreement.last_block_height)]));
+        let now = OffsetDateTime::now_utc();
         let cleared = UnreachablePolicy::Judge {
-            since: Some(OffsetDateTime::now_utc() - time::Duration::minutes(5)),
+            held: vec![HeldSpan {
+                from: now - time::Duration::hours(30),
+                to: now - time::Duration::minutes(5),
+            }],
+            max_grace: time::Duration::days(4),
         };
 
         check(&agreement, &registry, &chain, &stalled, cleared).await;
