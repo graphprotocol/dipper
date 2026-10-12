@@ -13,7 +13,9 @@ use crate::{
     worker::result::{JobError, JobResult},
 };
 
-/// How long a job whose database read or write failed waits before running again.
+/// How long a job whose database read or write failed waits before running again. It keeps
+/// running until the database answers: the listener queues it once per change, and nothing else
+/// checks an ended agreement for a live one, so a job given up on would leave its indexer paid.
 const RETRY_DELAY: Duration = Duration::from_secs(30);
 
 /// How long a job that couldn't read a cancelled agreement on-chain waits to read it again, at
@@ -107,14 +109,16 @@ where
     }
 }
 
-/// Log a failed database read or write and run the job again later.
+/// Log a failed database read or write and run the job again later, without using up its
+/// attempts.
 fn retry(agreement_id: &IndexingAgreementId, action: &str, err: anyhow::Error) -> JobError {
     tracing::warn!(
         %agreement_id,
         error = format!("{err:#}"),
+        retry_secs = RETRY_DELAY.as_secs(),
         "Failed to {action} an agreement dipper ended that was accepted on-chain; will retry"
     );
-    JobError::Retryable(err, RETRY_DELAY)
+    JobError::Deferred(RETRY_DELAY)
 }
 
 #[cfg(test)]
@@ -139,6 +143,7 @@ mod tests {
         reopened: Vec<bool>,
         accepts: Vec<ChainAccept>,
         fail_read: bool,
+        fail_reopen: bool,
         fail_accept: bool,
     }
 
@@ -169,6 +174,9 @@ mod tests {
             seen_live: bool,
         ) -> crate::registry::Result<()> {
             let mut state = self.0.lock().unwrap();
+            if state.fail_reopen {
+                return Err(db_down());
+            }
             let agreement = state.agreement.as_mut().expect("agreement");
             agreement.status = IndexingAgreementStatus::Cancelling;
             state.reopened.push(seen_live);
@@ -346,21 +354,45 @@ mod tests {
         registry.0.lock().unwrap().fail_accept = false;
         run_job(&registry, Some(true)).await.expect("retry ok");
 
-        assert!(matches!(first, Err(JobError::Retryable(..))));
+        assert!(matches!(first, Err(JobError::Deferred(RETRY_DELAY))));
         let state = registry.0.lock().unwrap();
         assert_eq!(state.reopened, vec![true]);
         assert_eq!(state.accepts, vec![chain_accept()]);
     }
 
     #[tokio::test]
-    async fn retries_when_the_agreement_cannot_be_read() {
-        let registry = registry(IndexingAgreementStatus::Rejected);
-        registry.0.lock().unwrap().fail_read = true;
+    async fn keeps_a_job_whose_database_keeps_failing() {
+        // The listener queues this check once per change, so a job given up on would leave an
+        // agreement live on-chain marked ended; deferring reruns it without using up attempts.
+        type Failure = (&'static str, fn(&mut State));
+        let failures: [Failure; 3] = [
+            ("read", |state| state.fail_read = true),
+            ("reopen", |state| state.fail_reopen = true),
+            ("accept", |state| state.fail_accept = true),
+        ];
+        for (failing, fail) in failures {
+            let registry = registry(IndexingAgreementStatus::CanceledByRequester);
+            fail(&mut registry.0.lock().unwrap());
 
-        let result = run_job(&registry, Some(true)).await;
+            for _ in 0..5 {
+                let result = run_job(&registry, Some(true)).await;
+                assert!(
+                    matches!(result, Err(JobError::Deferred(RETRY_DELAY))),
+                    "{failing}: {result:?}"
+                );
+            }
+            {
+                let mut state = registry.0.lock().unwrap();
+                state.fail_read = false;
+                state.fail_reopen = false;
+                state.fail_accept = false;
+            }
+            run_job(&registry, Some(true)).await.expect("job ok");
 
-        assert!(matches!(result, Err(JobError::Retryable(..))));
-        assert!(registry.0.lock().unwrap().reopened.is_empty());
+            let state = registry.0.lock().unwrap();
+            assert_eq!(state.reopened, vec![true], "{failing}");
+            assert_eq!(state.accepts, vec![chain_accept()], "{failing}");
+        }
     }
 
     /// A job queued before the listener carried the accept still runs.
