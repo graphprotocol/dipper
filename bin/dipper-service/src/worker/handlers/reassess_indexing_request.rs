@@ -958,6 +958,15 @@ mod lifecycle_event_tests {
             unimplemented!("not exercised by reassess handler")
         }
 
+        async fn cancel_rejected_agreement_on_chain(
+            &self,
+            _agreement_id: IndexingAgreementId,
+            _accept: Option<crate::worker::service::ChainAccept>,
+            _priority: crate::worker::queue::JobPriority,
+        ) -> anyhow::Result<crate::worker::queue::JobId> {
+            unimplemented!()
+        }
+
         async fn submit_offer(
             &self,
             _agreement_id: IndexingAgreementId,

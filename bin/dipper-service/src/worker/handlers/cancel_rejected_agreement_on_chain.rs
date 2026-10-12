@@ -1,6 +1,6 @@
-//! Kept so jobs queued before an upgrade still run. The chain listener now moves an
-//! agreement dipper rejected or cancelled that went live on-chain anyway back into
-//! `Cancelling` itself, and the cancel retry ends it; this job does the same.
+//! Moves an agreement dipper rejected or cancelled that is live on-chain after all back into
+//! `Cancelling`, with the accept the chain listener saw on record. The listener queues this
+//! rather than reading the chain itself, so a slow read can't hold up the rest of its page.
 
 use std::time::Duration;
 
@@ -13,19 +13,38 @@ use crate::{
     worker::result::{JobError, JobResult},
 };
 
+/// How long a job whose database read or write failed waits before running again.
+const RETRY_DELAY: Duration = Duration::from_secs(30);
+
 pub struct Ctx<R, T> {
     pub registry: R,
     pub chain_client: T,
 }
 
-/// Cancel on-chain an agreement dipper rejected or cancelled that was accepted anyway.
+/// Check on-chain an agreement dipper rejected or cancelled that was accepted anyway.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Message {
     pub agreement_id: IndexingAgreementId,
+    /// The accept the chain listener saw; absent from jobs queued before it was carried.
+    #[serde(default)]
+    pub accept: Option<ChainAccept>,
+}
+
+/// When an agreement was accepted on-chain, and in which transaction.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChainAccept {
+    pub at: u64,
+    pub tx: String,
 }
 
 /// Hand an agreement dipper rejected or cancelled that is live on-chain to the cancel retry.
-pub async fn handle<R, T>(ctx: Ctx<R, T>, Message { agreement_id }: &Message) -> JobResult<()>
+pub async fn handle<R, T>(
+    ctx: Ctx<R, T>,
+    Message {
+        agreement_id,
+        accept,
+    }: &Message,
+) -> JobResult<()>
 where
     R: AgreementRegistry + Sync,
     T: ChainClient,
@@ -34,21 +53,41 @@ where
         .registry
         .get_indexing_agreement_by_id(agreement_id)
         .await
-        .map_err(|err| JobError::Fatal(err.into()))?
+        .map_err(|err| retry(agreement_id, "read", err.into()))?
     else {
-        tracing::warn!(%agreement_id, "Agreement not found for on-chain cancellation");
+        tracing::warn!(%agreement_id, "Agreement not found for on-chain check");
         return Ok(());
     };
-    if !matches!(
-        agreement.status,
-        IndexingAgreementStatus::Rejected | IndexingAgreementStatus::CanceledByRequester
-    ) {
+    let cancelling = match agreement.status {
+        IndexingAgreementStatus::Rejected | IndexingAgreementStatus::CanceledByRequester => {
+            reopen_if_live(&ctx.registry, &ctx.chain_client, &agreement)
+                .await
+                .map_err(|err| retry(agreement_id, "reopen the cancel of", err.into()))?
+        }
+        // Moved back by an earlier run of this job, or a copy of it, so only its accept is left.
+        IndexingAgreementStatus::Cancelling => true,
+        _ => return Ok(()),
+    };
+    if !cancelling {
         return Ok(());
     }
-    reopen_if_live(&ctx.registry, &ctx.chain_client, &agreement)
+    let Some(accept) = accept else {
+        return Ok(());
+    };
+    ctx.registry
+        .record_accepted_audit(agreement_id, accept.at, &accept.tx)
         .await
-        .map(|_| ())
-        .map_err(|err| JobError::Retryable(err.into(), Duration::from_secs(30)))
+        .map_err(|err| retry(agreement_id, "record the on-chain accept of", err.into()))
+}
+
+/// Log a failed database read or write and run the job again later.
+fn retry(agreement_id: &IndexingAgreementId, action: &str, err: anyhow::Error) -> JobError {
+    tracing::warn!(
+        %agreement_id,
+        error = format!("{err:#}"),
+        "Failed to {action} an agreement dipper ended that was accepted on-chain; will retry"
+    );
+    JobError::Retryable(err, RETRY_DELAY)
 }
 
 #[cfg(test)]
@@ -66,9 +105,23 @@ mod tests {
         registry::{IndexingAgreement, StubAgreementRegistry},
     };
 
-    struct MockRegistry {
-        agreement: IndexingAgreement,
-        reopened: Arc<Mutex<Vec<IndexingAgreementId>>>,
+    #[derive(Default)]
+    struct State {
+        agreement: Option<IndexingAgreement>,
+        /// What each reopen was told about the chain.
+        reopened: Vec<bool>,
+        accepts: Vec<ChainAccept>,
+        fail_read: bool,
+        fail_accept: bool,
+    }
+
+    #[derive(Clone, Default)]
+    struct MockRegistry(Arc<Mutex<State>>);
+
+    fn db_down() -> crate::registry::Error {
+        crate::registry::Error::BackendError(dipper_pgregistry::Error::DbError(
+            sqlx::Error::Protocol("simulated outage".into()),
+        ))
     }
 
     #[async_trait]
@@ -77,20 +130,44 @@ mod tests {
             &self,
             _id: &IndexingAgreementId,
         ) -> crate::registry::Result<Option<IndexingAgreement>> {
-            Ok(Some(self.agreement.clone()))
+            let state = self.0.lock().unwrap();
+            if state.fail_read {
+                return Err(db_down());
+            }
+            Ok(state.agreement.clone())
         }
         async fn reopen_indexing_agreement_cancel(
             &self,
-            id: &IndexingAgreementId,
-            _seen_live: bool,
+            _id: &IndexingAgreementId,
+            seen_live: bool,
         ) -> crate::registry::Result<()> {
-            self.reopened.lock().unwrap().push(*id);
+            let mut state = self.0.lock().unwrap();
+            let agreement = state.agreement.as_mut().expect("agreement");
+            agreement.status = IndexingAgreementStatus::Cancelling;
+            state.reopened.push(seen_live);
+            Ok(())
+        }
+        async fn record_accepted_audit(
+            &self,
+            _agreement_id: &IndexingAgreementId,
+            accepted_at: u64,
+            accepted_tx: &str,
+        ) -> crate::registry::Result<()> {
+            let mut state = self.0.lock().unwrap();
+            if state.fail_accept {
+                return Err(db_down());
+            }
+            state.accepts.push(ChainAccept {
+                at: accepted_at,
+                tx: accepted_tx.to_string(),
+            });
             Ok(())
         }
     }
 
+    /// Every agreement reads as live or not, or the read fails when `live` is `None`.
     struct MockChain {
-        live: bool,
+        live: Option<bool>,
     }
 
     #[async_trait]
@@ -128,30 +205,39 @@ mod tests {
             &self,
             _agreement_id: &[u8; 16],
         ) -> Result<AgreementOnChain, ChainClientError> {
-            Ok(AgreementOnChain::live_if(self.live))
+            self.live
+                .map(AgreementOnChain::live_if)
+                .ok_or_else(|| ChainClientError::RpcError(anyhow::anyhow!("every endpoint failed")))
         }
         async fn latest_block_timestamp(&self) -> Result<u64, ChainClientError> {
             unimplemented!()
         }
     }
 
-    async fn run(status: IndexingAgreementStatus, live: bool) -> Vec<IndexingAgreementId> {
-        let reopened = Arc::new(Mutex::new(Vec::new()));
-        let agreement = agreement(status, Some(vec![7u8; 32]));
+    fn chain_accept() -> ChainAccept {
+        ChainAccept {
+            at: 1_700_000_001,
+            tx: "0x11".to_string(),
+        }
+    }
+
+    fn registry(status: IndexingAgreementStatus) -> MockRegistry {
+        let registry = MockRegistry::default();
+        registry.0.lock().unwrap().agreement = Some(agreement(status, Some(vec![7u8; 32])));
+        registry
+    }
+
+    async fn run_job(registry: &MockRegistry, live: Option<bool>) -> JobResult<()> {
+        let agreement_id = registry.0.lock().unwrap().agreement.as_ref().unwrap().id;
         let message = Message {
-            agreement_id: agreement.id,
+            agreement_id,
+            accept: Some(chain_accept()),
         };
         let ctx = Ctx {
-            registry: MockRegistry {
-                agreement,
-                reopened: Arc::clone(&reopened),
-            },
+            registry: registry.clone(),
             chain_client: MockChain { live },
         };
-
-        handle(ctx, &message).await.expect("job ok");
-
-        reopened.lock().unwrap().clone()
+        handle(ctx, &message).await
     }
 
     #[tokio::test]
@@ -160,21 +246,88 @@ mod tests {
             IndexingAgreementStatus::Rejected,
             IndexingAgreementStatus::CanceledByRequester,
         ] {
-            assert_eq!(run(status, true).await.len(), 1, "{status}");
+            let registry = registry(status);
+
+            run_job(&registry, Some(true)).await.expect("job ok");
+
+            let state = registry.0.lock().unwrap();
+            assert_eq!(state.reopened, vec![true], "{status}");
+            assert_eq!(
+                state.accepts,
+                vec![chain_accept()],
+                "{status}: its accept is recorded, so the cancel retry treats it as paying"
+            );
         }
     }
 
     #[tokio::test]
     async fn leaves_an_agreement_that_already_ended_or_is_still_wanted() {
-        assert!(
-            run(IndexingAgreementStatus::CanceledByRequester, false)
-                .await
-                .is_empty()
-        );
-        assert!(
-            run(IndexingAgreementStatus::AcceptedOnChain, true)
-                .await
-                .is_empty()
-        );
+        // An accept on record for one left as it is would be announced with no end to follow.
+        for (status, live) in [
+            (IndexingAgreementStatus::Rejected, false),
+            (IndexingAgreementStatus::CanceledByRequester, false),
+            (IndexingAgreementStatus::AcceptedOnChain, true),
+        ] {
+            let registry = registry(status);
+
+            run_job(&registry, Some(live)).await.expect("job ok");
+
+            let state = registry.0.lock().unwrap();
+            assert!(state.reopened.is_empty(), "{status}");
+            assert!(state.accepts.is_empty(), "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reopens_an_agreement_whose_chain_read_fails() {
+        // It may have ended, so the end on record stays, and the cancel retry reads it again.
+        for status in [
+            IndexingAgreementStatus::Rejected,
+            IndexingAgreementStatus::CanceledByRequester,
+        ] {
+            let registry = registry(status);
+
+            run_job(&registry, None).await.expect("job ok");
+
+            assert_eq!(registry.0.lock().unwrap().reopened, vec![false], "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_an_accept_that_failed_to_record_without_reopening_again() {
+        let registry = registry(IndexingAgreementStatus::CanceledByRequester);
+        registry.0.lock().unwrap().fail_accept = true;
+
+        let first = run_job(&registry, Some(true)).await;
+        registry.0.lock().unwrap().fail_accept = false;
+        run_job(&registry, Some(true)).await.expect("retry ok");
+
+        assert!(matches!(first, Err(JobError::Retryable(..))));
+        let state = registry.0.lock().unwrap();
+        assert_eq!(state.reopened, vec![true]);
+        assert_eq!(state.accepts, vec![chain_accept()]);
+    }
+
+    #[tokio::test]
+    async fn retries_when_the_agreement_cannot_be_read() {
+        let registry = registry(IndexingAgreementStatus::Rejected);
+        registry.0.lock().unwrap().fail_read = true;
+
+        let result = run_job(&registry, Some(true)).await;
+
+        assert!(matches!(result, Err(JobError::Retryable(..))));
+        assert!(registry.0.lock().unwrap().reopened.is_empty());
+    }
+
+    /// A job queued before the listener carried the accept still runs.
+    #[test]
+    fn reads_a_job_queued_without_an_accept() {
+        let id = IndexingAgreementId::from_bytes([1; 16]);
+        let queued = serde_json::json!({ "agreement_id": id });
+
+        let message: Message = serde_json::from_value(queued).expect("old message");
+
+        assert_eq!(message.agreement_id, id);
+        assert_eq!(message.accept, None);
     }
 }

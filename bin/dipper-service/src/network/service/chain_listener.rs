@@ -17,7 +17,8 @@
 //! | AcceptedOnChain    | CanceledBy*         | mark canceled (requester vs indexer from the CanceledBy* state)        |
 //! | Expired            | Accepted            | mark AcceptedOnChain (recovery), run pending cancellations              |
 //! | Expired            | CanceledBy*         | recover to AcceptedOnChain, run pending cancellations, then cancel     |
-//! | Rejected           | Accepted            | queue cancel-on-chain (adversarial path, dead code under proposal-first) |
+//! | Rejected           | Accepted            | queue a chain check, which reopens its cancel if live (adversarial path) |
+//! | CanceledByRequester | Accepted           | queue a chain check, which reopens its cancel if live                  |
 //! | Canceled*          | *                   | no-op (terminal)                                                       |
 //!
 //! ## Data Source
@@ -57,6 +58,7 @@ use crate::{
         AgreementRegistry, CancelKind, IndexingAgreement, IndexingAgreementStatus,
         PendingCancellationRegistry, ReconciliationItem,
     },
+    worker::service::{ChainAccept, JobPriority, WorkerQueue},
 };
 
 /// Idle interval used when no `Created` agreements are awaiting acceptance.
@@ -135,7 +137,7 @@ impl Handle {
 }
 
 /// Context required by the chain listener service
-pub struct Ctx<R, E, T> {
+pub struct Ctx<R, E, T, W> {
     /// Registry for querying and updating agreements
     pub registry: R,
     /// Chain event source (subgraph)
@@ -153,6 +155,8 @@ pub struct Ctx<R, E, T> {
     /// Emits `accepted` and `terminated` lifecycle events as on-chain state is reconciled.
     pub subgraph_indexing_agreements_events_emitter:
         Arc<dyn SubgraphIndexingAgreementEventsProducer>,
+    /// Queues the chain check of an agreement dipper ended that the subgraph shows accepted.
+    pub worker_queue: W,
 }
 
 /// State persisted in the database
@@ -177,11 +181,12 @@ pub struct ChainListenerState {
     clippy::too_many_lines,
     reason = "predates this lint; fix when next touched"
 )]
-pub fn new<R, E, T>(ctx: Ctx<R, E, T>) -> (Handle, impl Future<Output = anyhow::Result<()>>)
+pub fn new<R, E, T, W>(ctx: Ctx<R, E, T, W>) -> (Handle, impl Future<Output = anyhow::Result<()>>)
 where
     R: AgreementRegistry + ChainListenerStateRegistry + PendingCancellationRegistry + Send + Sync,
     E: ChainEventSource,
     T: ChainClient + Send + Sync,
+    W: WorkerQueue + Send + Sync,
 {
     let (tx_stop, mut rx_stop) = mpsc::channel(1);
 
@@ -193,6 +198,7 @@ where
         config,
         chain_listener_notify,
         subgraph_indexing_agreements_events_emitter,
+        worker_queue,
     } = ctx;
 
     let service = async move {
@@ -269,6 +275,7 @@ where
         // prematurely. Persisted in memory only; on restart it resets
         // and the first poll's bound is strict.
         let mut last_chain_ts_persist_wall: std::time::Instant = std::time::Instant::now();
+        let mut live_checks = LiveChecks::new(worker_queue);
 
         loop {
             tokio::select! {
@@ -336,6 +343,7 @@ where
                 bypass_chain_clock_defenses,
                 &registry,
                 &chain_client,
+                &mut live_checks,
                 &event_source,
                 &mut rx_stop,
                 &agreement_conf,
@@ -453,7 +461,7 @@ struct DrainOutcome {
     clippy::too_many_lines,
     reason = "predates this lint; fix when next touched"
 )]
-async fn drain_once<R, E, T>(
+async fn drain_once<R, E, T, W>(
     cursor: &mut Cursor,
     cursor_hold: &mut Option<CursorHold>,
     last_persisted_timestamp: &mut Option<u64>,
@@ -467,6 +475,7 @@ async fn drain_once<R, E, T>(
     bypass_chain_clock_defenses: bool,
     registry: &R,
     chain_client: &T,
+    live_checks: &mut LiveChecks<W>,
     event_source: &E,
     rx_stop: &mut mpsc::Receiver<()>,
     config: &crate::config::IndexingAgreementConfig,
@@ -475,6 +484,7 @@ where
     R: AgreementRegistry + ChainListenerStateRegistry + PendingCancellationRegistry + Send + Sync,
     E: ChainEventSource,
     T: ChainClient + Send + Sync,
+    W: WorkerQueue + Sync,
 {
     // Read-side cursor backs off by `reorg_buffer_blocks` so a
     // reorg that moves a state change across the boundary is still
@@ -491,6 +501,7 @@ where
     } else {
         cursor.clone()
     };
+    live_checks.forget_before(effective_cursor.block);
 
     let drain_start = std::time::Instant::now();
     let mut pages_per_tick: u32 = 0;
@@ -619,7 +630,7 @@ where
             }
 
             let agreement = agreements_by_id.remove(&snapshot.agreement_id);
-            match prepare_reconciliation(&snapshot, agreement, registry, chain_client).await {
+            match prepare_reconciliation(&snapshot, agreement, registry, live_checks).await {
                 Ok(Some(prep)) => prepared.push(prep),
                 Ok(None) => {}
                 Err(err) => {
@@ -861,15 +872,15 @@ fn apply_chain_ts_drift_cap(
     clippy::cognitive_complexity,
     reason = "predates this lint; fix when next touched"
 )]
-async fn prepare_reconciliation<R, T>(
+async fn prepare_reconciliation<R, W>(
     snapshot: &AgreementStateSnapshot,
     agreement: Option<IndexingAgreement>,
     registry: &R,
-    chain_client: &T,
+    live_checks: &mut LiveChecks<W>,
 ) -> anyhow::Result<Option<PreparedReconciliation>>
 where
     R: AgreementRegistry + Sync,
-    T: ChainClient,
+    W: WorkerQueue + Sync,
 {
     tracing::debug!(
         agreement_id = %snapshot.agreement_id,
@@ -899,31 +910,17 @@ where
     // (race with gRPC rejection or stale read), not the indexer.
     // Skipped when remote is already canceled because the cancel tx
     // would revert against canceled contract state.
-    if matches!(agreement.status, IndexingAgreementStatus::Rejected)
-        && snapshot.state.reached_accepted()
-        && !snapshot.state.is_canceled()
-    {
-        tracing::warn!(
-            agreement_id = %agreement.id,
-            indexer = %snapshot.indexer,
-            "Rejected agreement accepted on-chain, cancelling it"
-        );
-        // It never passes AcceptedOnChain, so its accept is recorded here for its end to be
-        // announced; one left Rejected, as the chain shows it already ended, gets none. A failed
-        // write gets the snapshot read again, which finds it cancelling and records the accept.
-        let reopened =
-            crate::cancel_dispatch::reopen_if_live(registry, chain_client, &agreement).await?;
-        if reopened {
-            registry
-                .record_accepted_audit(&agreement.id, snapshot.accepted_at, &snapshot.accepted_tx)
-                .await
-                .context("failed to record the on-chain accept of a rejected agreement")?;
+    if ended_but_accepted(snapshot, &agreement) {
+        if agreement.status == IndexingAgreementStatus::Rejected {
+            tracing::warn!(
+                agreement_id = %agreement.id,
+                indexer = %snapshot.indexer,
+                "Rejected agreement accepted on-chain, checking whether to cancel it"
+            );
         }
+        live_checks.queue(snapshot).await?;
     }
-
-    let reopened =
-        reopen_if_cancelled_but_accepted(snapshot, &agreement, registry, chain_client).await?;
-    record_accept_of_cancelling(snapshot, &agreement, reopened, registry).await?;
+    record_accept_of_cancelling(snapshot, &agreement, registry).await?;
 
     // Both transitions are applied atomically downstream so the
     // Accept-then-Cancel-in-one-snapshot path can't leak an intermediate
@@ -1012,42 +1009,75 @@ async fn record_accept_and_cancel_from_chain<R: AgreementRegistry + Sync>(
         .context("failed to record the on-chain accept and cancel of a cancelled agreement")
 }
 
-/// Safety net for an agreement dipper cancelled whose offer the indexer accepted
-/// anyway, such as one that landed after dipper's cancel. Nothing else would end
-/// it: reconciliation ignores an accept on a cancelled row. It goes back to
-/// `Cancelling` for the cancel retry, unless the chain shows it already ended. Returns whether it
-/// moved it back.
-async fn reopen_if_cancelled_but_accepted<R, T>(
-    snapshot: &AgreementStateSnapshot,
-    agreement: &IndexingAgreement,
-    registry: &R,
-    chain_client: &T,
-) -> anyhow::Result<bool>
-where
-    R: AgreementRegistry + Sync,
-    T: ChainClient,
-{
-    if agreement.status == IndexingAgreementStatus::CanceledByRequester
-        && snapshot.state.reached_accepted()
+/// Whether dipper rejected or cancelled an agreement the subgraph shows accepted and not ended,
+/// such as an offer that landed after dipper's cancel. Nothing else would end it, as
+/// reconciliation ignores an accept on an ended row, so a job checks the chain for it.
+fn ended_but_accepted(snapshot: &AgreementStateSnapshot, agreement: &IndexingAgreement) -> bool {
+    matches!(
+        agreement.status,
+        IndexingAgreementStatus::Rejected | IndexingAgreementStatus::CanceledByRequester
+    ) && snapshot.state.reached_accepted()
         && !snapshot.state.is_canceled()
-    {
-        return Ok(
-            crate::cancel_dispatch::reopen_if_live(registry, chain_client, agreement).await?,
-        );
-    }
-    Ok(false)
 }
 
-/// An agreement dipper is cancelling, or has just moved back to cancelling, stays `Cancelling`
-/// when the chain shows it accepted, so its accept is recorded here, to be announced with its
-/// end once the cancel lands. A withdrawn offer reads as cancelled with no accept time.
+/// Queues the chain check of an agreement dipper ended that the subgraph shows accepted, once
+/// per change, as the reorg buffer and a held cursor read a change again. The job runs off the
+/// drain, so a slow chain read can't hold up the rest of the page.
+struct LiveChecks<W> {
+    queue: W,
+    /// The changes checks were queued for, by agreement and block.
+    queued: std::collections::HashSet<(IndexingAgreementId, u64)>,
+}
+
+impl<W: WorkerQueue + Sync> LiveChecks<W> {
+    fn new(queue: W) -> Self {
+        Self {
+            queue,
+            queued: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Queue the check for this change, unless it is already queued.
+    async fn queue(&mut self, snapshot: &AgreementStateSnapshot) -> anyhow::Result<()> {
+        let change = (snapshot.agreement_id, snapshot.last_state_change_block);
+        if self.queued.contains(&change) {
+            tracing::debug!(
+                agreement_id = %snapshot.agreement_id,
+                "On-chain check already queued for this change"
+            );
+            return Ok(());
+        }
+        let accept = (snapshot.accepted_at != 0).then(|| ChainAccept {
+            at: snapshot.accepted_at,
+            tx: snapshot.accepted_tx.clone(),
+        });
+        self.queue
+            .cancel_rejected_agreement_on_chain(
+                snapshot.agreement_id,
+                accept,
+                JobPriority::Background,
+            )
+            .await
+            .context("failed to queue the on-chain check of an agreement dipper ended")?;
+        self.queued.insert(change);
+        Ok(())
+    }
+
+    /// Forget the changes before `block`, which the drain no longer reads.
+    fn forget_before(&mut self, block: u64) {
+        self.queued.retain(|&(_, changed_at)| changed_at >= block);
+    }
+}
+
+/// An agreement dipper is cancelling stays `Cancelling` when the chain shows it accepted, so its
+/// accept is recorded here, to be announced with its end once the cancel lands. A withdrawn offer
+/// reads as cancelled with no accept time.
 async fn record_accept_of_cancelling<R: AgreementRegistry + Sync>(
     snapshot: &AgreementStateSnapshot,
     agreement: &IndexingAgreement,
-    reopened: bool,
     registry: &R,
 ) -> anyhow::Result<()> {
-    if (agreement.status != IndexingAgreementStatus::Cancelling && !reopened)
+    if agreement.status != IndexingAgreementStatus::Cancelling
         || !snapshot.state.reached_accepted()
         || snapshot.accepted_at == 0
     {
@@ -1129,32 +1159,35 @@ where
 /// Reconcile a single agreement snapshot against dipper's local DB.
 ///
 /// Compares the snapshot's remote state to the local `IndexingAgreementStatus`
-/// and applies whatever transitions the diff implies. See the module-level
-/// transition table for the full mapping.
+/// and applies whatever transitions the diff implies, returning the chain checks it queued.
+/// See the module-level transition table for the full mapping.
 #[cfg(test)]
 async fn reconcile_agreement<R, T>(
     snapshot: &AgreementStateSnapshot,
     registry: &R,
     chain_client: &T,
     config: &crate::config::IndexingAgreementConfig,
-) -> anyhow::Result<()>
+) -> anyhow::Result<Vec<tests::QueuedCheck>>
 where
     R: AgreementRegistry + PendingCancellationRegistry + Sync,
     T: ChainClient,
 {
+    let mut live_checks = LiveChecks::new(tests::MockWorkerQueue::default());
     let agreement = registry
         .get_indexing_agreement_by_id(&snapshot.agreement_id)
         .await?;
-    let Some(prep) = prepare_reconciliation(snapshot, agreement, registry, chain_client).await?
-    else {
-        return Ok(());
+    let prep = prepare_reconciliation(snapshot, agreement, registry, &mut live_checks).await?;
+    let queued = live_checks.queue.queued();
+    let Some(prep) = prep else {
+        return Ok(queued);
     };
 
     let outcome = registry
         .apply_reconciliation(&prep.agreement.id, prep.item.apply_accept, prep.item.cancel)
         .await?;
 
-    finalize_reconciliation(&prep, outcome, registry, chain_client, config).await
+    finalize_reconciliation(&prep, outcome, registry, chain_client, config).await?;
+    Ok(queued)
 }
 
 /// Execute pending cancellations linked to a newly-accepted agreement.
@@ -2705,6 +2738,80 @@ mod tests {
         }
     }
 
+    /// A chain check the listener queued: the agreement, and the accept it carried.
+    pub(super) type QueuedCheck = (IndexingAgreementId, Option<ChainAccept>);
+
+    /// Records the chain checks queued; queuing fails while `fail` is set.
+    #[derive(Clone, Default)]
+    pub(super) struct MockWorkerQueue {
+        checks: Arc<Mutex<Vec<QueuedCheck>>>,
+        fail: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl MockWorkerQueue {
+        pub(super) fn queued(&self) -> Vec<QueuedCheck> {
+            self.checks.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WorkerQueue for MockWorkerQueue {
+        async fn send_indexing_agreement_proposal(
+            &self,
+            _candidate_url: url::Url,
+            _agreement_id: IndexingAgreementId,
+            _indexing_request_id: IndexingRequestId,
+            _deployment_id: DeploymentId,
+            _deployment_chain_id: ChainId,
+            _priority: JobPriority,
+        ) -> anyhow::Result<dipper_pgmq::JobId> {
+            unimplemented!()
+        }
+
+        async fn reassess_indexing_request(
+            &self,
+            _indexing_request_id: IndexingRequestId,
+            _deployment_id: DeploymentId,
+            _deployment_chain_id: ChainId,
+            _num_candidates: usize,
+            _priority: JobPriority,
+        ) -> anyhow::Result<dipper_pgmq::JobId> {
+            unimplemented!()
+        }
+
+        async fn cancel_rejected_agreement_on_chain(
+            &self,
+            agreement_id: IndexingAgreementId,
+            accept: Option<ChainAccept>,
+            _priority: JobPriority,
+        ) -> anyhow::Result<dipper_pgmq::JobId> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("queue unavailable");
+            }
+            self.checks.lock().unwrap().push((agreement_id, accept));
+            Ok(dipper_pgmq::JobId::default())
+        }
+
+        async fn submit_offer(
+            &self,
+            _agreement_id: IndexingAgreementId,
+            _indexing_request_id: IndexingRequestId,
+            _indexer_url: url::Url,
+            _deployment_id: DeploymentId,
+            _deployment_chain_id: ChainId,
+            _priority: JobPriority,
+        ) -> anyhow::Result<dipper_pgmq::JobId> {
+            unimplemented!()
+        }
+    }
+
+    fn snapshot_accept() -> Option<ChainAccept> {
+        Some(ChainAccept {
+            at: TEST_ACCEPTED_AT,
+            tx: TEST_ACCEPTED_TX.to_string(),
+        })
+    }
+
     // -- reconcile_agreement tests --
 
     #[tokio::test]
@@ -2922,52 +3029,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reconcile_reopens_the_cancel_of_a_rejected_agreement_live_on_chain() {
-        let registry = MockRegistry::new();
-        let chain_client = MockChainClient {
-            live_until_cancelled: true,
-            ..MockChainClient::default()
-        };
-        let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+    async fn test_reconcile_queues_a_chain_check_for_an_ended_agreement_accepted_on_chain() {
+        // Dipper rejected or cancelled it, but the indexer accepted it on-chain anyway, such as an
+        // offer that landed after dipper's cancel. The chain is read by the queued job, not here,
+        // so a slow read can't hold up the page, and the job records the accept if it reopens it.
+        for status in [
+            IndexingAgreementStatus::Rejected,
+            IndexingAgreementStatus::CanceledByRequester,
+        ] {
+            let registry = MockRegistry::new();
+            let chain_client = live_chain();
+            let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+            registry.add_agreement(agreement_id, status);
 
-        registry.add_agreement(agreement_id, IndexingAgreementStatus::Rejected);
+            let snapshot = make_snapshot(agreement_id, AgreementState::Accepted, Address::ZERO);
+            let queued = reconcile_agreement(
+                &snapshot,
+                &registry,
+                &chain_client,
+                test_agreement_conf().as_ref(),
+            )
+            .await
+            .expect("reconcile ok");
 
-        let snapshot = make_snapshot(agreement_id, AgreementState::Accepted, Address::ZERO);
-        let result = reconcile_agreement(
-            &snapshot,
-            &registry,
-            &chain_client,
-            test_agreement_conf().as_ref(),
-        )
-        .await;
-
-        assert!(result.is_ok());
-        assert!(!registry.was_marked_accepted_on_chain(&agreement_id));
-        assert!(registry.was_reopened(&agreement_id));
-    }
-
-    #[tokio::test]
-    async fn test_reconcile_records_no_accept_for_a_rejected_agreement_already_ended() {
-        // The snapshot shows it accepted, but by the time dipper reads the chain the indexer
-        // has ended it. It stays Rejected, so an accept on record would be announced with no
-        // end ever following it.
-        let registry = MockRegistry::new();
-        let chain_client = MockChainClient::default();
-        let agreement_id = IndexingAgreementId::from_bytes(rand::random());
-        registry.add_agreement(agreement_id, IndexingAgreementStatus::Rejected);
-
-        let snapshot = make_snapshot(agreement_id, AgreementState::Accepted, Address::ZERO);
-        let result = reconcile_agreement(
-            &snapshot,
-            &registry,
-            &chain_client,
-            test_agreement_conf().as_ref(),
-        )
-        .await;
-
-        assert!(result.is_ok());
-        assert!(!registry.was_reopened(&agreement_id));
-        assert!(registry.audit_writes().is_empty());
+            assert_eq!(queued, vec![(agreement_id, snapshot_accept())], "{status}");
+            assert_eq!(
+                chain_client.reads.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{status}"
+            );
+            assert!(!registry.was_reopened(&agreement_id), "{status}");
+            assert!(registry.audit_writes().is_empty(), "{status}");
+            assert!(
+                !registry.was_marked_accepted_on_chain(&agreement_id),
+                "{status}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2999,8 +3096,7 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_ok());
-        assert!(!registry.was_reopened(&agreement_id));
+        assert!(result.expect("reconcile ok").is_empty(), "no check queued");
         assert!(registry.was_marked_canceled_by_requester(&agreement_id));
         assert!(!registry.was_marked_accepted_on_chain(&agreement_id));
     }
@@ -3134,65 +3230,11 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_ok());
+        // Already canceled on-chain: must not queue a fresh check.
+        assert!(result.expect("reconcile ok").is_empty());
         assert!(registry.was_marked_canceled_by_requester(&agreement_id));
         assert!(!registry.was_marked_canceled_by_indexer(&agreement_id));
         assert!(!registry.was_marked_accepted_on_chain(&agreement_id));
-        // Already canceled on-chain: must not queue a fresh cancel job.
-        assert!(!registry.was_reopened(&agreement_id));
-    }
-
-    #[tokio::test]
-    async fn test_reconcile_reopens_the_cancel_of_a_cancelled_agreement_live_on_chain() {
-        // Dipper cancelled the agreement locally, but the indexer accepted its offer
-        // (for example one that landed after dipper's cancel). Nothing else would end
-        // it, so it goes back to cancelling for the cancel retry to end.
-        let registry = MockRegistry::new();
-        let chain_client = MockChainClient {
-            live_until_cancelled: true,
-            ..MockChainClient::default()
-        };
-        let agreement_id = IndexingAgreementId::from_bytes(rand::random());
-        registry.add_agreement(agreement_id, IndexingAgreementStatus::CanceledByRequester);
-
-        let snapshot = make_snapshot(agreement_id, AgreementState::Accepted, Address::ZERO);
-        let result = reconcile_agreement(
-            &snapshot,
-            &registry,
-            &chain_client,
-            test_agreement_conf().as_ref(),
-        )
-        .await;
-
-        assert!(result.is_ok());
-        assert!(registry.was_reopened(&agreement_id));
-        assert!(!registry.was_marked_accepted_on_chain(&agreement_id));
-        assert!(
-            registry.audit_writes().contains(&("accept", agreement_id)),
-            "its accept is recorded, so the cancel retry treats it as paying"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_reconcile_leaves_a_cancelled_agreement_the_chain_shows_ended() {
-        // The subgraph can still report an agreement accepted for a few polls after
-        // dipper's cancel lands; reopening it would only bring it back to cancelling.
-        let registry = MockRegistry::new();
-        let chain_client = MockChainClient::default();
-        let agreement_id = IndexingAgreementId::from_bytes(rand::random());
-        registry.add_agreement(agreement_id, IndexingAgreementStatus::CanceledByRequester);
-
-        let snapshot = make_snapshot(agreement_id, AgreementState::Accepted, Address::ZERO);
-        reconcile_agreement(
-            &snapshot,
-            &registry,
-            &chain_client,
-            test_agreement_conf().as_ref(),
-        )
-        .await
-        .expect("reconcile ok");
-
-        assert!(!registry.was_reopened(&agreement_id));
     }
 
     #[tokio::test]
@@ -3211,8 +3253,7 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_ok());
-        assert!(!registry.was_reopened(&agreement_id));
+        assert!(result.expect("reconcile ok").is_empty());
     }
 
     #[tokio::test]
@@ -3972,6 +4013,7 @@ mod tests {
             subgraph_indexing_agreements_events_emitter: Arc::new(
                 SubgraphIndexingAgreementsEventsEmitter::disabled(),
             ),
+            worker_queue: MockWorkerQueue::default(),
         };
 
         let (handle, service) = new(ctx);
@@ -4055,6 +4097,7 @@ mod tests {
             subgraph_indexing_agreements_events_emitter: Arc::new(
                 SubgraphIndexingAgreementsEventsEmitter::disabled(),
             ),
+            worker_queue: MockWorkerQueue::default(),
         };
 
         let (handle, service) = new(ctx);
@@ -4135,6 +4178,7 @@ mod tests {
             subgraph_indexing_agreements_events_emitter: Arc::new(
                 SubgraphIndexingAgreementsEventsEmitter::disabled(),
             ),
+            worker_queue: MockWorkerQueue::default(),
         };
 
         let (handle, service) = new(ctx);
@@ -4198,6 +4242,7 @@ mod tests {
         let mut stall_count: u32 = 0;
         let mut consecutive_failures: u32 = 0;
         let (_tx_stop, mut rx_stop) = mpsc::channel::<()>(1);
+        let mut live_checks = LiveChecks::new(MockWorkerQueue::default());
 
         let outcome = drain_once(
             &mut cursor,
@@ -4213,6 +4258,7 @@ mod tests {
             false,
             &registry,
             &chain_client,
+            &mut live_checks,
             &event_source,
             &mut rx_stop,
             test_agreement_conf().as_ref(),
@@ -4274,6 +4320,7 @@ mod tests {
         let mut stall_count: u32 = 0;
         let mut consecutive_failures: u32 = 0;
         let (_tx_stop, mut rx_stop) = mpsc::channel::<()>(1);
+        let mut live_checks = LiveChecks::new(MockWorkerQueue::default());
 
         for fails in apply_fails {
             registry.set_fail_batch(*fails);
@@ -4291,6 +4338,7 @@ mod tests {
                 false,
                 &registry,
                 &chain_client,
+                &mut live_checks,
                 &event_source,
                 &mut rx_stop,
                 test_agreement_conf().as_ref(),
@@ -4332,13 +4380,18 @@ mod tests {
     }
 
     /// Drain a page holding a change in `state` to an agreement in `status` 3 times: with its
-    /// audit writes failing, then working, then from the start again, as the reorg buffer
-    /// re-reads it. The agreement, the registry and the cursor after each drain.
+    /// audit writes and job queuing failing, then working, then from the start again, as the
+    /// reorg buffer re-reads it. The agreement, the registry, the queue and each drain's cursor.
     async fn drain_a_page_whose_audit_write_fails(
         status: IndexingAgreementStatus,
         state: AgreementState,
-        chain_client: &MockChainClient,
-    ) -> (IndexingAgreementId, MockRegistry, Vec<Cursor>) {
+    ) -> (
+        IndexingAgreementId,
+        MockRegistry,
+        MockWorkerQueue,
+        Vec<Cursor>,
+    ) {
+        let chain_client = live_chain();
         let registry = MockRegistry::new();
         let event_source = super::super::chain_events::mock::MockEventSource::new();
         event_source.set_latest_block(100);
@@ -4354,6 +4407,8 @@ mod tests {
         let mut stall_count: u32 = 0;
         let mut consecutive_failures: u32 = 0;
         let (_tx_stop, mut rx_stop) = mpsc::channel::<()>(1);
+        let queue = MockWorkerQueue::default();
+        let mut live_checks = LiveChecks::new(queue.clone());
         let mut cursors = Vec::new();
 
         for (writes_fail, from_start) in [(true, false), (false, false), (false, true)] {
@@ -4362,6 +4417,9 @@ mod tests {
                 mock.fail_accept_audit = writes_fail;
                 mock.fail_cancel_audit = writes_fail;
             }
+            queue
+                .fail
+                .store(writes_fail, std::sync::atomic::Ordering::SeqCst);
             if from_start {
                 cursor = Cursor::genesis();
             }
@@ -4378,7 +4436,8 @@ mod tests {
                 10,
                 false,
                 &registry,
-                chain_client,
+                &chain_client,
+                &mut live_checks,
                 &event_source,
                 &mut rx_stop,
                 test_agreement_conf().as_ref(),
@@ -4387,7 +4446,12 @@ mod tests {
             .expect("subgraph fetch succeeded");
             cursors.push(cursor.clone());
         }
-        (agreement_id, registry, cursors)
+        assert_eq!(
+            chain_client.reads.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the drain reads nothing from the chain"
+        );
+        (agreement_id, registry, queue, cursors)
     }
 
     /// The end of an agreement dipper already ended is its last change on-chain, so if recording
@@ -4395,10 +4459,9 @@ mod tests {
     /// repeats the write, which keeps what is already on record.
     #[tokio::test]
     async fn test_drain_rereads_an_accept_and_cancel_that_failed_to_record() {
-        let (id, registry, cursors) = drain_a_page_whose_audit_write_fails(
+        let (id, registry, _, cursors) = drain_a_page_whose_audit_write_fails(
             IndexingAgreementStatus::CanceledByRequester,
             AgreementState::CanceledByPayer,
-            &MockChainClient::default(),
         )
         .await;
 
@@ -4417,30 +4480,43 @@ mod tests {
         assert!(!registry.was_marked_canceled_by_requester(&id));
     }
 
-    /// The same holds for the accept of an agreement being cancelled, including a rejected or
-    /// cancelled one moved back to cancelling: read again, it is cancelling, so its accept is
-    /// recorded without moving it back a second time.
+    /// The same holds for the accept of an agreement being cancelled.
     #[tokio::test]
     async fn test_drain_rereads_the_accept_of_an_agreement_being_cancelled_that_failed_to_record() {
-        for (status, chain_client) in [
-            (
-                IndexingAgreementStatus::Cancelling,
-                MockChainClient::default(),
-            ),
-            (IndexingAgreementStatus::CanceledByRequester, live_chain()),
-            (IndexingAgreementStatus::Rejected, live_chain()),
+        let (id, registry, _, cursors) = drain_a_page_whose_audit_write_fails(
+            IndexingAgreementStatus::Cancelling,
+            AgreementState::Accepted,
+        )
+        .await;
+
+        assert_eq!(
+            cursors[0],
+            Cursor::genesis(),
+            "held before the failed write"
+        );
+        assert!(
+            cursors[1..]
+                .iter()
+                .all(|cursor| *cursor > Cursor::genesis())
+        );
+        assert_eq!(registry.audit_writes(), vec![("accept", id); 2]);
+    }
+
+    /// A rejected or cancelled agreement accepted on-chain is read again until its chain check
+    /// is queued, and only queued once, however often the change is read.
+    #[tokio::test]
+    async fn test_drain_queues_the_chain_check_of_an_ended_agreement_once() {
+        for status in [
+            IndexingAgreementStatus::Rejected,
+            IndexingAgreementStatus::CanceledByRequester,
         ] {
-            let (id, registry, cursors) = drain_a_page_whose_audit_write_fails(
-                status,
-                AgreementState::Accepted,
-                &chain_client,
-            )
-            .await;
+            let (id, registry, queue, cursors) =
+                drain_a_page_whose_audit_write_fails(status, AgreementState::Accepted).await;
 
             assert_eq!(
                 cursors[0],
                 Cursor::genesis(),
-                "{status}: held before the failed write"
+                "{status}: held before the failed queuing"
             );
             assert!(
                 cursors[1..]
@@ -4448,12 +4524,9 @@ mod tests {
                     .all(|cursor| *cursor > Cursor::genesis()),
                 "{status}"
             );
-            assert_eq!(registry.audit_writes(), vec![("accept", id); 2], "{status}");
-            assert_eq!(
-                registry.state.lock().unwrap().reopened.len(),
-                usize::from(status != IndexingAgreementStatus::Cancelling),
-                "{status}"
-            );
+            assert_eq!(queue.queued(), vec![(id, snapshot_accept())], "{status}");
+            assert!(!registry.was_reopened(&id), "{status}");
+            assert!(registry.audit_writes().is_empty(), "{status}");
         }
     }
 
@@ -4501,6 +4574,7 @@ mod tests {
         let mut stall_count: u32 = 0;
         let mut consecutive_failures: u32 = 0;
         let (_tx_stop, mut rx_stop) = mpsc::channel::<()>(1);
+        let mut live_checks = LiveChecks::new(MockWorkerQueue::default());
 
         drain_once(
             &mut cursor,
@@ -4516,6 +4590,7 @@ mod tests {
             false,
             &registry,
             &chain_client,
+            &mut live_checks,
             &event_source,
             &mut rx_stop,
             test_agreement_conf().as_ref(),
@@ -4544,6 +4619,7 @@ mod tests {
             false,
             &registry,
             &chain_client,
+            &mut live_checks,
             &event_source,
             &mut rx_stop,
             test_agreement_conf().as_ref(),
@@ -4633,6 +4709,7 @@ mod tests {
         let mut stall_count: u32 = 0;
         let mut consecutive_failures: u32 = 0;
         let (_tx_stop, mut rx_stop) = mpsc::channel::<()>(1);
+        let mut live_checks = LiveChecks::new(MockWorkerQueue::default());
 
         drain_once(
             &mut cursor,
@@ -4648,6 +4725,7 @@ mod tests {
             false,
             &registry,
             &chain_client,
+            &mut live_checks,
             &event_source,
             &mut rx_stop,
             test_agreement_conf().as_ref(),
@@ -4697,6 +4775,7 @@ mod tests {
             subgraph_indexing_agreements_events_emitter: Arc::new(
                 SubgraphIndexingAgreementsEventsEmitter::disabled(),
             ),
+            worker_queue: MockWorkerQueue::default(),
         };
 
         let (handle, service) = new(ctx);

@@ -4,7 +4,10 @@ use thegraph_core::{DeploymentId, alloy::primitives::ChainId};
 use url::Url;
 
 use super::{
-    handlers::{ReassessIndexingRequest, SendIndexingAgreementProposal, SubmitOffer},
+    handlers::{
+        CancelRejectedAgreementOnChain, ChainAccept, ReassessIndexingRequest,
+        SendIndexingAgreementProposal, SubmitOffer,
+    },
     messages::Message,
     queue::{JobId, JobPriority, Queue},
 };
@@ -27,6 +30,15 @@ pub trait WorkerQueue {
         deployment_id: DeploymentId,
         deployment_chain_id: ChainId,
         num_candidates: usize,
+        priority: JobPriority,
+    ) -> anyhow::Result<JobId>;
+
+    /// Check on-chain an agreement dipper rejected or cancelled that was accepted anyway, and
+    /// move it back into `Cancelling` if it is live, recording `accept`.
+    async fn cancel_rejected_agreement_on_chain(
+        &self,
+        agreement_id: IndexingAgreementId,
+        accept: Option<ChainAccept>,
         priority: JobPriority,
     ) -> anyhow::Result<JobId>;
 
@@ -106,6 +118,23 @@ where
                     deployment_id,
                     deployment_chain_id,
                     num_candidates,
+                }),
+                priority,
+            )
+            .await
+    }
+
+    async fn cancel_rejected_agreement_on_chain(
+        &self,
+        agreement_id: IndexingAgreementId,
+        accept: Option<ChainAccept>,
+        priority: JobPriority,
+    ) -> anyhow::Result<JobId> {
+        self.queue
+            .push(
+                Message::CancelRejectedAgreementOnChain(CancelRejectedAgreementOnChain {
+                    agreement_id,
+                    accept,
                 }),
                 priority,
             )

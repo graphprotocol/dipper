@@ -539,6 +539,7 @@ pub async fn main() -> anyhow::Result<()> {
                 chain_listener_notify: chain_listener_notify.clone(),
                 subgraph_indexing_agreements_events_emitter:
                     subgraph_indexing_agreements_events_emitter.clone(),
+                worker_queue: worker_handle.queue().clone(),
             };
             let (handle, service) = network::service::chain_listener::new(ctx);
             Some((handle, service))
