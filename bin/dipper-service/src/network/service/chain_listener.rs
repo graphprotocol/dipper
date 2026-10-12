@@ -1254,21 +1254,27 @@ where
         );
         return Ok(true);
     };
-    if old_agreement.status == IndexingAgreementStatus::Expired {
+    let reason = crate::cancel_dispatch::CancelReason::NotWanted;
+    // An expired one is read first, so one that really expired keeps its status.
+    let started = if old_agreement.status == IndexingAgreementStatus::Expired {
         match expired_but_live(chain_client, &old_agreement).await {
-            Some(true) => {}
+            Some(true) => {
+                crate::cancel_dispatch::start_cancel_seen_live(
+                    registry,
+                    chain_client,
+                    &old_agreement,
+                    reason,
+                    config,
+                )
+                .await
+            }
             Some(false) => return Ok(true),
             None => return Ok(false),
         }
-    }
-    let started = crate::cancel_dispatch::start_cancel(
-        registry,
-        chain_client,
-        &old_agreement,
-        crate::cancel_dispatch::CancelReason::NotWanted,
-        config,
-    )
-    .await;
+    } else {
+        crate::cancel_dispatch::start_cancel(registry, chain_client, &old_agreement, reason, config)
+            .await
+    };
     Ok(note_replaced_cancel(
         new_agreement_id,
         &old_agreement,
@@ -2601,6 +2607,8 @@ mod tests {
         fail_cancels: bool,
         /// When set, every agreement reads as live until a cancel is sent for it.
         live_until_cancelled: bool,
+        /// How many times an agreement was read.
+        reads: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     /// A chain on which every agreement is live until a cancel is sent for it.
@@ -2694,6 +2702,7 @@ mod tests {
             agreement_id: &[u8; 16],
         ) -> Result<crate::chain_client::AgreementOnChain, crate::chain_client::ChainClientError>
         {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             // Cancel dispatch always reads back after a mined cancel; reporting
             // not-active here means "cancel confirmed", which these tests expect.
             Ok(crate::chain_client::AgreementOnChain::live_if(
@@ -3594,6 +3603,12 @@ mod tests {
             assert_eq!(registry.was_marked_cancelling(&old_id), live);
             assert_eq!(chain_client.was_on_chain_cancel_attempted(&old_id), live);
             assert!(registry.was_pending_cancellation_deleted(&new_id, &old_id));
+            // Once before the cancel, and once after it to confirm it worked.
+            let reads = if live { 2 } else { 1 };
+            assert_eq!(
+                chain_client.reads.load(std::sync::atomic::Ordering::SeqCst),
+                reads
+            );
         }
     }
 
