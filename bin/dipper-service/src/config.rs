@@ -595,6 +595,20 @@ fn default_liveness_checker_unreachable_trip_min_indexers() -> usize {
     3
 }
 
+impl LivenessCheckerConfig {
+    /// Reject a trip share the breaker can't act on: at or below 0 it trips on every cycle with
+    /// enough indexers, and above 1 it never trips. Not-a-number is neither, so it is refused too.
+    pub fn validate(&self) -> Result<(), String> {
+        let fraction = self.unreachable_trip_fraction;
+        if fraction.is_nan() || fraction <= 0.0 || fraction > 1.0 {
+            return Err(format!(
+                "unreachable_trip_fraction ({fraction}) must be above 0 and at most 1"
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Default for LivenessCheckerConfig {
     fn default() -> Self {
         Self {
@@ -1687,6 +1701,22 @@ mod tests {
             conf(60, 3600).validate().is_ok(),
             "a comfortably wide window is valid"
         );
+    }
+
+    #[test]
+    fn validate_rejects_an_unreachable_trip_share_the_breaker_cannot_act_on() {
+        fn conf(fraction: f64) -> LivenessCheckerConfig {
+            LivenessCheckerConfig {
+                unreachable_trip_fraction: fraction,
+                ..LivenessCheckerConfig::default()
+            }
+        }
+        for fraction in [0.0, -0.5, 1.5, f64::NAN] {
+            assert!(conf(fraction).validate().is_err(), "{fraction}");
+        }
+        for fraction in [0.01, 0.5, 1.0] {
+            assert!(conf(fraction).validate().is_ok(), "{fraction}");
+        }
     }
 
     #[test]
