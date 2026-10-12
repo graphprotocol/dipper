@@ -772,8 +772,11 @@ async fn cancel_and_reassess<R, W, C>(
         );
         return;
     }
-    if started == CancelStarted::NotLive {
-        note_seen_ended(agreement, registry, db_timeout).await;
+    // Until its end is noted it keeps its slot, so a reassessment queued now could add nothing
+    // and, noted as queued, nothing would queue another for a day.
+    if started == CancelStarted::NotLive && !note_seen_ended(agreement, registry, db_timeout).await
+    {
+        return;
     }
     replace_abandoned(agreement, registry, worker_queue, db_timeout, queue_timeout).await;
 }
@@ -806,29 +809,35 @@ impl Uncancellable {
 }
 
 /// Note that the chain shows a stale agreement still cancelling has ended, so it no longer
-/// holds its slot in the request and the reassessment queued next fills it. Bounded by
-/// `db_timeout`, so a hung database can't stall the liveness cycle.
+/// holds its slot in the request and the reassessment queued next fills it; whether it was
+/// noted. Bounded by `db_timeout`, so a hung database can't stall the liveness cycle.
 async fn note_seen_ended<R: AgreementRegistry + Sync>(
     agreement: &IndexingAgreement,
     registry: &R,
     db_timeout: Duration,
-) {
+) -> bool {
     let noted = tokio::time::timeout(
         db_timeout,
         registry.record_cancel_check(&agreement.id, 0, Some(true)),
     )
     .await;
     match noted {
-        Ok(Ok(_) | Err(crate::registry::Error::NoRecordsUpdated)) => {}
-        Ok(Err(err)) => tracing::warn!(
-            agreement_id = %agreement.id,
-            error = %err,
-            "Failed to note a stale agreement ended; its replacement may wait for a later reassessment"
-        ),
-        Err(_) => tracing::warn!(
-            agreement_id = %agreement.id,
-            "Timeout noting a stale agreement ended; its replacement may wait for a later reassessment"
-        ),
+        Ok(Ok(_) | Err(crate::registry::Error::NoRecordsUpdated)) => true,
+        Ok(Err(err)) => {
+            tracing::warn!(
+                agreement_id = %agreement.id,
+                error = %err,
+                "Failed to note a stale agreement ended; the cancel retry replaces it once it has ended"
+            );
+            false
+        }
+        Err(_) => {
+            tracing::warn!(
+                agreement_id = %agreement.id,
+                "Timeout noting a stale agreement ended; the cancel retry replaces it once it has ended"
+            );
+            false
+        }
     }
 }
 
@@ -2105,7 +2114,9 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn still_replaces_an_ended_stale_agreement_when_noting_its_end_hangs() {
+    async fn leaves_an_ended_stale_agreement_to_the_cancel_retry_when_noting_its_end_hangs() {
+        // Unnoted, it still holds its slot, so a reassessment queued now could add nothing, and
+        // one noted as queued is never queued again; the cancel retry queues it once it has ended.
         let agreement = stale_agreement();
         let calls = MockCalls::default();
         let registry = MockRegistry {
@@ -2117,10 +2128,8 @@ mod tests {
 
         end_stale(&agreement, &registry, &chain).await;
 
-        assert_eq!(
-            calls.reassessments.lock().unwrap().as_slice(),
-            &[agreement.indexing_request_id]
-        );
+        assert!(calls.reassessments.lock().unwrap().is_empty());
+        assert!(calls.replacements_noted.lock().unwrap().is_empty());
     }
 
     // ---- Holding back abandonment while many indexers are unreachable ----
