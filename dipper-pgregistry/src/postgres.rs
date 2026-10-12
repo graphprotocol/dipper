@@ -990,7 +990,7 @@ impl PgRegistry {
         Ok(())
     }
 
-    /// One being cancelled because its indexer stopped serving it ends `AbandonedByIndexer`.
+    /// End an agreement dipper no longer wants `CanceledByRequester`.
     pub async fn mark_indexing_agreement_as_canceled_by_requester(
         &self,
         agreement_id: &IndexingAgreementId,
@@ -999,6 +999,20 @@ impl PgRegistry {
             agreement_id,
             IndexingAgreementStatus::CanceledByRequester,
             CANCEL_BY_REQUESTER_FROM,
+        )
+        .await
+    }
+
+    /// End an agreement dipper was cancelling because its indexer stopped serving it, once the
+    /// chain confirms dipper's cancel.
+    pub async fn mark_indexing_agreement_as_abandoned_by_indexer(
+        &self,
+        agreement_id: &IndexingAgreementId,
+    ) -> Result<(), Error> {
+        self.set_status_from(
+            agreement_id,
+            IndexingAgreementStatus::AbandonedByIndexer,
+            &[IndexingAgreementStatus::Cancelling],
         )
         .await
     }
@@ -1257,18 +1271,7 @@ impl PgRegistry {
 
         let mut did_cancel = false;
         if let Some(kind) = cancel {
-            let (new_status, allowed_from): (_, &[IndexingAgreementStatus]) = match kind {
-                CancelKind::ByRequester => (
-                    IndexingAgreementStatus::CanceledByRequester,
-                    CANCEL_BY_REQUESTER_FROM,
-                ),
-                CancelKind::ByIndexer => (
-                    IndexingAgreementStatus::CanceledByIndexer,
-                    CANCEL_BY_INDEXER_FROM,
-                ),
-            };
-            did_cancel =
-                update_status_from(&mut tx, agreement_id, new_status, allowed_from).await?;
+            did_cancel = apply_cancel(&mut tx, agreement_id, kind).await?;
             if did_accept && !did_cancel {
                 return Err(Error::NoRecordsUpdated);
             }
@@ -1293,7 +1296,6 @@ impl PgRegistry {
     /// stale outcome flags from the first iteration; debug_asserted.
     #[expect(
         clippy::expect_used,
-        clippy::too_many_lines,
         reason = "predates this lint; fix when next touched"
     )]
     pub async fn apply_reconciliation_batch(
@@ -1351,18 +1353,7 @@ impl PgRegistry {
                 ],
             )
             .await?;
-            let (new_status, allowed_from): (_, &[IndexingAgreementStatus]) = match cancel_kind {
-                CancelKind::ByRequester => (
-                    IndexingAgreementStatus::CanceledByRequester,
-                    CANCEL_BY_REQUESTER_FROM,
-                ),
-                CancelKind::ByIndexer => (
-                    IndexingAgreementStatus::CanceledByIndexer,
-                    CANCEL_BY_INDEXER_FROM,
-                ),
-            };
-            let did_cancel =
-                update_status_from(&mut tx, &item.agreement_id, new_status, allowed_from).await?;
+            let did_cancel = apply_cancel(&mut tx, &item.agreement_id, cancel_kind).await?;
             if did_accept && !did_cancel {
                 return Err(Error::NoRecordsUpdated);
             }
@@ -1389,25 +1380,12 @@ impl PgRegistry {
             outcomes.entry(id).or_default().did_accept = true;
         }
 
-        for id in batch_update_status_from(
-            &mut tx,
-            &cancel_by_requester,
-            IndexingAgreementStatus::CanceledByRequester,
-            CANCEL_BY_REQUESTER_FROM,
-        )
-        .await?
+        for id in batch_apply_cancel(&mut tx, &cancel_by_requester, CancelKind::ByRequester).await?
         {
             outcomes.entry(id).or_default().did_cancel = true;
         }
 
-        for id in batch_update_status_from(
-            &mut tx,
-            &cancel_by_indexer,
-            IndexingAgreementStatus::CanceledByIndexer,
-            CANCEL_BY_INDEXER_FROM,
-        )
-        .await?
-        {
+        for id in batch_apply_cancel(&mut tx, &cancel_by_indexer, CancelKind::ByIndexer).await? {
             outcomes.entry(id).or_default().did_cancel = true;
         }
 
@@ -2496,41 +2474,84 @@ impl PgRegistry {
     }
 }
 
-/// Batched form of `update_status_from`: transitions all rows whose `id`
-/// is in `agreement_ids` and whose current status is in `allowed_from` to
-/// `new_status`, in one statement; a row noted abandoned that `new_status` would make
-/// `CanceledByRequester` becomes `AbandonedByIndexer` instead. Returns the ids of the rows that
-/// actually flipped (matched the CAS guard) so callers can build per-id
-/// outcome maps. Empty input is a fast-path no-op.
+/// Batched form of `update_status_from`: moves every row in `agreement_ids` whose status is in
+/// `allowed_from` to `new_status`, in 1 statement. Returns the ids of the rows that moved, so
+/// callers can build per-id outcome maps; empty input is a no-op.
 async fn batch_update_status_from(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     agreement_ids: &[IndexingAgreementId],
     new_status: IndexingAgreementStatus,
     allowed_from: &[IndexingAgreementStatus],
 ) -> Result<Vec<IndexingAgreementId>, Error> {
+    batch_set_status(tx, agreement_ids, "$1", &[new_status], allowed_from).await
+}
+
+/// Record a cancel by `kind`, seen on the chain, in 1 row; true if it ended the row.
+async fn apply_cancel(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    agreement_id: &IndexingAgreementId,
+    kind: CancelKind,
+) -> Result<bool, Error> {
+    let ended = batch_apply_cancel(tx, std::slice::from_ref(agreement_id), kind).await?;
+    Ok(!ended.is_empty())
+}
+
+/// Record a cancel by `kind`, seen on the chain, in each row it ends, returning their ids. The
+/// chain doesn't say why dipper cancelled, so its cancel ends a row noted abandoned (its indexer
+/// stopped serving it) `AbandonedByIndexer`, and the rest `CanceledByRequester`.
+async fn batch_apply_cancel(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    agreement_ids: &[IndexingAgreementId],
+    kind: CancelKind,
+) -> Result<Vec<IndexingAgreementId>, Error> {
+    match kind {
+        CancelKind::ByRequester => {
+            let ended = [
+                IndexingAgreementStatus::AbandonedByIndexer,
+                IndexingAgreementStatus::CanceledByRequester,
+            ];
+            let status = "CASE WHEN abandoned THEN $1 ELSE $2 END";
+            batch_set_status(tx, agreement_ids, status, &ended, CANCEL_BY_REQUESTER_FROM).await
+        }
+        CancelKind::ByIndexer => {
+            let ended = IndexingAgreementStatus::CanceledByIndexer;
+            batch_update_status_from(tx, agreement_ids, ended, CANCEL_BY_INDEXER_FROM).await
+        }
+    }
+}
+
+/// Set the status of the rows in `agreement_ids` whose status is in `allowed_from` to
+/// `status_sql`, which reads `new_statuses` as `$1`, `$2` and so on, returning their ids.
+async fn batch_set_status(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    agreement_ids: &[IndexingAgreementId],
+    status_sql: &str,
+    new_statuses: &[IndexingAgreementStatus],
+    allowed_from: &[IndexingAgreementStatus],
+) -> Result<Vec<IndexingAgreementId>, Error> {
     if agreement_ids.is_empty() {
         return Ok(Vec::new());
     }
+    let ids_at = new_statuses.len() + 1;
     let placeholders = (0..allowed_from.len())
-        .map(|i| format!("${}", i + 5))
+        .map(|i| format!("${}", ids_at + 1 + i))
         .collect::<Vec<_>>()
         .join(", ");
-    // An agreement dipper ended because its indexer stopped serving it ends as abandoned.
     let sql = format!(
         r#"
         UPDATE dipper_reg_indexing_agreements
         SET
-            status = CASE WHEN abandoned AND $1 = $3 THEN $4 ELSE $1 END,
+            status = {status_sql},
             updated_at = timezone('UTC', now())
-        WHERE id = ANY($2) AND status IN ({placeholders})
+        WHERE id = ANY(${ids_at}) AND status IN ({placeholders})
         RETURNING id
         "#
     );
-    let mut query = sqlx::query_as::<_, (IndexingAgreementId,)>(&sql)
-        .bind(new_status)
-        .bind(agreement_ids)
-        .bind(IndexingAgreementStatus::CanceledByRequester)
-        .bind(IndexingAgreementStatus::AbandonedByIndexer);
+    let mut query = sqlx::query_as::<_, (IndexingAgreementId,)>(&sql);
+    for status in new_statuses {
+        query = query.bind(*status);
+    }
+    query = query.bind(agreement_ids);
     for status in allowed_from {
         query = query.bind(*status);
     }

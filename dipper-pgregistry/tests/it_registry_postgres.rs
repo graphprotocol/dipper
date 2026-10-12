@@ -698,7 +698,7 @@ async fn get_declined_indexers_by_deployment_includes_an_indexer_that_abandoned_
         .await
         .expect("abandon");
     registry
-        .mark_indexing_agreement_as_canceled_by_requester(&agreement_id)
+        .mark_indexing_agreement_as_abandoned_by_indexer(&agreement_id)
         .await
         .expect("ended abandoned");
 
@@ -1858,7 +1858,7 @@ where
 async fn an_abandoned_agreement_dipper_cancels_ends_abandoned() {
     let (again, status) = abandon_then_end(async |registry, id| {
         registry
-            .mark_indexing_agreement_as_canceled_by_requester(id)
+            .mark_indexing_agreement_as_abandoned_by_indexer(id)
             .await
             .expect("dipper's cancel confirmed");
     })
@@ -1869,6 +1869,40 @@ async fn an_abandoned_agreement_dipper_cancels_ends_abandoned() {
         matches!(again, Err(Error::NoRecordsUpdated)),
         "got {again:?}"
     );
+}
+
+#[tokio::test]
+async fn the_requester_mark_writes_its_own_status_whatever_the_abandoned_flag() {
+    // The caller picks the end status, so it logs the one written.
+    let (_, status) = abandon_then_end(async |registry, id| {
+        registry
+            .mark_indexing_agreement_as_canceled_by_requester(id)
+            .await
+            .expect("marked");
+    })
+    .await;
+
+    assert_eq!(status, IndexingAgreementStatus::CanceledByRequester);
+}
+
+#[tokio::test]
+async fn an_abandoned_agreement_the_listener_sees_cancelled_in_a_batch_ends_abandoned() {
+    let (_, status) = abandon_then_end(async |registry, id| {
+        let items = [ReconciliationItem {
+            agreement_id: *id,
+            apply_accept: false,
+            cancel: Some(CancelKind::ByRequester),
+            audit: ReconciliationAudit::default(),
+        }];
+        let outcomes = registry
+            .apply_reconciliation_batch(&items)
+            .await
+            .expect("reconciliation");
+        assert!(outcomes[id].did_cancel);
+    })
+    .await;
+
+    assert_eq!(status, IndexingAgreementStatus::AbandonedByIndexer);
 }
 
 #[tokio::test]
@@ -4198,7 +4232,7 @@ async fn an_abandoned_agreement_awaits_replacement_once_ended_until_queued() {
     );
 
     registry
-        .mark_indexing_agreement_as_canceled_by_requester(&id)
+        .mark_indexing_agreement_as_abandoned_by_indexer(&id)
         .await
         .expect("end it");
     assert_eq!(awaiting().await, vec![id]);

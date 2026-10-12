@@ -162,6 +162,26 @@ pub async fn mark_cancelling<R: AgreementRegistry + Sync>(
     }
 }
 
+/// Mark an agreement dipper's cancel ended in the status its `reason` ends it in.
+async fn mark_ended<R: AgreementRegistry + Sync>(
+    registry: &R,
+    agreement: &IndexingAgreement,
+    reason: CancelReason,
+) -> RegistryResult<()> {
+    match reason {
+        CancelReason::NotWanted => {
+            registry
+                .mark_indexing_agreement_as_canceled_by_requester(&agreement.id)
+                .await
+        }
+        CancelReason::Abandoned => {
+            registry
+                .mark_indexing_agreement_as_abandoned_by_indexer(&agreement.id)
+                .await
+        }
+    }
+}
+
 /// The second half of [`start_cancel`]: cancel a marked agreement if the chain shows it live.
 pub async fn send_marked_cancel<R, T>(
     registry: &R,
@@ -219,10 +239,10 @@ async fn finish_marked_cancel<R: AgreementRegistry + Sync>(
     }
 }
 
-/// Mark an agreement the chain shows dipper ended as ended, recording the cancel when its
-/// transaction is known, so the `terminated` sweep announces it. False, logged, when the mark
-/// fails; it stays `Cancelling` for the cancel retry. One the chain listener already marked
-/// ended counts as ended.
+/// Mark an agreement the chain shows dipper ended as ended, as its `reason` says, recording the
+/// cancel when its transaction is known, so the `terminated` sweep announces it. False, logged,
+/// when the mark fails; it stays `Cancelling` for the cancel retry. One the chain listener
+/// already marked ended counts as ended.
 pub async fn confirm_cancelled<R: AgreementRegistry + Sync>(
     registry: &R,
     agreement: &IndexingAgreement,
@@ -234,10 +254,7 @@ pub async fn confirm_cancelled<R: AgreementRegistry + Sync>(
     if tx_hash.is_some() {
         record_cancel(registry, agreement, tx_hash, config).await;
     }
-    match registry
-        .mark_indexing_agreement_as_canceled_by_requester(&agreement.id)
-        .await
-    {
+    match mark_ended(registry, agreement, reason).await {
         Ok(()) => {}
         Err(crate::registry::Error::NoRecordsUpdated) => {
             tracing::debug!(

@@ -133,6 +133,16 @@ pub trait StubAgreementRegistry: Send + Sync {
         unimplemented!("mark_indexing_agreement_as_canceled_by_requester")
     }
 
+    /// Defaults to the requester mark, so a mock that records only that dipper ended an
+    /// agreement sees both kinds of end; override it to tell them apart.
+    async fn mark_indexing_agreement_as_abandoned_by_indexer(
+        &self,
+        id: &IndexingAgreementId,
+    ) -> Result<()> {
+        self.mark_indexing_agreement_as_canceled_by_requester(id)
+            .await
+    }
+
     async fn mark_indexing_agreement_as_cancelling(&self, _id: &IndexingAgreementId) -> Result<()> {
         unimplemented!("mark_indexing_agreement_as_cancelling")
     }
@@ -471,6 +481,13 @@ impl<T: StubAgreementRegistry> AgreementRegistry for T {
         id: &IndexingAgreementId,
     ) -> Result<()> {
         StubAgreementRegistry::mark_indexing_agreement_as_canceled_by_requester(self, id).await
+    }
+
+    async fn mark_indexing_agreement_as_abandoned_by_indexer(
+        &self,
+        id: &IndexingAgreementId,
+    ) -> Result<()> {
+        StubAgreementRegistry::mark_indexing_agreement_as_abandoned_by_indexer(self, id).await
     }
 
     async fn mark_indexing_agreement_as_cancelling(&self, id: &IndexingAgreementId) -> Result<()> {

@@ -260,9 +260,16 @@ pub trait AgreementRegistry {
     ///
     /// If there is no indexing agreement with the given ID, or if the agreement is not in the
     /// `CREATED`, `ACCEPTED_ON_CHAIN`, `REJECTED` or `CANCELLING` state, this method returns a
-    /// [`NoRecordUpdated`](Error::NoRecordsUpdated) error. One dipper was cancelling because its
-    /// indexer stopped serving it becomes `ABANDONED_BY_INDEXER` instead.
+    /// [`NoRecordUpdated`](Error::NoRecordsUpdated) error.
     async fn mark_indexing_agreement_as_canceled_by_requester(
+        &self,
+        id: &IndexingAgreementId,
+    ) -> RegistryResult<()>;
+
+    /// Mark a `CANCELLING` agreement dipper was ending because its indexer stopped serving it
+    /// `ABANDONED_BY_INDEXER`, once the chain confirms dipper's cancel;
+    /// [`NoRecordUpdated`](Error::NoRecordsUpdated) otherwise.
+    async fn mark_indexing_agreement_as_abandoned_by_indexer(
         &self,
         id: &IndexingAgreementId,
     ) -> RegistryResult<()>;
@@ -324,7 +331,8 @@ pub trait AgreementRegistry {
     /// - `apply_accept`: attempt `Created | Expired → AcceptedOnChain`.
     ///   May be a no-op if the row is already in another status.
     /// - `cancel`: optionally apply `CanceledByRequester` or
-    ///   `CanceledByIndexer` from an accepting/pre-accept state.
+    ///   `CanceledByIndexer` from an accepting/pre-accept state. Dipper's cancel of one it was
+    ///   ending because its indexer stopped serving it applies `AbandonedByIndexer` instead.
     ///
     /// Returns which transitions actually affected a row so callers can
     /// gate post-commit side effects (e.g. running

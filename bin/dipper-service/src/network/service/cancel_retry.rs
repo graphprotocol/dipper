@@ -462,6 +462,7 @@ mod tests {
     struct MockRegistry {
         cancelling: Vec<CancellingAgreement>,
         marked_cancelled: Mutex<Vec<IndexingAgreementId>>,
+        marked_abandoned: Mutex<Vec<IndexingAgreementId>>,
         marked_by_indexer: Mutex<Vec<IndexingAgreementId>>,
         audits: Mutex<Vec<Option<String>>>,
         audited_by: Mutex<Vec<String>>,
@@ -516,6 +517,16 @@ mod tests {
             }
             self.marked_cancelled.lock().unwrap().push(*id);
             self.writes.lock().unwrap().push("ended");
+            Ok(())
+        }
+        async fn mark_indexing_agreement_as_abandoned_by_indexer(
+            &self,
+            id: &IndexingAgreementId,
+        ) -> crate::registry::Result<()> {
+            if self.listener_ended_it {
+                return Err(crate::registry::Error::NoRecordsUpdated);
+            }
+            self.marked_abandoned.lock().unwrap().push(*id);
             Ok(())
         }
         async fn record_cancel_audit(
@@ -884,6 +895,19 @@ mod tests {
         assert_eq!(registry.marked_cancelled.lock().unwrap().len(), 1);
         let tx = B256::repeat_byte(0xcd).to_string();
         assert_eq!(*registry.audits.lock().unwrap(), vec![Some(tx)]);
+    }
+
+    #[tokio::test]
+    async fn ends_an_agreement_its_indexer_stopped_serving_as_abandoned() {
+        let mut registry = registry_with_one(true);
+        registry.cancelling[0].abandoned = true;
+
+        let logs = logged(retry(&registry, &live_chain(), 0)).await;
+
+        let id = registry.cancelling[0].agreement.id;
+        assert_eq!(*registry.marked_abandoned.lock().unwrap(), vec![id]);
+        assert!(registry.marked_cancelled.lock().unwrap().is_empty());
+        assert!(logs.contains("ABANDONED_BY_INDEXER"), "{logs}");
     }
 
     #[tokio::test]
