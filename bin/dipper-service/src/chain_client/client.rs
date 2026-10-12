@@ -79,7 +79,7 @@ const ALERT_GAP_BLOCKS: u64 = 14_400;
 
 /// A minute of blocks at the chain's fastest: how far apart endpoints may be and still agree.
 /// Ones that are right differ by a few blocks, and the chain's progress is allowed for apart from
-/// this, so it only bounds how far ahead a faulty endpoint can move the newest block seen.
+/// this, so it only bounds how far ahead a faulty endpoint can move a confirmed newest block seen.
 const AGREE_WITHIN_BLOCKS: u64 = 60 * BLOCKS_PER_SECOND;
 
 /// How a read refused by an endpoint whose latest block is too far ahead to be real says so.
@@ -94,7 +94,10 @@ const CROSS_CHECK_DEADLINE: Duration = Duration::from_secs(3);
 
 /// The newest block dipper has seen and when it last moved; it never goes back, so a lagging
 /// endpoint can't show state from before it. Nothing ahead is refused until a receipt or 2 agreeing
-/// endpoints confirm it, so a wrong one answering first after a restart can't shut out the rest.
+/// endpoints confirm it, which replaces a block far ahead set by a faulty endpoint that answered
+/// first after a restart. Until then any endpoint's block is taken: with only 2 that disagree,
+/// which is right can't be told, so 1 far ahead has the other refused as behind until a receipt
+/// or the chain catches up. Refusing it instead would let 1 stuck far behind serve stale reads.
 #[derive(Debug)]
 struct SeenBlock {
     number: u64,
@@ -998,12 +1001,14 @@ impl AlloyChainClient {
         if pool.endpoint_count() < 2 || !self.seen_block().cross_check_due(Instant::now()) {
             return;
         }
-        match agreed_head(pool.latest_blocks(CROSS_CHECK_DEADLINE).await) {
+        let heads = pool.latest_blocks(CROSS_CHECK_DEADLINE).await;
+        match agreed_head(heads.clone()) {
             Some(head) => self.seen_block().confirm(head, Instant::now()),
             None => tracing::warn!(
-                "No 2 RPC endpoints agree on the chain's latest block; reads aren't checked \
-                 against blocks too far ahead, nor the newest block seen moved far ahead, until \
-                 they do"
+                latest_blocks = ?heads,
+                "No 2 RPC endpoints agree on the chain's latest block; until they do, or a \
+                 receipt confirms it, any endpoint's block is taken as the newest seen and \
+                 endpoints behind it are refused"
             ),
         }
     }
@@ -2900,6 +2905,28 @@ mod tests {
         seen.confirm(real, now);
 
         assert_eq!(seen.bounds(now).0, real);
+    }
+
+    #[test]
+    fn takes_the_higher_block_from_2_endpoints_that_disagree() {
+        // Which is right can't be told, so 1 stuck far behind is refused, and so is a right one
+        // behind 1 faulty far ahead, until a receipt replaces its block.
+        let now = Instant::now();
+        let real = 5_000_000;
+        let stuck = real - 10_000;
+        let faulty = real + 10_000;
+        assert_eq!(agreed_head(vec![stuck, real]), None);
+        assert_eq!(agreed_head(vec![real, faulty]), None);
+
+        let mut seen = SeenBlock::new();
+        assert_eq!(seen.advance(stuck, now, false), Noted::Taken);
+        assert_eq!(seen.advance(real, now, false), Noted::Taken);
+        assert_eq!(seen.bounds(now).0, real, "the stuck one is refused");
+        assert_eq!(seen.advance(faulty, now, false), Noted::Taken);
+        assert_eq!(seen.bounds(now).0, faulty, "the right one is refused");
+
+        seen.confirm(real + 4, now);
+        assert_eq!(seen.bounds(now).0, real + 4);
     }
 
     #[test]
