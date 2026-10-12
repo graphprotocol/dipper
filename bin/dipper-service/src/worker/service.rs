@@ -20,6 +20,7 @@ use super::{
     result::{JobError, JobResult, calculate_backoff_delay, retries_within_window},
 };
 pub use super::{
+    handlers::ChainAccept,
     queue::JobPriority,
     service_queue::{WorkerQueue, WorkerQueueHandle},
 };

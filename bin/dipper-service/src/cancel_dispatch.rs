@@ -85,10 +85,10 @@ pub enum CancelReason {
 }
 
 impl CancelReason {
-    fn ended_status(self) -> &'static str {
+    fn ended_status(self) -> IndexingAgreementStatus {
         match self {
-            Self::NotWanted => "CANCELED_BY_REQUESTER",
-            Self::Abandoned => "ABANDONED_BY_INDEXER",
+            Self::NotWanted => IndexingAgreementStatus::CanceledByRequester,
+            Self::Abandoned => IndexingAgreementStatus::AbandonedByIndexer,
         }
     }
 }
@@ -162,6 +162,26 @@ pub async fn mark_cancelling<R: AgreementRegistry + Sync>(
     }
 }
 
+/// Mark an agreement dipper's cancel ended in the status its `reason` ends it in.
+async fn mark_ended<R: AgreementRegistry + Sync>(
+    registry: &R,
+    agreement: &IndexingAgreement,
+    reason: CancelReason,
+) -> RegistryResult<()> {
+    match reason {
+        CancelReason::NotWanted => {
+            registry
+                .mark_indexing_agreement_as_canceled_by_requester(&agreement.id)
+                .await
+        }
+        CancelReason::Abandoned => {
+            registry
+                .mark_indexing_agreement_as_abandoned_by_indexer(&agreement.id)
+                .await
+        }
+    }
+}
+
 /// The second half of [`start_cancel`]: cancel a marked agreement if the chain shows it live.
 pub async fn send_marked_cancel<R, T>(
     registry: &R,
@@ -219,10 +239,10 @@ async fn finish_marked_cancel<R: AgreementRegistry + Sync>(
     }
 }
 
-/// Mark an agreement the chain shows dipper ended as ended, recording the cancel when its
-/// transaction is known, so the `terminated` sweep announces it. False, logged, when the mark
-/// fails; it stays `Cancelling` for the cancel retry. One the chain listener already marked
-/// ended counts as ended.
+/// Mark an agreement the chain shows dipper ended as ended, as its `reason` says, recording the
+/// cancel when its transaction is known, so the `terminated` sweep announces it. False, logged,
+/// when the mark fails; it stays `Cancelling` for the cancel retry. One the chain listener
+/// already marked ended counts as ended.
 pub async fn confirm_cancelled<R: AgreementRegistry + Sync>(
     registry: &R,
     agreement: &IndexingAgreement,
@@ -234,10 +254,7 @@ pub async fn confirm_cancelled<R: AgreementRegistry + Sync>(
     if tx_hash.is_some() {
         record_cancel(registry, agreement, tx_hash, config).await;
     }
-    match registry
-        .mark_indexing_agreement_as_canceled_by_requester(&agreement.id)
-        .await
-    {
+    match mark_ended(registry, agreement, reason).await {
         Ok(()) => {}
         Err(crate::registry::Error::NoRecordsUpdated) => {
             tracing::debug!(
@@ -258,8 +275,8 @@ pub async fn confirm_cancelled<R: AgreementRegistry + Sync>(
     tracing::info!(
         agreement_id = %agreement.id,
         indexing_request_id = %agreement.indexing_request_id,
-        old_status = "CANCELLING",
-        new_status = reason.ended_status(),
+        old_status = %IndexingAgreementStatus::Cancelling,
+        new_status = %reason.ended_status(),
         reason = "cancel_confirmed_on_chain",
         "agreement state transition"
     );
@@ -288,15 +305,25 @@ async fn record_cancel<R: AgreementRegistry + Sync>(
     }
 }
 
-/// Move an agreement dipper had already rejected or cancelled back into `Cancelling` when the
-/// chain shows it live after all, so the cancel retry ends it. The chain is read first, so a
-/// subgraph report from before dipper's cancel landed reopens nothing; an unreadable chain
-/// reopens it anyway, as the retry reads again before sending. True if it was reopened.
+/// What [`reopen_if_live`] did.
+#[derive(Debug)]
+pub enum Reopen {
+    /// Moved back into `Cancelling`.
+    Reopened,
+    /// Left as it was: the chain shows it ended, or it is no longer rejected or cancelled.
+    Left,
+    /// Left as it was, as the chain couldn't be read, so it needs reading again.
+    Unread(ChainClientError),
+}
+
+/// Move an agreement dipper rejected or cancelled back into `Cancelling` if the chain shows it
+/// live, for the cancel retry to end. An unreadable chain reopens only a rejected one, whose
+/// indexer may be paid; a cancelled one likely shows accepted only as the subgraph lags its end.
 pub async fn reopen_if_live<R, T>(
     registry: &R,
     chain_client: &T,
     agreement: &IndexingAgreement,
-) -> RegistryResult<bool>
+) -> RegistryResult<Reopen>
 where
     R: AgreementRegistry + Sync,
     T: ChainClient,
@@ -306,12 +333,15 @@ where
         .await
     {
         Ok(AgreementOnChain::Live) => true,
-        Ok(_) => return Ok(false),
+        Ok(_) => return Ok(Reopen::Left),
+        Err(err) if agreement.status != IndexingAgreementStatus::Rejected => {
+            return Ok(Reopen::Unread(err));
+        }
         Err(err) => {
             tracing::warn!(
                 agreement_id = %agreement.id,
                 error = %err,
-                "Failed to read an ended agreement reported live; the cancel retry checks it"
+                "Failed to read a rejected agreement reported live; the cancel retry checks it"
             );
             false
         }
@@ -321,7 +351,7 @@ where
         .await
     {
         Ok(()) => {}
-        Err(crate::registry::Error::NoRecordsUpdated) => return Ok(false),
+        Err(crate::registry::Error::NoRecordsUpdated) => return Ok(Reopen::Left),
         Err(err) => return Err(err),
     }
     tracing::warn!(
@@ -329,11 +359,11 @@ where
         indexer_id = %agreement.indexer.id,
         indexing_request_id = %agreement.indexing_request_id,
         old_status = %agreement.status,
-        new_status = "CANCELLING",
+        new_status = %IndexingAgreementStatus::Cancelling,
         reason = "live_on_chain_after_end",
         "agreement state transition"
     );
-    Ok(true)
+    Ok(Reopen::Reopened)
 }
 
 /// Log a cancel that mined but could not be read back, naming its transaction so it isn't lost;
@@ -407,7 +437,7 @@ pub(crate) mod tests {
     use time::OffsetDateTime;
     use url::Url;
 
-    use super::{LiveCancel, SCOPE_BOTH, cancel_agreement_on_chain};
+    use super::{CancelReason, LiveCancel, SCOPE_BOTH, cancel_agreement_on_chain};
     use crate::{
         chain_client::{AgreementOnChain, ChainClient, ChainClientError},
         config::IndexingAgreementConfig,
@@ -545,6 +575,18 @@ pub(crate) mod tests {
             rejection_reason: None,
             terms_version_hash: hash,
         }
+    }
+
+    #[test]
+    fn each_reason_ends_an_agreement_in_its_own_status() {
+        assert_eq!(
+            CancelReason::NotWanted.ended_status(),
+            IndexingAgreementStatus::CanceledByRequester
+        );
+        assert_eq!(
+            CancelReason::Abandoned.ended_status(),
+            IndexingAgreementStatus::AbandonedByIndexer
+        );
     }
 
     #[tokio::test]
@@ -724,11 +766,8 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_reopen_clears_the_end_on_record_only_when_the_chain_shows_it_live() {
-        // An unread chain reopens it all the same, but it may have ended, so its record stays.
-        let ag = agreement(
-            IndexingAgreementStatus::CanceledByRequester,
-            Some(vec![7u8; 32]),
-        );
+        // An unread chain reopens a rejected one all the same, but it may have ended, so its
+        // record stays.
         let live = RecordingChainClient {
             still_active_after_cancel: true,
             ..Default::default()
@@ -739,14 +778,37 @@ pub(crate) mod tests {
         };
 
         for (client, seen_live) in [(live, true), (unread, false)] {
+            let ag = agreement(IndexingAgreementStatus::Rejected, Some(vec![7u8; 32]));
             let registry = ReopenRegistry::default();
 
-            let reopened = super::reopen_if_live(&registry, &client, &ag)
+            let reopen = super::reopen_if_live(&registry, &client, &ag)
                 .await
                 .expect("reopen");
 
-            assert!(reopened);
+            assert!(matches!(reopen, super::Reopen::Reopened));
             assert_eq!(*registry.seen_live.lock().unwrap(), vec![seen_live]);
         }
+    }
+
+    #[tokio::test]
+    async fn an_unread_chain_leaves_a_cancelled_agreement_to_be_read_again() {
+        // The subgraph lagging behind dipper's own cancel is the likelier reason it shows
+        // accepted, and reopening an ended one counts it live until the cancel retry reads it.
+        let ag = agreement(
+            IndexingAgreementStatus::CanceledByRequester,
+            Some(vec![7u8; 32]),
+        );
+        let unread = RecordingChainClient {
+            read_back_fails: true,
+            ..Default::default()
+        };
+        let registry = ReopenRegistry::default();
+
+        let reopen = super::reopen_if_live(&registry, &unread, &ag)
+            .await
+            .expect("reopen");
+
+        assert!(matches!(reopen, super::Reopen::Unread(_)));
+        assert!(registry.seen_live.lock().unwrap().is_empty());
     }
 }

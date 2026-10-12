@@ -190,8 +190,8 @@ where
                 tracing::info!(
                     agreement_id = %agreement_id,
                     indexing_request_id = %indexing_request_id,
-                    old_status = "CREATED",
-                    new_status = "REJECTED",
+                    old_status = %IndexingAgreementStatus::Created,
+                    new_status = %IndexingAgreementStatus::Rejected,
                     reason = %format_args!("rejected_{rejection_reason_str}"),
                     detail = %rejected.detail,
                     "agreement state transition"
@@ -232,8 +232,8 @@ where
             tracing::info!(
                 agreement_id = %agreement_id,
                 indexing_request_id = %indexing_request_id,
-                old_status = "CREATED",
-                new_status = "UNRESPONSIVE",
+                old_status = %IndexingAgreementStatus::Created,
+                new_status = %IndexingAgreementStatus::Unresponsive,
                 reason = "unresponsive",
                 "agreement state transition"
             );
@@ -727,6 +727,15 @@ mod tests {
                 num_candidates,
             ));
             Ok(JobId::default())
+        }
+
+        async fn cancel_rejected_agreement_on_chain(
+            &self,
+            _agreement_id: IndexingAgreementId,
+            _accept: Option<crate::worker::service::ChainAccept>,
+            _priority: JobPriority,
+        ) -> anyhow::Result<JobId> {
+            unimplemented!()
         }
 
         async fn submit_offer(

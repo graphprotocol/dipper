@@ -95,6 +95,46 @@ pub struct ReconciliationAudit {
     pub canceled_tx: Option<String>,
 }
 
+/// An agreement's end as recorded: when, in chain seconds, who ended it, and in which transaction.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecordedEnd {
+    pub canceled_at: Option<u64>,
+    pub canceled_by: Option<String>,
+    pub canceled_tx: Option<String>,
+}
+
+/// An announced end that a write replaced or cleared, so its `terminated` event goes out again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndCorrection {
+    pub old: RecordedEnd,
+    pub new: RecordedEnd,
+}
+
+/// What a write that can replace an end returns: whether it cleared that end's announcement, then
+/// the end before and after it. The end before is read under a row lock, so it is the one replaced.
+type EndChangeRow = (
+    bool,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+);
+
+fn end_correction(row: EndChangeRow) -> Option<EndCorrection> {
+    let (announcement_cleared, old_at, old_by, old_tx, new_at, new_by, new_tx) = row;
+    let end = |at: Option<i64>, canceled_by, canceled_tx| RecordedEnd {
+        canceled_at: at.and_then(|at| u64::try_from(at).ok()),
+        canceled_by,
+        canceled_tx,
+    };
+    announcement_cleared.then(|| EndCorrection {
+        old: end(old_at, old_by, old_tx),
+        new: end(new_at, new_by, new_tx),
+    })
+}
+
 /// A row that needs a `terminated` lifecycle event emitted. Sourced entirely
 /// from the agreement row so the emission sweep is a pure DB -> broker drain.
 #[derive(Debug, Clone)]
@@ -950,7 +990,7 @@ impl PgRegistry {
         Ok(())
     }
 
-    /// One being cancelled because its indexer stopped serving it ends `AbandonedByIndexer`.
+    /// End an agreement dipper no longer wants `CanceledByRequester`.
     pub async fn mark_indexing_agreement_as_canceled_by_requester(
         &self,
         agreement_id: &IndexingAgreementId,
@@ -959,6 +999,20 @@ impl PgRegistry {
             agreement_id,
             IndexingAgreementStatus::CanceledByRequester,
             CANCEL_BY_REQUESTER_FROM,
+        )
+        .await
+    }
+
+    /// End an agreement dipper was cancelling because its indexer stopped serving it, once the
+    /// chain confirms dipper's cancel.
+    pub async fn mark_indexing_agreement_as_abandoned_by_indexer(
+        &self,
+        agreement_id: &IndexingAgreementId,
+    ) -> Result<(), Error> {
+        self.set_status_from(
+            agreement_id,
+            IndexingAgreementStatus::AbandonedByIndexer,
+            &[IndexingAgreementStatus::Cancelling],
         )
         .await
     }
@@ -1015,13 +1069,14 @@ impl PgRegistry {
     /// as checked, since no cancel is sent with it, so the retry takes it on its next sweep rather
     /// than waiting for one to be mined. When the chain was read and showed it live (`seen_live`),
     /// the end on record, and any announcement of it, no longer stands, so both are cleared for
-    /// the end still to come; an unread chain leaves them, as the agreement may have ended.
+    /// the end still to come, and the end returned if it was announced; an unread chain leaves
+    /// them, as the agreement may have ended.
     pub async fn reopen_indexing_agreement_cancel(
         &self,
         agreement_id: &IndexingAgreementId,
         seen_live: bool,
-    ) -> Result<(), Error> {
-        let updated = sqlx::query(
+    ) -> Result<Option<EndCorrection>, Error> {
+        let row: Option<EndChangeRow> = sqlx::query_as(
             r#"
             UPDATE dipper_reg_indexing_agreements
             SET
@@ -1035,7 +1090,14 @@ impl PgRegistry {
                 terminated_event_emitted_at =
                     CASE WHEN $5 THEN NULL ELSE terminated_event_emitted_at END,
                 updated_at = timezone('UTC', now())
+            FROM (
+                SELECT canceled_at AS old_at, canceled_by AS old_by, canceled_tx AS old_tx,
+                    terminated_event_emitted_at IS NOT NULL AS was_announced
+                FROM dipper_reg_indexing_agreements WHERE id = $2 FOR UPDATE
+            ) AS before
             WHERE id = $2 AND status IN ($3, $4)
+            RETURNING was_announced AND terminated_event_emitted_at IS NULL,
+                old_at, old_by, old_tx, canceled_at, canceled_by, canceled_tx
             "#,
         )
         .bind(IndexingAgreementStatus::Cancelling)
@@ -1043,12 +1105,9 @@ impl PgRegistry {
         .bind(IndexingAgreementStatus::CanceledByRequester)
         .bind(IndexingAgreementStatus::Rejected)
         .bind(seen_live)
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
-        if updated.rows_affected() == 0 {
-            return Err(Error::NoRecordsUpdated);
-        }
-        Ok(())
+        row.map(end_correction).ok_or(Error::NoRecordsUpdated)
     }
 
     /// `Cancelling` agreements, those checked longest ago first, leaving out any never checked
@@ -1212,18 +1271,7 @@ impl PgRegistry {
 
         let mut did_cancel = false;
         if let Some(kind) = cancel {
-            let (new_status, allowed_from): (_, &[IndexingAgreementStatus]) = match kind {
-                CancelKind::ByRequester => (
-                    IndexingAgreementStatus::CanceledByRequester,
-                    CANCEL_BY_REQUESTER_FROM,
-                ),
-                CancelKind::ByIndexer => (
-                    IndexingAgreementStatus::CanceledByIndexer,
-                    CANCEL_BY_INDEXER_FROM,
-                ),
-            };
-            did_cancel =
-                update_status_from(&mut tx, agreement_id, new_status, allowed_from).await?;
+            did_cancel = apply_cancel(&mut tx, agreement_id, kind).await?;
             if did_accept && !did_cancel {
                 return Err(Error::NoRecordsUpdated);
             }
@@ -1248,7 +1296,6 @@ impl PgRegistry {
     /// stale outcome flags from the first iteration; debug_asserted.
     #[expect(
         clippy::expect_used,
-        clippy::too_many_lines,
         reason = "predates this lint; fix when next touched"
     )]
     pub async fn apply_reconciliation_batch(
@@ -1306,18 +1353,7 @@ impl PgRegistry {
                 ],
             )
             .await?;
-            let (new_status, allowed_from): (_, &[IndexingAgreementStatus]) = match cancel_kind {
-                CancelKind::ByRequester => (
-                    IndexingAgreementStatus::CanceledByRequester,
-                    CANCEL_BY_REQUESTER_FROM,
-                ),
-                CancelKind::ByIndexer => (
-                    IndexingAgreementStatus::CanceledByIndexer,
-                    CANCEL_BY_INDEXER_FROM,
-                ),
-            };
-            let did_cancel =
-                update_status_from(&mut tx, &item.agreement_id, new_status, allowed_from).await?;
+            let did_cancel = apply_cancel(&mut tx, &item.agreement_id, cancel_kind).await?;
             if did_accept && !did_cancel {
                 return Err(Error::NoRecordsUpdated);
             }
@@ -1344,25 +1380,12 @@ impl PgRegistry {
             outcomes.entry(id).or_default().did_accept = true;
         }
 
-        for id in batch_update_status_from(
-            &mut tx,
-            &cancel_by_requester,
-            IndexingAgreementStatus::CanceledByRequester,
-            CANCEL_BY_REQUESTER_FROM,
-        )
-        .await?
+        for id in batch_apply_cancel(&mut tx, &cancel_by_requester, CancelKind::ByRequester).await?
         {
             outcomes.entry(id).or_default().did_cancel = true;
         }
 
-        for id in batch_update_status_from(
-            &mut tx,
-            &cancel_by_indexer,
-            IndexingAgreementStatus::CanceledByIndexer,
-            CANCEL_BY_INDEXER_FROM,
-        )
-        .await?
-        {
+        for id in batch_apply_cancel(&mut tx, &cancel_by_indexer, CancelKind::ByIndexer).await? {
             outcomes.entry(id).or_default().did_cancel = true;
         }
 
@@ -1558,13 +1581,9 @@ impl PgRegistry {
         Ok(())
     }
 
-    /// Record the cancel audit payload for a dipper-initiated cancel so the
-    /// emission sweep can populate the `terminated` event's tx/by/at fields.
-    /// `COALESCE` keeps any value already observed on-chain. Best-effort
-    /// enrichment: the event still emits (with fallbacks) if never recorded.
-    /// An end recorded before the agreement's accept, such as its offer's withdrawal before the
-    /// offer landed after all, can't be its end, so a later one replaces it and is announced.
-    /// That is decided once per row, so the end's 4 fields always come from the same end.
+    /// Record an agreement's end for its `terminated` event. A new end from the accept on replaces
+    /// the end on record whole, to be announced again, if that came before the accept, so can't
+    /// be the end, or is dipper's estimate, with no transaction, and the new one has it.
     #[expect(
         clippy::cast_possible_wrap,
         reason = "predates this lint; fix when next touched"
@@ -1575,8 +1594,8 @@ impl PgRegistry {
         canceled_at: u64,
         canceled_by: &str,
         canceled_tx: Option<&str>,
-    ) -> Result<(), Error> {
-        sqlx::query(
+    ) -> Result<Option<EndCorrection>, Error> {
+        let row: Option<EndChangeRow> = sqlx::query_as(
             r#"
             UPDATE dipper_reg_indexing_agreements AS agreement
             SET (canceled_at, canceled_by, canceled_tx, terminated_event_emitted_at) = (
@@ -1586,20 +1605,29 @@ impl PgRegistry {
                     CASE WHEN replace_end THEN $4 ELSE COALESCE(agreement.canceled_tx, $4) END,
                     CASE WHEN replace_end THEN NULL ELSE agreement.terminated_event_emitted_at END
                 FROM (
-                    SELECT agreement.canceled_at < agreement.accepted_at
-                        AND $2 >= agreement.accepted_at AS replace_end
+                    SELECT $2 >= agreement.accepted_at
+                        AND (agreement.canceled_at < agreement.accepted_at
+                            OR (agreement.canceled_tx IS NULL AND $4 IS NOT NULL)) AS replace_end
                 ) AS end_rule
             )
+            FROM (
+                SELECT canceled_at AS old_at, canceled_by AS old_by, canceled_tx AS old_tx,
+                    terminated_event_emitted_at IS NOT NULL AS was_announced
+                FROM dipper_reg_indexing_agreements WHERE id = $1 FOR UPDATE
+            ) AS before
             WHERE agreement.id = $1
+            RETURNING was_announced AND agreement.terminated_event_emitted_at IS NULL,
+                old_at, old_by, old_tx,
+                agreement.canceled_at, agreement.canceled_by, agreement.canceled_tx
             "#,
         )
         .bind(agreement_id)
         .bind(canceled_at as i64)
         .bind(canceled_by)
         .bind(canceled_tx)
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
-        Ok(())
+        Ok(row.and_then(end_correction))
     }
 
     /// Record an agreement's accept and its end together, as the chain shows them, in 1 write,
@@ -1617,8 +1645,8 @@ impl PgRegistry {
         canceled_at: u64,
         canceled_by: &str,
         canceled_tx: Option<&str>,
-    ) -> Result<(), Error> {
-        sqlx::query(
+    ) -> Result<Option<EndCorrection>, Error> {
+        let row: Option<EndChangeRow> = sqlx::query_as(
             r#"
             UPDATE dipper_reg_indexing_agreements AS agreement
             SET accepted_at = COALESCE(agreement.accepted_at, $2),
@@ -1631,11 +1659,21 @@ impl PgRegistry {
                         CASE WHEN replace_end THEN NULL
                             ELSE agreement.terminated_event_emitted_at END
                     FROM (
-                        SELECT agreement.canceled_at < COALESCE(agreement.accepted_at, $2)
-                            AND $4 >= COALESCE(agreement.accepted_at, $2) AS replace_end
+                        SELECT $4 >= COALESCE(agreement.accepted_at, $2)
+                            AND (agreement.canceled_at < COALESCE(agreement.accepted_at, $2)
+                                OR (agreement.canceled_tx IS NULL AND $6 IS NOT NULL))
+                            AS replace_end
                     ) AS end_rule
                 )
+            FROM (
+                SELECT canceled_at AS old_at, canceled_by AS old_by, canceled_tx AS old_tx,
+                    terminated_event_emitted_at IS NOT NULL AS was_announced
+                FROM dipper_reg_indexing_agreements WHERE id = $1 FOR UPDATE
+            ) AS before
             WHERE agreement.id = $1
+            RETURNING was_announced AND agreement.terminated_event_emitted_at IS NULL,
+                old_at, old_by, old_tx,
+                agreement.canceled_at, agreement.canceled_by, agreement.canceled_tx
             "#,
         )
         .bind(agreement_id)
@@ -1644,9 +1682,9 @@ impl PgRegistry {
         .bind(canceled_at as i64)
         .bind(canceled_by)
         .bind(canceled_tx)
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
-        Ok(())
+        Ok(row.and_then(end_correction))
     }
 
     // =========================================================================
@@ -2453,41 +2491,84 @@ impl PgRegistry {
     }
 }
 
-/// Batched form of `update_status_from`: transitions all rows whose `id`
-/// is in `agreement_ids` and whose current status is in `allowed_from` to
-/// `new_status`, in one statement; a row noted abandoned that `new_status` would make
-/// `CanceledByRequester` becomes `AbandonedByIndexer` instead. Returns the ids of the rows that
-/// actually flipped (matched the CAS guard) so callers can build per-id
-/// outcome maps. Empty input is a fast-path no-op.
+/// Batched form of `update_status_from`: moves every row in `agreement_ids` whose status is in
+/// `allowed_from` to `new_status`, in 1 statement. Returns the ids of the rows that moved, so
+/// callers can build per-id outcome maps; empty input is a no-op.
 async fn batch_update_status_from(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     agreement_ids: &[IndexingAgreementId],
     new_status: IndexingAgreementStatus,
     allowed_from: &[IndexingAgreementStatus],
 ) -> Result<Vec<IndexingAgreementId>, Error> {
+    batch_set_status(tx, agreement_ids, "$1", &[new_status], allowed_from).await
+}
+
+/// Record a cancel by `kind`, seen on the chain, in 1 row; true if it ended the row.
+async fn apply_cancel(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    agreement_id: &IndexingAgreementId,
+    kind: CancelKind,
+) -> Result<bool, Error> {
+    let ended = batch_apply_cancel(tx, std::slice::from_ref(agreement_id), kind).await?;
+    Ok(!ended.is_empty())
+}
+
+/// Record a cancel by `kind`, seen on the chain, in each row it ends, returning their ids. The
+/// chain doesn't say why dipper cancelled, so its cancel ends a row noted abandoned (its indexer
+/// stopped serving it) `AbandonedByIndexer`, and the rest `CanceledByRequester`.
+async fn batch_apply_cancel(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    agreement_ids: &[IndexingAgreementId],
+    kind: CancelKind,
+) -> Result<Vec<IndexingAgreementId>, Error> {
+    match kind {
+        CancelKind::ByRequester => {
+            let ended = [
+                IndexingAgreementStatus::AbandonedByIndexer,
+                IndexingAgreementStatus::CanceledByRequester,
+            ];
+            let status = "CASE WHEN abandoned THEN $1 ELSE $2 END";
+            batch_set_status(tx, agreement_ids, status, &ended, CANCEL_BY_REQUESTER_FROM).await
+        }
+        CancelKind::ByIndexer => {
+            let ended = IndexingAgreementStatus::CanceledByIndexer;
+            batch_update_status_from(tx, agreement_ids, ended, CANCEL_BY_INDEXER_FROM).await
+        }
+    }
+}
+
+/// Set the status of the rows in `agreement_ids` whose status is in `allowed_from` to
+/// `status_sql`, which reads `new_statuses` as `$1`, `$2` and so on, returning their ids.
+async fn batch_set_status(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    agreement_ids: &[IndexingAgreementId],
+    status_sql: &str,
+    new_statuses: &[IndexingAgreementStatus],
+    allowed_from: &[IndexingAgreementStatus],
+) -> Result<Vec<IndexingAgreementId>, Error> {
     if agreement_ids.is_empty() {
         return Ok(Vec::new());
     }
+    let ids_at = new_statuses.len() + 1;
     let placeholders = (0..allowed_from.len())
-        .map(|i| format!("${}", i + 5))
+        .map(|i| format!("${}", ids_at + 1 + i))
         .collect::<Vec<_>>()
         .join(", ");
-    // An agreement dipper ended because its indexer stopped serving it ends as abandoned.
     let sql = format!(
         r#"
         UPDATE dipper_reg_indexing_agreements
         SET
-            status = CASE WHEN abandoned AND $1 = $3 THEN $4 ELSE $1 END,
+            status = {status_sql},
             updated_at = timezone('UTC', now())
-        WHERE id = ANY($2) AND status IN ({placeholders})
+        WHERE id = ANY(${ids_at}) AND status IN ({placeholders})
         RETURNING id
         "#
     );
-    let mut query = sqlx::query_as::<_, (IndexingAgreementId,)>(&sql)
-        .bind(new_status)
-        .bind(agreement_ids)
-        .bind(IndexingAgreementStatus::CanceledByRequester)
-        .bind(IndexingAgreementStatus::AbandonedByIndexer);
+    let mut query = sqlx::query_as::<_, (IndexingAgreementId,)>(&sql);
+    for status in new_statuses {
+        query = query.bind(*status);
+    }
+    query = query.bind(agreement_ids);
     for status in allowed_from {
         query = query.bind(*status);
     }
@@ -2495,8 +2576,6 @@ async fn batch_update_status_from(
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
-/// Transition an agreement's status inside a transaction. Thin wrapper
-/// over `batch_update_status_from` for the single-row case.
 /// Persist the accepted-transition audit payload for a single row. `COALESCE`
 /// keeps any already-stored value rather than clobbering it with `NULL`.
 #[expect(
@@ -2559,6 +2638,8 @@ async fn persist_cancel_audit(
     Ok(())
 }
 
+/// Move an agreement whose status is in `allowed_from` to `new_status` inside a transaction,
+/// returning whether it moved. Thin wrapper over `batch_update_status_from` for 1 row.
 async fn update_status_from(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     agreement_id: &IndexingAgreementId,
@@ -2573,4 +2654,41 @@ async fn update_status_from(
     )
     .await?
     .is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_end_counts_as_corrected_only_when_its_announcement_was_cleared() {
+        let row = |cleared| {
+            (
+                cleared,
+                Some(9_000),
+                Some("0xindexer".to_owned()),
+                None,
+                Some(5_000),
+                Some("0xprovider".to_owned()),
+                Some("0xend".to_owned()),
+            )
+        };
+
+        assert_eq!(end_correction(row(false)), None);
+        assert_eq!(
+            end_correction(row(true)),
+            Some(EndCorrection {
+                old: RecordedEnd {
+                    canceled_at: Some(9_000),
+                    canceled_by: Some("0xindexer".to_owned()),
+                    canceled_tx: None,
+                },
+                new: RecordedEnd {
+                    canceled_at: Some(5_000),
+                    canceled_by: Some("0xprovider".to_owned()),
+                    canceled_tx: Some("0xend".to_owned()),
+                },
+            })
+        );
+    }
 }

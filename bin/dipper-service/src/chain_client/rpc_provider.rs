@@ -224,6 +224,21 @@ impl RpcProviderPool {
         F: Fn(HttpProvider) -> Fut,
         Fut: Future<Output = Result<T, TransportError>>,
     {
+        self.execute_with_endpoint(operation, |provider, _| f(provider))
+            .await
+    }
+
+    /// As [`execute`](Self::execute), also telling `f` which endpoint it is asking, by its place
+    /// in the list, so a caller can keep something for each endpoint.
+    pub async fn execute_with_endpoint<F, Fut, T>(
+        &self,
+        operation: &str,
+        f: F,
+    ) -> Result<T, ChainClientError>
+    where
+        F: Fn(HttpProvider, usize) -> Fut,
+        Fut: Future<Output = Result<T, TransportError>>,
+    {
         self.execute_with_retries(operation, self.max_retries, f)
             .await
     }
@@ -235,7 +250,7 @@ impl RpcProviderPool {
         f: F,
     ) -> Result<T, ChainClientError>
     where
-        F: Fn(HttpProvider) -> Fut,
+        F: Fn(HttpProvider, usize) -> Fut,
         Fut: Future<Output = Result<T, TransportError>>,
     {
         // What each endpoint said, in the order they were tried. `sign_and_send` matches
@@ -254,11 +269,12 @@ impl RpcProviderPool {
         let start = self.current_index.load(Ordering::Relaxed);
 
         loop {
-            let current_url = self.url_at(start + providers_tried).clone();
+            let position = (start + providers_tried) % self.providers.len();
+            let current_url = self.url_at(position).clone();
             let endpoint = endpoint_name(&current_url);
 
             let endpoint_error = match self
-                .ask_endpoint(operation, &current_url, max_retries, &f)
+                .ask_endpoint(operation, position, &current_url, max_retries, &f)
                 .await
             {
                 Ok(result) => return Ok(result),
@@ -315,17 +331,18 @@ impl RpcProviderPool {
         }
     }
 
-    /// Run a call against one endpoint, retrying a fault worth another go, and return what it
+    /// Run a call against 1 endpoint, retrying a fault worth another go, and return what it
     /// answered or why it last failed.
     async fn ask_endpoint<F, Fut, T>(
         &self,
         operation: &str,
+        position: usize,
         url: &Url,
         max_retries: u32,
         f: &F,
     ) -> Result<T, TransportError>
     where
-        F: Fn(HttpProvider) -> Fut,
+        F: Fn(HttpProvider, usize) -> Fut,
         Fut: Future<Output = Result<T, TransportError>>,
     {
         let endpoint = endpoint_name(url);
@@ -335,7 +352,7 @@ impl RpcProviderPool {
         let mut endpoint_error: Option<TransportError> = None;
         let mut lag_retries = 0;
         for attempt in 0..=max_retries {
-            match f(provider.clone()).await {
+            match f(provider.clone(), position).await {
                 Ok(result) => return Ok(result),
                 Err(e)
                     if Self::is_behind(&e)
@@ -535,6 +552,34 @@ mod tests {
                 "endpoint {i} should have been tried exactly once"
             );
         }
+    }
+
+    /// A caller keeping something for each endpoint must be told the one it is really asking.
+    #[tokio::test]
+    async fn a_call_is_told_which_endpoint_it_is_asking() {
+        let servers = [server_answering_block(7).await, server_refusing().await];
+        let pool = RpcProviderPool::new(
+            servers
+                .iter()
+                .map(|s| s.uri().parse().expect("server URL"))
+                .collect(),
+            Duration::from_secs(5),
+            0,
+        )
+        .expect("pool");
+        pool.rotate();
+
+        let asked = std::sync::Mutex::new(Vec::new());
+        let block = pool
+            .execute_with_endpoint("probe", |provider, endpoint| {
+                asked.lock().expect("asked").push(endpoint);
+                async move { provider.get_block_number().await }
+            })
+            .await
+            .expect("the first endpoint answers");
+
+        assert_eq!(block, 7);
+        assert_eq!(*asked.lock().expect("asked"), vec![1, 0], "wrapped round");
     }
 
     /// Hosted RPC endpoints carry their API key in the path, and this failure text reaches the

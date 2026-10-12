@@ -16,7 +16,7 @@ use crate::{
     config::IndexingAgreementConfig,
     registry::{
         AgreementRegistry, CancelKind, CancellingAgreement, IndexingAgreement,
-        IndexingRequestRegistry,
+        IndexingAgreementStatus, IndexingRequestRegistry,
     },
     worker::service::WorkerQueue,
 };
@@ -288,8 +288,8 @@ async fn confirm_if_over<R: AgreementRegistry + Sync>(
 }
 
 /// Mark an agreement the indexer ended `CanceledByIndexer` when the chain listener hasn't in
-/// time, so it doesn't stay cancelling for good. The indexer is recorded as ending it first,
-/// so its announcement names them; the time recorded is when dipper noticed.
+/// time, so it doesn't stay cancelling for good. The indexer is recorded as ending it first, at
+/// the time dipper noticed: an estimate the chain's end, once the listener reads it, replaces.
 async fn record_end_by_indexer<R: AgreementRegistry + Sync>(
     registry: &R,
     agreement: &IndexingAgreement,
@@ -329,8 +329,8 @@ fn log_end_by_indexer(agreement: &IndexingAgreement, changed: bool) {
         tracing::info!(
             agreement_id = %agreement.id,
             indexing_request_id = %agreement.indexing_request_id,
-            old_status = "CANCELLING",
-            new_status = "CANCELED_BY_INDEXER",
+            old_status = %IndexingAgreementStatus::Cancelling,
+            new_status = %IndexingAgreementStatus::CanceledByIndexer,
             reason = "indexer_ended_it_before_dipper_cancelled",
             "agreement state transition"
         );
@@ -366,6 +366,10 @@ async fn note_check<R: AgreementRegistry + Sync>(
                 log_failed_cancel(row, attempts, failed_attempts, err);
             }
         }
+        Err(crate::registry::Error::NoRecordsUpdated) => tracing::debug!(
+            agreement_id = %agreement.id,
+            "Agreement no longer cancelling when its check was recorded, as the chain listener can end it first"
+        ),
         Err(err) => tracing::warn!(
             agreement_id = %agreement.id,
             error = %err,
@@ -382,7 +386,7 @@ fn log_uncounted_failure(agreement: &IndexingAgreement, err: &ChainClientError) 
     );
 }
 
-/// One ERROR as an agreement reaches the limit, for an operator to look into; a WARN for
+/// Log 1 ERROR as an agreement reaches the limit, for an operator to look into, and a WARN for
 /// every other failed cancel.
 fn log_failed_cancel(
     row: &CancellingAgreement,
@@ -442,10 +446,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        cancel_dispatch::tests::agreement,
-        chain_client::AgreementOnChain,
-        registry::{IndexingAgreementStatus, StubAgreementRegistry},
-        worker::service::JobPriority,
+        cancel_dispatch::tests::agreement, chain_client::AgreementOnChain,
+        registry::StubAgreementRegistry, test_support::logged, worker::service::JobPriority,
     };
 
     const DEADLINE: u64 = 1_000;
@@ -460,6 +462,7 @@ mod tests {
     struct MockRegistry {
         cancelling: Vec<CancellingAgreement>,
         marked_cancelled: Mutex<Vec<IndexingAgreementId>>,
+        marked_abandoned: Mutex<Vec<IndexingAgreementId>>,
         marked_by_indexer: Mutex<Vec<IndexingAgreementId>>,
         audits: Mutex<Vec<Option<String>>>,
         audited_by: Mutex<Vec<String>>,
@@ -468,6 +471,8 @@ mod tests {
         found_ended: Mutex<Vec<Option<bool>>>,
         /// The chain listener marks it ended before the retry's own mark lands.
         listener_ended_it: bool,
+        /// Recording a check fails, as with the database down.
+        check_fails: bool,
         writes: Mutex<Vec<&'static str>>,
         /// Ended agreements awaiting replacement, until noted as replaced.
         awaiting_replacement: Vec<IndexingAgreement>,
@@ -514,6 +519,16 @@ mod tests {
             self.writes.lock().unwrap().push("ended");
             Ok(())
         }
+        async fn mark_indexing_agreement_as_abandoned_by_indexer(
+            &self,
+            id: &IndexingAgreementId,
+        ) -> crate::registry::Result<()> {
+            if self.listener_ended_it {
+                return Err(crate::registry::Error::NoRecordsUpdated);
+            }
+            self.marked_abandoned.lock().unwrap().push(*id);
+            Ok(())
+        }
         async fn record_cancel_audit(
             &self,
             _id: &IndexingAgreementId,
@@ -548,6 +563,14 @@ mod tests {
             failed_attempts: u32,
             ended: Option<bool>,
         ) -> crate::registry::Result<u32> {
+            if self.listener_ended_it {
+                return Err(crate::registry::Error::NoRecordsUpdated);
+            }
+            if self.check_fails {
+                return Err(crate::registry::Error::BackendError(
+                    dipper_pgregistry::Error::DbError(sqlx::Error::PoolTimedOut),
+                ));
+            }
             self.checks.fetch_add(1, Ordering::SeqCst);
             self.found_ended.lock().unwrap().push(ended);
             Ok(self.attempts.fetch_add(failed_attempts, Ordering::SeqCst) + failed_attempts)
@@ -758,6 +781,14 @@ mod tests {
             self.0.lock().unwrap().push(indexing_request_id);
             Ok(dipper_pgmq::JobId::default())
         }
+        async fn cancel_rejected_agreement_on_chain(
+            &self,
+            _agreement_id: IndexingAgreementId,
+            _accept: Option<crate::worker::service::ChainAccept>,
+            _priority: JobPriority,
+        ) -> anyhow::Result<dipper_pgmq::JobId> {
+            unimplemented!()
+        }
         async fn submit_offer(
             &self,
             _agreement_id: IndexingAgreementId,
@@ -864,6 +895,19 @@ mod tests {
         assert_eq!(registry.marked_cancelled.lock().unwrap().len(), 1);
         let tx = B256::repeat_byte(0xcd).to_string();
         assert_eq!(*registry.audits.lock().unwrap(), vec![Some(tx)]);
+    }
+
+    #[tokio::test]
+    async fn ends_an_agreement_its_indexer_stopped_serving_as_abandoned() {
+        let mut registry = registry_with_one(true);
+        registry.cancelling[0].abandoned = true;
+
+        let logs = logged(retry(&registry, &live_chain(), 0)).await;
+
+        let id = registry.cancelling[0].agreement.id;
+        assert_eq!(*registry.marked_abandoned.lock().unwrap(), vec![id]);
+        assert!(registry.marked_cancelled.lock().unwrap().is_empty());
+        assert!(logs.contains("ABANDONED_BY_INDEXER"), "{logs}");
     }
 
     #[tokio::test]
@@ -996,30 +1040,6 @@ mod tests {
         }
     }
 
-    /// What dipper logs, at every level, while `run` runs.
-    async fn logged(run: impl Future<Output = ()>) -> String {
-        struct Buffer(Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for Buffer {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let lines = Arc::new(Mutex::new(Vec::new()));
-        let writer = Arc::clone(&lines);
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_max_level(tracing::Level::DEBUG)
-            .with_writer(move || Buffer(Arc::clone(&writer)))
-            .finish();
-        let _logging = tracing::subscriber::set_default(subscriber);
-        run.await;
-        String::from_utf8(lines.lock().unwrap().clone()).unwrap()
-    }
-
     #[tokio::test]
     async fn logs_an_end_by_the_indexer_as_a_status_change_only_when_it_made_one() {
         for listener_ended_it in [false, true] {
@@ -1048,11 +1068,48 @@ mod tests {
                 "{logs}"
             );
             assert_eq!(
+                logs.contains("old_status=CANCELLING new_status=CANCELED_BY_INDEXER"),
+                changed,
+                "{logs}"
+            );
+            assert_eq!(
                 logs.contains("already recorded the indexer's end"),
                 !changed,
                 "{logs}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn logs_a_check_the_listener_beat_at_debug_and_a_failed_one_as_a_warning() {
+        // The listener ending the agreement mid-sweep is expected; only a failed write needs a look.
+        let check = async |listener_ended_it, check_fails| {
+            let registry = MockRegistry {
+                listener_ended_it,
+                check_fails,
+                ..registry_with_one(false)
+            };
+            // Withdrawn before its deadline, so the check is recorded and it stays cancelling.
+            logged(retry(&registry, &MockChain::default(), DEADLINE)).await
+        };
+
+        let beaten = check(true, false).await;
+        let failed = check(false, true).await;
+
+        let line = |logs: &str, message: &str| {
+            let line = logs.lines().find(|line| line.contains(message));
+            line.unwrap_or_else(|| panic!("no {message:?} in {logs}"))
+                .to_owned()
+        };
+        assert!(
+            line(&beaten, "no longer cancelling").contains("DEBUG"),
+            "{beaten}"
+        );
+        assert!(!beaten.contains("WARN"), "{beaten}");
+        assert!(
+            line(&failed, "Failed to record a check").contains("WARN"),
+            "{failed}"
+        );
     }
 
     #[tokio::test]
