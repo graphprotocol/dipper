@@ -193,7 +193,7 @@ impl RpcProviderPool {
         while let Some(answer) = asks.join_next().await {
             match answer {
                 Ok((_, Ok(head))) => heads.push(head),
-                Ok((endpoint, Err(reason))) => tracing::debug!(
+                Ok((endpoint, Err(reason))) => tracing::warn!(
                     provider = %endpoint,
                     error = %reason,
                     "RPC endpoint didn't give its latest block for a cross-check"
