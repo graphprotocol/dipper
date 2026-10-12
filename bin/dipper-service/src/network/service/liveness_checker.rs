@@ -61,7 +61,8 @@ use crate::{
     config::LivenessCheckerConfig,
     network::provider::NetworkProviderService,
     registry::{
-        AgreementRegistry, IndexingAgreement, IndexingRequestRegistry, PendingCancellationRegistry,
+        AgreementRegistry, IndexingAgreement, IndexingRequestRegistry, IndexingRequestStatus,
+        PendingCancellationRegistry,
     },
     worker::service::{JobPriority, WorkerQueue},
 };
@@ -908,7 +909,7 @@ async fn forget_replaced_agreement<R: PendingCancellationRegistry + Sync>(
 }
 
 /// Queue a reassessment of an abandoned agreement's request, which replaces its indexer. True
-/// once nothing is left to do: queued, or its request is gone.
+/// once nothing is left to do: queued, or its request is gone or cancelled.
 async fn queue_replacement<R, W>(
     agreement: &IndexingAgreement,
     registry: &R,
@@ -965,8 +966,8 @@ where
     }
 }
 
-/// The request an abandoned agreement served, `None` when it is gone; `Err`, logged, when it
-/// can't be read.
+/// The request an abandoned agreement served, `None` when it is gone or cancelled; `Err`,
+/// logged, when it can't be read.
 async fn abandoned_request<R: IndexingRequestRegistry + Sync>(
     agreement: &IndexingAgreement,
     registry: &R,
@@ -978,7 +979,7 @@ async fn abandoned_request<R: IndexingRequestRegistry + Sync>(
     )
     .await
     {
-        Ok(Ok(Some(r))) => Ok(Some(r)),
+        Ok(Ok(Some(r))) => Ok(open_request(agreement, r)),
         Ok(Ok(None)) => {
             tracing::warn!(
                 agreement_id = %agreement.id,
@@ -1003,6 +1004,23 @@ async fn abandoned_request<R: IndexingRequestRegistry + Sync>(
             Err(())
         }
     }
+}
+
+/// `request` while it is open; `None`, logged, once its requester has cancelled it.
+fn open_request(
+    agreement: &IndexingAgreement,
+    request: crate::registry::IndexingRequest,
+) -> Option<crate::registry::IndexingRequest> {
+    if request.status == IndexingRequestStatus::Open {
+        return Some(request);
+    }
+    tracing::info!(
+        agreement_id = %agreement.id,
+        indexing_request_id = %agreement.indexing_request_id,
+        request_status = %request.status,
+        "Not replacing an abandoned agreement whose request was cancelled"
+    );
+    None
 }
 
 /// The action the liveness checker should take for a single agreement after evaluating its sync state.
@@ -1156,7 +1174,7 @@ mod tests {
     use super::{
         Checker, LivenessAction, Probe, Uncancellable, UnreachableBreaker, UnreachablePolicy,
         cancel_and_reassess, decide_liveness_action, group_by_indexer_id, record_progress,
-        tolerance_duration, unreachable_trips,
+        replace_abandoned, tolerance_duration, unreachable_trips,
     };
     use crate::{
         chain_client::{AgreementOnChain, ChainClient, ChainClientError},
@@ -1900,6 +1918,31 @@ mod tests {
             calls.replacements_noted.lock().unwrap().as_slice(),
             &[agreement.id],
             "so the cancel retry doesn't queue it again"
+        );
+    }
+
+    #[tokio::test]
+    async fn does_not_replace_an_abandoned_agreement_whose_request_was_cancelled() {
+        // Its replacement waits for its end, which can come after the requester cancelled.
+        let agreement = stale_agreement();
+        let calls = MockCalls::default();
+        let mut request = make_request(agreement.indexing_request_id, 2);
+        request.status = crate::registry::IndexingRequestStatus::Canceled;
+        let registry = MockRegistry {
+            get_request_result: Arc::new(Mutex::new(Some(Ok(Some(request))))),
+            ..MockRegistry::new(calls.clone(), agreement.clone())
+        };
+        let queue = MockWorkerQueue {
+            calls: calls.clone(),
+        };
+
+        replace_abandoned(&agreement, &registry, &queue, DB_TIMEOUT, QUEUE_TIMEOUT).await;
+
+        assert!(calls.reassessments.lock().unwrap().is_empty());
+        assert_eq!(
+            calls.replacements_noted.lock().unwrap().as_slice(),
+            &[agreement.id],
+            "so it isn't tried again"
         );
     }
 
