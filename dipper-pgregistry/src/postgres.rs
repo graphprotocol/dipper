@@ -1836,7 +1836,9 @@ impl PgRegistry {
     // Liveness tracking operations
     // =========================================================================
 
-    /// Get all `AcceptedOnChain` agreements for liveness checking.
+    /// Get `AcceptedOnChain` agreements for liveness checking: the `batch_size` longest without
+    /// progress (all when it is 0 or less), plus the one longest without progress of every other
+    /// indexer holding one, so each cycle asks every such indexer whether it can be reached.
     ///
     /// Returns agreements ordered by `last_progress_at` ascending (NULLs first),
     /// so agreements that have never been checked are processed first.
@@ -1846,6 +1848,22 @@ impl PgRegistry {
     ) -> Result<Vec<IndexingAgreement>, Error> {
         sqlx::query_as(
             r#"
+            WITH accepted AS (
+                SELECT id, indexer_id, last_progress_at
+                FROM dipper_reg_indexing_agreements
+                WHERE status = $1
+            ),
+            stalest AS (
+                SELECT id
+                FROM accepted
+                ORDER BY last_progress_at ASC NULLS FIRST
+                LIMIT CASE WHEN $2 > 0 THEN $2 ELSE NULL END
+            ),
+            stalest_per_indexer AS (
+                SELECT DISTINCT ON (indexer_id) id
+                FROM accepted
+                ORDER BY indexer_id, last_progress_at ASC NULLS FIRST
+            )
             SELECT
                 id,
                 nonce_uuid,
@@ -1862,9 +1880,8 @@ impl PgRegistry {
                 rejection_reason,
                 terms_version_hash
             FROM dipper_reg_indexing_agreements
-            WHERE status = $1
+            WHERE id IN (SELECT id FROM stalest UNION SELECT id FROM stalest_per_indexer)
             ORDER BY last_progress_at ASC NULLS FIRST
-            LIMIT CASE WHEN $2 > 0 THEN $2 ELSE NULL END
             "#,
         )
         .bind(IndexingAgreementStatus::AcceptedOnChain)

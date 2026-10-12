@@ -127,6 +127,9 @@ impl Default for AlertsConfig {
                 "agreement_cancel_stuck",
                 "rpc_blocks_refused",
                 "nonce_gap_fill_failed",
+                "chain_listener_changes_skipped",
+                "stale_agreement_uncancellable",
+                "liveness_abandonment_paused",
             ]
             .map(str::to_owned)
             .to_vec(),
@@ -536,9 +539,22 @@ pub struct LivenessCheckerConfig {
     #[serde(default = "default_liveness_checker_request_timeout")]
     pub request_timeout: Duration,
 
-    /// Maximum agreements to fetch per cycle (default: 500).
+    /// Agreements to check per cycle, those longest without progress (default: 500). Every
+    /// other indexer holding an accepted agreement adds 1 more, so all are asked each cycle.
     #[serde(default = "default_liveness_checker_batch_size")]
     pub batch_size: i64,
+
+    /// Share of the indexers checked in a cycle that, when unreachable at once (status call
+    /// failed, or missing from the network registry), stops abandoning agreements for
+    /// unreachability, for at most `max_tolerance_days` days, since so many points to a fault on
+    /// dipper's side (default: 0.5).
+    #[serde(default = "default_liveness_checker_unreachable_trip_fraction")]
+    pub unreachable_trip_fraction: f64,
+
+    /// Fewest indexers checked in a cycle for that share to count; with fewer, 1 indexer going
+    /// down is too large a share to tell apart from a fault on dipper's side (default: 3).
+    #[serde(default = "default_liveness_checker_unreachable_trip_min_indexers")]
+    pub unreachable_trip_min_indexers: usize,
 }
 
 fn default_liveness_checker_enabled() -> bool {
@@ -561,6 +577,14 @@ fn default_liveness_checker_batch_size() -> i64 {
     500
 }
 
+fn default_liveness_checker_unreachable_trip_fraction() -> f64 {
+    0.5
+}
+
+fn default_liveness_checker_unreachable_trip_min_indexers() -> usize {
+    3
+}
+
 impl Default for LivenessCheckerConfig {
     fn default() -> Self {
         Self {
@@ -569,6 +593,8 @@ impl Default for LivenessCheckerConfig {
             max_tolerance_days: default_liveness_checker_max_tolerance_days(),
             request_timeout: default_liveness_checker_request_timeout(),
             batch_size: default_liveness_checker_batch_size(),
+            unreachable_trip_fraction: default_liveness_checker_unreachable_trip_fraction(),
+            unreachable_trip_min_indexers: default_liveness_checker_unreachable_trip_min_indexers(),
         }
     }
 }
@@ -2118,8 +2144,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_example_configmap_alerts_section_parses() {
+    /// The config.json in the example configmap.
+    fn example_config() -> serde_json::Value {
         let example = include_str!("../../../k8s/configmap-example.yaml");
         let json: String = example
             .split_once("config.json: |\n")
@@ -2128,11 +2154,39 @@ mod tests {
             .lines()
             .map(|line| format!("{}\n", line.strip_prefix("    ").unwrap_or(line)))
             .collect();
-        let config: serde_json::Value = serde_json::from_str(&json).expect("config.json is JSON");
+        serde_json::from_str(&json).expect("config.json is JSON")
+    }
+
+    #[test]
+    fn the_example_configmap_liveness_checker_section_parses() {
+        let liveness = serde_json::from_value::<LivenessCheckerConfig>(
+            example_config()["liveness_checker"].clone(),
+        )
+        .expect("the example's liveness_checker section is a valid liveness checker config");
+        let defaults = LivenessCheckerConfig::default();
+
+        assert_eq!(
+            liveness.unreachable_trip_fraction,
+            defaults.unreachable_trip_fraction
+        );
+        assert_eq!(
+            liveness.unreachable_trip_min_indexers,
+            defaults.unreachable_trip_min_indexers
+        );
+    }
+
+    #[test]
+    fn the_example_configmap_alerts_section_parses() {
+        let config = example_config();
 
         let alerts = serde_json::from_value::<AlertsConfig>(config["alerts"].clone())
             .expect("the example's alerts section is a valid alerts config");
         assert!(alerts.slack_webhook_url.is_some());
+        assert_eq!(
+            alerts.events,
+            AlertsConfig::default().events,
+            "the example lists every event alerted on by default"
+        );
     }
 
     #[test]
