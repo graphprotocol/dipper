@@ -1558,13 +1558,9 @@ impl PgRegistry {
         Ok(())
     }
 
-    /// Record the cancel audit payload for a dipper-initiated cancel so the
-    /// emission sweep can populate the `terminated` event's tx/by/at fields.
-    /// `COALESCE` keeps any value already observed on-chain. Best-effort
-    /// enrichment: the event still emits (with fallbacks) if never recorded.
-    /// An end recorded before the agreement's accept, such as its offer's withdrawal before the
-    /// offer landed after all, can't be its end, so a later one replaces it and is announced.
-    /// That is decided once per row, so the end's 4 fields always come from the same end.
+    /// Record an agreement's end for its `terminated` event. A new end from the accept on replaces
+    /// the end on record whole, to be announced again, if that came before the accept, so can't
+    /// be the end, or is dipper's estimate, with no transaction, and the new one has it.
     #[expect(
         clippy::cast_possible_wrap,
         reason = "predates this lint; fix when next touched"
@@ -1586,8 +1582,9 @@ impl PgRegistry {
                     CASE WHEN replace_end THEN $4 ELSE COALESCE(agreement.canceled_tx, $4) END,
                     CASE WHEN replace_end THEN NULL ELSE agreement.terminated_event_emitted_at END
                 FROM (
-                    SELECT agreement.canceled_at < agreement.accepted_at
-                        AND $2 >= agreement.accepted_at AS replace_end
+                    SELECT $2 >= agreement.accepted_at
+                        AND (agreement.canceled_at < agreement.accepted_at
+                            OR (agreement.canceled_tx IS NULL AND $4 IS NOT NULL)) AS replace_end
                 ) AS end_rule
             )
             WHERE agreement.id = $1
@@ -1631,8 +1628,10 @@ impl PgRegistry {
                         CASE WHEN replace_end THEN NULL
                             ELSE agreement.terminated_event_emitted_at END
                     FROM (
-                        SELECT agreement.canceled_at < COALESCE(agreement.accepted_at, $2)
-                            AND $4 >= COALESCE(agreement.accepted_at, $2) AS replace_end
+                        SELECT $4 >= COALESCE(agreement.accepted_at, $2)
+                            AND (agreement.canceled_at < COALESCE(agreement.accepted_at, $2)
+                                OR (agreement.canceled_tx IS NULL AND $6 IS NOT NULL))
+                            AS replace_end
                     ) AS end_rule
                 )
             WHERE agreement.id = $1

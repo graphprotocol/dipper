@@ -288,8 +288,8 @@ async fn confirm_if_over<R: AgreementRegistry + Sync>(
 }
 
 /// Mark an agreement the indexer ended `CanceledByIndexer` when the chain listener hasn't in
-/// time, so it doesn't stay cancelling for good. The indexer is recorded as ending it first,
-/// so its announcement names them; the time recorded is when dipper noticed.
+/// time, so it doesn't stay cancelling for good. The indexer is recorded as ending it first, at
+/// the time dipper noticed: an estimate the chain's end, once the listener reads it, replaces.
 async fn record_end_by_indexer<R: AgreementRegistry + Sync>(
     registry: &R,
     agreement: &IndexingAgreement,

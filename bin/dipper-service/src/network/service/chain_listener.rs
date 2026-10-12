@@ -986,8 +986,8 @@ where
 }
 
 /// Record the accept and end of an agreement dipper already ended that went live on-chain, in 1
-/// write, as the terminated sweep waits only for the accept; what is on record wins, but an end
-/// before the accept gives way. The end is its last change on-chain, so a failure is returned.
+/// write, as the terminated sweep waits only for the accept. What is on record wins, unless its end
+/// predates the accept or has no transaction. The end is its last change, so a failure is returned.
 async fn record_accept_and_cancel_from_chain<R: AgreementRegistry + Sync>(
     snapshot: &AgreementStateSnapshot,
     agreement: &IndexingAgreement,
