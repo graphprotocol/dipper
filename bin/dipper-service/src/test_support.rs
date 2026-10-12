@@ -3,7 +3,8 @@
 //! Currently provides [`CapturingEventsProducer`], a test double for
 //! [`SubgraphIndexingAgreementEventsProducer`] that records every produced event
 //! so handler/service tests can assert exactly which lifecycle events were emitted
-//! (and with which payloads) without a Kafka backend.
+//! (and with which payloads) without a Kafka backend, and [`logged`], which captures what
+//! dipper logs.
 
 use std::sync::{Arc, Mutex};
 
@@ -156,4 +157,28 @@ impl SubgraphIndexingAgreementEventsProducer for CapturingEventsProducer {
         });
         Ok(())
     }
+}
+
+/// What dipper logs, at every level, while `run` runs.
+pub async fn logged(run: impl std::future::Future<Output = ()>) -> String {
+    struct Buffer(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Buffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let writer = Arc::clone(&lines);
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(move || Buffer(Arc::clone(&writer)))
+        .finish();
+    let _logging = tracing::subscriber::set_default(subscriber);
+    run.await;
+    String::from_utf8(lines.lock().unwrap().clone()).unwrap()
 }

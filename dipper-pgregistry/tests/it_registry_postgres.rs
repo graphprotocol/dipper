@@ -4,8 +4,9 @@ use std::collections::HashSet;
 
 use dipper_core::ids::{IndexingAgreementId, IndexingRequestId};
 use dipper_pgregistry::{
-    CancelKind, Error, IndexingAgreementStatus, IndexingAgreementTerms, IndexingRequestStatus,
-    NewAgreementParams, PgRegistry, ReconciliationAudit, ReconciliationItem,
+    CancelKind, EndCorrection, Error, IndexingAgreementStatus, IndexingAgreementTerms,
+    IndexingRequestStatus, NewAgreementParams, PgRegistry, ReconciliationAudit, ReconciliationItem,
+    RecordedEnd,
 };
 use fake::{Fake, Faker};
 use pgtemp::PgTempDB;
@@ -3925,6 +3926,117 @@ async fn an_end_recorded_before_the_accept_gives_way_to_the_real_one() {
         recorded(3_000, "0xpayer", "0xcancel"),
         "a real end, after the accept, is kept"
     );
+}
+
+/// Each write that can change an agreement's end reports a change to an end already announced,
+/// whose `terminated` event then goes out again, and nothing otherwise.
+#[tokio::test]
+async fn a_change_to_an_announced_end_is_reported() {
+    let (db, _temp_db) = temp_registry_db().await;
+    run_fixture(
+        &db,
+        include_str!("fixtures/0003_multi_indexer_agreements.sql"),
+    )
+    .await
+    .expect("Failed to run fixture");
+    let registry = PgRegistry::new(db.clone());
+    let announce = async |id: IndexingAgreementId| {
+        registry
+            .mark_terminated_event_emitted(&id)
+            .await
+            .expect("announce");
+    };
+    let end = |at: u64, by: &str, tx: &str| RecordedEnd {
+        canceled_at: Some(at),
+        canceled_by: Some(by.to_owned()),
+        canceled_tx: Some(tx.to_owned()),
+    };
+
+    // An offer withdrawn and announced, then accepted after all, so its real end replaces it.
+    let id = fixture_agreement(0xaa);
+    let first = registry
+        .record_cancel_audit(&id, 1_000, "0xwithdrawer", Some("0xwithdrawal"))
+        .await
+        .expect("cancel record");
+    assert_eq!(first, None, "nothing was announced yet");
+    announce(id).await;
+    registry
+        .record_accepted_audit(&id, 2_000, "0xaccept")
+        .await
+        .expect("accept record");
+    let replaced = registry
+        .record_cancel_audit(&id, 3_000, "0xpayer", Some("0xcancel"))
+        .await
+        .expect("cancel record");
+    assert_eq!(
+        replaced,
+        Some(EndCorrection {
+            old: end(1_000, "0xwithdrawer", "0xwithdrawal"),
+            new: end(3_000, "0xpayer", "0xcancel"),
+        })
+    );
+    announce(id).await;
+    let kept = registry
+        .record_cancel_audit(&id, 4_000, "0xlater", Some("0xlater"))
+        .await
+        .expect("cancel record");
+    assert_eq!(kept, None, "an end kept is no change");
+
+    // Found live on-chain after its announced end, which no longer stands.
+    registry
+        .mark_indexing_agreement_as_canceled_by_requester(&id)
+        .await
+        .expect("mark ended");
+    let unread = registry
+        .reopen_indexing_agreement_cancel(&id, false)
+        .await
+        .expect("reopen");
+    assert_eq!(
+        unread, None,
+        "an unread chain keeps the end and its announcement"
+    );
+    registry
+        .mark_indexing_agreement_as_canceled_by_requester(&id)
+        .await
+        .expect("mark ended");
+    let reopened = registry
+        .reopen_indexing_agreement_cancel(&id, true)
+        .await
+        .expect("reopen");
+    assert_eq!(
+        reopened,
+        Some(EndCorrection {
+            old: end(3_000, "0xpayer", "0xcancel"),
+            new: RecordedEnd::default(),
+        })
+    );
+
+    // The chain's accept and end, read together, replace an announced withdrawal the same way.
+    let other =
+        IndexingAgreementId::from_bytes([0xaa, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    sqlx::query(
+        "UPDATE dipper_reg_indexing_agreements SET canceled_at = 50, canceled_by = '0xwd', \
+         canceled_tx = '0xwd', terminated_event_emitted_at = now() WHERE id = $1",
+    )
+    .bind(other)
+    .execute(&db)
+    .await
+    .expect("withdraw");
+    let read = async || {
+        registry
+            .record_accept_and_cancel_audit(&other, 100, "0xacc", 200, "0xpayer", Some("0xend"))
+            .await
+            .expect("record")
+    };
+    assert_eq!(
+        read().await,
+        Some(EndCorrection {
+            old: end(50, "0xwd", "0xwd"),
+            new: end(200, "0xpayer", "0xend"),
+        })
+    );
+    announce(other).await;
+    assert_eq!(read().await, None, "a replay changes nothing");
 }
 
 #[tokio::test]

@@ -95,6 +95,46 @@ pub struct ReconciliationAudit {
     pub canceled_tx: Option<String>,
 }
 
+/// An agreement's end as recorded: when, in chain seconds, who ended it, and in which transaction.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecordedEnd {
+    pub canceled_at: Option<u64>,
+    pub canceled_by: Option<String>,
+    pub canceled_tx: Option<String>,
+}
+
+/// An announced end that a write replaced or cleared, so its `terminated` event goes out again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndCorrection {
+    pub old: RecordedEnd,
+    pub new: RecordedEnd,
+}
+
+/// What a write that can replace an end returns: whether it cleared that end's announcement, then
+/// the end before and after it. The end before is read under a row lock, so it is the one replaced.
+type EndChangeRow = (
+    bool,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+);
+
+fn end_correction(row: EndChangeRow) -> Option<EndCorrection> {
+    let (announcement_cleared, old_at, old_by, old_tx, new_at, new_by, new_tx) = row;
+    let end = |at: Option<i64>, canceled_by, canceled_tx| RecordedEnd {
+        canceled_at: at.and_then(|at| u64::try_from(at).ok()),
+        canceled_by,
+        canceled_tx,
+    };
+    announcement_cleared.then(|| EndCorrection {
+        old: end(old_at, old_by, old_tx),
+        new: end(new_at, new_by, new_tx),
+    })
+}
+
 /// A row that needs a `terminated` lifecycle event emitted. Sourced entirely
 /// from the agreement row so the emission sweep is a pure DB -> broker drain.
 #[derive(Debug, Clone)]
@@ -1015,13 +1055,14 @@ impl PgRegistry {
     /// as checked, since no cancel is sent with it, so the retry takes it on its next sweep rather
     /// than waiting for one to be mined. When the chain was read and showed it live (`seen_live`),
     /// the end on record, and any announcement of it, no longer stands, so both are cleared for
-    /// the end still to come; an unread chain leaves them, as the agreement may have ended.
+    /// the end still to come, and the end returned if it was announced; an unread chain leaves
+    /// them, as the agreement may have ended.
     pub async fn reopen_indexing_agreement_cancel(
         &self,
         agreement_id: &IndexingAgreementId,
         seen_live: bool,
-    ) -> Result<(), Error> {
-        let updated = sqlx::query(
+    ) -> Result<Option<EndCorrection>, Error> {
+        let row: Option<EndChangeRow> = sqlx::query_as(
             r#"
             UPDATE dipper_reg_indexing_agreements
             SET
@@ -1035,7 +1076,14 @@ impl PgRegistry {
                 terminated_event_emitted_at =
                     CASE WHEN $5 THEN NULL ELSE terminated_event_emitted_at END,
                 updated_at = timezone('UTC', now())
+            FROM (
+                SELECT canceled_at AS old_at, canceled_by AS old_by, canceled_tx AS old_tx,
+                    terminated_event_emitted_at IS NOT NULL AS was_announced
+                FROM dipper_reg_indexing_agreements WHERE id = $2 FOR UPDATE
+            ) AS before
             WHERE id = $2 AND status IN ($3, $4)
+            RETURNING was_announced AND terminated_event_emitted_at IS NULL,
+                old_at, old_by, old_tx, canceled_at, canceled_by, canceled_tx
             "#,
         )
         .bind(IndexingAgreementStatus::Cancelling)
@@ -1043,12 +1091,9 @@ impl PgRegistry {
         .bind(IndexingAgreementStatus::CanceledByRequester)
         .bind(IndexingAgreementStatus::Rejected)
         .bind(seen_live)
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
-        if updated.rows_affected() == 0 {
-            return Err(Error::NoRecordsUpdated);
-        }
-        Ok(())
+        row.map(end_correction).ok_or(Error::NoRecordsUpdated)
     }
 
     /// `Cancelling` agreements, those checked longest ago first, leaving out any never checked
@@ -1571,8 +1616,8 @@ impl PgRegistry {
         canceled_at: u64,
         canceled_by: &str,
         canceled_tx: Option<&str>,
-    ) -> Result<(), Error> {
-        sqlx::query(
+    ) -> Result<Option<EndCorrection>, Error> {
+        let row: Option<EndChangeRow> = sqlx::query_as(
             r#"
             UPDATE dipper_reg_indexing_agreements AS agreement
             SET (canceled_at, canceled_by, canceled_tx, terminated_event_emitted_at) = (
@@ -1587,16 +1632,24 @@ impl PgRegistry {
                             OR (agreement.canceled_tx IS NULL AND $4 IS NOT NULL)) AS replace_end
                 ) AS end_rule
             )
+            FROM (
+                SELECT canceled_at AS old_at, canceled_by AS old_by, canceled_tx AS old_tx,
+                    terminated_event_emitted_at IS NOT NULL AS was_announced
+                FROM dipper_reg_indexing_agreements WHERE id = $1 FOR UPDATE
+            ) AS before
             WHERE agreement.id = $1
+            RETURNING was_announced AND agreement.terminated_event_emitted_at IS NULL,
+                old_at, old_by, old_tx,
+                agreement.canceled_at, agreement.canceled_by, agreement.canceled_tx
             "#,
         )
         .bind(agreement_id)
         .bind(canceled_at as i64)
         .bind(canceled_by)
         .bind(canceled_tx)
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
-        Ok(())
+        Ok(row.and_then(end_correction))
     }
 
     /// Record an agreement's accept and its end together, as the chain shows them, in 1 write,
@@ -1614,8 +1667,8 @@ impl PgRegistry {
         canceled_at: u64,
         canceled_by: &str,
         canceled_tx: Option<&str>,
-    ) -> Result<(), Error> {
-        sqlx::query(
+    ) -> Result<Option<EndCorrection>, Error> {
+        let row: Option<EndChangeRow> = sqlx::query_as(
             r#"
             UPDATE dipper_reg_indexing_agreements AS agreement
             SET accepted_at = COALESCE(agreement.accepted_at, $2),
@@ -1634,7 +1687,15 @@ impl PgRegistry {
                             AS replace_end
                     ) AS end_rule
                 )
+            FROM (
+                SELECT canceled_at AS old_at, canceled_by AS old_by, canceled_tx AS old_tx,
+                    terminated_event_emitted_at IS NOT NULL AS was_announced
+                FROM dipper_reg_indexing_agreements WHERE id = $1 FOR UPDATE
+            ) AS before
             WHERE agreement.id = $1
+            RETURNING was_announced AND agreement.terminated_event_emitted_at IS NULL,
+                old_at, old_by, old_tx,
+                agreement.canceled_at, agreement.canceled_by, agreement.canceled_tx
             "#,
         )
         .bind(agreement_id)
@@ -1643,9 +1704,9 @@ impl PgRegistry {
         .bind(canceled_at as i64)
         .bind(canceled_by)
         .bind(canceled_tx)
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
-        Ok(())
+        Ok(row.and_then(end_correction))
     }
 
     // =========================================================================
@@ -2555,4 +2616,41 @@ async fn update_status_from(
     )
     .await?
     .is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_end_counts_as_corrected_only_when_its_announcement_was_cleared() {
+        let row = |cleared| {
+            (
+                cleared,
+                Some(9_000),
+                Some("0xindexer".to_owned()),
+                None,
+                Some(5_000),
+                Some("0xprovider".to_owned()),
+                Some("0xend".to_owned()),
+            )
+        };
+
+        assert_eq!(end_correction(row(false)), None);
+        assert_eq!(
+            end_correction(row(true)),
+            Some(EndCorrection {
+                old: RecordedEnd {
+                    canceled_at: Some(9_000),
+                    canceled_by: Some("0xindexer".to_owned()),
+                    canceled_tx: None,
+                },
+                new: RecordedEnd {
+                    canceled_at: Some(5_000),
+                    canceled_by: Some("0xprovider".to_owned()),
+                    canceled_tx: Some("0xend".to_owned()),
+                },
+            })
+        );
+    }
 }

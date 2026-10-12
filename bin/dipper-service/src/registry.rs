@@ -99,6 +99,30 @@ fn filter_map_with_logging<T, E: std::fmt::Display>(
     }
 }
 
+/// Warn when a write changed an agreement's end after its `terminated` event went out. The event
+/// goes out again with the new end, but consumers dedupe on the agreement id and event type, so
+/// they may drop it and keep the old end.
+fn warn_if_end_corrected(
+    agreement_id: &IndexingAgreementId,
+    correction: Option<dipper_pgregistry::EndCorrection>,
+) {
+    let Some(dipper_pgregistry::EndCorrection { old, new }) = correction else {
+        return;
+    };
+    tracing::warn!(
+        event = "agreement_end_corrected_after_announcement",
+        %agreement_id,
+        old_canceled_at = ?old.canceled_at,
+        old_canceled_by = ?old.canceled_by,
+        old_canceled_tx = ?old.canceled_tx,
+        new_canceled_at = ?new.canceled_at,
+        new_canceled_by = ?new.canceled_by,
+        new_canceled_tx = ?new.canceled_tx,
+        "An agreement's end changed after its terminated event went out; the event goes out \
+         again, but consumers may drop it as a repeat"
+    );
+}
+
 /// A service for interacting with the registry, including registering new
 /// indexing requests and indexing agreements.
 #[derive(Clone)]
@@ -416,10 +440,12 @@ impl AgreementRegistry for RegistryProvider {
         id: &IndexingAgreementId,
         seen_live: bool,
     ) -> RegistryResult<()> {
-        self.inner
+        let correction = self
+            .inner
             .reopen_indexing_agreement_cancel(id, seen_live)
-            .await
-            .map_err(Into::into)
+            .await?;
+        warn_if_end_corrected(id, correction);
+        Ok(())
     }
 
     async fn get_cancelling_agreements(
@@ -620,9 +646,11 @@ impl AgreementRegistry for RegistryProvider {
         canceled_by: &str,
         canceled_tx: Option<&str>,
     ) -> RegistryResult<()> {
-        self.inner
+        let correction = self
+            .inner
             .record_cancel_audit(agreement_id, canceled_at, canceled_by, canceled_tx)
             .await?;
+        warn_if_end_corrected(agreement_id, correction);
         Ok(())
     }
 
@@ -635,7 +663,8 @@ impl AgreementRegistry for RegistryProvider {
         canceled_by: &str,
         canceled_tx: Option<&str>,
     ) -> RegistryResult<()> {
-        self.inner
+        let correction = self
+            .inner
             .record_accept_and_cancel_audit(
                 agreement_id,
                 accepted_at,
@@ -645,6 +674,7 @@ impl AgreementRegistry for RegistryProvider {
                 canceled_tx,
             )
             .await?;
+        warn_if_end_corrected(agreement_id, correction);
         Ok(())
     }
 
@@ -892,5 +922,55 @@ impl crate::network::service::chain_listener::ChainListenerStateRegistry for Reg
             )
             .await
             .map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use dipper_core::ids::IndexingAgreementId;
+    use dipper_pgregistry::{EndCorrection, RecordedEnd};
+
+    use super::warn_if_end_corrected;
+    use crate::test_support::logged;
+
+    #[tokio::test]
+    async fn warns_with_both_ends_when_an_announced_end_changes() {
+        let id = IndexingAgreementId::from_bytes([0xaa; 16]);
+        let correction = EndCorrection {
+            old: RecordedEnd {
+                canceled_at: Some(9_000),
+                canceled_by: Some("0xindexer".to_owned()),
+                canceled_tx: None,
+            },
+            new: RecordedEnd {
+                canceled_at: Some(5_000),
+                canceled_by: Some("0xprovider".to_owned()),
+                canceled_tx: Some("0xend".to_owned()),
+            },
+        };
+
+        let logs = logged(async { warn_if_end_corrected(&id, Some(correction)) }).await;
+
+        for expected in [
+            "WARN",
+            "event=\"agreement_end_corrected_after_announcement\"",
+            &format!("agreement_id={id}"),
+            "old_canceled_at=Some(9000)",
+            "old_canceled_tx=None",
+            "new_canceled_at=Some(5000)",
+            "new_canceled_tx=Some(\"0xend\")",
+            "consumers may drop it",
+        ] {
+            assert!(logs.contains(expected), "missing {expected} in {logs}");
+        }
+    }
+
+    #[tokio::test]
+    async fn stays_quiet_when_no_announced_end_changes() {
+        let id = IndexingAgreementId::from_bytes([0xaa; 16]);
+
+        let logs = logged(async { warn_if_end_corrected(&id, None) }).await;
+
+        assert!(logs.is_empty(), "{logs}");
     }
 }

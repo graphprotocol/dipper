@@ -1608,7 +1608,7 @@ where
                     .await
                 {
                     // Sent but not stamped: the next sweep re-sends (deduped by
-                    // consumers on agreement_id). Better than dropping.
+                    // consumers on agreement_id and event type). Better than dropping.
                     tracing::warn!(
                         agreement_id = %p.agreement_id,
                         error = %err,
