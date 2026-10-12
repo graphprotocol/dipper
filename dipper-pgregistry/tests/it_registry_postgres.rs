@@ -4157,6 +4157,17 @@ async fn an_accept_and_end_from_the_chain_are_recorded_in_1_write() {
         (Some(100), Some(200), Some("0xend".to_owned()), true),
         "what is already known stays"
     );
+
+    registry
+        .mark_terminated_event_emitted(&id)
+        .await
+        .expect("announce the end");
+    record(100, 200, "0xend").await;
+    assert_eq!(
+        recorded().await,
+        (Some(100), Some(200), Some("0xend".to_owned()), false),
+        "the chain listener reading the same change again doesn't announce it again"
+    );
 }
 
 /// An ended agreement's `terminated` event waits for the transaction that ended it, which the
