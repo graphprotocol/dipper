@@ -744,6 +744,9 @@ where
         // Persist per-page so a crash mid-drain replays at most
         // one page. Skip the write when neither cursor nor
         // ratcheted timestamp moved.
+        let already_held = cursor_hold
+            .as_ref()
+            .is_some_and(|hold| hold.cursor == *cursor);
         let skip = !unapplied.is_empty() && hold_expired(cursor_hold, cursor, now_instant);
         if unapplied.is_empty() {
             *cursor_hold = None;
@@ -757,6 +760,15 @@ where
                 agreement_ids = %listed_ids(&unapplied),
                 "Skipped on-chain changes to agreements that kept failing to apply; they won't \
                  be read again until their next change"
+            );
+        } else if !unapplied.is_empty() && already_held {
+            // The hold started with the tagged ERROR below; a WARN on each poll it goes on, which
+            // can be every few seconds for 10 minutes, with no tag so it isn't alerted on again.
+            tracing::warn!(
+                cursor_block = cursor.block,
+                agreement_count = unapplied.len(),
+                agreement_ids = %listed_ids(&unapplied),
+                "Still failing to apply on-chain changes to agreements; re-reading them next poll"
             );
         } else if !unapplied.is_empty() {
             tracing::error!(
@@ -4382,6 +4394,36 @@ mod tests {
         assert!(accepted);
         assert!(cursor > Cursor::genesis());
         assert!(hold.is_none());
+    }
+
+    /// A held cursor is an ERROR once, tagged for an alert, then a WARN with no tag on each poll
+    /// it goes on, so a 10-minute hold isn't alerted on every few seconds.
+    #[tokio::test]
+    async fn test_drain_logs_a_held_cursor_as_an_error_once_then_as_warnings() {
+        let first = crate::test_support::logged(async {
+            drain_a_page(&[true], None).await;
+        })
+        .await;
+        let again = crate::test_support::logged(async {
+            drain_a_page(&[true], Some(std::time::Instant::now())).await;
+        })
+        .await;
+
+        let started = first
+            .lines()
+            .find(|line| line.contains("Failed to apply on-chain changes"))
+            .expect("the hold is logged");
+        assert!(started.contains("ERROR"), "{started}");
+        assert!(
+            started.contains(r#"event="chain_listener_cursor_held""#),
+            "{started}"
+        );
+        let went_on = again
+            .lines()
+            .find(|line| line.contains("Still failing to apply on-chain changes"))
+            .expect("the hold going on is logged");
+        assert!(went_on.contains("WARN"), "{went_on}");
+        assert!(!again.contains("chain_listener_cursor_held"), "{again}");
     }
 
     /// A page that keeps failing is passed over once the cursor has been held long enough, so

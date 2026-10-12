@@ -106,6 +106,11 @@ pub async fn main() -> anyhow::Result<()> {
     if let Err(err) = conf.health.validate(conf.admin_rpc.listen_addr) {
         anyhow::bail!("invalid health config: {err}");
     }
+    if let Some(liveness_conf) = &conf.liveness_checker
+        && let Err(err) = liveness_conf.validate()
+    {
+        anyhow::bail!("invalid liveness checker config: {err}");
+    }
 
     // TODO: Decouple the config file format from the internal representation
     let (agreement_conf, pricing_table) = conf.dips.into();
