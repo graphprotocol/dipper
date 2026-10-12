@@ -544,8 +544,9 @@ pub struct LivenessCheckerConfig {
     pub batch_size: i64,
 
     /// Share of the indexers checked in a cycle that, when unreachable at once (status call
-    /// failed, or missing from the network registry), stops that cycle abandoning agreements for
-    /// unreachability, since so many points to a fault on dipper's side (default: 0.5).
+    /// failed, or missing from the network registry), stops abandoning agreements for
+    /// unreachability, for at most `max_tolerance_days` days, since so many points to a fault on
+    /// dipper's side (default: 0.5).
     #[serde(default = "default_liveness_checker_unreachable_trip_fraction")]
     pub unreachable_trip_fraction: f64,
 

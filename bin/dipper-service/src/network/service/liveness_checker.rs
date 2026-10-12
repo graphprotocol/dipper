@@ -31,10 +31,11 @@
 //! - Deployment missing from response → treat as no progress
 //!
 //! When at least `unreachable_trip_fraction` of the indexers checked in a cycle can't be
-//! reached, the fault is likely dipper's own, so that cycle abandons no agreement for
-//! unreachability; indexers that answered without progress are still handled as above. Once
-//! 3 cycles in a row see fewer, an indexer still unreachable is abandoned only after a full
-//! tolerance without progress from the last cycle that held it, since dipper couldn't see it.
+//! reached, the fault is likely dipper's own, so no agreement is abandoned for unreachability
+//! until fewer are, for at most `max_tolerance_days` days; indexers that answered without
+//! progress are still handled as above. Once 3 cycles in a row see fewer, or the hold runs out,
+//! an indexer still unreachable is abandoned only after a full tolerance without progress from
+//! the last cycle that held it, since dipper couldn't see it.
 //!
 //! ## URL Refresh
 //!
@@ -376,20 +377,27 @@ impl UnreachablePolicy {
 /// clears, so a share hovering around the trip fraction doesn't trip and clear it over and over.
 const UNREACHABLE_CLEAR_CYCLES: u32 = 3;
 
+/// How often the alert repeats while the breaker stays tripped.
+const UNREACHABLE_ALERT_REPEAT: time::Duration = time::Duration::hours(6);
+
 /// Stops agreements being abandoned for unreachability while so many indexers can't be reached
 /// at once that the fault is likely dipper's own (its network, or the network registry), which
 /// would hand every deployment to new indexers and bar the current ones for weeks.
 #[derive(Default)]
 struct UnreachableBreaker {
-    tripped: bool,
+    /// When the current trip began; `None` while clear.
+    tripped_since: Option<OffsetDateTime>,
     /// Cycles in a row, while tripped, with too few indexers unreachable to trip it.
     quiet_cycles: u32,
     /// The last cycle that held agreements back.
     last_held: Option<OffsetDateTime>,
+    /// When an operator was last alerted to the current trip.
+    alerted_at: Option<OffsetDateTime>,
 }
 
 impl UnreachableBreaker {
-    /// How this cycle treats agreements whose indexer can't be reached.
+    /// How this cycle treats agreements whose indexer can't be reached. A trip holds them for at
+    /// most `max_tolerance_days` days, so indexers that are really gone can't keep it tripped.
     fn evaluate(
         &mut self,
         checked: usize,
@@ -397,76 +405,128 @@ impl UnreachableBreaker {
         now: OffsetDateTime,
         config: &LivenessCheckerConfig,
     ) -> UnreachablePolicy {
-        let trip_fraction = config.unreachable_trip_fraction;
         let trips = unreachable_trips(
             checked,
             unreachable,
-            trip_fraction,
+            config.unreachable_trip_fraction,
             config.unreachable_trip_min_indexers,
         );
-        let holds = if trips {
-            self.note_trip(unreachable, checked, trip_fraction);
-            true
-        } else {
-            self.tripped && !self.note_quiet_cycle(unreachable, checked, trip_fraction)
-        };
-        if !holds {
-            return UnreachablePolicy::Judge {
-                since: self.last_held,
-            };
+        if trips {
+            self.note_trip(now);
+        } else if self.tripped_since.is_some() {
+            self.note_quiet_cycle(unreachable, checked);
         }
-        self.tripped = true;
+        let judge = UnreachablePolicy::Judge {
+            since: self.last_held,
+        };
+        let Some(since) = self.tripped_since else {
+            return judge;
+        };
+        let max_hold = time::Duration::days(i64::from(config.max_tolerance_days.max(1)));
+        if now - since > max_hold {
+            self.give_up(unreachable, checked, now, max_hold);
+            return judge;
+        }
+        self.report_hold(trips, unreachable, checked, now, max_hold);
         self.last_held = Some(now);
         UnreachablePolicy::Hold
     }
 
-    /// Note a cycle with enough indexers unreachable to trip the breaker: an ERROR as it trips,
-    /// a WARN while it stays tripped.
-    fn note_trip(&mut self, unreachable: usize, checked: usize, trip_fraction: f64) {
+    /// Note a cycle with enough indexers unreachable to trip the breaker.
+    fn note_trip(&mut self, now: OffsetDateTime) {
         self.quiet_cycles = 0;
-        if self.tripped {
-            tracing::warn!(
-                unreachable,
-                checked,
-                trip_fraction,
-                "Still too many indexers unreachable; not abandoning agreements for unreachability"
-            );
-        } else {
-            tracing::error!(
-                event = "liveness_abandonment_paused",
-                unreachable,
-                checked,
-                trip_fraction,
-                "Too many indexers unreachable at once, likely a fault on dipper's side; not \
-                 abandoning agreements for unreachability until fewer are"
-            );
+        if self.tripped_since.is_none() {
+            self.tripped_since = Some(now);
+            self.alerted_at = None;
         }
     }
 
-    /// Note a cycle, while tripped, with too few indexers unreachable to trip it; true, logged,
-    /// once enough of those in a row clear it.
-    fn note_quiet_cycle(&mut self, unreachable: usize, checked: usize, trip_fraction: f64) -> bool {
+    /// Note a cycle, while tripped, with too few indexers unreachable to trip it, clearing the
+    /// breaker once enough of those come in a row.
+    fn note_quiet_cycle(&mut self, unreachable: usize, checked: usize) {
         self.quiet_cycles += 1;
         if self.quiet_cycles < UNREACHABLE_CLEAR_CYCLES {
             tracing::info!(
                 unreachable,
                 checked,
                 quiet_cycles = self.quiet_cycles,
-                "Fewer indexers unreachable; still not abandoning agreements for unreachability \
-                 until it stays so"
+                "Fewer indexers unreachable; the breaker clears if it stays so"
             );
-            return false;
+            return;
         }
-        self.tripped = false;
+        self.tripped_since = None;
         self.quiet_cycles = 0;
         tracing::info!(
             unreachable,
             checked,
-            trip_fraction,
             "Fewer indexers unreachable; abandoning agreements for unreachability resumes, each \
-             after a full tolerance from now without progress"
+             after a full tolerance without progress since the breaker last held it"
         );
-        true
+    }
+
+    /// Log a cycle that holds agreements back: an ERROR, for an operator, as the breaker trips
+    /// and every `UNREACHABLE_ALERT_REPEAT` after, and otherwise a WARN while it stays tripped.
+    fn report_hold(
+        &mut self,
+        trips: bool,
+        unreachable: usize,
+        checked: usize,
+        now: OffsetDateTime,
+        max_hold: time::Duration,
+    ) {
+        let held_hours = self
+            .tripped_since
+            .map_or(0, |since| (now - since).whole_hours());
+        if self
+            .alerted_at
+            .is_none_or(|at| now - at >= UNREACHABLE_ALERT_REPEAT)
+        {
+            self.alerted_at = Some(now);
+            tracing::error!(
+                event = "liveness_abandonment_paused",
+                unreachable,
+                checked,
+                held_hours,
+                max_hold_days = max_hold.whole_days(),
+                "Too many indexers unreachable at once: a fault on dipper's side (its network or \
+                 the network registry), or that many really gone; not abandoning agreements for \
+                 unreachability while it lasts, for up to max_hold_days"
+            );
+        } else if trips {
+            tracing::warn!(
+                unreachable,
+                checked,
+                held_hours,
+                "Still too many indexers unreachable; not abandoning agreements for unreachability"
+            );
+        }
+    }
+
+    /// Log, once, a trip that has held agreements back as long as it may: an ERROR, since from
+    /// here each indexer still unreachable is abandoned after a full tolerance without progress.
+    fn give_up(
+        &mut self,
+        unreachable: usize,
+        checked: usize,
+        now: OffsetDateTime,
+        max_hold: time::Duration,
+    ) {
+        let Some(since) = self.tripped_since else {
+            return;
+        };
+        if self.alerted_at.is_some_and(|at| at - since > max_hold) {
+            return;
+        }
+        self.alerted_at = Some(now);
+        tracing::error!(
+            event = "liveness_abandonment_paused",
+            unreachable,
+            checked,
+            held_days = max_hold.whole_days(),
+            "Too many indexers unreachable for longer than an outage on dipper's side should \
+             last; abandoning agreements for unreachability again, each after a full tolerance \
+             without progress from now"
+        );
     }
 }
 
@@ -2050,6 +2110,64 @@ mod tests {
         };
         assert_eq!(evaluate(6, 1), cleared, "counting from the last cycle held");
         assert_eq!(evaluate(7, 0), cleared, "and on every cycle after");
+    }
+
+    #[tokio::test]
+    async fn reminds_an_operator_every_6_hours_while_tripped() {
+        let config = LivenessCheckerConfig::default();
+        let mut breaker = UnreachableBreaker::default();
+        let start = OffsetDateTime::now_utc();
+        let mut evaluate =
+            |hours| breaker.evaluate(4, 4, start + time::Duration::hours(hours), &config);
+
+        let tripped = logged(async { assert_eq!(evaluate(0), UnreachablePolicy::Hold) }).await;
+        let soon = logged(async { assert_eq!(evaluate(5), UnreachablePolicy::Hold) }).await;
+        let later = logged(async { assert_eq!(evaluate(6), UnreachablePolicy::Hold) }).await;
+
+        assert!(tripped.contains("liveness_abandonment_paused"), "{tripped}");
+        assert!(!soon.contains("liveness_abandonment_paused"), "{soon}");
+        assert!(later.contains(" ERROR "), "{later}");
+        assert!(later.contains("liveness_abandonment_paused"), "{later}");
+    }
+
+    #[tokio::test]
+    async fn stops_holding_after_max_tolerance_days_and_says_so_once() {
+        // Indexers that are really gone can keep the share up for good; past the longest
+        // tolerance, an outage on dipper's side is no longer the likely cause.
+        let config = LivenessCheckerConfig::default();
+        let mut breaker = UnreachableBreaker::default();
+        let start = OffsetDateTime::now_utc();
+        let last_held = start + time::Duration::days(i64::from(config.max_tolerance_days));
+        let minutes = |m| last_held + time::Duration::minutes(m);
+        breaker.evaluate(4, 4, start, &config);
+        assert_eq!(
+            breaker.evaluate(4, 4, last_held, &config),
+            UnreachablePolicy::Hold
+        );
+
+        let mut evaluate = |at| breaker.evaluate(4, 4, at, &config);
+        let gave_up = logged(async {
+            assert_eq!(
+                evaluate(minutes(5)),
+                UnreachablePolicy::Judge {
+                    since: Some(last_held)
+                }
+            );
+        })
+        .await;
+        let after = logged(async {
+            assert_eq!(
+                evaluate(minutes(10)),
+                UnreachablePolicy::Judge {
+                    since: Some(last_held)
+                }
+            );
+        })
+        .await;
+
+        assert!(gave_up.contains(" ERROR "), "{gave_up}");
+        assert!(gave_up.contains("liveness_abandonment_paused"), "{gave_up}");
+        assert!(!after.contains("liveness_abandonment_paused"), "{after}");
     }
 
     /// An agreement whose indexer last made progress 25 hours ago, past its 1-day tolerance.
