@@ -28,7 +28,7 @@ use tokio::sync::Mutex;
 use super::{
     abi::{IRecurringAgreementManager, IRecurringCollector},
     gas::{GasEstimator, calculate_max_fee, exceeds_max_gas_price, get_gas_prices},
-    rpc_provider::{BEHIND_A_SEEN_BLOCK, RpcProviderPool},
+    rpc_provider::{BEHIND_A_SEEN_BLOCK, HttpProvider, RpcProviderPool},
 };
 use crate::{
     chain_client::{
@@ -301,6 +301,61 @@ impl Refusals {
     }
 }
 
+/// How long a read reuses an endpoint's latest block before asking it again: about 4 blocks.
+/// A read at it is still checked against the newest block seen, and asking before every read
+/// doubled the calls a run of reads makes.
+const HEAD_REUSE: Duration = Duration::from_secs(1);
+
+/// Each endpoint's latest block and when it was asked for, by the endpoint's place in the list.
+struct EndpointHeads(std::sync::Mutex<Vec<Option<(u64, Instant)>>>);
+
+impl EndpointHeads {
+    fn new(endpoints: usize) -> Self {
+        Self(std::sync::Mutex::new(vec![None; endpoints]))
+    }
+
+    fn slots(&self) -> std::sync::MutexGuard<'_, Vec<Option<(u64, Instant)>>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// `endpoint`'s latest block, if it was asked for under [`HEAD_REUSE`] before `now`.
+    fn fresh(&self, endpoint: usize, now: Instant) -> Option<u64> {
+        let (head, asked_at) = self.slots()[endpoint]?;
+        (now.saturating_duration_since(asked_at) < HEAD_REUSE).then_some(head)
+    }
+
+    fn remember(&self, endpoint: usize, head: u64, asked_at: Instant) {
+        self.slots()[endpoint] = Some((head, asked_at));
+    }
+
+    fn forget(&self, endpoint: usize) {
+        self.slots()[endpoint] = None;
+    }
+
+    /// `endpoint`'s latest block, reused if fresh and not behind `seen`, the newest block seen,
+    /// otherwise asked for and remembered.
+    async fn latest(
+        &self,
+        provider: &HttpProvider,
+        endpoint: usize,
+        seen: u64,
+        refusals: &Refusals,
+    ) -> Result<u64, TransportError> {
+        let reusable = self
+            .fresh(endpoint, Instant::now())
+            .filter(|&head| head >= seen);
+        if let Some(head) = reusable {
+            return Ok(head);
+        }
+        let asked_at = Instant::now();
+        let head = refusals.other(provider.get_block_number().await)?;
+        self.remember(endpoint, head, asked_at);
+        Ok(head)
+    }
+}
+
 /// `AgreementDetails.state` flags from `IAgreementCollector.sol` (REGISTERED=1,
 /// ACCEPTED=2, NOTICE_GIVEN=4, SETTLED=8, BY_PROVIDER=32). `getAgreementDetails` keeps
 /// ACCEPTED set on a canceled agreement and ORs in NOTICE_GIVEN, so a cancel must clear it,
@@ -498,6 +553,8 @@ struct AlloyChainClientInner {
     /// behind it, so a lagging endpoint can't undo what dipper saw, nor from one too far
     /// ahead of it to be real, so a faulty endpoint can't refuse every read after it.
     seen_block: std::sync::Mutex<SeenBlock>,
+    /// Each endpoint's latest block, so a run of reads asks for it once a second, not every read.
+    endpoint_heads: EndpointHeads,
 }
 
 impl AlloyChainClient {
@@ -534,6 +591,7 @@ impl AlloyChainClient {
         );
 
         let submit_deadline = derive_submit_deadline(&rpc_pool);
+        let endpoint_heads = EndpointHeads::new(rpc_pool.endpoint_count());
 
         Ok(Self {
             inner: Arc::new(AlloyChainClientInner {
@@ -549,6 +607,7 @@ impl AlloyChainClient {
                 submit_lock: Mutex::new(()),
                 submit_deadline,
                 seen_block: std::sync::Mutex::new(SeenBlock::new()),
+                endpoint_heads,
             }),
         })
     }
@@ -879,9 +938,9 @@ impl AlloyChainClient {
             .state)
     }
 
-    /// Run a read-only contract call at the endpoint's latest block, refusing an endpoint
-    /// whose latest block is older than one dipper has already seen, or too far ahead of it
-    /// to be real; the pool moves on to the next endpoint instead.
+    /// Run a read-only contract call at the endpoint's latest block, as of [`HEAD_REUSE`] ago at
+    /// most, refusing an endpoint whose latest block is older than one dipper has already seen,
+    /// or too far ahead of it to be real; the pool moves on to the next endpoint instead.
     async fn view_at_seen_block<C: SolCall>(
         &self,
         to: Address,
@@ -892,19 +951,23 @@ impl AlloyChainClient {
         self.cross_check_seen_block().await;
         let (seen, highest) = self.block_bounds();
         let refusals = Refusals::new();
+        let heads = &self.inner.endpoint_heads;
         let read = self
             .inner
             .rpc_pool
-            .execute(operation, |provider| {
+            .execute_with_endpoint(operation, |provider, endpoint| {
                 let calldata = calldata.clone();
                 let refusals = &refusals;
                 async move {
-                    let head = refusals.other(provider.get_block_number().await)?;
-                    refusals.behind(head, seen)?;
-                    refusals.far_ahead(head, seen, highest)?;
-                    let tx = TransactionRequest::default().to(to).input(calldata.into());
-                    let output =
-                        refusals.other(provider.call(tx).block(BlockId::number(head)).await)?;
+                    let head = heads.latest(&provider, endpoint, seen, refusals).await?;
+                    let read = async {
+                        refusals.behind(head, seen)?;
+                        refusals.far_ahead(head, seen, highest)?;
+                        let tx = TransactionRequest::default().to(to).input(calldata.into());
+                        refusals.other(provider.call(tx).block(BlockId::number(head)).await)
+                    };
+                    // An endpoint refused or failing may have moved on by the next attempt.
+                    let output = read.await.inspect_err(|_| heads.forget(endpoint))?;
                     Ok((head, output))
                 }
             })
@@ -1383,7 +1446,10 @@ impl ManagerEscrowReader for AlloyChainClient {
 #[cfg(test)]
 mod tests {
     use url::Url;
-    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate, matchers::method};
+    use wiremock::{
+        Mock, MockServer, Request, Respond, ResponseTemplate,
+        matchers::{body_partial_json, method},
+    };
 
     use super::*;
 
@@ -2503,6 +2569,88 @@ mod tests {
             .is_live();
 
         assert!(live);
+    }
+
+    /// How many of `requests` called `method`.
+    fn calls_to(requests: &[wiremock::Request], method: &str) -> usize {
+        requests
+            .iter()
+            .filter(|r| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(&r.body).expect("JSON-RPC request body");
+                body["method"] == method
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn reads_in_quick_succession_ask_for_the_latest_block_once() {
+        let endpoint = server_at_block(100, STATE_REGISTERED).await;
+        let client = client_over(vec![endpoint.uri().parse().expect("provider URL")]);
+
+        for _ in 0..3 {
+            client.agreement_on_chain(&[0xab; 16]).await.expect("read");
+        }
+
+        let requests = endpoint.received_requests().await.unwrap_or_default();
+        assert_eq!(calls_to(&requests, "eth_blockNumber"), 1);
+        assert_eq!(calls_to(&requests, "eth_call"), 3);
+    }
+
+    #[test]
+    fn reuses_an_endpoints_latest_block_for_a_second_unless_forgotten() {
+        let asked_at = Instant::now();
+        let heads = EndpointHeads::new(2);
+        heads.remember(0, 100, asked_at);
+
+        let soon = asked_at + Duration::from_millis(900);
+        assert_eq!(heads.fresh(0, soon), Some(100));
+        assert_eq!(heads.fresh(0, asked_at + HEAD_REUSE), None, "asked again");
+        assert_eq!(heads.fresh(1, soon), None, "each endpoint gives its own");
+
+        heads.forget(0);
+        assert_eq!(heads.fresh(0, soon), None, "asked again after a failure");
+    }
+
+    #[tokio::test]
+    async fn asks_for_the_latest_block_again_once_a_newer_one_is_seen() {
+        // As when dipper's own transaction has just mined: the read must not come from before it.
+        let endpoint = server_catching_up(100, 1, STATE_REGISTERED).await;
+        let client = client_over(vec![endpoint.uri().parse().expect("provider URL")]);
+        client.agreement_on_chain(&[0xab; 16]).await.expect("read");
+        trust_block(&client, 101);
+
+        client.agreement_on_chain(&[0xab; 16]).await.expect("read");
+
+        let requests = endpoint.received_requests().await.unwrap_or_default();
+        assert_eq!(calls_to(&requests, "eth_blockNumber"), 2);
+    }
+
+    #[tokio::test]
+    async fn asks_for_the_latest_block_again_after_a_failed_read() {
+        // The endpoint may have answered from a node that lacks the block it gave.
+        let endpoint = server_at_block(100, STATE_REGISTERED).await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "eth_call" }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 0,
+                "error": { "code": -32000, "message": "missing trie node" },
+            })))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&endpoint)
+            .await;
+        let client = client_over(vec![endpoint.uri().parse().expect("provider URL")]);
+        let failed = client.agreement_on_chain(&[0xab; 16]).await;
+        assert!(failed.is_err(), "got {failed:?}");
+
+        client.agreement_on_chain(&[0xab; 16]).await.expect("read");
+
+        let requests = endpoint.received_requests().await.unwrap_or_default();
+        assert_eq!(calls_to(&requests, "eth_blockNumber"), 2);
     }
 
     #[tokio::test]
