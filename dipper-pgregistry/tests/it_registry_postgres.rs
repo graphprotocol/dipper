@@ -3887,19 +3887,24 @@ async fn an_end_recorded_before_the_accept_gives_way_to_the_real_one() {
     .expect("Failed to run fixture");
     let registry = PgRegistry::new(db.clone());
     let id = fixture_agreement(0xaa);
-    let canceled_tx = async || -> Option<String> {
-        let (tx,): (Option<String>,) =
-            sqlx::query_as("SELECT canceled_tx FROM dipper_reg_indexing_agreements WHERE id = $1")
-                .bind(id)
-                .fetch_one(&db)
-                .await
-                .expect("cancel record query");
-        tx
+    // The time, canceller and transaction of the end on record, which must all be from 1 end.
+    let end = async || -> (Option<i64>, Option<String>, Option<String>) {
+        sqlx::query_as(
+            "SELECT canceled_at, canceled_by, canceled_tx \
+             FROM dipper_reg_indexing_agreements WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&db)
+        .await
+        .expect("cancel record query")
     };
+    let recorded =
+        |at: i64, by: &str, tx: &str| (Some(at), Some(by.to_owned()), Some(tx.to_owned()));
     registry
-        .record_cancel_audit(&id, 1_000, "0xpayer", Some("0xwithdrawal"))
+        .record_cancel_audit(&id, 1_000, "0xwithdrawer", Some("0xwithdrawal"))
         .await
         .expect("cancel record");
+    assert_eq!(end().await, recorded(1_000, "0xwithdrawer", "0xwithdrawal"));
     registry
         .record_accepted_audit(&id, 2_000, "0xaccept")
         .await
@@ -3909,15 +3914,15 @@ async fn an_end_recorded_before_the_accept_gives_way_to_the_real_one() {
         .record_cancel_audit(&id, 3_000, "0xpayer", Some("0xcancel"))
         .await
         .expect("cancel record");
-    assert_eq!(canceled_tx().await.as_deref(), Some("0xcancel"));
+    assert_eq!(end().await, recorded(3_000, "0xpayer", "0xcancel"));
 
     registry
-        .record_cancel_audit(&id, 4_000, "0xpayer", Some("0xlater"))
+        .record_cancel_audit(&id, 4_000, "0xlater", Some("0xlater"))
         .await
         .expect("cancel record");
     assert_eq!(
-        canceled_tx().await.as_deref(),
-        Some("0xcancel"),
+        end().await,
+        recorded(3_000, "0xpayer", "0xcancel"),
         "a real end, after the accept, is kept"
     );
 }

@@ -1564,6 +1564,7 @@ impl PgRegistry {
     /// enrichment: the event still emits (with fallbacks) if never recorded.
     /// An end recorded before the agreement's accept, such as its offer's withdrawal before the
     /// offer landed after all, can't be its end, so a later one replaces it and is announced.
+    /// That is decided once per row, so the end's 4 fields always come from the same end.
     #[expect(
         clippy::cast_possible_wrap,
         reason = "predates this lint; fix when next touched"
@@ -1577,18 +1578,19 @@ impl PgRegistry {
     ) -> Result<(), Error> {
         sqlx::query(
             r#"
-            UPDATE dipper_reg_indexing_agreements
-            SET canceled_at = CASE WHEN canceled_at < accepted_at AND $2 >= accepted_at
-                    THEN $2 ELSE COALESCE(canceled_at, $2) END,
-                canceled_by = CASE WHEN canceled_at < accepted_at AND $2 >= accepted_at
-                    THEN $3 ELSE COALESCE(canceled_by, $3) END,
-                canceled_tx = CASE WHEN canceled_at < accepted_at AND $2 >= accepted_at
-                    THEN $4 ELSE COALESCE(canceled_tx, $4) END,
-                terminated_event_emitted_at = CASE
-                    WHEN canceled_at < accepted_at AND $2 >= accepted_at THEN NULL
-                    ELSE terminated_event_emitted_at
-                END
-            WHERE id = $1
+            UPDATE dipper_reg_indexing_agreements AS agreement
+            SET (canceled_at, canceled_by, canceled_tx, terminated_event_emitted_at) = (
+                SELECT
+                    CASE WHEN replace_end THEN $2 ELSE COALESCE(agreement.canceled_at, $2) END,
+                    CASE WHEN replace_end THEN $3 ELSE COALESCE(agreement.canceled_by, $3) END,
+                    CASE WHEN replace_end THEN $4 ELSE COALESCE(agreement.canceled_tx, $4) END,
+                    CASE WHEN replace_end THEN NULL ELSE agreement.terminated_event_emitted_at END
+                FROM (
+                    SELECT agreement.canceled_at < agreement.accepted_at
+                        AND $2 >= agreement.accepted_at AS replace_end
+                ) AS end_rule
+            )
+            WHERE agreement.id = $1
             "#,
         )
         .bind(agreement_id)
@@ -1618,22 +1620,22 @@ impl PgRegistry {
     ) -> Result<(), Error> {
         sqlx::query(
             r#"
-            UPDATE dipper_reg_indexing_agreements
-            SET accepted_at = COALESCE(accepted_at, $2),
-                accepted_tx = COALESCE(accepted_tx, $3),
-                canceled_at = CASE
-                    WHEN canceled_at < COALESCE(accepted_at, $2) AND $4 >= COALESCE(accepted_at, $2)
-                    THEN $4 ELSE COALESCE(canceled_at, $4) END,
-                canceled_by = CASE
-                    WHEN canceled_at < COALESCE(accepted_at, $2) AND $4 >= COALESCE(accepted_at, $2)
-                    THEN $5 ELSE COALESCE(canceled_by, $5) END,
-                canceled_tx = CASE
-                    WHEN canceled_at < COALESCE(accepted_at, $2) AND $4 >= COALESCE(accepted_at, $2)
-                    THEN $6 ELSE COALESCE(canceled_tx, $6) END,
-                terminated_event_emitted_at = CASE
-                    WHEN canceled_at < COALESCE(accepted_at, $2) AND $4 >= COALESCE(accepted_at, $2)
-                    THEN NULL ELSE terminated_event_emitted_at END
-            WHERE id = $1
+            UPDATE dipper_reg_indexing_agreements AS agreement
+            SET accepted_at = COALESCE(agreement.accepted_at, $2),
+                accepted_tx = COALESCE(agreement.accepted_tx, $3),
+                (canceled_at, canceled_by, canceled_tx, terminated_event_emitted_at) = (
+                    SELECT
+                        CASE WHEN replace_end THEN $4 ELSE COALESCE(agreement.canceled_at, $4) END,
+                        CASE WHEN replace_end THEN $5 ELSE COALESCE(agreement.canceled_by, $5) END,
+                        CASE WHEN replace_end THEN $6 ELSE COALESCE(agreement.canceled_tx, $6) END,
+                        CASE WHEN replace_end THEN NULL
+                            ELSE agreement.terminated_event_emitted_at END
+                    FROM (
+                        SELECT agreement.canceled_at < COALESCE(agreement.accepted_at, $2)
+                            AND $4 >= COALESCE(agreement.accepted_at, $2) AS replace_end
+                    ) AS end_rule
+                )
+            WHERE agreement.id = $1
             "#,
         )
         .bind(agreement_id)
