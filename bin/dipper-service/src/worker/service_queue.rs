@@ -5,8 +5,8 @@ use url::Url;
 
 use super::{
     handlers::{
-        CancelRejectedAgreementOnChain, ReassessIndexingRequest, SendIndexingAgreementProposal,
-        SubmitOffer,
+        CancelRejectedAgreementOnChain, ChainAccept, ReassessIndexingRequest,
+        SendIndexingAgreementProposal, SubmitOffer,
     },
     messages::Message,
     queue::{JobId, JobPriority, Queue},
@@ -33,12 +33,12 @@ pub trait WorkerQueue {
         priority: JobPriority,
     ) -> anyhow::Result<JobId>;
 
-    /// Cancel a rejected agreement on-chain. When an indexer rejected off-chain
-    /// but accepted on-chain, this cancels the agreement via
-    /// `cancelIndexingAgreementByPayer`.
+    /// Check on-chain an agreement dipper rejected or cancelled that was accepted anyway, and
+    /// move it back into `Cancelling` if it is live, recording `accept`.
     async fn cancel_rejected_agreement_on_chain(
         &self,
         agreement_id: IndexingAgreementId,
+        accept: Option<ChainAccept>,
         priority: JobPriority,
     ) -> anyhow::Result<JobId>;
 
@@ -127,12 +127,14 @@ where
     async fn cancel_rejected_agreement_on_chain(
         &self,
         agreement_id: IndexingAgreementId,
+        accept: Option<ChainAccept>,
         priority: JobPriority,
     ) -> anyhow::Result<JobId> {
         self.queue
             .push(
                 Message::CancelRejectedAgreementOnChain(CancelRejectedAgreementOnChain {
                     agreement_id,
+                    accept,
                 }),
                 priority,
             )
@@ -246,10 +248,10 @@ mod tests {
         assert_eq!(*queue.queue.pushes.lock().unwrap(), vec![Some(4)]);
     }
 
-    /// Only the offer submission has a deadline to spend its retries against,
-    /// so every other job keeps the queue-wide budget.
+    /// A proposal has no deadline of its own to spend retries against, so it
+    /// keeps the queue-wide budget.
     #[tokio::test]
-    async fn other_jobs_keep_the_queue_default_retry_budget() {
+    async fn a_proposal_keeps_the_queue_default_retry_budget() {
         //* Arrange
         let queue = handle(4);
 
@@ -265,15 +267,8 @@ mod tests {
             )
             .await
             .unwrap();
-        queue
-            .cancel_rejected_agreement_on_chain(
-                IndexingAgreementId::from_bytes([0; 16]),
-                JobPriority::Background,
-            )
-            .await
-            .unwrap();
 
         //* Assert
-        assert_eq!(*queue.queue.pushes.lock().unwrap(), vec![None, None]);
+        assert_eq!(*queue.queue.pushes.lock().unwrap(), vec![None]);
     }
 }

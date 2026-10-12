@@ -190,8 +190,8 @@ where
                 tracing::info!(
                     agreement_id = %agreement_id,
                     indexing_request_id = %indexing_request_id,
-                    old_status = "CREATED",
-                    new_status = "REJECTED",
+                    old_status = %IndexingAgreementStatus::Created,
+                    new_status = %IndexingAgreementStatus::Rejected,
                     reason = %format_args!("rejected_{rejection_reason_str}"),
                     detail = %rejected.detail,
                     "agreement state transition"
@@ -232,8 +232,8 @@ where
             tracing::info!(
                 agreement_id = %agreement_id,
                 indexing_request_id = %indexing_request_id,
-                old_status = "CREATED",
-                new_status = "UNRESPONSIVE",
+                old_status = %IndexingAgreementStatus::Created,
+                new_status = %IndexingAgreementStatus::Unresponsive,
                 reason = "unresponsive",
                 "agreement state transition"
             );
@@ -415,7 +415,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl AgreementRegistry for MockRegistry {
+    impl crate::registry::StubAgreementRegistry for MockRegistry {
         async fn get_indexing_agreement_by_id(
             &self,
             _id: &IndexingAgreementId,
@@ -522,6 +522,13 @@ mod tests {
             Ok(())
         }
 
+        async fn mark_indexing_agreement_as_cancelling(
+            &self,
+            _id: &IndexingAgreementId,
+        ) -> crate::registry::Result<()> {
+            Ok(())
+        }
+
         async fn apply_reconciliation(
             &self,
             _id: &IndexingAgreementId,
@@ -598,13 +605,6 @@ mod tests {
             u64,
         )> {
             Ok((std::collections::HashMap::new(), 0))
-        }
-
-        async fn mark_indexing_agreement_as_abandoned(
-            &self,
-            _id: &IndexingAgreementId,
-        ) -> crate::registry::Result<IndexingAgreement> {
-            Err(crate::registry::Error::NoRecordsUpdated)
         }
 
         async fn get_agreement_fee_rates(&self) -> crate::registry::Result<Vec<AgreementFeeRate>> {
@@ -732,9 +732,10 @@ mod tests {
         async fn cancel_rejected_agreement_on_chain(
             &self,
             _agreement_id: IndexingAgreementId,
+            _accept: Option<crate::worker::service::ChainAccept>,
             _priority: JobPriority,
         ) -> anyhow::Result<JobId> {
-            Ok(JobId::default())
+            unimplemented!()
         }
 
         async fn submit_offer(

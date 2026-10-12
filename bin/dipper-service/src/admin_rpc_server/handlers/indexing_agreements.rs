@@ -135,5 +135,6 @@ fn into_indexing_agreement_status(
         IndexingAgreementRecordStatus::AbandonedByIndexer => {
             IndexingAgreementStatus::AbandonedByIndexer
         }
+        IndexingAgreementRecordStatus::Cancelling => IndexingAgreementStatus::Cancelling,
     }
 }

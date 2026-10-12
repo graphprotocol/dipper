@@ -8,31 +8,32 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
 use dipper_rpc::indexer::indexer_client::sol::RecurringCollectionAgreement;
 use thegraph_core::alloy::{
-    eips::{BlockNumberOrTag, eip2718::Encodable2718},
+    eips::{BlockId, BlockNumberOrTag, eip2718::Encodable2718},
     network::{EthereumWallet, TransactionBuilder},
     primitives::{Address, B256, FixedBytes, U256},
     providers::Provider,
     rpc::types::TransactionRequest,
     signers::local::PrivateKeySigner,
     sol_types::{SolCall, SolValue},
-    transports::TransportError,
+    transports::{TransportError, TransportErrorKind},
 };
 use tokio::sync::Mutex;
 
 use super::{
     abi::{IRecurringAgreementManager, IRecurringCollector},
     gas::{GasEstimator, calculate_max_fee, exceeds_max_gas_price, get_gas_prices},
-    rpc_provider::RpcProviderPool,
+    rpc_provider::{BEHIND_A_SEEN_BLOCK, HttpProvider, RpcProviderPool},
 };
 use crate::{
     chain_client::{
-        ChainClient, ChainClientError, EscrowAccount, ManagerEscrowReader, TrackedProviders,
+        AgreementOnChain, ChainClient, ChainClientError, EscrowAccount, ManagerEscrowReader,
+        TrackedProviders,
     },
     config::ChainClientConfig,
     worker::service::PROCESS_JOB_TIMEOUT,
@@ -53,15 +54,341 @@ const RECEIPT_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 /// loose enough to avoid hammering the RPC.
 const RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// What waiting for a transaction's receipt found.
+enum ReceiptWait {
+    /// It mined; whether it succeeded.
+    Mined(bool),
+    /// No receipt appeared in time; `checked` when an endpoint did answer that it had none,
+    /// rather than every check failing.
+    NotSeen { checked: bool },
+}
+
 /// VERSION_CURRENT index from `IAgreementCollector.sol`: the active (or
 /// pre-acceptance) terms. `getAgreementDetails(id, 0)` reports their state.
 const VERSION_CURRENT: u64 = 0;
 
-/// `AgreementDetails.state` flags from `IAgreementCollector.sol` (ACCEPTED=2,
-/// NOTICE_GIVEN=4). `getAgreementDetails` keeps ACCEPTED set on a canceled
-/// agreement and ORs in NOTICE_GIVEN, so a cancel must clear it, not just lack it.
+/// Blocks Arbitrum adds in a week, at its 4 a second.
+const WEEK_OF_BLOCKS: u64 = 2_419_200;
+
+/// The most blocks Arbitrum adds a second.
+const BLOCKS_PER_SECOND: u64 = 4;
+
+/// An hour of blocks. A read every endpoint fails while the nearest is further than this from
+/// the newest block dipper has seen raises an ERROR; nearer is lag that clears by itself.
+const ALERT_GAP_BLOCKS: u64 = 14_400;
+
+/// A minute of blocks at the chain's fastest: how far apart endpoints may be and still agree.
+/// Ones that are right differ by a few blocks, and the chain's progress is allowed for apart from
+/// this, so it only bounds how far ahead a faulty endpoint can move a confirmed newest block seen.
+const AGREE_WITHIN_BLOCKS: u64 = 60 * BLOCKS_PER_SECOND;
+
+/// How a read refused by an endpoint whose latest block is too far ahead to be real says so.
+const FAR_AHEAD_OF_A_SEEN_BLOCK: &str = "too far ahead of the newest block seen";
+
+/// How often, at most, dipper asks every endpoint for its latest block to confirm the newest
+/// block it has seen, while that block is unconfirmed.
+const CROSS_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+/// An answer takes well under a second, so this only bounds how long a hung endpoint holds a read.
+const CROSS_CHECK_DEADLINE: Duration = Duration::from_secs(3);
+
+/// The newest block dipper has seen and when it last moved; it never goes back, so a lagging
+/// endpoint can't show state from before it. Nothing ahead is refused until a receipt or 2 agreeing
+/// endpoints confirm it, which replaces a block far ahead set by a faulty endpoint that answered
+/// first after a restart. Until then any endpoint's block is taken: with only 2 that disagree,
+/// which is right can't be told, so 1 far ahead has the other refused as behind until a receipt
+/// or the chain catches up. Refusing it instead would let 1 stuck far behind serve stale reads.
+#[derive(Debug)]
+struct SeenBlock {
+    number: u64,
+    moved_at: Instant,
+    confirmed: bool,
+    cross_checked_at: Option<Instant>,
+    /// An endpoint reported a block further ahead than 1 endpoint alone may move it, so the
+    /// endpoints are asked whether they agree.
+    jump_reported: bool,
+}
+
+/// What became of a block 1 endpoint reported.
+#[derive(Debug, PartialEq, Eq)]
+enum Noted {
+    Taken,
+    /// Too far ahead for 1 endpoint alone; it waits for 2 to agree.
+    Unagreed,
+    /// Too far ahead to be real.
+    TooFarAhead,
+}
+
+impl SeenBlock {
+    fn new() -> Self {
+        Self {
+            number: 0,
+            moved_at: Instant::now(),
+            confirmed: false,
+            cross_checked_at: None,
+            jump_reported: false,
+        }
+    }
+
+    /// The highest block that believably follows the newest one seen: a week of blocks past
+    /// it, plus what the chain can have added since.
+    fn believable_limit(&self, now: Instant) -> u64 {
+        let since = now.saturating_duration_since(self.moved_at).as_secs();
+        self.number
+            .saturating_add(WEEK_OF_BLOCKS)
+            .saturating_add(since.saturating_mul(BLOCKS_PER_SECOND))
+    }
+
+    /// The lowest and highest latest block an endpoint may report to be read from: from the
+    /// newest seen to its believable limit once confirmed, with no limit until then.
+    fn bounds(&self, now: Instant) -> (u64, u64) {
+        let highest = if self.confirmed {
+            self.believable_limit(now)
+        } else {
+            u64::MAX
+        };
+        (self.number, highest)
+    }
+
+    /// The highest block 1 endpoint alone may move a confirmed newest block to: a minute of
+    /// blocks past it, plus what the chain can have added since.
+    fn lone_limit(&self, now: Instant) -> u64 {
+        let since = now.saturating_duration_since(self.moved_at).as_secs();
+        self.number
+            .saturating_add(AGREE_WITHIN_BLOCKS)
+            .saturating_add(since.saturating_mul(BLOCKS_PER_SECOND))
+    }
+
+    /// Take `block`, reported by 1 endpoint, as seen. Once the newest block is confirmed, one
+    /// too far ahead to be real is refused, and one past [`Self::lone_limit`] waits for 2
+    /// endpoints to agree, unless this is the `only_endpoint` there is to ask.
+    fn advance(&mut self, block: u64, now: Instant, only_endpoint: bool) -> Noted {
+        if self.confirmed {
+            if block > self.believable_limit(now) {
+                return Noted::TooFarAhead;
+            }
+            if !only_endpoint && block > self.lone_limit(now) {
+                self.jump_reported = true;
+                return Noted::Unagreed;
+            }
+        }
+        self.take(block, now);
+        Noted::Taken
+    }
+
+    fn take(&mut self, block: u64, now: Instant) {
+        if block > self.number {
+            self.number = block;
+            self.moved_at = now;
+        }
+    }
+
+    /// Take `block` as one the chain is known to have reached. An unconfirmed newest block more
+    /// than a minute of blocks past it came from a faulty endpoint, so it is replaced.
+    fn confirm(&mut self, block: u64, now: Instant) {
+        self.jump_reported = false;
+        if self.confirmed {
+            if block <= self.believable_limit(now) {
+                self.take(block, now);
+            }
+            return;
+        }
+        if block > self.number || self.number > block.saturating_add(AGREE_WITHIN_BLOCKS) {
+            self.number = block;
+            self.moved_at = now;
+        }
+        self.confirmed = true;
+    }
+
+    /// Whether to ask every endpoint for its latest block: only while unconfirmed or after a
+    /// jump 1 endpoint reported, and at most once every [`CROSS_CHECK_INTERVAL`].
+    fn cross_check_due(&mut self, now: Instant) -> bool {
+        let checked_lately = self
+            .cross_checked_at
+            .is_some_and(|at| now.saturating_duration_since(at) < CROSS_CHECK_INTERVAL);
+        if (self.confirmed && !self.jump_reported) || checked_lately {
+            return false;
+        }
+        self.cross_checked_at = Some(now);
+        true
+    }
+}
+
+/// The newest of the latest blocks that the most endpoints agree on, at least 2 of them within
+/// a minute of blocks of each other, or `None` when no 2 agree.
+fn agreed_head(mut heads: Vec<u64>) -> Option<u64> {
+    heads.sort_unstable();
+    let mut agreed: Option<(usize, u64)> = None;
+    let mut start = 0;
+    for (end, &head) in heads.iter().enumerate() {
+        while head - heads[start] > AGREE_WITHIN_BLOCKS {
+            start += 1;
+        }
+        let agreeing = end - start + 1;
+        if agreeing >= 2 && agreed.is_none_or(|(most, _)| agreeing >= most) {
+            agreed = Some((agreeing, head));
+        }
+    }
+    agreed.map(|(_, head)| head)
+}
+
+/// Why a read's attempts were refused, to tell a wrong newest block, or endpoints all far out
+/// of step, from an outage.
+struct Refusals {
+    /// How far, in blocks, the nearest endpoint refused for its latest block was off.
+    nearest: AtomicU64,
+    /// Attempts that failed for any other reason.
+    other_failures: AtomicU64,
+}
+
+impl Refusals {
+    fn new() -> Self {
+        Self {
+            nearest: AtomicU64::new(u64::MAX),
+            other_failures: AtomicU64::new(0),
+        }
+    }
+
+    /// Refuse an endpoint whose latest block is older than the newest one seen.
+    fn behind(&self, head: u64, seen: u64) -> Result<(), TransportError> {
+        if head >= seen {
+            return Ok(());
+        }
+        self.nearest.fetch_min(seen - head, Ordering::Relaxed);
+        Err(TransportErrorKind::custom_str(&format!(
+            "endpoint is at block {head}, {BEHIND_A_SEEN_BLOCK} ({seen})"
+        )))
+    }
+
+    /// Refuse an endpoint whose latest block is too far ahead of the newest one seen to be real.
+    fn far_ahead(&self, head: u64, seen: u64, highest: u64) -> Result<(), TransportError> {
+        if head <= highest {
+            return Ok(());
+        }
+        self.nearest.fetch_min(head - seen, Ordering::Relaxed);
+        Err(TransportErrorKind::custom_str(&format!(
+            "endpoint is at block {head}, {FAR_AHEAD_OF_A_SEEN_BLOCK} ({seen})"
+        )))
+    }
+
+    /// Count an attempt that failed for another reason.
+    fn other<T>(&self, result: Result<T, TransportError>) -> Result<T, TransportError> {
+        if result.is_err() {
+            self.other_failures.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    /// Whether every attempt was refused for its block, the nearest over an hour of blocks
+    /// off: then the endpoints, or the newest block seen, are wrong, not briefly behind.
+    fn all_far_off(&self) -> bool {
+        let nearest = self.nearest.load(Ordering::Relaxed);
+        self.other_failures.load(Ordering::Relaxed) == 0
+            && nearest != u64::MAX
+            && nearest > ALERT_GAP_BLOCKS
+    }
+
+    /// An ERROR for a read that failed because every endpoint was far out of step.
+    fn alert(&self, operation: &str, seen: u64) {
+        if self.all_far_off() {
+            tracing::error!(
+                event = "rpc_blocks_refused",
+                operation,
+                seen_block = seen,
+                blocks_off = self.nearest.load(Ordering::Relaxed),
+                "Every RPC endpoint is over an hour of blocks from the newest block dipper has \
+                 seen, so chain reads are refused; check the endpoints are in sync and on the \
+                 right chain, then restart dipper"
+            );
+        }
+    }
+}
+
+/// How long a read reuses an endpoint's latest block before asking it again: about 4 blocks.
+/// A read at it is still checked against the newest block seen, and asking before every read
+/// doubled the calls a run of reads makes.
+const HEAD_REUSE: Duration = Duration::from_secs(1);
+
+/// Each endpoint's latest block and when it was asked for, by the endpoint's place in the list.
+struct EndpointHeads(std::sync::Mutex<Vec<Option<(u64, Instant)>>>);
+
+impl EndpointHeads {
+    fn new(endpoints: usize) -> Self {
+        Self(std::sync::Mutex::new(vec![None; endpoints]))
+    }
+
+    fn slots(&self) -> std::sync::MutexGuard<'_, Vec<Option<(u64, Instant)>>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// `endpoint`'s latest block, if it was asked for under [`HEAD_REUSE`] before `now`.
+    fn fresh(&self, endpoint: usize, now: Instant) -> Option<u64> {
+        let (head, asked_at) = self.slots()[endpoint]?;
+        (now.saturating_duration_since(asked_at) < HEAD_REUSE).then_some(head)
+    }
+
+    fn remember(&self, endpoint: usize, head: u64, asked_at: Instant) {
+        self.slots()[endpoint] = Some((head, asked_at));
+    }
+
+    fn forget(&self, endpoint: usize) {
+        self.slots()[endpoint] = None;
+    }
+
+    /// `endpoint`'s latest block, reused if fresh and not behind `seen`, the newest block seen,
+    /// otherwise asked for and remembered.
+    async fn latest(
+        &self,
+        provider: &HttpProvider,
+        endpoint: usize,
+        seen: u64,
+        refusals: &Refusals,
+    ) -> Result<u64, TransportError> {
+        let reusable = self
+            .fresh(endpoint, Instant::now())
+            .filter(|&head| head >= seen);
+        if let Some(head) = reusable {
+            return Ok(head);
+        }
+        let asked_at = Instant::now();
+        let head = refusals.other(provider.get_block_number().await)?;
+        self.remember(endpoint, head, asked_at);
+        Ok(head)
+    }
+}
+
+/// `AgreementDetails.state` flags from `IAgreementCollector.sol` (REGISTERED=1,
+/// ACCEPTED=2, NOTICE_GIVEN=4, SETTLED=8, BY_PROVIDER=32). `getAgreementDetails` keeps
+/// ACCEPTED set on a canceled agreement and ORs in NOTICE_GIVEN, so a cancel must clear it,
+/// not just lack it. SETTLED: nothing left to claim. BY_PROVIDER: the indexer cancelled.
+const STATE_REGISTERED: u16 = 1;
 const STATE_ACCEPTED: u16 = 2;
 const STATE_NOTICE_GIVEN: u16 = 4;
+const STATE_SETTLED: u16 = 8;
+const STATE_BY_PROVIDER: u16 = 32;
+
+/// Live iff the terms are accepted and no cancellation notice exists, or an
+/// offer is still stored for the indexer to accept. A cancel sets NOTICE_GIVEN
+/// while ACCEPTED stays set, so the notice bit tells a live agreement from a
+/// cancelled one; a revoked offer reads as an empty state. An offer past its
+/// deadline stays stored but is SETTLED, since it can no longer be accepted.
+fn still_live(state: u16) -> bool {
+    let accepted = state & STATE_ACCEPTED != 0;
+    let pending_offer = state & STATE_REGISTERED != 0 && !accepted && state & STATE_SETTLED == 0;
+    pending_offer || (accepted && state & STATE_NOTICE_GIVEN == 0)
+}
+
+fn on_chain(state: u16) -> AgreementOnChain {
+    if still_live(state) {
+        AgreementOnChain::Live
+    } else if state & STATE_BY_PROVIDER != 0 {
+        AgreementOnChain::EndedByIndexer
+    } else {
+        AgreementOnChain::NotLive
+    }
+}
 
 /// Error patterns that indicate a nonce-related issue.
 ///
@@ -225,6 +552,12 @@ struct AlloyChainClientInner {
     submit_lock: Mutex<()>,
     /// How long one submission may hold `submit_lock`; see `derive_submit_deadline`.
     submit_deadline: Duration,
+    /// The newest block dipper has seen. An agreement's state is never read from an endpoint
+    /// behind it, so a lagging endpoint can't undo what dipper saw, nor from one too far
+    /// ahead of it to be real, so a faulty endpoint can't refuse every read after it.
+    seen_block: std::sync::Mutex<SeenBlock>,
+    /// Each endpoint's latest block, so a run of reads asks for it once a second, not every read.
+    endpoint_heads: EndpointHeads,
 }
 
 impl AlloyChainClient {
@@ -261,6 +594,7 @@ impl AlloyChainClient {
         );
 
         let submit_deadline = derive_submit_deadline(&rpc_pool);
+        let endpoint_heads = EndpointHeads::new(rpc_pool.endpoint_count());
 
         Ok(Self {
             inner: Arc::new(AlloyChainClientInner {
@@ -275,6 +609,8 @@ impl AlloyChainClient {
                 nonce: AtomicU64::new(NONCE_UNINITIALIZED),
                 submit_lock: Mutex::new(()),
                 submit_deadline,
+                seen_block: std::sync::Mutex::new(SeenBlock::new()),
+                endpoint_heads,
             }),
         })
     }
@@ -503,9 +839,8 @@ impl AlloyChainClient {
     /// already does. Signing happens once, up front, so every endpoint is offered the same
     /// bytes under one hash and the hash is known before anyone is asked to accept them.
     async fn send_transaction(&self, tx: &TransactionRequest) -> Result<B256, ChainClientError> {
-        // Nothing fills a field in on this path any more, and a request that names no chain is
-        // signed for chain 1 rather than refused, so check before the signature exists. Not a
-        // `ConfigError`: the cancel path reads that as the chain client being switched off.
+        // Nothing fills a field in on this path, and a request that names no chain is signed
+        // for chain 1 rather than refused, so check before the signature exists.
         if tx.chain_id() != Some(self.inner.chain_id) {
             return Err(ChainClientError::SubmitFailed(anyhow::anyhow!(
                 "refusing to sign for chain {:?} while configured for chain {}",
@@ -573,9 +908,9 @@ impl AlloyChainClient {
             .await?;
 
         match self.wait_for_receipt(tx_hash, RECEIPT_POLL_TIMEOUT).await? {
-            Some(true) => Ok(Some(tx_hash)),
-            Some(false) => Err(ChainClientError::TxReverted { tx_hash }),
-            None => {
+            ReceiptWait::Mined(true) => Ok(Some(tx_hash)),
+            ReceiptWait::Mined(false) => Err(ChainClientError::TxReverted { tx_hash }),
+            ReceiptWait::NotSeen { checked } => {
                 tracing::warn!(
                     reconciling = subject,
                     tx_hash = %tx_hash,
@@ -585,8 +920,124 @@ impl AlloyChainClient {
                 if let Err(err) = self.fill_nonce_gap(dropped_nonce).await {
                     tracing::warn!(nonce = dropped_nonce, error = %err, "Failed to fill mempool nonce gap");
                 }
-                Err(ChainClientError::TxDropped { tx_hash })
+                Err(ChainClientError::TxDropped {
+                    tx_hash,
+                    receipt_checked: checked,
+                })
             }
+        }
+    }
+
+    /// The agreement's `AgreementDetails.state` flags for its current terms.
+    async fn agreement_state(&self, agreement_id: &[u8; 16]) -> Result<u16, ChainClientError> {
+        let call = IRecurringCollector::getAgreementDetailsCall {
+            agreementId: FixedBytes::<16>::from_slice(agreement_id),
+            index: thegraph_core::alloy::primitives::U256::from(VERSION_CURRENT),
+        };
+        let collector = self.inner.recurring_collector_address;
+        Ok(self
+            .view_at_seen_block(collector, call, "get_agreement_details")
+            .await?
+            .state)
+    }
+
+    /// Run a read-only contract call at the endpoint's latest block, as of [`HEAD_REUSE`] ago at
+    /// most, refusing an endpoint whose latest block is older than one dipper has already seen,
+    /// or too far ahead of it to be real; the pool moves on to the next endpoint instead.
+    async fn view_at_seen_block<C: SolCall>(
+        &self,
+        to: Address,
+        call: C,
+        operation: &'static str,
+    ) -> Result<C::Return, ChainClientError> {
+        let calldata = call.abi_encode();
+        self.cross_check_seen_block().await;
+        let (seen, highest) = self.block_bounds();
+        let refusals = Refusals::new();
+        let heads = &self.inner.endpoint_heads;
+        let read = self
+            .inner
+            .rpc_pool
+            .execute_with_endpoint(operation, |provider, endpoint| {
+                let calldata = calldata.clone();
+                let refusals = &refusals;
+                async move {
+                    let head = heads.latest(&provider, endpoint, seen, refusals).await?;
+                    let read = async {
+                        refusals.behind(head, seen)?;
+                        refusals.far_ahead(head, seen, highest)?;
+                        let tx = TransactionRequest::default().to(to).input(calldata.into());
+                        refusals.other(provider.call(tx).block(BlockId::number(head)).await)
+                    };
+                    // An endpoint refused or failing may have moved on by the next attempt.
+                    let output = read.await.inspect_err(|_| heads.forget(endpoint))?;
+                    Ok((head, output))
+                }
+            })
+            .await;
+        let (head, output) = read.inspect_err(|_| refusals.alert(operation, seen))?;
+        self.note_block(head);
+        C::abi_decode_returns(&output).map_err(|err| {
+            ChainClientError::RpcError(anyhow::anyhow!("undecodable {operation} from {to}: {err}"))
+        })
+    }
+
+    fn seen_block(&self) -> std::sync::MutexGuard<'_, SeenBlock> {
+        self.inner
+            .seen_block
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The lowest and highest latest block an endpoint may report to be read from.
+    fn block_bounds(&self) -> (u64, u64) {
+        self.seen_block().bounds(Instant::now())
+    }
+
+    /// Confirm the newest block seen from the endpoints' own agreement, if it isn't yet and
+    /// there are at least 2 to agree.
+    async fn cross_check_seen_block(&self) {
+        let pool = &self.inner.rpc_pool;
+        if pool.endpoint_count() < 2 || !self.seen_block().cross_check_due(Instant::now()) {
+            return;
+        }
+        let heads = pool.latest_blocks(CROSS_CHECK_DEADLINE).await;
+        match agreed_head(heads.clone()) {
+            Some(head) => self.seen_block().confirm(head, Instant::now()),
+            None => tracing::warn!(
+                latest_blocks = ?heads,
+                "No 2 RPC endpoints agree on the chain's latest block; until they do, or a \
+                 receipt confirms it, any endpoint's block is taken as the newest seen and \
+                 endpoints behind it are refused"
+            ),
+        }
+    }
+
+    /// Remember a block dipper has seen, so later reads are never older. One too far ahead to
+    /// be real is ignored, so it can't refuse every read after it, and one over a minute ahead
+    /// waits for 2 endpoints to agree on it.
+    fn note_block(&self, block: u64) {
+        let only_endpoint = self.inner.rpc_pool.endpoint_count() < 2;
+        let (noted, seen) = {
+            let mut seen = self.seen_block();
+            (
+                seen.advance(block, Instant::now(), only_endpoint),
+                seen.number,
+            )
+        };
+        match noted {
+            Noted::Taken => {}
+            Noted::Unagreed => tracing::warn!(
+                block,
+                seen_block = seen,
+                "Not moving to a block over a minute ahead of the newest block dipper has seen \
+                 until 2 RPC endpoints agree on it"
+            ),
+            Noted::TooFarAhead => tracing::warn!(
+                block,
+                seen_block = seen,
+                "Ignoring a block too far ahead of the newest block dipper has seen"
+            ),
         }
     }
 
@@ -614,15 +1065,16 @@ impl AlloyChainClient {
         })
     }
 
-    /// Poll `eth_getTransactionReceipt` until the tx has mined or the timeout elapses.
-    /// `Ok(Some(status))` reports the receipt's success flag; `Ok(None)` says the tx never
-    /// appeared in time (dropped from the mempool). Transient RPC errors keep polling.
+    /// Poll `eth_getTransactionReceipt` until the tx has mined or the timeout elapses, saying
+    /// whether it mined and succeeded, or never appeared in time (dropped from the mempool), and
+    /// then whether any check got an answer. Transient RPC errors keep polling.
     async fn wait_for_receipt(
         &self,
         tx_hash: B256,
         timeout: Duration,
-    ) -> Result<Option<bool>, ChainClientError> {
+    ) -> Result<ReceiptWait, ChainClientError> {
         let deadline = tokio::time::Instant::now() + timeout;
+        let mut checked = false;
         loop {
             let receipt = self
                 .inner
@@ -633,8 +1085,13 @@ impl AlloyChainClient {
                 .await;
 
             match receipt {
-                Ok(Some(r)) => return Ok(Some(r.status())),
-                Ok(None) => {} // not mined yet
+                Ok(Some(r)) => {
+                    if let Some(block) = r.block_number {
+                        self.seen_block().confirm(block, Instant::now());
+                    }
+                    return Ok(ReceiptWait::Mined(r.status()));
+                }
+                Ok(None) => checked = true, // not mined yet
                 Err(e) => {
                     // Transient RPC error: log and keep polling. If it persists, the outer
                     // handler sees the timeout as `Ok(None)` and resubmits, the safe default.
@@ -647,7 +1104,7 @@ impl AlloyChainClient {
             }
 
             if tokio::time::Instant::now() >= deadline {
-                return Ok(None);
+                return Ok(ReceiptWait::NotSeen { checked });
             }
             tokio::time::sleep(RECEIPT_POLL_INTERVAL).await;
         }
@@ -657,16 +1114,31 @@ impl AlloyChainClient {
 #[async_trait]
 impl ChainClient for AlloyChainClient {
     async fn latest_block_timestamp(&self) -> Result<u64, ChainClientError> {
-        let block = self
+        self.cross_check_seen_block().await;
+        let (seen, highest) = self.block_bounds();
+        let refusals = Refusals::new();
+        let read = self
             .inner
             .rpc_pool
-            .execute("get_latest_block", |provider| async move {
-                provider.get_block_by_number(BlockNumberOrTag::Latest).await
+            .execute("get_latest_block", |provider| {
+                let refusals = &refusals;
+                async move {
+                    let block = refusals
+                        .other(provider.get_block_by_number(BlockNumberOrTag::Latest).await)?;
+                    // A lagging endpoint's time is only a little early, which brings nothing forward.
+                    if let Some(block) = &block {
+                        refusals.far_ahead(block.header.number, seen, highest)?;
+                    }
+                    Ok(block)
+                }
             })
-            .await?
+            .await;
+        let block = read
+            .inspect_err(|_| refusals.alert("get_latest_block", seen))?
             .ok_or_else(|| {
                 ChainClientError::RpcError(anyhow::anyhow!("no latest block returned"))
             })?;
+        self.note_block(block.header.number);
         Ok(block.header.timestamp)
     }
 
@@ -703,9 +1175,9 @@ impl ChainClient for AlloyChainClient {
             nonce: dropped_nonce,
         } = submitted;
         match self.wait_for_receipt(tx_hash, RECEIPT_POLL_TIMEOUT).await? {
-            Some(true) => Ok(Some(tx_hash)),
-            Some(false) => Err(ChainClientError::TxReverted { tx_hash }),
-            None => {
+            ReceiptWait::Mined(true) => Ok(Some(tx_hash)),
+            ReceiptWait::Mined(false) => Err(ChainClientError::TxReverted { tx_hash }),
+            ReceiptWait::NotSeen { checked } => {
                 tracing::warn!(
                     agreement_id = %format_args!("0x{}", agreement_id.iter().map(|b| format!("{b:02x}")).collect::<String>()),
                     tx_hash = %tx_hash,
@@ -715,7 +1187,10 @@ impl ChainClient for AlloyChainClient {
                 if let Err(err) = self.fill_nonce_gap(dropped_nonce).await {
                     tracing::warn!(nonce = dropped_nonce, error = %err, "Failed to fill mempool nonce gap");
                 }
-                Err(ChainClientError::TxDropped { tx_hash })
+                Err(ChainClientError::TxDropped {
+                    tx_hash,
+                    receipt_checked: checked,
+                })
             }
         }
     }
@@ -756,9 +1231,9 @@ impl ChainClient for AlloyChainClient {
             nonce: dropped_nonce,
         } = submitted;
         match self.wait_for_receipt(tx_hash, RECEIPT_POLL_TIMEOUT).await? {
-            Some(true) => Ok(Some(tx_hash)),
-            Some(false) => Err(ChainClientError::TxReverted { tx_hash }),
-            None => {
+            ReceiptWait::Mined(true) => Ok(Some(tx_hash)),
+            ReceiptWait::Mined(false) => Err(ChainClientError::TxReverted { tx_hash }),
+            ReceiptWait::NotSeen { checked } => {
                 tracing::warn!(
                     agreement_id = %format_args!("0x{}", agreement_id.iter().map(|b| format!("{b:02x}")).collect::<String>()),
                     tx_hash = %tx_hash,
@@ -768,48 +1243,19 @@ impl ChainClient for AlloyChainClient {
                 if let Err(err) = self.fill_nonce_gap(dropped_nonce).await {
                     tracing::warn!(nonce = dropped_nonce, error = %err, "Failed to fill mempool nonce gap");
                 }
-                Err(ChainClientError::TxDropped { tx_hash })
+                Err(ChainClientError::TxDropped {
+                    tx_hash,
+                    receipt_checked: checked,
+                })
             }
         }
     }
 
-    async fn agreement_still_active(
+    async fn agreement_on_chain(
         &self,
         agreement_id: &[u8; 16],
-    ) -> Result<bool, ChainClientError> {
-        let calldata = IRecurringCollector::getAgreementDetailsCall {
-            agreementId: FixedBytes::<16>::from_slice(agreement_id),
-            index: thegraph_core::alloy::primitives::U256::from(VERSION_CURRENT),
-        }
-        .abi_encode();
-
-        let collector = self.inner.recurring_collector_address;
-        let output = self
-            .inner
-            .rpc_pool
-            .execute("get_agreement_details", |provider| {
-                let calldata = calldata.clone();
-                async move {
-                    let tx = TransactionRequest::default()
-                        .to(collector)
-                        .input(calldata.into());
-                    provider.call(tx).await
-                }
-            })
-            .await?;
-
-        let details = IRecurringCollector::getAgreementDetailsCall::abi_decode_returns(&output)
-            .map_err(|err| {
-                ChainClientError::RpcError(anyhow::anyhow!(
-                    "undecodable getAgreementDetails from {collector}: {err}"
-                ))
-            })?;
-
-        // Live iff the terms are accepted and no cancellation notice exists.
-        // A cancel sets NOTICE_GIVEN while ACCEPTED stays set, so checking the
-        // notice bit is what tells a still-live agreement from a cancelled one.
-        let state = details.state;
-        Ok(state & STATE_ACCEPTED != 0 && state & STATE_NOTICE_GIVEN == 0)
+    ) -> Result<AgreementOnChain, ChainClientError> {
+        Ok(on_chain(self.agreement_state(agreement_id).await?))
     }
 
     async fn reconcile_provider(
@@ -1005,9 +1451,54 @@ impl ManagerEscrowReader for AlloyChainClient {
 #[cfg(test)]
 mod tests {
     use url::Url;
-    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate, matchers::method};
+    use wiremock::{
+        Mock, MockServer, Request, Respond, ResponseTemplate,
+        matchers::{body_partial_json, method},
+    };
 
     use super::*;
+
+    /// A cancel must leave nothing the indexer can still be paid through: neither
+    /// an accepted agreement without a cancellation notice, nor an offer still
+    /// stored and waiting to be accepted. The collector reports a revoked offer,
+    /// or an id it never saw, as an empty state.
+    #[test]
+    fn still_live_covers_accepted_agreements_and_pending_offers() {
+        const BY_PAYER: u16 = 16;
+        assert!(still_live(STATE_REGISTERED | STATE_ACCEPTED));
+        assert!(
+            still_live(STATE_REGISTERED),
+            "a pending offer can still be accepted"
+        );
+        assert!(
+            !still_live(STATE_REGISTERED | STATE_SETTLED),
+            "an offer past its deadline can't be"
+        );
+        assert!(
+            still_live(STATE_REGISTERED | STATE_ACCEPTED | STATE_SETTLED),
+            "an accepted agreement just collected from is still live"
+        );
+        assert!(!still_live(
+            STATE_REGISTERED | STATE_ACCEPTED | STATE_NOTICE_GIVEN | BY_PAYER | STATE_SETTLED
+        ));
+        assert!(!still_live(0), "revoked or never offered");
+    }
+
+    #[test]
+    fn tells_an_end_by_the_indexer_from_any_other() {
+        const BY_PAYER: u16 = 16;
+        let ended = STATE_REGISTERED | STATE_ACCEPTED | STATE_NOTICE_GIVEN;
+        assert_eq!(
+            on_chain(ended | STATE_BY_PROVIDER),
+            AgreementOnChain::EndedByIndexer
+        );
+        assert_eq!(on_chain(ended | BY_PAYER), AgreementOnChain::NotLive);
+        assert_eq!(on_chain(0), AgreementOnChain::NotLive);
+        assert_eq!(
+            on_chain(STATE_REGISTERED | STATE_ACCEPTED),
+            AgreementOnChain::Live
+        );
+    }
 
     /// Answers a send with a fixed transaction hash, echoing the request id so alloy's
     /// transport accepts the response. Any other call is a mistake in the test rather than
@@ -1999,6 +2490,547 @@ mod tests {
                 "result": format!("0x{}", thegraph_core::alloy::primitives::hex::encode(output)),
             }))
         }
+    }
+
+    /// Answers as an endpoint whose latest block is `head`, reporting `state` for any
+    /// agreement read at that block.
+    struct AgreementStateResponder {
+        head: AtomicU64,
+        /// Blocks the endpoint gains each time it reports its head.
+        catch_up: u64,
+        state: u16,
+    }
+
+    impl Respond for AgreementStateResponder {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).expect("JSON-RPC request body");
+            let result = match body["method"].as_str().unwrap_or_default() {
+                "eth_blockNumber" => {
+                    let head = self.head.fetch_add(self.catch_up, Ordering::SeqCst);
+                    format!("{head:#x}")
+                }
+                "eth_call" => {
+                    let at = body["params"][1].as_str().expect("a block number");
+                    let at = u64::from_str_radix(at.trim_start_matches("0x"), 16).expect("hex");
+                    assert!(
+                        at <= self.head.load(Ordering::SeqCst),
+                        "read at a block the endpoint has"
+                    );
+                    let details = IRecurringCollector::AgreementDetails {
+                        agreementId: FixedBytes::<16>::ZERO,
+                        payer: Address::ZERO,
+                        dataService: Address::ZERO,
+                        serviceProvider: Address::ZERO,
+                        versionHash: B256::ZERO,
+                        state: self.state,
+                    };
+                    let output =
+                        IRecurringCollector::getAgreementDetailsCall::abi_encode_returns(&details);
+                    format!(
+                        "0x{}",
+                        thegraph_core::alloy::primitives::hex::encode(output)
+                    )
+                }
+                other => panic!("unexpected call {other}"),
+            };
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": body["id"],
+                "result": result,
+            }))
+        }
+    }
+
+    async fn server_at_block(head: u64, state: u16) -> MockServer {
+        server_catching_up(head, 0, state).await
+    }
+
+    async fn server_catching_up(head: u64, catch_up: u64, state: u16) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(AgreementStateResponder {
+                head: AtomicU64::new(head),
+                catch_up,
+                state,
+            })
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn waits_for_an_endpoint_a_block_behind_to_catch_up() {
+        // Hosted endpoints spread calls across nodes, so one a block behind is routine
+        // rather than a reason to give up on the endpoint.
+        let endpoint = server_catching_up(94, 1, STATE_REGISTERED | STATE_ACCEPTED).await;
+        let client = client_over_retrying(vec![endpoint.uri().parse().expect("provider URL")], 1);
+        client.note_block(95);
+
+        let live = client
+            .agreement_on_chain(&[0xab; 16])
+            .await
+            .expect("read once the endpoint caught up")
+            .is_live();
+
+        assert!(live);
+    }
+
+    /// How many of `requests` called `method`.
+    fn calls_to(requests: &[wiremock::Request], method: &str) -> usize {
+        requests
+            .iter()
+            .filter(|r| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(&r.body).expect("JSON-RPC request body");
+                body["method"] == method
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn reads_in_quick_succession_ask_for_the_latest_block_once() {
+        let endpoint = server_at_block(100, STATE_REGISTERED).await;
+        let client = client_over(vec![endpoint.uri().parse().expect("provider URL")]);
+
+        for _ in 0..3 {
+            client.agreement_on_chain(&[0xab; 16]).await.expect("read");
+        }
+
+        let requests = endpoint.received_requests().await.unwrap_or_default();
+        assert_eq!(calls_to(&requests, "eth_blockNumber"), 1);
+        assert_eq!(calls_to(&requests, "eth_call"), 3);
+    }
+
+    #[test]
+    fn reuses_an_endpoints_latest_block_for_a_second_unless_forgotten() {
+        let asked_at = Instant::now();
+        let heads = EndpointHeads::new(2);
+        heads.remember(0, 100, asked_at);
+
+        let soon = asked_at + Duration::from_millis(900);
+        assert_eq!(heads.fresh(0, soon), Some(100));
+        assert_eq!(heads.fresh(0, asked_at + HEAD_REUSE), None, "asked again");
+        assert_eq!(heads.fresh(1, soon), None, "each endpoint gives its own");
+
+        heads.forget(0);
+        assert_eq!(heads.fresh(0, soon), None, "asked again after a failure");
+    }
+
+    #[tokio::test]
+    async fn asks_for_the_latest_block_again_once_a_newer_one_is_seen() {
+        // As when dipper's own transaction has just mined: the read must not come from before it.
+        let endpoint = server_catching_up(100, 1, STATE_REGISTERED).await;
+        let client = client_over(vec![endpoint.uri().parse().expect("provider URL")]);
+        client.agreement_on_chain(&[0xab; 16]).await.expect("read");
+        trust_block(&client, 101);
+
+        client.agreement_on_chain(&[0xab; 16]).await.expect("read");
+
+        let requests = endpoint.received_requests().await.unwrap_or_default();
+        assert_eq!(calls_to(&requests, "eth_blockNumber"), 2);
+    }
+
+    #[tokio::test]
+    async fn asks_for_the_latest_block_again_after_a_failed_read() {
+        // The endpoint may have answered from a node that lacks the block it gave.
+        let endpoint = server_at_block(100, STATE_REGISTERED).await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "eth_call" }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 0,
+                "error": { "code": -32000, "message": "missing trie node" },
+            })))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&endpoint)
+            .await;
+        let client = client_over(vec![endpoint.uri().parse().expect("provider URL")]);
+        let failed = client.agreement_on_chain(&[0xab; 16]).await;
+        assert!(failed.is_err(), "got {failed:?}");
+
+        client.agreement_on_chain(&[0xab; 16]).await.expect("read");
+
+        let requests = endpoint.received_requests().await.unwrap_or_default();
+        assert_eq!(calls_to(&requests, "eth_blockNumber"), 2);
+    }
+
+    #[tokio::test]
+    async fn never_reads_an_agreement_from_an_endpoint_behind_a_block_already_seen() {
+        // The lagging endpoint still shows the offer it hasn't seen accepted and cancelled.
+        let lagging = server_at_block(90, STATE_REGISTERED).await;
+        let current =
+            server_at_block(100, STATE_REGISTERED | STATE_ACCEPTED | STATE_NOTICE_GIVEN).await;
+        let client = client_over(vec![
+            lagging.uri().parse().expect("provider URL"),
+            current.uri().parse().expect("provider URL"),
+        ]);
+        // Not yet confirmed, as after a restart: a lagging endpoint is refused all the same.
+        client.note_block(95);
+
+        let live = client
+            .agreement_on_chain(&[0xab; 16])
+            .await
+            .expect("read")
+            .is_live();
+
+        assert!(!live, "read from the endpoint that has reached block 95");
+        assert_eq!(client.seen_block().number, 100);
+    }
+
+    #[tokio::test]
+    async fn fails_a_read_rather_than_answer_from_endpoints_all_behind() {
+        let lagging = server_at_block(90, STATE_REGISTERED).await;
+        let client = client_over(vec![lagging.uri().parse().expect("provider URL")]);
+        client.note_block(95);
+
+        let read = client.agreement_on_chain(&[0xab; 16]).await;
+
+        assert!(read.is_err(), "got {read:?}");
+    }
+
+    #[tokio::test]
+    async fn skips_an_endpoint_too_far_ahead_to_be_real() {
+        // Otherwise its block would refuse every read from the endpoints that are right.
+        let faulty = server_at_block(100 + WEEK_OF_BLOCKS + 1_000, STATE_REGISTERED).await;
+        let current =
+            server_at_block(150, STATE_REGISTERED | STATE_ACCEPTED | STATE_NOTICE_GIVEN).await;
+        let client = client_over(vec![
+            faulty.uri().parse().expect("provider URL"),
+            current.uri().parse().expect("provider URL"),
+        ]);
+        trust_block(&client, 100);
+
+        let live = client
+            .agreement_on_chain(&[0xab; 16])
+            .await
+            .expect("read")
+            .is_live();
+
+        assert!(!live, "read from the endpoint at block 150");
+        assert_eq!(client.seen_block().number, 150);
+    }
+
+    /// Set the newest block seen as a confirmed one, as a receipt for dipper's transaction does.
+    fn trust_block(client: &AlloyChainClient, block: u64) {
+        client.seen_block().confirm(block, Instant::now());
+    }
+
+    #[tokio::test]
+    async fn takes_the_first_block_after_a_restart_however_far_ahead() {
+        // Dipper may have been down for over a week.
+        let endpoint = server_at_block(WEEK_OF_BLOCKS * 3, STATE_REGISTERED).await;
+        let client = client_over(vec![endpoint.uri().parse().expect("provider URL")]);
+
+        client
+            .agreement_on_chain(&[0xab; 16])
+            .await
+            .expect("read")
+            .is_live();
+
+        assert_eq!(client.seen_block().number, WEEK_OF_BLOCKS * 3);
+    }
+
+    #[test]
+    fn ignores_a_receipt_block_too_far_ahead_to_be_real() {
+        let client = client_over(vec!["http://127.0.0.1:1".parse().expect("provider URL")]);
+        trust_block(&client, 100);
+
+        client.note_block(100 + WEEK_OF_BLOCKS + 1);
+        assert_eq!(client.seen_block().number, 100);
+
+        client.note_block(100 + WEEK_OF_BLOCKS);
+        assert_eq!(client.seen_block().number, 100 + WEEK_OF_BLOCKS);
+    }
+
+    #[test]
+    fn believes_a_week_of_blocks_ahead_plus_what_the_chain_added_since() {
+        // A quiet spell with no reads mustn't make the chain's real progress look faulty.
+        let now = Instant::now();
+        let seen = SeenBlock {
+            number: 100,
+            moved_at: now.checked_sub(Duration::from_secs(600)).expect("instant"),
+            confirmed: true,
+            cross_checked_at: None,
+            jump_reported: false,
+        };
+
+        assert_eq!(seen.bounds(now), (100, 100 + WEEK_OF_BLOCKS + 2_400));
+        assert_eq!(SeenBlock::new().bounds(now), (0, u64::MAX));
+    }
+
+    #[tokio::test]
+    async fn says_whether_any_receipt_check_was_answered() {
+        // A receipt that was never seen only shows the chain didn't mine it when an endpoint
+        // answered; when every check failed, an outage may be hiding one that did.
+        let empty = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 0,
+                "result": null,
+            })))
+            .mount(&empty)
+            .await;
+        let down = server_answering_500().await;
+        let wait = Duration::from_millis(100);
+
+        for (server, answered) in [(empty, true), (down, false)] {
+            let client = client_over(vec![server.uri().parse().expect("provider URL")]);
+            let found = client
+                .wait_for_receipt(B256::repeat_byte(0x01), wait)
+                .await
+                .expect("waited");
+
+            assert!(
+                matches!(found, ReceiptWait::NotSeen { checked } if checked == answered),
+                "answered: {answered}"
+            );
+        }
+    }
+
+    #[test]
+    fn never_goes_back_even_before_it_is_confirmed() {
+        // So a read just after dipper's cancel mined can't come from an endpoint behind it.
+        let now = Instant::now();
+        let mut seen = SeenBlock::new();
+        assert_eq!(seen.advance(100, now, false), Noted::Taken);
+        assert_eq!(seen.advance(90, now, false), Noted::Taken);
+
+        assert_eq!(seen.bounds(now), (100, u64::MAX));
+    }
+
+    #[test]
+    fn refuses_blocks_far_ahead_only_once_confirmed() {
+        // An endpoint stuck far behind may answer first after a restart; refusing what is
+        // far ahead of its block would shut out every endpoint that is right.
+        let now = Instant::now();
+        let mut seen = SeenBlock::new();
+        let real = 1_000 + WEEK_OF_BLOCKS * 3;
+        assert_eq!(seen.advance(1_000, now, false), Noted::Taken);
+        assert_eq!(
+            seen.advance(real, now, false),
+            Noted::Taken,
+            "taken while unconfirmed"
+        );
+
+        seen.confirm(real, now);
+
+        assert_eq!(
+            seen.advance(real + WEEK_OF_BLOCKS * 2, now, false),
+            Noted::TooFarAhead
+        );
+        assert_eq!(seen.bounds(now).0, real);
+    }
+
+    #[test]
+    fn waits_for_2_endpoints_to_agree_before_a_jump_past_a_confirmed_block() {
+        // 1 faulty endpoint moving it far ahead would have every endpoint that is right
+        // refused as behind, for as long as the real chain takes to catch up.
+        let now = Instant::now();
+        let mut seen = SeenBlock::new();
+        let real = 5_000_000;
+        seen.confirm(real, now);
+        let jump = real + AGREE_WITHIN_BLOCKS + 1_000;
+
+        assert_eq!(seen.advance(real + 10, now, false), Noted::Taken);
+        assert_eq!(seen.advance(jump, now, false), Noted::Unagreed);
+        assert_eq!(seen.bounds(now).0, real + 10);
+        assert!(seen.cross_check_due(now), "the endpoints are asked");
+
+        seen.confirm(jump, now);
+
+        assert_eq!(seen.bounds(now).0, jump, "taken once 2 agree");
+        assert!(!seen.cross_check_due(now + CROSS_CHECK_INTERVAL));
+        assert_eq!(
+            seen.advance(jump + AGREE_WITHIN_BLOCKS + 1, now, true),
+            Noted::Taken,
+            "the only endpoint has no other to agree with"
+        );
+    }
+
+    #[test]
+    fn a_confirmed_block_replaces_one_far_ahead_that_was_never_confirmed() {
+        let now = Instant::now();
+        let mut seen = SeenBlock::new();
+        let real = 5_000_000;
+        assert_eq!(
+            seen.advance(real + WEEK_OF_BLOCKS * 10, now, false),
+            Noted::Taken
+        );
+
+        seen.confirm(real, now);
+
+        assert_eq!(seen.bounds(now).0, real);
+    }
+
+    #[test]
+    fn agrees_on_the_head_most_endpoints_share() {
+        let real = 5_000_000;
+        assert_eq!(agreed_head(vec![1_000, real, real + 3]), Some(real + 3));
+        assert_eq!(
+            agreed_head(vec![real + WEEK_OF_BLOCKS, real + 2, real]),
+            Some(real + 2)
+        );
+        assert_eq!(agreed_head(vec![1_000, real]), None, "2 that disagree");
+        assert_eq!(agreed_head(vec![real]), None, "1 can't agree with itself");
+    }
+
+    #[test]
+    fn a_faulty_endpoint_well_ahead_neither_agrees_nor_moves_a_confirmed_block() {
+        // Its block taken as seen would have the endpoints that are right refused as behind
+        // until the chain caught up with it: 10,000 blocks is about 42 minutes.
+        let now = Instant::now();
+        let real = 5_000_000;
+        let faulty = real + 10_000;
+        assert_eq!(agreed_head(vec![real, real + 2, faulty]), Some(real + 2));
+
+        let mut seen = SeenBlock::new();
+        seen.confirm(real, now);
+        assert_eq!(seen.advance(faulty, now, false), Noted::Unagreed);
+        assert_eq!(seen.bounds(now).0, real);
+    }
+
+    #[test]
+    fn a_block_from_a_faulty_endpoint_well_ahead_is_replaced_once_confirmed() {
+        // After a restart the faulty endpoint may answer first, before anything is confirmed.
+        let now = Instant::now();
+        let real = 5_000_000;
+        let mut seen = SeenBlock::new();
+        assert_eq!(seen.advance(real + 10_000, now, false), Noted::Taken);
+
+        seen.confirm(real, now);
+
+        assert_eq!(seen.bounds(now).0, real);
+    }
+
+    #[test]
+    fn takes_the_higher_block_from_2_endpoints_that_disagree() {
+        // Which is right can't be told, so 1 stuck far behind is refused, and so is a right one
+        // behind 1 faulty far ahead, until a receipt replaces its block.
+        let now = Instant::now();
+        let real = 5_000_000;
+        let stuck = real - 10_000;
+        let faulty = real + 10_000;
+        assert_eq!(agreed_head(vec![stuck, real]), None);
+        assert_eq!(agreed_head(vec![real, faulty]), None);
+
+        let mut seen = SeenBlock::new();
+        assert_eq!(seen.advance(stuck, now, false), Noted::Taken);
+        assert_eq!(seen.advance(real, now, false), Noted::Taken);
+        assert_eq!(seen.bounds(now).0, real, "the stuck one is refused");
+        assert_eq!(seen.advance(faulty, now, false), Noted::Taken);
+        assert_eq!(seen.bounds(now).0, faulty, "the right one is refused");
+
+        seen.confirm(real + 4, now);
+        assert_eq!(seen.bounds(now).0, real + 4);
+    }
+
+    #[test]
+    fn takes_the_few_blocks_endpoints_that_are_right_differ_by() {
+        let now = Instant::now();
+        let real = 5_000_000;
+        let minute_ahead = real + AGREE_WITHIN_BLOCKS;
+        assert_eq!(agreed_head(vec![real, real + 3]), Some(real + 3));
+        assert_eq!(agreed_head(vec![real, minute_ahead]), Some(minute_ahead));
+
+        let mut seen = SeenBlock::new();
+        assert_eq!(seen.advance(minute_ahead, now, false), Noted::Taken);
+        seen.confirm(real, now);
+        assert_eq!(
+            seen.bounds(now).0,
+            minute_ahead,
+            "a lead of a minute is kept"
+        );
+
+        let mut seen = SeenBlock::new();
+        seen.confirm(real, now);
+        assert_eq!(seen.advance(real + 40, now, false), Noted::Taken);
+        assert_eq!(seen.advance(minute_ahead + 40, now, false), Noted::Taken);
+
+        // 10 quiet minutes, in which the chain can add 2,400 blocks.
+        let mut quiet = SeenBlock {
+            number: real,
+            moved_at: now.checked_sub(Duration::from_secs(600)).expect("instant"),
+            confirmed: true,
+            cross_checked_at: None,
+            jump_reported: false,
+        };
+        assert_eq!(quiet.advance(real + 2_400 + 40, now, false), Noted::Taken);
+    }
+
+    #[tokio::test]
+    async fn a_faulty_endpoint_well_ahead_does_not_shut_out_the_ones_that_are_right() {
+        let real = 5_000_000;
+        let ended = STATE_REGISTERED | STATE_ACCEPTED | STATE_NOTICE_GIVEN;
+        let right = server_at_block(real, ended).await;
+        let also_right = server_at_block(real, ended).await;
+        let faulty = server_at_block(real + 10_000, STATE_REGISTERED).await;
+        let client = client_over(vec![
+            right.uri().parse().expect("provider URL"),
+            also_right.uri().parse().expect("provider URL"),
+            faulty.uri().parse().expect("provider URL"),
+        ]);
+        // The faulty endpoint answered first after a restart.
+        client.note_block(real + 10_000);
+
+        let live = client
+            .agreement_on_chain(&[0xab; 16])
+            .await
+            .expect("read")
+            .is_live();
+
+        assert!(!live, "read from an endpoint that is right");
+        assert!(client.seen_block().confirmed);
+        assert_eq!(client.seen_block().number, real);
+    }
+
+    #[tokio::test]
+    async fn confirms_the_newest_block_from_endpoints_that_agree() {
+        // The first endpoint is stuck far behind; the other 2 agree, so it is passed over
+        // rather than read from.
+        let stuck = server_at_block(1_000, STATE_REGISTERED).await;
+        let ended = STATE_REGISTERED | STATE_ACCEPTED | STATE_NOTICE_GIVEN;
+        let current = server_at_block(5_000_002, ended).await;
+        let also_current = server_at_block(5_000_002, ended).await;
+        let client = client_over(vec![
+            stuck.uri().parse().expect("provider URL"),
+            current.uri().parse().expect("provider URL"),
+            also_current.uri().parse().expect("provider URL"),
+        ]);
+
+        let live = client
+            .agreement_on_chain(&[0xab; 16])
+            .await
+            .expect("read")
+            .is_live();
+
+        assert!(!live, "read from an endpoint that is right");
+        assert!(client.seen_block().confirmed);
+        assert_eq!(client.seen_block().number, 5_000_002);
+    }
+
+    #[test]
+    fn alerts_only_when_every_attempt_is_refused_far_off() {
+        let far = Refusals::new();
+        assert!(far.behind(100, 100 + ALERT_GAP_BLOCKS + 1).is_err());
+        assert!(far.all_far_off());
+
+        let near = Refusals::new();
+        assert!(near.behind(97, 100).is_err());
+        assert!(!near.all_far_off(), "a few blocks of lag clears by itself");
+
+        // A primary that is down while a fallback lags is an outage, not a wrong block.
+        let outage = Refusals::new();
+        assert!(outage.behind(100, 100 + ALERT_GAP_BLOCKS + 1).is_err());
+        let failed: Result<(), TransportError> = Err(TransportErrorKind::custom_str("down"));
+        assert!(outage.other(failed).is_err());
+        assert!(!outage.all_far_off());
+
+        assert!(!Refusals::new().all_far_off(), "none refused");
     }
 
     async fn client_over_manager(

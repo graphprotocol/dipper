@@ -22,12 +22,8 @@ pub enum Message {
     /// See [`SendIndexingAgreementProposal`] for more details.
     SendIndexingAgreementProposal(SendIndexingAgreementProposal),
 
-    /// Cancel a rejected agreement on-chain.
-    ///
-    /// When an indexer rejects an agreement off-chain but later accepts it on-chain,
-    /// this message triggers on-chain cancellation via `cancelIndexingAgreementByPayer`.
-    ///
-    /// See [`CancelRejectedAgreementOnChain`] for more details.
+    /// Check on-chain an agreement dipper rejected or cancelled that the chain listener saw
+    /// accepted. See [`CancelRejectedAgreementOnChain`] for more details.
     CancelRejectedAgreementOnChain(CancelRejectedAgreementOnChain),
 
     /// Submit an RCA offer on-chain after the indexer has accepted the
