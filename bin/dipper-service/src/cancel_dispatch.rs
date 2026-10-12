@@ -85,10 +85,10 @@ pub enum CancelReason {
 }
 
 impl CancelReason {
-    fn ended_status(self) -> &'static str {
+    fn ended_status(self) -> IndexingAgreementStatus {
         match self {
-            Self::NotWanted => "CANCELED_BY_REQUESTER",
-            Self::Abandoned => "ABANDONED_BY_INDEXER",
+            Self::NotWanted => IndexingAgreementStatus::CanceledByRequester,
+            Self::Abandoned => IndexingAgreementStatus::AbandonedByIndexer,
         }
     }
 }
@@ -258,8 +258,8 @@ pub async fn confirm_cancelled<R: AgreementRegistry + Sync>(
     tracing::info!(
         agreement_id = %agreement.id,
         indexing_request_id = %agreement.indexing_request_id,
-        old_status = "CANCELLING",
-        new_status = reason.ended_status(),
+        old_status = %IndexingAgreementStatus::Cancelling,
+        new_status = %reason.ended_status(),
         reason = "cancel_confirmed_on_chain",
         "agreement state transition"
     );
@@ -342,7 +342,7 @@ where
         indexer_id = %agreement.indexer.id,
         indexing_request_id = %agreement.indexing_request_id,
         old_status = %agreement.status,
-        new_status = "CANCELLING",
+        new_status = %IndexingAgreementStatus::Cancelling,
         reason = "live_on_chain_after_end",
         "agreement state transition"
     );
@@ -420,7 +420,7 @@ pub(crate) mod tests {
     use time::OffsetDateTime;
     use url::Url;
 
-    use super::{LiveCancel, SCOPE_BOTH, cancel_agreement_on_chain};
+    use super::{CancelReason, LiveCancel, SCOPE_BOTH, cancel_agreement_on_chain};
     use crate::{
         chain_client::{AgreementOnChain, ChainClient, ChainClientError},
         config::IndexingAgreementConfig,
@@ -558,6 +558,18 @@ pub(crate) mod tests {
             rejection_reason: None,
             terms_version_hash: hash,
         }
+    }
+
+    #[test]
+    fn each_reason_ends_an_agreement_in_its_own_status() {
+        assert_eq!(
+            CancelReason::NotWanted.ended_status(),
+            IndexingAgreementStatus::CanceledByRequester
+        );
+        assert_eq!(
+            CancelReason::Abandoned.ended_status(),
+            IndexingAgreementStatus::AbandonedByIndexer
+        );
     }
 
     #[tokio::test]

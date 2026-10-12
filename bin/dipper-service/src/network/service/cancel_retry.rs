@@ -16,7 +16,7 @@ use crate::{
     config::IndexingAgreementConfig,
     registry::{
         AgreementRegistry, CancelKind, CancellingAgreement, IndexingAgreement,
-        IndexingRequestRegistry,
+        IndexingAgreementStatus, IndexingRequestRegistry,
     },
     worker::service::WorkerQueue,
 };
@@ -329,8 +329,8 @@ fn log_end_by_indexer(agreement: &IndexingAgreement, changed: bool) {
         tracing::info!(
             agreement_id = %agreement.id,
             indexing_request_id = %agreement.indexing_request_id,
-            old_status = "CANCELLING",
-            new_status = "CANCELED_BY_INDEXER",
+            old_status = %IndexingAgreementStatus::Cancelling,
+            new_status = %IndexingAgreementStatus::CanceledByIndexer,
             reason = "indexer_ended_it_before_dipper_cancelled",
             "agreement state transition"
         );
@@ -446,11 +446,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        cancel_dispatch::tests::agreement,
-        chain_client::AgreementOnChain,
-        registry::{IndexingAgreementStatus, StubAgreementRegistry},
-        test_support::logged,
-        worker::service::JobPriority,
+        cancel_dispatch::tests::agreement, chain_client::AgreementOnChain,
+        registry::StubAgreementRegistry, test_support::logged, worker::service::JobPriority,
     };
 
     const DEADLINE: u64 = 1_000;
@@ -1043,6 +1040,11 @@ mod tests {
             );
             assert_eq!(
                 logs.contains("indexer_ended_it_before_dipper_cancelled"),
+                changed,
+                "{logs}"
+            );
+            assert_eq!(
+                logs.contains("old_status=CANCELLING new_status=CANCELED_BY_INDEXER"),
                 changed,
                 "{logs}"
             );

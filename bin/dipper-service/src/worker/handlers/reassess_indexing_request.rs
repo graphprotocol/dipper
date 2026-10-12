@@ -27,9 +27,9 @@ use crate::{
         },
     },
     registry::{
-        AgreementRegistry, IndexerDenylistRegistry, IndexingAgreementTerms,
-        IndexingAgreementTermsMetadata, IndexingRequestRegistry, NewAgreementParams,
-        PendingCancellationRegistry,
+        AgreementRegistry, IndexerDenylistRegistry, IndexingAgreementStatus,
+        IndexingAgreementTerms, IndexingAgreementTermsMetadata, IndexingRequestRegistry,
+        NewAgreementParams, PendingCancellationRegistry,
     },
     signing::eip712::Eip712Signer,
     worker::{
@@ -556,7 +556,7 @@ where
                         agreement_id = %id,
                         indexing_request_id = %indexing_request_id,
                         old_status = "none",
-                        new_status = "CREATED",
+                        new_status = %IndexingAgreementStatus::Created,
                         reason = "reassessment_replacement",
                         "agreement state transition"
                     );
@@ -594,7 +594,7 @@ where
                         agreement_id = %id,
                         indexing_request_id = %indexing_request_id,
                         old_status = "none",
-                        new_status = "CREATED",
+                        new_status = %IndexingAgreementStatus::Created,
                         reason = "reassessment_addition",
                         "agreement state transition"
                     );
@@ -674,7 +674,7 @@ where
             agreement_id = %old_agreement.id,
             indexing_request_id = %indexing_request_id,
             old_status = %old_agreement.status,
-            new_status,
+            new_status = %new_status,
             reason = "reassessment_not_in_target_group",
             "agreement state transition"
         );
@@ -2015,8 +2015,8 @@ mod lifecycle_event_tests {
 /// What became of an old agreement taken out of the target group.
 #[derive(Debug, PartialEq, Eq)]
 enum Unpaired {
-    /// Moved to the status named.
-    Moved(&'static str),
+    /// Moved to this status.
+    Moved(IndexingAgreementStatus),
     /// Already ended or being cancelled, as a race with another path can leave it.
     AlreadyEnding,
     /// Couldn't be marked; logged.
@@ -2042,7 +2042,7 @@ where
             .mark_indexing_agreement_as_canceled_by_requester(&agreement.id)
             .await
         {
-            Ok(()) => Unpaired::Moved("CANCELED_BY_REQUESTER"),
+            Ok(()) => Unpaired::Moved(IndexingAgreementStatus::CanceledByRequester),
             Err(err) => unmarked(agreement, &err),
         };
     }
@@ -2056,12 +2056,12 @@ where
     .await
     {
         Ok(crate::cancel_dispatch::CancelStarted::Ended) => {
-            Unpaired::Moved("CANCELED_BY_REQUESTER")
+            Unpaired::Moved(IndexingAgreementStatus::CanceledByRequester)
         }
         Ok(
             crate::cancel_dispatch::CancelStarted::NotLive
             | crate::cancel_dispatch::CancelStarted::MayBeLive,
-        ) => Unpaired::Moved("CANCELLING"),
+        ) => Unpaired::Moved(IndexingAgreementStatus::Cancelling),
         Err(err) => unmarked(agreement, &err),
     }
 }
