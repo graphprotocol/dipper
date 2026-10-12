@@ -765,18 +765,22 @@ async fn cancel_and_reassess<R, W, C>(
         return;
     };
     forget_replaced_agreement(agreement, registry).await;
-    if started == CancelStarted::MayBeLive {
-        tracing::info!(
-            agreement_id = %agreement.id,
-            "Stale agreement may still be paid; the cancel retry replaces it once it has ended"
-        );
-        return;
-    }
-    // Until its end is noted it keeps its slot, so a reassessment queued now could add nothing
-    // and, noted as queued, nothing would queue another for a day.
-    if started == CancelStarted::NotLive && !note_seen_ended(agreement, registry, db_timeout).await
-    {
-        return;
+    match started {
+        CancelStarted::Ended => {}
+        CancelStarted::MayBeLive => {
+            tracing::info!(
+                agreement_id = %agreement.id,
+                "Stale agreement may still be paid; the cancel retry replaces it once it has ended"
+            );
+            return;
+        }
+        // Until its end is noted it keeps its slot, so a reassessment that runs before its
+        // replacement is marked queued adds nothing, and nothing queues another for a day.
+        CancelStarted::NotLive => {
+            if !note_seen_ended(agreement, registry, db_timeout).await {
+                return;
+            }
+        }
     }
     replace_abandoned(agreement, registry, worker_queue, db_timeout, queue_timeout).await;
 }
