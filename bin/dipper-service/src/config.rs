@@ -539,7 +539,8 @@ pub struct LivenessCheckerConfig {
     #[serde(default = "default_liveness_checker_request_timeout")]
     pub request_timeout: Duration,
 
-    /// Maximum agreements to fetch per cycle (default: 500).
+    /// Agreements to check per cycle, those longest without progress (default: 500). Every
+    /// other indexer holding an accepted agreement adds 1 more, so all are asked each cycle.
     #[serde(default = "default_liveness_checker_batch_size")]
     pub batch_size: i64,
 
