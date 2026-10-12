@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.2](https://github.com/graphprotocol/dipper/compare/v0.2.1...v0.2.2) (2026-10-12)
+
+
+### Fixed
+
+* close gaps in replacements, config checks and log levels ([#751](https://github.com/graphprotocol/dipper/issues/751)) ([9669993](https://github.com/graphprotocol/dipper/commit/96699939562a13be8695d7f0c073ca4d5a728cbe))
+* end cancelled agreements reliably on-chain ([#715](https://github.com/graphprotocol/dipper/issues/715)) ([524fb1c](https://github.com/graphprotocol/dipper/commit/524fb1cba2495a3d07f18b5b4f3de2948419f4d0))
+
+
+### Changed
+
+* **lint:** hold new code to stricter clippy lints ([#706](https://github.com/graphprotocol/dipper/issues/706)) ([0f2ca41](https://github.com/graphprotocol/dipper/commit/0f2ca418aeac561f0699d298300e6bdeb979488e))
+
 ## [0.2.1](https://github.com/graphprotocol/dipper/compare/v0.2.0...v0.2.1) (2026-10-01)
 
 
