@@ -1321,6 +1321,8 @@ mod tests {
         already_ending: bool,
         mark_hangs: bool,
         check_hangs: bool,
+        /// What noting a cancel check fails with, if it does.
+        check_error: Option<fn() -> crate::registry::Error>,
         get_request_result: Arc<Mutex<Option<RegistryResult<Option<IndexingRequest>>>>>,
     }
 
@@ -1332,9 +1334,16 @@ mod tests {
                 already_ending: false,
                 mark_hangs: false,
                 check_hangs: false,
+                check_error: None,
                 get_request_result: Arc::new(Mutex::new(Some(Ok(Some(request))))),
             }
         }
+    }
+
+    fn db_down() -> crate::registry::Error {
+        crate::registry::Error::BackendError(dipper_pgregistry::Error::DbError(
+            sqlx::Error::Protocol("simulated outage".into()),
+        ))
     }
 
     #[async_trait]
@@ -1386,6 +1395,9 @@ mod tests {
         ) -> RegistryResult<u32> {
             if self.check_hangs {
                 std::future::pending::<()>().await;
+            }
+            if let Some(error) = self.check_error {
+                return Err(error());
             }
             if ended == Some(true) {
                 self.calls.seen_ended.lock().unwrap().push(*id);
@@ -2118,13 +2130,41 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn leaves_an_ended_stale_agreement_to_the_cancel_retry_when_noting_its_end_hangs() {
-        // Unnoted, it still holds its slot, so a reassessment queued now could add nothing, and
-        // one noted as queued is never queued again; the cancel retry queues it once it has ended.
+    async fn leaves_an_ended_stale_agreement_to_the_cancel_retry_when_noting_its_end_fails() {
+        // Unnoted, it still holds its slot, so a reassessment run before its replacement is
+        // marked queued adds nothing, and one marked queued is never queued again; the cancel
+        // retry queues it once it has ended.
+        let hangs = MockRegistry {
+            check_hangs: true,
+            ..MockRegistry::new(MockCalls::default(), stale_agreement())
+        };
+        let fails = MockRegistry {
+            check_error: Some(db_down),
+            ..MockRegistry::new(MockCalls::default(), stale_agreement())
+        };
+        for (failing, registry) in [("hangs", hangs), ("fails", fails)] {
+            let agreement = stale_agreement();
+            let calls = registry.calls.clone();
+            let chain = MockChainClient::rpc_error(calls.clone());
+            chain.live.store(false, std::sync::atomic::Ordering::SeqCst);
+
+            end_stale(&agreement, &registry, &chain).await;
+
+            assert!(calls.reassessments.lock().unwrap().is_empty(), "{failing}");
+            assert!(
+                calls.replacements_noted.lock().unwrap().is_empty(),
+                "{failing}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn replaces_at_once_an_ended_stale_agreement_the_chain_listener_already_ended() {
+        // Nothing to note: the listener marked it ended first, so it no longer holds its slot.
         let agreement = stale_agreement();
         let calls = MockCalls::default();
         let registry = MockRegistry {
-            check_hangs: true,
+            check_error: Some(|| crate::registry::Error::NoRecordsUpdated),
             ..MockRegistry::new(calls.clone(), agreement.clone())
         };
         let chain = MockChainClient::rpc_error(calls.clone());
@@ -2132,8 +2172,14 @@ mod tests {
 
         end_stale(&agreement, &registry, &chain).await;
 
-        assert!(calls.reassessments.lock().unwrap().is_empty());
-        assert!(calls.replacements_noted.lock().unwrap().is_empty());
+        assert_eq!(
+            calls.reassessments.lock().unwrap().as_slice(),
+            &[agreement.indexing_request_id]
+        );
+        assert_eq!(
+            calls.replacements_noted.lock().unwrap().as_slice(),
+            &[agreement.id]
+        );
     }
 
     // ---- Holding back abandonment while many indexers are unreachable ----
