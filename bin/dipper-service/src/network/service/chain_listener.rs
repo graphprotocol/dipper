@@ -3553,7 +3553,7 @@ mod tests {
         assert!(!registry.was_cancel_audit_recorded(&old_id));
     }
 
-    /// Runs the pending cancellation of one old agreement in `status`, returning
+    /// Runs the pending cancellation of 1 old agreement in `status`, returning
     /// whether it was already marked cancelling when its on-chain cancel went out.
     async fn marked_at_pending_cancel(status: IndexingAgreementStatus) -> Vec<bool> {
         let registry = MockRegistry::new();

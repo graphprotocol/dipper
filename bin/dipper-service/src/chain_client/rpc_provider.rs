@@ -331,7 +331,7 @@ impl RpcProviderPool {
         }
     }
 
-    /// Run a call against one endpoint, retrying a fault worth another go, and return what it
+    /// Run a call against 1 endpoint, retrying a fault worth another go, and return what it
     /// answered or why it last failed.
     async fn ask_endpoint<F, Fut, T>(
         &self,

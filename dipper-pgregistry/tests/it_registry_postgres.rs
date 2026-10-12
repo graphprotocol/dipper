@@ -3470,7 +3470,7 @@ async fn count_created_agreements_by_indexer_counts_offers_being_withdrawn() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    // 3 agreements being cancelled: an offer still open, one accepted, one past its deadline.
+    // 3 agreements being cancelled: an offer still open, 1 accepted, 1 past its deadline.
     let mut ids = Vec::new();
     for (deployment_id, deadline) in [
         (

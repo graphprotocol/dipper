@@ -386,7 +386,7 @@ fn log_uncounted_failure(agreement: &IndexingAgreement, err: &ChainClientError) 
     );
 }
 
-/// One ERROR as an agreement reaches the limit, for an operator to look into; a WARN for
+/// Log 1 ERROR as an agreement reaches the limit, for an operator to look into, and a WARN for
 /// every other failed cancel.
 fn log_failed_cancel(
     row: &CancellingAgreement,
