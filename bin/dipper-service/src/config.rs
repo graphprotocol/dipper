@@ -2119,6 +2119,23 @@ mod tests {
     }
 
     #[test]
+    fn the_example_configmap_alerts_section_parses() {
+        let example = include_str!("../../../k8s/configmap-example.yaml");
+        let json: String = example
+            .split_once("config.json: |\n")
+            .expect("the example holds a config.json")
+            .1
+            .lines()
+            .map(|line| format!("{}\n", line.strip_prefix("    ").unwrap_or(line)))
+            .collect();
+        let config: serde_json::Value = serde_json::from_str(&json).expect("config.json is JSON");
+
+        let alerts = serde_json::from_value::<AlertsConfig>(config["alerts"].clone())
+            .expect("the example's alerts section is a valid alerts config");
+        assert!(alerts.slack_webhook_url.is_some());
+    }
+
+    #[test]
     fn alerts_config_takes_a_webhook_and_keeps_the_default_events() {
         let alerts = serde_json::from_str::<AlertsConfig>(
             r#"{"slack_webhook_url": "https://hooks.slack.com/services/T/B/x", "throttle": 60}"#,

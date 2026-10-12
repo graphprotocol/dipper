@@ -359,101 +359,76 @@ pub trait AgreementRegistry {
     }
 
     /// Fetch agreements awaiting a `terminated` event: terminal-cancel status,
-    /// genuinely accepted on-chain, marker unset. Default returns empty so mocks
-    /// need not override; the production registry runs the real query.
+    /// genuinely accepted on-chain, marker unset.
     async fn get_agreements_pending_terminated_emission(
         &self,
-        _limit: i64,
-    ) -> RegistryResult<Vec<PendingTerminatedEvent>> {
-        Ok(Vec::new())
-    }
+        limit: i64,
+    ) -> RegistryResult<Vec<PendingTerminatedEvent>>;
 
     /// Stamp the `terminated` emission marker after a confirmed broker send.
-    /// Default no-op so mocks need not override.
     async fn mark_terminated_event_emitted(
         &self,
-        _agreement_id: &IndexingAgreementId,
-    ) -> RegistryResult<()> {
-        Ok(())
-    }
+        agreement_id: &IndexingAgreementId,
+    ) -> RegistryResult<()>;
 
     /// Fetch agreements awaiting an `accepted` event: `AcceptedOnChain`, accept
-    /// observed by the new reconcile path, marker unset. Default returns empty so
-    /// mocks need not override; the production registry runs the real query.
+    /// observed by the new reconcile path, marker unset.
     async fn get_agreements_pending_accepted_emission(
         &self,
-        _limit: i64,
-    ) -> RegistryResult<Vec<PendingAcceptedEvent>> {
-        Ok(Vec::new())
-    }
+        limit: i64,
+    ) -> RegistryResult<Vec<PendingAcceptedEvent>>;
 
     /// Stamp the `accepted` emission marker after a confirmed broker send.
-    /// Default no-op so mocks need not override.
     async fn mark_accepted_event_emitted(
         &self,
-        _agreement_id: &IndexingAgreementId,
-    ) -> RegistryResult<()> {
-        Ok(())
-    }
+        agreement_id: &IndexingAgreementId,
+    ) -> RegistryResult<()>;
 
     /// Fetch agreements awaiting a `request.expired` event: `Expired`, marker
-    /// unset. Default returns empty so mocks need not override; the production
-    /// registry runs the real query.
+    /// unset.
     async fn get_agreements_pending_expired_emission(
         &self,
-        _limit: i64,
-    ) -> RegistryResult<Vec<PendingExpiredEvent>> {
-        Ok(Vec::new())
-    }
+        limit: i64,
+    ) -> RegistryResult<Vec<PendingExpiredEvent>>;
 
     /// Stamp the `request.expired` emission marker after a confirmed broker send.
-    /// Default no-op so mocks need not override.
     async fn mark_expired_event_emitted(
         &self,
-        _agreement_id: &IndexingAgreementId,
-    ) -> RegistryResult<()> {
-        Ok(())
-    }
+        agreement_id: &IndexingAgreementId,
+    ) -> RegistryResult<()>;
 
     /// Record the accepted audit payload out-of-band (rejected-then-accepted
     /// anomaly), marking the row as genuinely accepted so its eventual
-    /// `terminated` is sweep-eligible. Default no-op so mocks need not override.
+    /// `terminated` is sweep-eligible.
     async fn record_accepted_audit(
         &self,
-        _agreement_id: &IndexingAgreementId,
-        _accepted_at: u64,
-        _accepted_tx: &str,
-    ) -> RegistryResult<()> {
-        Ok(())
-    }
+        agreement_id: &IndexingAgreementId,
+        accepted_at: u64,
+        accepted_tx: &str,
+    ) -> RegistryResult<()>;
 
     /// Record an agreement's accept and its end together, in 1 write, so nothing reads one
-    /// without the other. Default no-op so mocks need not override.
+    /// without the other.
     #[allow(clippy::too_many_arguments)]
     async fn record_accept_and_cancel_audit(
         &self,
-        _agreement_id: &IndexingAgreementId,
-        _accepted_at: u64,
-        _accepted_tx: &str,
-        _canceled_at: u64,
-        _canceled_by: &str,
-        _canceled_tx: Option<&str>,
-    ) -> RegistryResult<()> {
-        Ok(())
-    }
+        agreement_id: &IndexingAgreementId,
+        accepted_at: u64,
+        accepted_tx: &str,
+        canceled_at: u64,
+        canceled_by: &str,
+        canceled_tx: Option<&str>,
+    ) -> RegistryResult<()>;
 
     /// Record the cancel audit payload for a dipper-initiated cancel so the
-    /// emission sweep can populate the `terminated` event fields. Default no-op
-    /// so mocks need not override.
+    /// emission sweep can populate the `terminated` event fields.
     async fn record_cancel_audit(
         &self,
-        _agreement_id: &IndexingAgreementId,
-        _canceled_at: u64,
-        _canceled_by: &str,
-        _canceled_tx: Option<&str>,
-    ) -> RegistryResult<()> {
-        Ok(())
-    }
+        agreement_id: &IndexingAgreementId,
+        canceled_at: u64,
+        canceled_by: &str,
+        canceled_tx: Option<&str>,
+    ) -> RegistryResult<()>;
 
     /// Get `Created` agreements whose deadline has passed (by block timestamp).
     async fn get_expired_created_agreements(
@@ -522,6 +497,13 @@ pub trait AgreementRegistry {
     /// Note that an agreement's replacement has been queued.
     async fn mark_replacement_queued(&self, id: &IndexingAgreementId) -> RegistryResult<()>;
 
+    /// The indexers holding a slot in a request with an agreement they stopped serving that may
+    /// still be paid, so a reassessment fills only the rest and never picks them again.
+    async fn get_abandoned_indexers_holding_slots(
+        &self,
+        request_id: &IndexingRequestId,
+    ) -> RegistryResult<Vec<IndexerId>>;
+
     /// Update the sync progress for an agreement.
     ///
     /// Called when the liveness checker observes the block height has changed
@@ -542,9 +524,9 @@ pub trait AgreementRegistry {
         &self,
     ) -> RegistryResult<std::collections::HashMap<DeploymentId, usize>>;
 
-    /// Count `Created` (in-flight, not yet accepted) agreements per indexer,
-    /// plus the global total. Offer pacing reads both to decide whether an
-    /// indexer or the network has spare acceptance capacity.
+    /// Count in-flight offers per indexer, plus the global total: `Created` agreements, and
+    /// `Cancelling` ones never accepted until their offer deadline. Offer pacing reads both to
+    /// decide whether an indexer or the network has spare acceptance capacity.
     async fn count_created_agreements_by_indexer(
         &self,
     ) -> RegistryResult<(std::collections::HashMap<IndexerId, u64>, u64)>;

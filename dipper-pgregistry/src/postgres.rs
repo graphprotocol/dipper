@@ -1951,6 +1951,30 @@ impl PgRegistry {
         .map_err(Into::into)
     }
 
+    /// The indexers of a request's agreements whose indexer stopped serving them that may still
+    /// be paid: being cancelled, not yet seen ended on-chain, and with no replacement queued.
+    /// Each keeps its slot in the request until then, so it isn't replaced while both are paid.
+    pub async fn get_abandoned_indexers_holding_slots(
+        &self,
+        request_id: &IndexingRequestId,
+    ) -> Result<Vec<IndexerId>, Error> {
+        let rows: Vec<(PgIndexerId,)> = sqlx::query_as(
+            r#"
+            SELECT indexer_id
+            FROM dipper_reg_indexing_agreements
+            WHERE indexing_request_id = $1
+              AND status = $2
+              AND replacement_pending
+              AND ended_seen_at IS NULL
+            "#,
+        )
+        .bind(request_id)
+        .bind(IndexingAgreementStatus::Cancelling)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(id,)| id.0).collect())
+    }
+
     /// Note that an agreement's replacement has been queued.
     pub async fn mark_replacement_queued(
         &self,
@@ -2029,9 +2053,10 @@ impl PgRegistry {
             .collect())
     }
 
-    /// Count `Created` (in-flight, not yet accepted) agreements per indexer,
-    /// returning the per-indexer map and global total in one round-trip. Offer
-    /// pacing reads both to gauge spare acceptance capacity before creating more.
+    /// Count in-flight offers per indexer, returning the per-indexer map and global total in
+    /// one round-trip. Offer pacing reads both to gauge spare acceptance capacity before
+    /// creating more. Besides `Created` agreements, a `Cancelling` one never accepted counts
+    /// until its offer deadline, since its offer may be accepted before its cancel lands.
     #[expect(
         clippy::cast_sign_loss,
         reason = "predates this lint; fix when next touched"
@@ -2046,10 +2071,14 @@ impl PgRegistry {
             SELECT indexer_id, COUNT(*) as count
             FROM dipper_reg_indexing_agreements
             WHERE status = $1
+               OR (status = $2
+                   AND accepted_at IS NULL
+                   AND CAST(terms->>'deadline' AS bigint) > EXTRACT(EPOCH FROM now()))
             GROUP BY GROUPING SETS ((indexer_id), ())
             "#,
         )
         .bind(IndexingAgreementStatus::Created)
+        .bind(IndexingAgreementStatus::Cancelling)
         .fetch_all(&self.pool)
         .await?;
 

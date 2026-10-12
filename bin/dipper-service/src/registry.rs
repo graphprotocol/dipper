@@ -733,6 +733,16 @@ impl AgreementRegistry for RegistryProvider {
             .map_err(Into::into)
     }
 
+    async fn get_abandoned_indexers_holding_slots(
+        &self,
+        request_id: &IndexingRequestId,
+    ) -> RegistryResult<Vec<IndexerId>> {
+        self.inner
+            .get_abandoned_indexers_holding_slots(request_id)
+            .await
+            .map_err(Into::into)
+    }
+
     async fn update_agreement_sync_progress(
         &self,
         id: &IndexingAgreementId,

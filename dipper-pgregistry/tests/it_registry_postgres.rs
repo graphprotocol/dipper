@@ -3424,6 +3424,164 @@ async fn count_created_agreements_by_indexer_counts_only_created() {
     assert_eq!(global, 3, "global counts only the 3 Created rows");
 }
 
+#[tokio::test]
+async fn count_created_agreements_by_indexer_counts_offers_being_withdrawn() {
+    //* Given
+    let (db, _temp_db) = temp_registry_db().await;
+    let registry = PgRegistry::new(db);
+    let requested_by = address!("8f8c426f956876325b1e037c6eae9b189952994c");
+    let indexer = indexer_id!("cccccccccccccccccccccccccccccccccccccccc");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // 3 agreements being cancelled: an offer still open, one accepted, one past its deadline.
+    let mut ids = Vec::new();
+    for (deployment_id, deadline) in [
+        (
+            deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv"),
+            now + 3_600,
+        ),
+        (
+            deployment_id!("QmXbNL4EMkQ6DAPUcBjYSDXZJdpu1Kb1XkKvNvS8JdT7Hs"),
+            now + 3_600,
+        ),
+        (
+            deployment_id!("QmYbNL4EMkQ6DAPUcBjYSDXZJdpu1Kb1XkKvNvS8JdT7Hs"),
+            now - 60,
+        ),
+    ] {
+        let request_id = match registry
+            .set_indexing_target_candidates(requested_by, deployment_id, 42161, 3)
+            .await
+            .expect("set target candidates")
+        {
+            dipper_pgregistry::IndexingRequestSetTargetOutcome::Inserted { id } => id,
+            other => panic!("unexpected set-target outcome: {other:?}"),
+        };
+        let mut terms = Faker.fake::<IndexingAgreementTerms>();
+        terms.metadata.subgraph_deployment_id = deployment_id;
+        terms.deadline = deadline;
+        let id = registry
+            .register_new_indexing_agreement(NewAgreementParams {
+                agreement_id: Faker.fake::<IndexingAgreementId>(),
+                nonce_uuid: uuid::Uuid::now_v7(),
+                request_id,
+                deployment_id,
+                indexer_id: indexer,
+                indexer_url: "http://localhost:8020".parse().expect("Invalid URL"),
+                terms,
+                terms_version_hash: None,
+            })
+            .await
+            .expect("register agreement");
+        registry
+            .mark_indexing_agreement_as_cancelling(&id)
+            .await
+            .expect("mark cancelling");
+        ids.push(id);
+    }
+    registry
+        .record_accepted_audit(&ids[1], now, "0xacc")
+        .await
+        .expect("accept record");
+
+    //* When
+    let (per_indexer, global) = registry
+        .count_created_agreements_by_indexer()
+        .await
+        .expect("count in-flight offers");
+
+    //* Then
+    assert_eq!(
+        per_indexer.get(&indexer).copied(),
+        Some(1),
+        "only the open offer can still be accepted"
+    );
+    assert_eq!(global, 1);
+}
+
+#[tokio::test]
+async fn an_abandoned_agreement_holds_its_slot_while_it_may_still_be_paid() {
+    //* Given
+    let (db, _temp_db) = temp_registry_db().await;
+    let registry = PgRegistry::new(db);
+    let deployment_id = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
+    let request_id = match registry
+        .set_indexing_target_candidates(
+            address!("8f8c426f956876325b1e037c6eae9b189952994c"),
+            deployment_id,
+            42161,
+            3,
+        )
+        .await
+        .expect("set target candidates")
+    {
+        dipper_pgregistry::IndexingRequestSetTargetOutcome::Inserted { id } => id,
+        other => panic!("unexpected set-target outcome: {other:?}"),
+    };
+    let mut ids = Vec::new();
+    for indexer_id in [
+        indexer_id!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        indexer_id!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+    ] {
+        let mut terms = Faker.fake::<IndexingAgreementTerms>();
+        terms.metadata.subgraph_deployment_id = deployment_id;
+        let id = registry
+            .register_new_indexing_agreement(NewAgreementParams {
+                agreement_id: Faker.fake::<IndexingAgreementId>(),
+                nonce_uuid: uuid::Uuid::now_v7(),
+                request_id,
+                deployment_id,
+                indexer_id,
+                indexer_url: "http://localhost:8020".parse().expect("Invalid URL"),
+                terms,
+                terms_version_hash: None,
+            })
+            .await
+            .expect("register agreement");
+        registry
+            .apply_reconciliation(&id, true, None)
+            .await
+            .expect("accept");
+        ids.push(id);
+    }
+    let (abandoned, unwanted) = (ids[0], ids[1]);
+    registry
+        .mark_indexing_agreement_as_abandoning(&abandoned)
+        .await
+        .expect("abandon");
+    registry
+        .mark_indexing_agreement_as_cancelling(&unwanted)
+        .await
+        .expect("cancel");
+    let held = || async {
+        registry
+            .get_abandoned_indexers_holding_slots(&request_id)
+            .await
+            .expect("held slots")
+            .len()
+    };
+
+    //* Then
+    assert_eq!(held().await, 1, "only the abandoned one holds its slot");
+    registry
+        .record_cancel_check(&abandoned, 0, Some(true))
+        .await
+        .expect("seen ended");
+    assert_eq!(held().await, 0, "not once the chain shows it ended");
+    registry
+        .record_cancel_check(&abandoned, 0, Some(false))
+        .await
+        .expect("seen live again");
+    assert_eq!(held().await, 1);
+    registry
+        .mark_replacement_queued(&abandoned)
+        .await
+        .expect("replacement queued");
+    assert_eq!(held().await, 0, "not once its replacement is queued");
+}
+
 fn fixture_agreement(prefix: u8) -> IndexingAgreementId {
     let mut bytes = [0u8; 16];
     bytes[0] = prefix;

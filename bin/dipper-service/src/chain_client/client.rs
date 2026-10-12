@@ -92,12 +92,26 @@ const CROSS_CHECK_DEADLINE: Duration = Duration::from_secs(3);
 /// Blocks too far ahead of it are refused only once it is confirmed, by the receipt for one of
 /// dipper's transactions or by 2 endpoints agreeing, so an endpoint stuck far behind, or far
 /// ahead, that answers first after a restart can't shut out the endpoints that are right.
+/// Once confirmed, 1 endpoint alone can't move it far ahead either, for the same reason.
 #[derive(Debug)]
 struct SeenBlock {
     number: u64,
     moved_at: Instant,
     confirmed: bool,
     cross_checked_at: Option<Instant>,
+    /// An endpoint reported a block further ahead than 1 endpoint alone may move it, so the
+    /// endpoints are asked whether they agree.
+    jump_reported: bool,
+}
+
+/// What became of a block 1 endpoint reported.
+#[derive(Debug, PartialEq, Eq)]
+enum Noted {
+    Taken,
+    /// Too far ahead for 1 endpoint alone; it waits for 2 to agree.
+    Unagreed,
+    /// Too far ahead to be real.
+    TooFarAhead,
 }
 
 impl SeenBlock {
@@ -107,6 +121,7 @@ impl SeenBlock {
             moved_at: Instant::now(),
             confirmed: false,
             cross_checked_at: None,
+            jump_reported: false,
         }
     }
 
@@ -130,24 +145,47 @@ impl SeenBlock {
         (self.number, highest)
     }
 
-    /// Take `block` as seen, unless it is too far ahead of a confirmed one to be real; false
-    /// when it is.
-    fn advance(&mut self, block: u64, now: Instant) -> bool {
-        if self.confirmed && block > self.believable_limit(now) {
-            return false;
+    /// The highest block 1 endpoint alone may move a confirmed newest block to: an hour of
+    /// blocks past it, plus what the chain can have added since.
+    fn lone_limit(&self, now: Instant) -> u64 {
+        let since = now.saturating_duration_since(self.moved_at).as_secs();
+        self.number
+            .saturating_add(ALERT_GAP_BLOCKS)
+            .saturating_add(since.saturating_mul(BLOCKS_PER_SECOND))
+    }
+
+    /// Take `block`, reported by 1 endpoint, as seen. Once the newest block is confirmed, one
+    /// too far ahead to be real is refused, and one past [`Self::lone_limit`] waits for 2
+    /// endpoints to agree, unless this is the `only_endpoint` there is to ask.
+    fn advance(&mut self, block: u64, now: Instant, only_endpoint: bool) -> Noted {
+        if self.confirmed {
+            if block > self.believable_limit(now) {
+                return Noted::TooFarAhead;
+            }
+            if !only_endpoint && block > self.lone_limit(now) {
+                self.jump_reported = true;
+                return Noted::Unagreed;
+            }
         }
+        self.take(block, now);
+        Noted::Taken
+    }
+
+    fn take(&mut self, block: u64, now: Instant) {
         if block > self.number {
             self.number = block;
             self.moved_at = now;
         }
-        true
     }
 
     /// Take `block` as one the chain is known to have reached. An unconfirmed newest block more
     /// than an hour of blocks past it came from a faulty endpoint, so it is replaced.
     fn confirm(&mut self, block: u64, now: Instant) {
+        self.jump_reported = false;
         if self.confirmed {
-            self.advance(block, now);
+            if block <= self.believable_limit(now) {
+                self.take(block, now);
+            }
             return;
         }
         if block > self.number || self.number > block.saturating_add(ALERT_GAP_BLOCKS) {
@@ -157,13 +195,13 @@ impl SeenBlock {
         self.confirmed = true;
     }
 
-    /// Whether to ask every endpoint for its latest block: only while unconfirmed, and at most
-    /// once every [`CROSS_CHECK_INTERVAL`].
+    /// Whether to ask every endpoint for its latest block: only while unconfirmed or after a
+    /// jump 1 endpoint reported, and at most once every [`CROSS_CHECK_INTERVAL`].
     fn cross_check_due(&mut self, now: Instant) -> bool {
         let checked_lately = self
             .cross_checked_at
             .is_some_and(|at| now.saturating_duration_since(at) < CROSS_CHECK_INTERVAL);
-        if self.confirmed || checked_lately {
+        if (self.confirmed && !self.jump_reported) || checked_lately {
             return false;
         }
         self.cross_checked_at = Some(now);
@@ -899,24 +937,37 @@ impl AlloyChainClient {
             Some(head) => self.seen_block().confirm(head, Instant::now()),
             None => tracing::warn!(
                 "No 2 RPC endpoints agree on the chain's latest block; reads aren't checked \
-                 against blocks too far ahead until they do"
+                 against blocks too far ahead, nor the newest block seen moved far ahead, until \
+                 they do"
             ),
         }
     }
 
     /// Remember a block dipper has seen, so later reads are never older. One too far ahead to
-    /// be real is ignored, so it can't refuse every read after it.
+    /// be real is ignored, so it can't refuse every read after it, and one over an hour ahead
+    /// waits for 2 endpoints to agree on it.
     fn note_block(&self, block: u64) {
-        let (taken, seen) = {
+        let only_endpoint = self.inner.rpc_pool.endpoint_count() < 2;
+        let (noted, seen) = {
             let mut seen = self.seen_block();
-            (seen.advance(block, Instant::now()), seen.number)
+            (
+                seen.advance(block, Instant::now(), only_endpoint),
+                seen.number,
+            )
         };
-        if !taken {
-            tracing::warn!(
+        match noted {
+            Noted::Taken => {}
+            Noted::Unagreed => tracing::warn!(
+                block,
+                seen_block = seen,
+                "Not moving to a block over an hour ahead of the newest block dipper has seen \
+                 until 2 RPC endpoints agree on it"
+            ),
+            Noted::TooFarAhead => tracing::warn!(
                 block,
                 seen_block = seen,
                 "Ignoring a block too far ahead of the newest block dipper has seen"
-            );
+            ),
         }
     }
 
@@ -2549,6 +2600,7 @@ mod tests {
             moved_at: now.checked_sub(Duration::from_secs(600)).expect("instant"),
             confirmed: true,
             cross_checked_at: None,
+            jump_reported: false,
         };
 
         assert_eq!(seen.bounds(now), (100, 100 + WEEK_OF_BLOCKS + 2_400));
@@ -2590,8 +2642,8 @@ mod tests {
         // So a read just after dipper's cancel mined can't come from an endpoint behind it.
         let now = Instant::now();
         let mut seen = SeenBlock::new();
-        assert!(seen.advance(100, now));
-        assert!(seen.advance(90, now));
+        assert_eq!(seen.advance(100, now, false), Noted::Taken);
+        assert_eq!(seen.advance(90, now, false), Noted::Taken);
 
         assert_eq!(seen.bounds(now), (100, u64::MAX));
     }
@@ -2603,13 +2655,46 @@ mod tests {
         let now = Instant::now();
         let mut seen = SeenBlock::new();
         let real = 1_000 + WEEK_OF_BLOCKS * 3;
-        assert!(seen.advance(1_000, now));
-        assert!(seen.advance(real, now), "taken while unconfirmed");
+        assert_eq!(seen.advance(1_000, now, false), Noted::Taken);
+        assert_eq!(
+            seen.advance(real, now, false),
+            Noted::Taken,
+            "taken while unconfirmed"
+        );
 
         seen.confirm(real, now);
 
-        assert!(!seen.advance(real + WEEK_OF_BLOCKS * 2, now));
+        assert_eq!(
+            seen.advance(real + WEEK_OF_BLOCKS * 2, now, false),
+            Noted::TooFarAhead
+        );
         assert_eq!(seen.bounds(now).0, real);
+    }
+
+    #[test]
+    fn waits_for_2_endpoints_to_agree_before_a_jump_past_a_confirmed_block() {
+        // 1 faulty endpoint moving it far ahead would have every endpoint that is right
+        // refused as behind, for as long as the real chain takes to catch up.
+        let now = Instant::now();
+        let mut seen = SeenBlock::new();
+        let real = 5_000_000;
+        seen.confirm(real, now);
+        let jump = real + ALERT_GAP_BLOCKS + 1_000;
+
+        assert_eq!(seen.advance(real + 10, now, false), Noted::Taken);
+        assert_eq!(seen.advance(jump, now, false), Noted::Unagreed);
+        assert_eq!(seen.bounds(now).0, real + 10);
+        assert!(seen.cross_check_due(now), "the endpoints are asked");
+
+        seen.confirm(jump, now);
+
+        assert_eq!(seen.bounds(now).0, jump, "taken once 2 agree");
+        assert!(!seen.cross_check_due(now + CROSS_CHECK_INTERVAL));
+        assert_eq!(
+            seen.advance(jump + ALERT_GAP_BLOCKS + 1, now, true),
+            Noted::Taken,
+            "the only endpoint has no other to agree with"
+        );
     }
 
     #[test]
@@ -2617,7 +2702,10 @@ mod tests {
         let now = Instant::now();
         let mut seen = SeenBlock::new();
         let real = 5_000_000;
-        assert!(seen.advance(real + WEEK_OF_BLOCKS * 10, now));
+        assert_eq!(
+            seen.advance(real + WEEK_OF_BLOCKS * 10, now, false),
+            Noted::Taken
+        );
 
         seen.confirm(real, now);
 

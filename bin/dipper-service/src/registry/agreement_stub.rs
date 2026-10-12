@@ -236,6 +236,13 @@ pub trait StubAgreementRegistry: Send + Sync {
         unimplemented!("mark_replacement_queued")
     }
 
+    async fn get_abandoned_indexers_holding_slots(
+        &self,
+        _request_id: &IndexingRequestId,
+    ) -> Result<Vec<IndexerId>> {
+        unimplemented!("get_abandoned_indexers_holding_slots")
+    }
+
     async fn update_agreement_sync_progress(
         &self,
         _id: &IndexingAgreementId,
@@ -271,8 +278,8 @@ pub trait StubAgreementRegistry: Send + Sync {
         unimplemented!("count_accepted_agreements_by_deployment")
     }
 
-    // The emission-sweep and audit methods mirror the real trait's defaults
-    // (empty batch / no-op) so only emission-focused mocks override them.
+    // The emission-sweep and audit methods default to an empty batch or a
+    // no-op, here only, so only emission-focused mocks override them.
     async fn get_agreements_pending_terminated_emission(
         &self,
         _limit: i64,
@@ -566,6 +573,13 @@ impl<T: StubAgreementRegistry> AgreementRegistry for T {
 
     async fn mark_replacement_queued(&self, id: &IndexingAgreementId) -> Result<()> {
         StubAgreementRegistry::mark_replacement_queued(self, id).await
+    }
+
+    async fn get_abandoned_indexers_holding_slots(
+        &self,
+        request_id: &IndexingRequestId,
+    ) -> Result<Vec<IndexerId>> {
+        StubAgreementRegistry::get_abandoned_indexers_holding_slots(self, request_id).await
     }
 
     async fn update_agreement_sync_progress(
