@@ -7,14 +7,18 @@ use std::time::Duration;
 use dipper_core::ids::IndexingAgreementId;
 
 use crate::{
-    cancel_dispatch::reopen_if_live,
+    cancel_dispatch::{Reopen, reopen_if_live},
     chain_client::ChainClient,
-    registry::{AgreementRegistry, IndexingAgreementStatus},
+    registry::{AgreementRegistry, IndexingAgreement, IndexingAgreementStatus},
     worker::result::{JobError, JobResult},
 };
 
 /// How long a job whose database read or write failed waits before running again.
 const RETRY_DELAY: Duration = Duration::from_secs(30);
+
+/// How long a job that couldn't read a cancelled agreement on-chain waits to read it again, at
+/// the cancel retry's own pace. It keeps reading until the chain answers.
+const CHAIN_READ_RETRY_DELAY: Duration = Duration::from_secs(300);
 
 pub struct Ctx<R, T> {
     pub registry: R,
@@ -60,9 +64,7 @@ where
     };
     let cancelling = match agreement.status {
         IndexingAgreementStatus::Rejected | IndexingAgreementStatus::CanceledByRequester => {
-            reopen_if_live(&ctx.registry, &ctx.chain_client, &agreement)
-                .await
-                .map_err(|err| retry(agreement_id, "reopen the cancel of", err.into()))?
+            reopen(&ctx, &agreement).await?
         }
         // Moved back by an earlier run of this job, or a copy of it, so only its accept is left.
         IndexingAgreementStatus::Cancelling => true,
@@ -78,6 +80,31 @@ where
         .record_accepted_audit(agreement_id, accept.at, &accept.tx)
         .await
         .map_err(|err| retry(agreement_id, "record the on-chain accept of", err.into()))
+}
+
+/// Move an agreement back into `Cancelling` if the chain shows it live; whether it moved.
+async fn reopen<R, T>(ctx: &Ctx<R, T>, agreement: &IndexingAgreement) -> JobResult<bool>
+where
+    R: AgreementRegistry + Sync,
+    T: ChainClient,
+{
+    let agreement_id = &agreement.id;
+    match reopen_if_live(&ctx.registry, &ctx.chain_client, agreement)
+        .await
+        .map_err(|err| retry(agreement_id, "reopen the cancel of", err.into()))?
+    {
+        Reopen::Reopened => Ok(true),
+        Reopen::Left => Ok(false),
+        Reopen::Unread(err) => {
+            tracing::warn!(
+                %agreement_id,
+                error = %err,
+                retry_secs = CHAIN_READ_RETRY_DELAY.as_secs(),
+                "Failed to read whether a cancelled agreement reported live is live; will read again"
+            );
+            Err(JobError::Deferred(CHAIN_READ_RETRY_DELAY))
+        }
+    }
 }
 
 /// Log a failed database read or write and run the job again later.
@@ -102,7 +129,7 @@ mod tests {
     use crate::{
         cancel_dispatch::tests::agreement,
         chain_client::{AgreementOnChain, ChainClientError},
-        registry::{IndexingAgreement, StubAgreementRegistry},
+        registry::StubAgreementRegistry,
     };
 
     #[derive(Default)]
@@ -279,18 +306,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reopens_an_agreement_whose_chain_read_fails() {
-        // It may have ended, so the end on record stays, and the cancel retry reads it again.
-        for status in [
-            IndexingAgreementStatus::Rejected,
-            IndexingAgreementStatus::CanceledByRequester,
-        ] {
-            let registry = registry(status);
+    async fn reopens_a_rejected_agreement_whose_chain_read_fails() {
+        // Its indexer may be paid, so it is reopened; it may have ended, so the end on record
+        // stays, and the cancel retry reads it again.
+        let registry = registry(IndexingAgreementStatus::Rejected);
 
-            run_job(&registry, None).await.expect("job ok");
+        run_job(&registry, None).await.expect("job ok");
 
-            assert_eq!(registry.0.lock().unwrap().reopened, vec![false], "{status}");
-        }
+        let state = registry.0.lock().unwrap();
+        assert_eq!(state.reopened, vec![false]);
+        assert_eq!(state.accepts, vec![chain_accept()]);
+    }
+
+    #[tokio::test]
+    async fn reads_a_cancelled_agreement_again_when_its_chain_read_fails() {
+        // Most likely dipper's cancel landed and the subgraph is behind, so it isn't reopened on
+        // a guess, but it may be an offer accepted after dipper withdrew it, so it is read again.
+        let registry = registry(IndexingAgreementStatus::CanceledByRequester);
+
+        let unread = run_job(&registry, None).await;
+        let read = run_job(&registry, Some(true)).await;
+
+        assert!(matches!(
+            unread,
+            Err(JobError::Deferred(CHAIN_READ_RETRY_DELAY))
+        ));
+        read.expect("job ok");
+        let state = registry.0.lock().unwrap();
+        assert_eq!(state.reopened, vec![true], "reopened only once read live");
+        assert_eq!(state.accepts, vec![chain_accept()]);
     }
 
     #[tokio::test]
