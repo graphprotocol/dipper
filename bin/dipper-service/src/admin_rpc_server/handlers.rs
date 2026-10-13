@@ -19,6 +19,10 @@ pub use self::{
 };
 
 /// Create a new RPC module with all the admin handlers.
+#[expect(
+    clippy::expect_used,
+    reason = "predates this lint; fix when next touched"
+)]
 pub(super) fn rpc_handlers<S, R, W>(ctx: S) -> RpcModule<S>
 where
     R: IndexingRequestRegistry + AgreementRegistry + Clone + Send + Sync + 'static,

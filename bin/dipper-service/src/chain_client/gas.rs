@@ -109,6 +109,11 @@ impl GasEstimator {
     /// Apply the bounds and report which one set the final limit, so the gas
     /// log can show whether the buffer, the ceiling, or the floor won instead
     /// of implying `buffer_multiplier` always drives the result.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "predates this lint; fix when next touched"
+    )]
     fn compute_bounds(&self, estimated: u64) -> GasBounds {
         let with_buffer = (estimated as f64 * self.buffer_multiplier) as u64;
         let ceiling = estimated.saturating_add(self.max_addition);
@@ -170,6 +175,11 @@ pub async fn get_gas_prices(provider: &HttpProvider) -> Result<(u128, u128), Cha
 /// Calculate max fee per gas with a multiplier.
 ///
 /// Formula: (base_fee * multiplier) + priority_fee
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "predates this lint; fix when next touched"
+)]
 pub fn calculate_max_fee(base_fee: u128, priority_fee: u128, multiplier: f64) -> u128 {
     let adjusted_base = (base_fee as f64 * multiplier) as u128;
     adjusted_base.saturating_add(priority_fee)

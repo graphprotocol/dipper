@@ -262,7 +262,12 @@ async fn connect_with_retries(
 /// reaching back past a cancellation briefly re-opens it until the cancel
 /// replays too, which is why re-anchoring below never rewinds further than
 /// the broker forces it to.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::cognitive_complexity,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "predates this lint; fix when next touched"
+)]
 async fn partition_loop<R, W>(
     consumer: Arc<KafkaConsumer>,
     partition: i32,
@@ -279,7 +284,7 @@ async fn partition_loop<R, W>(
 {
     let topic = consumer.topic().to_string();
     let expected_network = format!("eip155:{protocol_chain_id}");
-    let max_wait_ms = config.max_wait.as_millis().min(i32::MAX as u128) as i32;
+    let max_wait_ms = i32::try_from(config.max_wait.as_millis()).unwrap_or(i32::MAX);
 
     // Resume from the persisted offset; a partition never seen before starts at
     // the earliest available record so requests published before the consumer's
@@ -1025,6 +1030,7 @@ mod tests {
         async fn cancel_rejected_agreement_on_chain(
             &self,
             _agreement_id: IndexingAgreementId,
+            _accept: Option<crate::worker::service::ChainAccept>,
             _priority: crate::worker::queue::JobPriority,
         ) -> anyhow::Result<JobId> {
             unimplemented!()
@@ -1341,6 +1347,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "predates this lint; fix when next touched"
+    )]
     async fn it_consumer_resumes_from_persisted_offsets_across_restarts() {
         let Some(brokers) = redpanda_brokers() else {
             return;

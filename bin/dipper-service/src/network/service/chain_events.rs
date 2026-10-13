@@ -287,6 +287,10 @@ struct SubgraphBlock {
 
 impl SubgraphEventSource {
     /// Create a new subgraph event source.
+    #[expect(
+        clippy::expect_used,
+        reason = "predates this lint; fix when next touched"
+    )]
     pub fn new(config: SubgraphEventSourceConfig) -> Self {
         let client = reqwest::Client::builder()
             .timeout(config.request_timeout)
@@ -420,6 +424,10 @@ pub(super) const SUBGRAPH_PAGE_SIZE: usize = 1000;
 
 #[async_trait]
 impl ChainEventSource for SubgraphEventSource {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "predates this lint; fix when next touched"
+    )]
     async fn get_changed_agreements(
         &self,
         since: &Cursor,

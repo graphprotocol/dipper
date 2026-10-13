@@ -53,6 +53,12 @@ pub enum ApplyError {
 /// Upserts the indexing request, emits the request-received lifecycle event on
 /// a genuinely new request, and queues reassessment when the row changed.
 /// Returns the request id, or `None` when there was nothing to act on.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cognitive_complexity,
+    reason = "predates this lint; fix when next touched"
+)]
 pub async fn apply_set_indexing_target<R, W>(
     registry: &R,
     worker: &W,

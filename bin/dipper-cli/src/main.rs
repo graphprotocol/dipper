@@ -1,3 +1,4 @@
+mod chain;
 mod client;
 mod cmd;
 mod config;

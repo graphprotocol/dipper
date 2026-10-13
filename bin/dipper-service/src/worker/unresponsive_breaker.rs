@@ -28,6 +28,10 @@ impl UnresponsiveBreaker {
     /// Decide whether to suppress `chain`'s unresponsive exclusion this round, updating
     /// that chain's hysteresis (trip above `trip`, resume below `reset`, hold between).
     /// Fail-safe: a missing/stale/empty snapshot returns `false` without mutating state.
+    #[expect(
+        clippy::expect_used,
+        reason = "predates this lint; fix when next touched"
+    )]
     pub fn evaluate(
         &self,
         chain: &str,

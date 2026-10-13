@@ -31,3 +31,17 @@ tracing = "0.1"
 url = "2.5"
 uuid = { version = "1.11.0", features = ["v7"] }
 wiremock = "0.6"
+
+[workspace.lints.rust]
+# Allow the gen_event_proto cfg flag used for conditional protobuf code generation in dipper-producer
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(gen_event_proto)'] }
+
+[workspace.lints.clippy]
+cast_possible_truncation = "warn"
+cast_possible_wrap = "warn"
+cast_sign_loss = "warn"
+cognitive_complexity = "warn"
+expect_used = "warn"
+too_many_arguments = "warn"
+too_many_lines = "warn"
+unwrap_used = "warn"

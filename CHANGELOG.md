@@ -1,5 +1,67 @@
 # Changelog
 
+## [0.2.2](https://github.com/graphprotocol/dipper/compare/v0.2.1...v0.2.2) (2026-10-12)
+
+
+### Fixed
+
+* close gaps in replacements, config checks and log levels ([#751](https://github.com/graphprotocol/dipper/issues/751)) ([9669993](https://github.com/graphprotocol/dipper/commit/96699939562a13be8695d7f0c073ca4d5a728cbe))
+* end cancelled agreements reliably on-chain ([#715](https://github.com/graphprotocol/dipper/issues/715)) ([524fb1c](https://github.com/graphprotocol/dipper/commit/524fb1cba2495a3d07f18b5b4f3de2948419f4d0))
+
+
+### Changed
+
+* **lint:** hold new code to stricter clippy lints ([#706](https://github.com/graphprotocol/dipper/issues/706)) ([0f2ca41](https://github.com/graphprotocol/dipper/commit/0f2ca418aeac561f0699d298300e6bdeb979488e))
+
+## [0.2.1](https://github.com/graphprotocol/dipper/compare/v0.2.0...v0.2.1) (2026-10-01)
+
+
+### Fixed
+
+* **escrow:** release escrow held by agreements that have ended ([#703](https://github.com/graphprotocol/dipper/issues/703)) ([37c980d](https://github.com/graphprotocol/dipper/commit/37c980d732e657e4677738277dc3d2498a6d9b1c))
+* **escrow:** send reconciles only where the escrow needs one ([#702](https://github.com/graphprotocol/dipper/issues/702)) ([9300302](https://github.com/graphprotocol/dipper/commit/930030212de2cf6a7cd8d111043898cd8c66601d))
+* **escrow:** wait for reconcile transactions to be mined ([#701](https://github.com/graphprotocol/dipper/issues/701)) ([3400d51](https://github.com/graphprotocol/dipper/commit/3400d51bea76593c65fe9430e08bbb76ed3a9337))
+
+
+### Changed
+
+* **ci:** fail the build on dead code and unused dependencies ([#705](https://github.com/graphprotocol/dipper/issues/705)) ([837090d](https://github.com/graphprotocol/dipper/commit/837090dffe92d00c0797b5c4c7ae5537f3f7d368))
+
+## [0.2.0](https://github.com/graphprotocol/dipper/compare/v0.1.12...v0.2.0) (2026-10-01)
+
+
+### ⚠ BREAKING CHANGES
+
+* **cli:** detect the chain from the subgraph manifest ([#699](https://github.com/graphprotocol/dipper/issues/699))
+
+### Added
+
+* **cli:** detect the chain from the subgraph manifest ([#699](https://github.com/graphprotocol/dipper/issues/699)) ([bd61524](https://github.com/graphprotocol/dipper/commit/bd6152480e143a96073b9379619c60962be9aadf))
+
+
+### Fixed
+
+* send agreement proposals to https indexers over TLS ([#698](https://github.com/graphprotocol/dipper/issues/698)) ([2b5f751](https://github.com/graphprotocol/dipper/commit/2b5f7510f83c4452083442055e9ded0eb161a6d2))
+
+## [0.1.12](https://github.com/graphprotocol/dipper/compare/v0.1.11...v0.1.12) (2026-09-17)
+
+
+### Fixed
+
+* **ci:** publish container images under the graphprotocol organisation ([#696](https://github.com/graphprotocol/dipper/issues/696)) ([87f7c12](https://github.com/graphprotocol/dipper/commit/87f7c12a11e878fafd8c69c226c6e8d49973e6fc))
+
+## [0.1.11](https://github.com/graphprotocol/dipper/compare/v0.1.10...v0.1.11) (2026-09-17)
+
+
+### Fixed
+
+* **worker:** let a chain submission try every RPC provider in one job ([#695](https://github.com/graphprotocol/dipper/issues/695)) ([f40a71f](https://github.com/graphprotocol/dipper/commit/f40a71ff52e78d37ffa57fe19a9d88b28b8ada1d))
+
+
+### Documentation
+
+* rewrite the README around the agreement lifecycle ([#688](https://github.com/graphprotocol/dipper/issues/688)) ([38f86ae](https://github.com/graphprotocol/dipper/commit/38f86ae44b9067877f121fdf7c86e9f03fb316b1))
+
 ## [0.1.10](https://github.com/edgeandnode/dipper/compare/v0.1.9...v0.1.10) (2026-08-03)
 
 

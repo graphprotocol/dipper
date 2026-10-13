@@ -28,6 +28,10 @@ fn brokers() -> Option<Vec<String>> {
 
 /// A topic name unique to this test process and call site, so parallel tests
 /// on a shared broker never read each other's records.
+#[expect(
+    clippy::expect_used,
+    reason = "a test helper fails its test on any error"
+)]
 fn unique_topic(label: &str) -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -36,6 +40,10 @@ fn unique_topic(label: &str) -> String {
     format!("dipper.test.{label}.{}.{nanos}", std::process::id())
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "a test helper fails its test on any error"
+)]
 async fn create_topic(brokers: &[String], topic: &str, partitions: i32) {
     let client = rskafka::client::ClientBuilder::new(brokers.to_vec())
         .build()
@@ -49,6 +57,10 @@ async fn create_topic(brokers: &[String], topic: &str, partitions: i32) {
         .expect("create topic");
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "a test helper fails its test on any error"
+)]
 fn producer_config(brokers: Vec<String>, topic: &str, partitions: u32) -> KafkaConfig {
     serde_json::from_value(serde_json::json!({
         "brokers": brokers,
@@ -58,6 +70,10 @@ fn producer_config(brokers: Vec<String>, topic: &str, partitions: u32) -> KafkaC
     .expect("valid producer config")
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "a test helper fails its test on any error"
+)]
 fn consumer_config(brokers: Vec<String>, topic: &str) -> KafkaConsumerConfig {
     serde_json::from_value(serde_json::json!({
         "brokers": brokers,

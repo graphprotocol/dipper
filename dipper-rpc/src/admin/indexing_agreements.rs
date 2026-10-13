@@ -122,6 +122,9 @@ pub enum Status {
     /// This is a terminal state.
     AbandonedByIndexer,
 
+    /// Dipper is cancelling the agreement on-chain; it may still be live there.
+    Cancelling,
+
     /// A fallback for unknown status values.
     Unknown,
 }
@@ -140,6 +143,7 @@ impl serde::Serialize for Status {
             Status::AcceptedOnChain => "ACCEPTED_ON_CHAIN",
             Status::Rejected => "REJECTED",
             Status::AbandonedByIndexer => "ABANDONED_BY_INDEXER",
+            Status::Cancelling => "CANCELLING",
             Status::Unknown => "UNKNOWN",
         };
         serializer.serialize_str(status)
@@ -161,6 +165,7 @@ impl<'de> serde::Deserialize<'de> for Status {
             "ACCEPTED_ON_CHAIN" => Status::AcceptedOnChain,
             "REJECTED" => Status::Rejected,
             "ABANDONED_BY_INDEXER" => Status::AbandonedByIndexer,
+            "CANCELLING" => Status::Cancelling,
             _ => Status::Unknown,
         };
         Ok(status)

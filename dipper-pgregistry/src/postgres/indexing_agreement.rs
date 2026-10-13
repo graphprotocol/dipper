@@ -9,6 +9,10 @@ use super::common::{PgIndexerId, PgUrl};
 use crate::indexing_agreement::{Indexer, IndexingAgreement, Status};
 
 impl sqlx::FromRow<'_, PgRow> for IndexingAgreement {
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "predates this lint; fix when next touched"
+    )]
     fn from_row(row: &'_ PgRow) -> Result<Self, sqlx::Error> {
         let id = row.try_get("id")?;
         let nonce_uuid = row.try_get("nonce_uuid")?;

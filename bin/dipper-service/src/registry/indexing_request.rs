@@ -182,6 +182,10 @@ impl std::fmt::Display for Status {
 impl TryFrom<dipper_pgregistry::IndexingRequest> for IndexingRequest {
     type Error = anyhow::Error;
 
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "predates this lint; fix when next touched"
+    )]
     fn try_from(value: dipper_pgregistry::IndexingRequest) -> Result<Self, Self::Error> {
         Ok(Self {
             id: value.id,
@@ -209,6 +213,10 @@ impl TryFrom<dipper_pgregistry::IndexingRequestStatus> for Status {
 }
 
 impl From<dipper_pgregistry::IndexingRequestSetTargetOutcome> for SetTargetOutcome {
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "predates this lint; fix when next touched"
+    )]
     fn from(value: dipper_pgregistry::IndexingRequestSetTargetOutcome) -> Self {
         use dipper_pgregistry::IndexingRequestSetTargetOutcome as Pg;
         match value {

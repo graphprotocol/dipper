@@ -65,6 +65,10 @@ pub async fn fetch_rca_eip712_domain(
 /// Re-fetch the domain and swap it into `shared` when it changed, so a running
 /// dipper follows an in-place contract upgrade without a restart. Returns
 /// whether the domain changed; on error the current domain stays in place.
+#[expect(
+    clippy::expect_used,
+    reason = "predates this lint; fix when next touched"
+)]
 pub async fn refresh_rca_eip712_domain(
     config: &ChainClientConfig,
     chain_id: u64,

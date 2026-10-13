@@ -10,7 +10,10 @@ use tokio::{sync::mpsc, time::MissedTickBehavior};
 use crate::{
     config::ExpirationConfig,
     network::service::chain_listener::ChainListenerStateRegistry,
-    registry::{AgreementRegistry, IndexingRequestRegistry, PendingCancellationRegistry},
+    registry::{
+        AgreementRegistry, IndexingAgreementStatus, IndexingRequestRegistry,
+        PendingCancellationRegistry,
+    },
     worker::service::{JobPriority, WorkerQueue},
 };
 
@@ -47,6 +50,10 @@ pub struct Ctx<R, W> {
 /// Create a new expiration service: a control handle plus a future to spawn
 /// that periodically queries for `Created` agreements past their deadline,
 /// marks them `Expired`, and queues reassessment jobs.
+#[expect(
+    clippy::too_many_lines,
+    reason = "predates this lint; fix when next touched"
+)]
 pub fn new<R, W>(ctx: Ctx<R, W>) -> (Handle, impl Future<Output = anyhow::Result<()>>)
 where
     R: AgreementRegistry
@@ -181,8 +188,8 @@ where
                         tracing::info!(
                             agreement_id = %agreement.id,
                             indexing_request_id = %agreement.indexing_request_id,
-                            old_status = "Created",
-                            new_status = "Expired",
+                            old_status = %IndexingAgreementStatus::Created,
+                            new_status = %IndexingAgreementStatus::Expired,
                             "agreement state transition"
                         );
 
@@ -537,6 +544,7 @@ mod tests {
         async fn cancel_rejected_agreement_on_chain(
             &self,
             _agreement_id: IndexingAgreementId,
+            _accept: Option<crate::worker::service::ChainAccept>,
             _priority: JobPriority,
         ) -> anyhow::Result<JobId> {
             unimplemented!()

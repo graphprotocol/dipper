@@ -23,8 +23,8 @@ pub use self::agreement_stub::StubAgreementRegistry;
 use self::result::Result as RegistryResult;
 pub use self::{
     agreement::{
-        AgreementFeeRate, AgreementRegistry, CancelKind, IndexingAgreement, NewAgreementParams,
-        ReconciliationAudit, ReconciliationItem, ReconciliationOutcome,
+        AgreementFeeRate, AgreementRegistry, CancelKind, CancellingAgreement, IndexingAgreement,
+        NewAgreementParams, ReconciliationAudit, ReconciliationItem, ReconciliationOutcome,
         Status as IndexingAgreementStatus, Terms as IndexingAgreementTerms,
         TermsMetadata as IndexingAgreementTermsMetadata,
     },
@@ -99,6 +99,30 @@ fn filter_map_with_logging<T, E: std::fmt::Display>(
     }
 }
 
+/// Warn when a write changed an agreement's end after its `terminated` event went out. The event
+/// goes out again with the new end, but consumers dedupe on the agreement id and event type, so
+/// they may drop it and keep the old end.
+fn warn_if_end_corrected(
+    agreement_id: &IndexingAgreementId,
+    correction: Option<dipper_pgregistry::EndCorrection>,
+) {
+    let Some(dipper_pgregistry::EndCorrection { old, new }) = correction else {
+        return;
+    };
+    tracing::warn!(
+        event = "agreement_end_corrected_after_announcement",
+        %agreement_id,
+        old_canceled_at = ?old.canceled_at,
+        old_canceled_by = ?old.canceled_by,
+        old_canceled_tx = ?old.canceled_tx,
+        new_canceled_at = ?new.canceled_at,
+        new_canceled_by = ?new.canceled_by,
+        new_canceled_tx = ?new.canceled_tx,
+        "An agreement's end changed after its terminated event went out; the event goes out \
+         again, but consumers may drop it as a repeat"
+    );
+}
+
 /// A service for interacting with the registry, including registering new
 /// indexing requests and indexing agreements.
 #[derive(Clone)]
@@ -117,6 +141,11 @@ impl RegistryProvider {
 
 #[async_trait]
 impl IndexingRequestRegistry for RegistryProvider {
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "predates this lint; fix when next touched"
+    )]
     async fn set_indexing_target_candidates(
         &self,
         requested_by: Address,
@@ -386,6 +415,77 @@ impl AgreementRegistry for RegistryProvider {
             .map_err(Into::into)
     }
 
+    async fn mark_indexing_agreement_as_abandoned_by_indexer(
+        &self,
+        id: &IndexingAgreementId,
+    ) -> RegistryResult<()> {
+        self.inner
+            .mark_indexing_agreement_as_abandoned_by_indexer(id)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn mark_indexing_agreement_as_cancelling(
+        &self,
+        id: &IndexingAgreementId,
+    ) -> RegistryResult<()> {
+        self.inner
+            .mark_indexing_agreement_as_cancelling(id)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn mark_indexing_agreement_as_abandoning(
+        &self,
+        id: &IndexingAgreementId,
+    ) -> RegistryResult<()> {
+        self.inner
+            .mark_indexing_agreement_as_abandoning(id)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn reopen_indexing_agreement_cancel(
+        &self,
+        id: &IndexingAgreementId,
+        seen_live: bool,
+    ) -> RegistryResult<()> {
+        let correction = self
+            .inner
+            .reopen_indexing_agreement_cancel(id, seen_live)
+            .await?;
+        warn_if_end_corrected(id, correction);
+        Ok(())
+    }
+
+    async fn get_cancelling_agreements(
+        &self,
+        batch_size: i64,
+        max_attempts: u32,
+        min_age_minutes: i32,
+    ) -> RegistryResult<Vec<CancellingAgreement>> {
+        Ok(self
+            .inner
+            .get_cancelling_agreements(batch_size, max_attempts, min_age_minutes)
+            .await?
+            .into_iter()
+            .map(CancellingAgreement::try_from)
+            .filter_map(filter_map_with_logging)
+            .collect())
+    }
+
+    async fn record_cancel_check(
+        &self,
+        id: &IndexingAgreementId,
+        failed_attempts: u32,
+        ended: Option<bool>,
+    ) -> RegistryResult<u32> {
+        self.inner
+            .record_cancel_check(id, failed_attempts, ended)
+            .await
+            .map_err(Into::into)
+    }
+
     async fn apply_reconciliation(
         &self,
         id: &IndexingAgreementId,
@@ -556,9 +656,35 @@ impl AgreementRegistry for RegistryProvider {
         canceled_by: &str,
         canceled_tx: Option<&str>,
     ) -> RegistryResult<()> {
-        self.inner
+        let correction = self
+            .inner
             .record_cancel_audit(agreement_id, canceled_at, canceled_by, canceled_tx)
             .await?;
+        warn_if_end_corrected(agreement_id, correction);
+        Ok(())
+    }
+
+    async fn record_accept_and_cancel_audit(
+        &self,
+        agreement_id: &IndexingAgreementId,
+        accepted_at: u64,
+        accepted_tx: &str,
+        canceled_at: u64,
+        canceled_by: &str,
+        canceled_tx: Option<&str>,
+    ) -> RegistryResult<()> {
+        let correction = self
+            .inner
+            .record_accept_and_cancel_audit(
+                agreement_id,
+                accepted_at,
+                accepted_tx,
+                canceled_at,
+                canceled_by,
+                canceled_tx,
+            )
+            .await?;
+        warn_if_end_corrected(agreement_id, correction);
         Ok(())
     }
 
@@ -626,12 +752,33 @@ impl AgreementRegistry for RegistryProvider {
             .collect())
     }
 
-    async fn get_providers_for_escrow_reconciliation(
+    async fn get_ended_agreements_awaiting_replacement(
         &self,
-        limit: i64,
-    ) -> RegistryResult<Vec<Address>> {
+        batch_size: i64,
+    ) -> RegistryResult<Vec<IndexingAgreement>> {
+        Ok(self
+            .inner
+            .get_ended_agreements_awaiting_replacement(batch_size)
+            .await?
+            .into_iter()
+            .map(IndexingAgreement::try_from)
+            .filter_map(filter_map_with_logging)
+            .collect())
+    }
+
+    async fn mark_replacement_queued(&self, id: &IndexingAgreementId) -> RegistryResult<()> {
         self.inner
-            .get_providers_for_escrow_reconciliation(limit)
+            .mark_replacement_queued(id)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn get_abandoned_indexers_holding_slots(
+        &self,
+        request_id: &IndexingRequestId,
+    ) -> RegistryResult<Vec<IndexerId>> {
+        self.inner
+            .get_abandoned_indexers_holding_slots(request_id)
             .await
             .map_err(Into::into)
     }
@@ -671,17 +818,6 @@ impl AgreementRegistry for RegistryProvider {
             .exists_active_agreements()
             .await
             .map_err(Into::into)
-    }
-
-    async fn mark_indexing_agreement_as_abandoned(
-        &self,
-        id: &IndexingAgreementId,
-    ) -> RegistryResult<IndexingAgreement> {
-        let raw = self.inner.mark_indexing_agreement_as_abandoned(id).await?;
-        // The conversion only fails for Unknown status; since we just wrote
-        // AbandonedByIndexer, this cannot fail in practice.
-        IndexingAgreement::try_from(raw)
-            .map_err(|_| dipper_pgregistry::Error::NoRecordsUpdated.into())
     }
 
     async fn get_agreement_fee_rates(&self) -> RegistryResult<Vec<AgreementFeeRate>> {
@@ -824,5 +960,55 @@ impl crate::network::service::indexing_request_consumer::KafkaConsumerOffsetRegi
             .set_kafka_consumer_offset(topic, partition_id, next_offset)
             .await
             .map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use dipper_core::ids::IndexingAgreementId;
+    use dipper_pgregistry::{EndCorrection, RecordedEnd};
+
+    use super::warn_if_end_corrected;
+    use crate::test_support::logged;
+
+    #[tokio::test]
+    async fn warns_with_both_ends_when_an_announced_end_changes() {
+        let id = IndexingAgreementId::from_bytes([0xaa; 16]);
+        let correction = EndCorrection {
+            old: RecordedEnd {
+                canceled_at: Some(9_000),
+                canceled_by: Some("0xindexer".to_owned()),
+                canceled_tx: None,
+            },
+            new: RecordedEnd {
+                canceled_at: Some(5_000),
+                canceled_by: Some("0xprovider".to_owned()),
+                canceled_tx: Some("0xend".to_owned()),
+            },
+        };
+
+        let logs = logged(async { warn_if_end_corrected(&id, Some(correction)) }).await;
+
+        for expected in [
+            "WARN",
+            "event=\"agreement_end_corrected_after_announcement\"",
+            &format!("agreement_id={id}"),
+            "old_canceled_at=Some(9000)",
+            "old_canceled_tx=None",
+            "new_canceled_at=Some(5000)",
+            "new_canceled_tx=Some(\"0xend\")",
+            "consumers may drop it",
+        ] {
+            assert!(logs.contains(expected), "missing {expected} in {logs}");
+        }
+    }
+
+    #[tokio::test]
+    async fn stays_quiet_when_no_announced_end_changes() {
+        let id = IndexingAgreementId::from_bytes([0xaa; 16]);
+
+        let logs = logged(async { warn_if_end_corrected(&id, None) }).await;
+
+        assert!(logs.is_empty(), "{logs}");
     }
 }
