@@ -38,7 +38,20 @@ jobs:
         with:
           sweep-cache: true
 
-      - run: cargo clippy -- -D warnings --force-warn deprecated --force-warn dead-code
+      - run: cargo clippy --all-targets -- -D warnings --force-warn deprecated -D dead-code
+
+  unused-deps:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
+
+      - name: Install cargo-machete
+        uses: taiki-e/install-action@dfcb1ee29051d97c8d0f2d437199570008fd5612 # v2
+        with:
+          tool: cargo-machete
+
+      # Called directly rather than as `cargo machete`, so no Rust toolchain is needed
+      - run: cargo-machete
 
   test-rust:
     runs-on: ubuntu-latest

@@ -17,3 +17,6 @@ uuid = { workspace = true, features = ["serde"] }
 fake.workspace = true
 pgtemp = "0.6.0"
 tokio = { workspace = true, features = ["macros", "test-util"] }
+
+[lints]
+workspace = true

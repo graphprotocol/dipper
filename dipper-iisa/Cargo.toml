@@ -21,3 +21,6 @@ thegraph-core = { workspace = true, features = ["fake"] }
 tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 wiremock = "0.6"
+
+[lints]
+workspace = true

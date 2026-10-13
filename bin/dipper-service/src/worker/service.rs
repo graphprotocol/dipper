@@ -20,6 +20,7 @@ use super::{
     result::{JobError, JobResult, calculate_backoff_delay, retries_within_window},
 };
 pub use super::{
+    handlers::ChainAccept,
     queue::JobPriority,
     service_queue::{WorkerQueue, WorkerQueueHandle},
 };
@@ -41,7 +42,10 @@ const DEFAULT_QUEUE_POLL_PERIOD: Duration = Duration::from_secs(1);
 /// (IISA HTTP, indexer RPC, chain RPC + receipt polling), so the legitimate
 /// worst case is their sum, on the order of a couple of minutes. This timeout
 /// sits comfortably above that and only fires if a dependency accepts the
-/// connection but never responds, defeating the per-call timeouts. Critically,
+/// connection but never responds, defeating the per-call timeouts. It also
+/// bounds how long a chain submission may retry across the RPC providers
+/// (see `derive_submit_deadline`): 4/5 of it must hold two walks of a
+/// 3-provider ring at the default 10s timeout and 3 retries. Critically,
 /// for the whole `process_job` call the job's `JobGuard` holds the row's
 /// `Running` lock (and the pgmq transaction behind it). An unbounded hang
 /// would therefore both wedge the worker loop and pin that row indefinitely.
@@ -50,7 +54,7 @@ const DEFAULT_QUEUE_POLL_PERIOD: Duration = Duration::from_secs(1);
 /// `JobGuard` reschedules the row and releases its lock. Recovery is
 /// idempotent (chain-as-source-of-truth), so re-running a job whose handler
 /// was cancelled mid-flight is safe.
-pub(crate) const PROCESS_JOB_TIMEOUT: Duration = Duration::from_secs(300);
+pub(crate) const PROCESS_JOB_TIMEOUT: Duration = Duration::from_secs(420);
 
 /// Base backoff for a job rescheduled after hitting [`PROCESS_JOB_TIMEOUT`].
 const JOB_TIMEOUT_RETRY_BASE_DELAY: Duration = Duration::from_secs(30);
@@ -236,6 +240,10 @@ impl WarnPacer {
 /// or not, because PostgreSQL only holds them for sessions currently listening.
 /// The 1 second poll bounds that to added latency, never a dropped job, which is
 /// the property worth relying on here.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "predates this lint; fix when next touched"
+)]
 async fn await_next_tick<N: JobNotifications>(
     stop_rx: &mut watch::Receiver<bool>,
     listener: &mut Option<N>,
@@ -365,6 +373,10 @@ impl<N: JobNotifications> Subscription<N> {
 
     /// Re-opens the subscription. A failure here keeps us in poll-only mode,
     /// which processes every job just as reliably, only later.
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "predates this lint; fix when next touched"
+    )]
     async fn resubscribe<Q: Queue<Message, Listener = N>>(&mut self, queue: &Q) {
         match queue.subscribe().await {
             Ok(l) => {
@@ -532,6 +544,10 @@ where
 /// One worker loop: drains jobs until the stop signal fires. Each loop owns its
 /// own queue notification listener because the underlying `LISTEN`/`NOTIFY` is
 /// per-connection and can't be shared across tasks.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "predates this lint; fix when next touched"
+)]
 async fn run_loop<Q, R, C, I, T>(
     state: InnerCtx<R, WorkerQueueHandle<Q>, C, I, T>,
     queue: Q,
@@ -604,14 +620,14 @@ where
                 }
             }
             Err(JobError::Deferred(delay)) => {
-                // Couldn't run now (another reassessment holds the global lock);
-                // re-queue at a flat delay without counting a failed attempt.
-                // Logged at info so sustained contention is visible per job id.
+                // Couldn't run now (the global reassess lock is busy, or pacing
+                // held it back); re-queue at a flat delay without counting a failed
+                // attempt. Logged at info so sustained contention is visible per job id.
                 let scheduled_for = OffsetDateTime::now_utc() + delay;
                 tracing::info!(
                     job = %job.id(),
                     delay_secs = %delay.as_secs(),
-                    "Deferring job; another reassessment holds the global lock, will retry"
+                    "Deferring job; it can't run yet, will retry"
                 );
                 if let Err(err) = job.reschedule(scheduled_for).await {
                     tracing::error!(error=?err, "Failed to reschedule deferred job");

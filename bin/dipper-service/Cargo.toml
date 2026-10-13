@@ -29,7 +29,7 @@ thegraph-core = { workspace = true, features = ["alloy-signer-local", "serde", "
 thiserror.workspace = true
 time = { workspace = true, features = ["parsing", "formatting"] }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
-tonic = { version = "0.14", default-features = false, features = ["server", "channel"] }
+tonic = { version = "0.14", default-features = false, features = ["server", "channel", "tls-aws-lc", "tls-webpki-roots"] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 uuid.workspace = true
@@ -43,3 +43,6 @@ tokio = { workspace = true, features = ["test-util"] }
 test-with = { version = "0.14.4", default-features = false }
 thegraph-core = { workspace = true, features = ["fake"] }
 wiremock.workspace = true
+
+[lints]
+workspace = true

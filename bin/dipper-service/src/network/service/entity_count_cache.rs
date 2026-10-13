@@ -97,6 +97,10 @@ async fn run(
     }
 }
 
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "predates this lint; fix when next touched"
+)]
 async fn refresh_cache(cache: &EntityCountCache, endpoint: &Url) {
     tracing::debug!("refreshing entity count cache");
 
@@ -123,6 +127,10 @@ async fn refresh_cache(cache: &EntityCountCache, endpoint: &Url) {
 
 /// Fetch all IndexerDeploymentLatest entities from the subgraph with
 /// cursor-based pagination.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "predates this lint; fix when next touched"
+)]
 async fn fetch_all_entity_counts(endpoint: &Url) -> HashMap<EntityCountKey, u64> {
     let mut result = HashMap::new();
     let mut last_id = String::new();

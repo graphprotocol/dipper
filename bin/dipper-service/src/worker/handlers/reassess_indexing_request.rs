@@ -27,9 +27,9 @@ use crate::{
         },
     },
     registry::{
-        AgreementRegistry, IndexerDenylistRegistry, IndexingAgreementTerms,
-        IndexingAgreementTermsMetadata, IndexingRequestRegistry, NewAgreementParams,
-        PendingCancellationRegistry,
+        AgreementRegistry, IndexerDenylistRegistry, IndexingAgreementStatus,
+        IndexingAgreementTerms, IndexingAgreementTermsMetadata, IndexingRequestRegistry,
+        NewAgreementParams, PendingCancellationRegistry,
     },
     signing::eip712::Eip712Signer,
     worker::{
@@ -97,6 +97,14 @@ pub struct Message {
     pub num_candidates: usize,
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cognitive_complexity,
+    clippy::expect_used,
+    clippy::too_many_lines,
+    reason = "predates this lint; fix when next touched"
+)]
 pub async fn handle<R, W, I, T>(
     ctx: Ctx<R, W, I, T>,
     Message {
@@ -139,6 +147,17 @@ where
         .map(|agreement| agreement.indexer.id)
         .collect();
 
+    // An agreement whose indexer stopped serving it keeps its slot while it may still be paid,
+    // so it isn't replaced while both are paid; once it can't be, its replacement is queued.
+    // Held slots only limit what is added, never what is cancelled.
+    let held: HashSet<IndexerId> = ctx
+        .registry
+        .get_abandoned_indexers_holding_slots(indexing_request_id)
+        .await
+        .map_err(|err| JobError::Fatal(err.into()))?
+        .into_iter()
+        .collect();
+
     // In-flight offer counts, fetched once and reused by both the saturated
     // short-circuit (global figure only) and the per-indexer cap after IISA.
     let (in_flight_per_indexer, global_in_flight) = ctx
@@ -154,7 +173,7 @@ where
     if should_defer_saturated(
         global_in_flight,
         global_cap,
-        *num_candidates,
+        num_candidates.saturating_sub(held.len()),
         active_agreements.len(),
     ) {
         tracing::debug!(
@@ -265,9 +284,18 @@ where
     let target_pricing: HashMap<IndexerId, &SelectedIndexer> =
         target_selected.iter().map(|s| (s.id, s)).collect();
 
-    // Compute the diff
+    // Compute the diff. New offers fill only what the agreements kept and the held slots leave
+    // of the target, in IISA's order, and never for an indexer holding a slot.
     let to_cancel: HashSet<&IndexerId> = current_ids.difference(&target_ids).collect();
-    let to_add: HashSet<&IndexerId> = target_ids.difference(&current_ids).collect();
+    let diff_add_count = target_ids.difference(&current_ids).count();
+    let kept = current_ids.intersection(&target_ids).count();
+    let room = num_candidates.saturating_sub(held.len() + kept);
+    let to_add: HashSet<&IndexerId> = target_selected
+        .iter()
+        .map(|s| &s.id)
+        .filter(|id| !current_ids.contains(*id) && !held.contains(*id))
+        .take(room)
+        .collect();
 
     // Surface the IISA outcome alongside the diff so the operator can tell
     // "everyone is declined" apart from "we're already synced" without
@@ -278,6 +306,7 @@ where
         indexing_request_id=%indexing_request_id,
         deployment_id=%deployment_id,
         requested_num_candidates = num_candidates,
+        held_slots = held.len(),
         iisa_returned_count = target_selected.len(),
         current_active_count = current_ids.len(),
         to_add_count = to_add.len(),
@@ -337,8 +366,11 @@ where
 
     // Offer pacing: only create as many agreements as the network can accept
     // before the deadline, so a burst does not queue offers that expire unaccepted.
+    // Adds left out for held slots count as withheld, so the old agreements they would have
+    // replaced stay until a later pass can replace them.
     let (capped_to_add, offer_pacing_withheld, reserved_cancel_count) = if to_add.is_empty() {
-        (HashSet::new(), 0usize, 0usize)
+        let reserved = reserved_cancel_count(old_to_cancel.len(), diff_add_count, 0);
+        (HashSet::new(), 0usize, reserved)
     } else {
         // Reuse the in-flight counts and global cap fetched at the top of the pass.
         let per_indexer_cap = ctx.agreement_conf.max_in_flight_offers_per_indexer();
@@ -350,7 +382,7 @@ where
             per_indexer_cap,
             global_cap,
         );
-        let reserved = reserved_cancel_count(old_to_cancel.len(), to_add.len(), allowed.len());
+        let reserved = reserved_cancel_count(old_to_cancel.len(), diff_add_count, allowed.len());
         if withheld > 0 {
             tracing::info!(
                 event = "offer_pacing_capped",
@@ -524,7 +556,7 @@ where
                         agreement_id = %id,
                         indexing_request_id = %indexing_request_id,
                         old_status = "none",
-                        new_status = "CREATED",
+                        new_status = %IndexingAgreementStatus::Created,
                         reason = "reassessment_replacement",
                         "agreement state transition"
                     );
@@ -562,7 +594,7 @@ where
                         agreement_id = %id,
                         indexing_request_id = %indexing_request_id,
                         old_status = "none",
-                        new_status = "CREATED",
+                        new_status = %IndexingAgreementStatus::Created,
                         reason = "reassessment_addition",
                         "agreement state transition"
                     );
@@ -625,107 +657,27 @@ where
             );
     }
 
-    // Cancel old agreements that have no replacement to pair with.
-    // These indexers are leaving the target group with nothing taking
-    // their place. Fire the on-chain cancel first; only mark the local row
-    // CanceledByRequester after the chain tx is accepted, so retry on a
-    // transient chain-client failure does the right thing.
+    // Cancel old agreements that have no replacement to pair with: these indexers
+    // leave the target group with nothing taking their place.
     let mut directly_cancelled = 0u32;
     let mut cancel_failures = 0u32;
     for old_agreement in old_iter {
-        // Skip agreements that haven't been accepted on-chain yet -- there is
-        // nothing on the contract to cancel. The local row goes straight to
-        // CanceledByRequester so the indexer never picks it up.
-        let needs_on_chain_cancel = matches!(
-            old_agreement.status,
-            crate::registry::IndexingAgreementStatus::AcceptedOnChain
-        );
-
-        let mut on_chain_cancel_tx: Option<String> = None;
-        if needs_on_chain_cancel {
-            match crate::cancel_dispatch::cancel_agreement_on_chain(
-                &ctx.chain_client,
-                old_agreement,
-                &ctx.agreement_conf,
-            )
-            .await
-            {
-                Ok(Some(tx_hash)) => {
-                    tracing::info!(
-                        agreement_id = %old_agreement.id,
-                        indexing_request_id = %indexing_request_id,
-                        %tx_hash,
-                        "Submitted on-chain cancellation for unpaired old agreement"
-                    );
-                    on_chain_cancel_tx = Some(tx_hash.to_string());
-                }
-                Ok(None) => {
-                    tracing::info!(
-                        agreement_id = %old_agreement.id,
-                        indexing_request_id = %indexing_request_id,
-                        "Unpaired old agreement already canceled on-chain; proceeding with local cleanup"
-                    );
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        agreement_id = %old_agreement.id,
-                        "On-chain cancel failed; will retry on next reassessment"
-                    );
-                    cancel_failures += 1;
-                    continue;
-                }
+        let new_status = match cancel_unpaired(&ctx, old_agreement).await {
+            Unpaired::Moved(new_status) => new_status,
+            Unpaired::AlreadyEnding => continue,
+            Unpaired::Failed => {
+                cancel_failures += 1;
+                continue;
             }
-        }
-
-        if let Err(err) = ctx
-            .registry
-            .mark_indexing_agreement_as_canceled_by_requester(&old_agreement.id)
-            .await
-        {
-            tracing::error!(
-                error=%err,
-                agreement_id=%old_agreement.id,
-                "Failed to mark unpaired old agreement as canceled in local DB"
-            );
-            cancel_failures += 1;
-            continue;
-        }
-
+        };
         tracing::info!(
             agreement_id = %old_agreement.id,
             indexing_request_id = %indexing_request_id,
             old_status = %old_agreement.status,
-            new_status = "CANCELED_BY_REQUESTER",
+            new_status = %new_status,
             reason = "reassessment_not_in_target_group",
             "agreement state transition"
         );
-
-        // Record the cancel audit for the accepted-on-chain agreements dipper just
-        // cancelled, so the chain_listener's `terminated` sweep announces them
-        // durably. Never-accepted agreements (`!needs_on_chain_cancel`) were never
-        // live on-chain: they are not sweep-eligible (`accepted_at IS NULL`) and
-        // correctly emit nothing.
-        if needs_on_chain_cancel {
-            let manager = ctx.agreement_conf.recurring_agreement_manager().to_string();
-            if let Err(err) = ctx
-                .registry
-                .record_cancel_audit(
-                    &old_agreement.id,
-                    now_secs(),
-                    &manager,
-                    on_chain_cancel_tx.as_deref(),
-                )
-                .await
-            {
-                tracing::warn!(
-                    agreement_id = %old_agreement.id,
-                    error = %err,
-                    "failed to record cancel audit; terminated event may emit with fallback fields"
-                );
-            }
-        }
-
         directly_cancelled += 1;
     }
 
@@ -738,19 +690,14 @@ where
     }
 
     if cancel_failures > 0 {
-        // Two recovery paths cover any agreements left AcceptedOnChain here:
-        //
-        // - Shrink-to-zero (request now Canceled): the chain_listener's
-        //   `sweep_orphan_canceled_agreements` retries on every sweep tick
-        //   (default ~5 min at fast poll, ~5 h at slow poll).
-        // - Shrink-not-zero (request still Open with too many agreements):
-        //   the periodic reassignment service re-queues reassessment at its
-        //   configured cadence (default 24 h).
+        // An agreement that couldn't be marked keeps its status: the orphan-cancel sweep
+        // retries it once the request is Canceled, the periodic reassignment service
+        // (24 h) while it is Open.
         tracing::warn!(
             indexing_request_id=%indexing_request_id,
             failures=cancel_failures,
-            "some agreement cancels failed during reassessment; retry will fire \
-             via the orphan-cancel sweep (Canceled requests) or the periodic \
+            "some agreements could not be marked for cancelling during reassessment; retry \
+             will fire via the orphan-cancel sweep (Canceled requests) or the periodic \
              reassignment service (Open requests over-target)"
         );
     }
@@ -782,6 +729,10 @@ where
 /// Compute the EIP-712 terms hash persisted for the protocol-managed cancel
 /// path, reusing the proposal signer's RCA-to-sol conversion and signing-hash so
 /// the value matches the hash dipper signs over.
+#[expect(
+    clippy::expect_used,
+    reason = "predates this lint; fix when next touched"
+)]
 fn compute_terms_version_hash(
     nonce_uuid: uuid::Uuid,
     terms: &IndexingAgreementTerms,
@@ -800,6 +751,10 @@ fn compute_terms_version_hash(
 /// Pick the clock denominating `terms.deadline`/`terms.ends_at`: wall clock when
 /// `bypass` is false; otherwise chain time — live chain head, else the listener's
 /// persisted timestamp, else wall clock, warning on each demotion; registry errors retry.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "predates this lint; fix when next touched"
+)]
 async fn resolve_deadline_clock<R, C>(
     bypass: bool,
     chain_listener_chain_id: Option<u64>,
@@ -902,7 +857,7 @@ mod lifecycle_event_tests {
 
     use super::{Ctx, Message, handle};
     use crate::{
-        chain_client::{ChainClient, ChainClientError},
+        chain_client::{AgreementOnChain, ChainClient, ChainClientError},
         config::IndexingAgreementConfig,
         network::{
             provider::NetworkProviderService,
@@ -912,11 +867,10 @@ mod lifecycle_event_tests {
             },
         },
         registry::{
-            AgreementFeeRate, AgreementRegistry, CancelKind, Indexer, IndexerDenylistRegistry,
-            IndexingAgreement, IndexingAgreementStatus, IndexingAgreementTerms,
-            IndexingAgreementTermsMetadata, IndexingRequest, IndexingRequestRegistry,
-            NewAgreementParams, PendingCancellation, PendingCancellationRegistry,
-            ReconciliationItem, ReconciliationOutcome, Result as RegistryResult, SetTargetOutcome,
+            AgreementFeeRate, Indexer, IndexerDenylistRegistry, IndexingAgreement,
+            IndexingAgreementStatus, IndexingAgreementTerms, IndexingAgreementTermsMetadata,
+            IndexingRequest, IndexingRequestRegistry, NewAgreementParams, PendingCancellation,
+            PendingCancellationRegistry, Result as RegistryResult, SetTargetOutcome,
         },
         signing::eip712::Eip712Signer,
         test_support::{CapturedEvent, CapturingEventsProducer},
@@ -941,7 +895,7 @@ mod lifecycle_event_tests {
 
     // ---- Mock: IISA candidate selection -------------------------------------
 
-    /// Returns a fixed list of [`SelectedIndexer`] regardless of arguments.
+    /// Returns a fixed list of [`SelectedIndexer`], at most as many as asked for.
     struct MockIisa {
         selected: Vec<SelectedIndexer>,
     }
@@ -951,10 +905,10 @@ mod lifecycle_event_tests {
         async fn select_indexers(
             &self,
             _deployment_id: DeploymentId,
-            _num_candidates: usize,
+            num_candidates: usize,
             _context: &SelectionContext,
         ) -> std::result::Result<Vec<SelectedIndexer>, SelectionError> {
-            Ok(self.selected.clone())
+            Ok(self.selected.iter().take(num_candidates).cloned().collect())
         }
 
         async fn dips_accepting_indexers(
@@ -971,8 +925,8 @@ mod lifecycle_event_tests {
 
     // ---- Mock: worker queue --------------------------------------------------
 
-    /// Records every `send_indexing_agreement_proposal` call's indexer URL.
-    /// Clone shares the buffer so a caller can inspect proposals after `handle`.
+    /// Records every `send_indexing_agreement_proposal` call's indexer URL. Clone shares the
+    /// buffer for inspection after `handle`.
     #[derive(Default, Clone)]
     struct MockQueue {
         proposals: Arc<Mutex<Vec<Url>>>,
@@ -1007,9 +961,10 @@ mod lifecycle_event_tests {
         async fn cancel_rejected_agreement_on_chain(
             &self,
             _agreement_id: IndexingAgreementId,
+            _accept: Option<crate::worker::service::ChainAccept>,
             _priority: crate::worker::queue::JobPriority,
         ) -> anyhow::Result<crate::worker::queue::JobId> {
-            unimplemented!("not exercised by reassess handler")
+            unimplemented!()
         }
 
         async fn submit_offer(
@@ -1027,9 +982,17 @@ mod lifecycle_event_tests {
 
     // ---- Mock: chain client --------------------------------------------------
 
-    /// Always reports a successful cancel that the post-cancel read confirms.
-    #[derive(Default)]
-    struct MockChainClient;
+    /// Shows every agreement live until a cancel is sent for it, unless nothing is on
+    /// chain, and records the id of every agreement it was asked to cancel.
+    #[derive(Default, Clone)]
+    struct MockChainClient {
+        cancelled: Arc<Mutex<Vec<[u8; 16]>>>,
+        nothing_on_chain: bool,
+        /// When set, each cancel records whether its agreement was already marked cancelling.
+        marked_cancelling: Option<Arc<Mutex<Vec<IndexingAgreementId>>>>,
+        marked_at_cancel: Arc<Mutex<Vec<bool>>>,
+        fail_cancel: bool,
+    }
 
     #[async_trait]
     impl ChainClient for MockChainClient {
@@ -1049,10 +1012,19 @@ mod lifecycle_event_tests {
         async fn cancel_via_manager(
             &self,
             _collector: Address,
-            _agreement_id: &[u8; 16],
+            agreement_id: &[u8; 16],
             _version_hash: B256,
             _options: u16,
         ) -> std::result::Result<Option<B256>, ChainClientError> {
+            if self.fail_cancel {
+                return Err(ChainClientError::RpcError(anyhow::anyhow!("rpc down")));
+            }
+            self.cancelled.lock().unwrap().push(*agreement_id);
+            if let Some(marked) = &self.marked_cancelling {
+                let id = IndexingAgreementId::from_bytes(*agreement_id);
+                let was_marked = marked.lock().unwrap().contains(&id);
+                self.marked_at_cancel.lock().unwrap().push(was_marked);
+            }
             Ok(Some(B256::repeat_byte(0xcd)))
         }
 
@@ -1063,13 +1035,21 @@ mod lifecycle_event_tests {
         ) -> std::result::Result<Option<B256>, ChainClientError> {
             Ok(None)
         }
-
-        async fn agreement_still_active(
+        async fn reconcile_agreement(
             &self,
+            _collector: Address,
             _agreement_id: &[u8; 16],
-        ) -> std::result::Result<bool, ChainClientError> {
-            // Cancel confirmed: agreement is no longer active on-chain.
-            Ok(false)
+        ) -> Result<Option<B256>, ChainClientError> {
+            unimplemented!()
+        }
+
+        async fn agreement_on_chain(
+            &self,
+            agreement_id: &[u8; 16],
+        ) -> std::result::Result<AgreementOnChain, ChainClientError> {
+            Ok(AgreementOnChain::live_if(
+                !self.nothing_on_chain && !self.cancelled.lock().unwrap().contains(agreement_id),
+            ))
         }
     }
 
@@ -1089,6 +1069,11 @@ mod lifecycle_event_tests {
         /// `set_indexing_request_shortfall_active` flips it and reports whether it
         /// changed, so tests can exercise the transition-based emit.
         shortfall_active: std::sync::Mutex<bool>,
+        /// Ids marked CanceledByRequester locally.
+        marked_cancelled: Arc<Mutex<Vec<IndexingAgreementId>>>,
+        marked_cancelling: Arc<Mutex<Vec<IndexingAgreementId>>>,
+        /// Indexers holding a slot with an agreement they stopped serving.
+        held: Vec<IndexerId>,
     }
 
     #[async_trait]
@@ -1137,25 +1122,13 @@ mod lifecycle_event_tests {
     }
 
     #[async_trait]
-    impl AgreementRegistry for MockRegistry {
-        async fn get_indexing_agreement_by_id(
-            &self,
-            _id: &IndexingAgreementId,
-        ) -> RegistryResult<Option<IndexingAgreement>> {
-            unimplemented!()
-        }
+    impl crate::registry::StubAgreementRegistry for MockRegistry {
         // gather_selection_context: all active agreements for the deployment.
         async fn get_indexing_agreements_by_deployment_id(
             &self,
             _deployment_id: &DeploymentId,
         ) -> RegistryResult<Vec<IndexingAgreement>> {
             Ok(self.active_agreements.clone())
-        }
-        async fn get_indexing_agreements_by_indexer_id(
-            &self,
-            _indexer_id: &IndexerId,
-        ) -> RegistryResult<Vec<IndexingAgreement>> {
-            unimplemented!()
         }
         // gather_selection_context: no pending agreements.
         async fn get_pending_agreement_indexers_by_deployment(
@@ -1174,18 +1147,18 @@ mod lifecycle_event_tests {
         ) -> RegistryResult<HashMap<DeploymentId, Vec<IndexerId>>> {
             Ok(HashMap::new())
         }
-        async fn get_indexing_agreements_by_indexing_request_id(
-            &self,
-            _request_id: &IndexingRequestId,
-        ) -> RegistryResult<Vec<IndexingAgreement>> {
-            unimplemented!()
-        }
         // The handler's current-state baseline for the diff.
         async fn get_active_indexing_agreements_by_indexing_request_id(
             &self,
             _request_id: &IndexingRequestId,
         ) -> RegistryResult<Vec<IndexingAgreement>> {
             Ok(self.active_agreements.clone())
+        }
+        async fn get_abandoned_indexers_holding_slots(
+            &self,
+            _request_id: &IndexingRequestId,
+        ) -> RegistryResult<Vec<IndexerId>> {
+            Ok(self.held.clone())
         }
         // Populates the `terminated` event's remaining count.
         async fn count_accepted_agreements_by_deployment(
@@ -1214,96 +1187,27 @@ mod lifecycle_event_tests {
         ) -> RegistryResult<Vec<IndexerId>> {
             Ok(Vec::new())
         }
-        async fn mark_indexing_agreement_as_unresponsive(
-            &self,
-            _id: &IndexingAgreementId,
-        ) -> RegistryResult<()> {
-            unimplemented!()
-        }
         async fn count_created_agreements_by_indexer(
             &self,
         ) -> RegistryResult<(std::collections::HashMap<IndexerId, u64>, u64)> {
             Ok((std::collections::HashMap::new(), 0))
         }
-        async fn update_offer_tx_hash(
-            &self,
-            _id: &IndexingAgreementId,
-            _tx_hash: &[u8; 32],
-        ) -> RegistryResult<()> {
-            unimplemented!()
-        }
         // Cancel path: pre-mark the local row terminal.
         async fn mark_indexing_agreement_as_canceled_by_requester(
             &self,
-            _id: &IndexingAgreementId,
+            id: &IndexingAgreementId,
         ) -> RegistryResult<()> {
+            self.marked_cancelled.lock().unwrap().push(*id);
             Ok(())
         }
-        async fn apply_reconciliation(
+        async fn mark_indexing_agreement_as_cancelling(
             &self,
-            _id: &IndexingAgreementId,
-            _apply_accept: bool,
-            _cancel: Option<CancelKind>,
-        ) -> RegistryResult<ReconciliationOutcome> {
-            unimplemented!()
-        }
-        async fn apply_reconciliation_batch(
-            &self,
-            _items: &[ReconciliationItem],
-        ) -> RegistryResult<HashMap<IndexingAgreementId, ReconciliationOutcome>> {
-            unimplemented!()
-        }
-        async fn get_expired_created_agreements(
-            &self,
-            _batch_size: i64,
-            _chain_timestamp: u64,
-        ) -> RegistryResult<Vec<IndexingAgreement>> {
-            unimplemented!()
-        }
-        async fn mark_indexing_agreement_as_expired(
-            &self,
-            _id: &IndexingAgreementId,
+            id: &IndexingAgreementId,
         ) -> RegistryResult<()> {
-            unimplemented!()
+            self.marked_cancelling.lock().unwrap().push(*id);
+            Ok(())
         }
-        async fn mark_indexing_agreement_as_rejected(
-            &self,
-            _id: &IndexingAgreementId,
-            _rejection_reason: Option<&str>,
-        ) -> RegistryResult<()> {
-            unimplemented!()
-        }
-        async fn get_accepted_on_chain_agreements(
-            &self,
-            _batch_size: i64,
-        ) -> RegistryResult<Vec<IndexingAgreement>> {
-            unimplemented!()
-        }
-        async fn get_agreements_pending_chain_cancel(
-            &self,
-            _batch_size: i64,
-        ) -> RegistryResult<Vec<IndexingAgreement>> {
-            unimplemented!()
-        }
-        async fn update_agreement_sync_progress(
-            &self,
-            _id: &IndexingAgreementId,
-            _block_height: u64,
-            _progress_at: OffsetDateTime,
-        ) -> RegistryResult<()> {
-            unimplemented!()
-        }
-        async fn count_active_agreements_by_deployment(
-            &self,
-        ) -> RegistryResult<HashMap<DeploymentId, usize>> {
-            unimplemented!()
-        }
-        async fn mark_indexing_agreement_as_abandoned(
-            &self,
-            _id: &IndexingAgreementId,
-        ) -> RegistryResult<IndexingAgreement> {
-            unimplemented!()
-        }
+
         // gather_selection_context: optimistic DIPs fees (none).
         async fn get_agreement_fee_rates(&self) -> RegistryResult<Vec<AgreementFeeRate>> {
             Ok(Vec::new())
@@ -1393,19 +1297,11 @@ mod lifecycle_event_tests {
             min_seconds_per_collection: 60,
             duration_seconds: 86400,
             deadline_seconds: 3600,
-            max_grt_per_30_days: std::collections::BTreeMap::new(),
-            max_grt_per_billion_entities_per_30_days: 0.0,
             declined_indexer_lookback_days: 30,
             price_rejection_lookback_days: 1,
             transient_rejection_lookback_minutes: 30,
             uncertain_rejection_lookback_days: 1,
-            unresponsive_indexer_lookback_days: 0,
-            mass_unresponsive_trip_fraction: 0.5,
-            mass_unresponsive_reset_fraction: 0.25,
-            dips_accepting_snapshot_max_age_hours: 48,
-            dips_accepting_cache_ttl_seconds: 300,
-            max_in_flight_offers_per_indexer: None,
-            max_in_flight_offers_total: None,
+            ..IndexingAgreementConfig::for_tests()
         }
     }
 
@@ -1550,7 +1446,7 @@ mod lifecycle_event_tests {
                 selected: vec![selected(new_idx)],
             },
             MockQueue::default(),
-            MockChainClient,
+            MockChainClient::default(),
             events.clone(),
             snapshot,
         );
@@ -1603,7 +1499,7 @@ mod lifecycle_event_tests {
                 selected: vec![selected(new_idx)],
             },
             MockQueue::default(),
-            MockChainClient,
+            MockChainClient::default(),
             events.clone(),
             snapshot,
         );
@@ -1643,6 +1539,9 @@ mod lifecycle_event_tests {
             chain_state_lookup_fails: false,
             // Already in shortfall.
             shortfall_active: std::sync::Mutex::new(true),
+            marked_cancelled: Arc::default(),
+            marked_cancelling: Arc::default(),
+            held: Vec::new(),
         };
         let ctx = build_ctx(
             registry,
@@ -1650,7 +1549,7 @@ mod lifecycle_event_tests {
                 selected: vec![selected(idx)],
             },
             MockQueue::default(),
-            MockChainClient,
+            MockChainClient::default(),
             events.clone(),
             indexer_urls::Snapshot::new(),
         );
@@ -1679,6 +1578,9 @@ mod lifecycle_event_tests {
             accepted_count: 1,
             chain_state_lookup_fails: false,
             shortfall_active: std::sync::Mutex::new(false),
+            marked_cancelled: Arc::default(),
+            marked_cancelling: Arc::default(),
+            held: Vec::new(),
         };
         let ctx = build_ctx(
             registry,
@@ -1686,7 +1588,7 @@ mod lifecycle_event_tests {
                 selected: vec![selected(idx)],
             },
             MockQueue::default(),
-            MockChainClient,
+            MockChainClient::default(),
             events.clone(),
             indexer_urls::Snapshot::new(),
         );
@@ -1711,7 +1613,7 @@ mod lifecycle_event_tests {
             MockRegistry::default(),       // no current agreements, latch false
             MockIisa { selected: vec![] }, // zero available
             MockQueue::default(),
-            MockChainClient,
+            MockChainClient::default(),
             events.clone(),
             indexer_urls::Snapshot::new(),
         );
@@ -1736,6 +1638,73 @@ mod lifecycle_event_tests {
     }
 
     #[tokio::test]
+    async fn fills_only_the_slots_an_abandoned_agreement_does_not_hold() {
+        // The abandoned agreement may still be paid until its cancel lands, so filling its
+        // slot now would pay 2 indexers for it; its replacement is queued once it can't be.
+        let held = indexer_id(0x20);
+        let candidates = [held, indexer_id(0x21), indexer_id(0x22), indexer_id(0x23)];
+        let url = |id: IndexerId| Url::parse(&format!("https://{id}.example")).unwrap();
+        let mut snapshot = indexer_urls::Snapshot::new();
+        for id in candidates {
+            snapshot.insert(id, url(id));
+        }
+        let queue = MockQueue::default();
+        let ctx = build_ctx(
+            MockRegistry {
+                held: vec![held],
+                ..MockRegistry::default()
+            },
+            MockIisa {
+                selected: candidates.iter().copied().map(selected).collect(),
+            },
+            queue.clone(),
+            MockChainClient::default(),
+            CapturingEventsProducer::new(),
+            snapshot,
+        );
+
+        handle(ctx, &test_message(3)).await.expect("handler ok");
+
+        let proposed: std::collections::HashSet<Url> =
+            queue.proposals.lock().unwrap().iter().cloned().collect();
+        assert_eq!(
+            proposed,
+            std::collections::HashSet::from([url(candidates[1]), url(candidates[2])]),
+            "2 offers, the first in IISA's order, none to the indexer holding a slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn never_cancels_an_agreement_for_a_slot_another_holds() {
+        // Target of 1: the healthy agreement stays, though an abandoned one holds a slot too.
+        let healthy = indexer_id(0x11);
+        let chain_client = MockChainClient::default();
+        let queue = MockQueue::default();
+        let registry = MockRegistry {
+            active_agreements: vec![agreement(healthy, IndexingAgreementStatus::AcceptedOnChain)],
+            held: vec![indexer_id(0x20)],
+            ..MockRegistry::default()
+        };
+        let marked_cancelling = Arc::clone(&registry.marked_cancelling);
+        let ctx = build_ctx(
+            registry,
+            MockIisa {
+                selected: vec![selected(healthy)],
+            },
+            queue.clone(),
+            chain_client.clone(),
+            CapturingEventsProducer::new(),
+            indexer_urls::Snapshot::new(),
+        );
+
+        handle(ctx, &test_message(1)).await.expect("handler ok");
+
+        assert!(chain_client.cancelled.lock().unwrap().is_empty());
+        assert!(marked_cancelling.lock().unwrap().is_empty());
+        assert!(queue.proposals.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn emits_shortfall_when_coverage_drops_below_target() {
         // Item 9: an indexer leaves the target group and IISA can't replace it, so
         // coverage falls below the requested count. The diff is cancel-only
@@ -1749,12 +1718,15 @@ mod lifecycle_event_tests {
             accepted_count: 0,
             chain_state_lookup_fails: false,
             shortfall_active: std::sync::Mutex::new(false),
+            marked_cancelled: Arc::default(),
+            marked_cancelling: Arc::default(),
+            held: Vec::new(),
         };
         let ctx = build_ctx(
             registry,
             MockIisa { selected: vec![] }, // IISA returns nothing -> coverage drops
             MockQueue::default(),
-            MockChainClient,
+            MockChainClient::default(),
             events.clone(),
             indexer_urls::Snapshot::new(),
         );
@@ -1802,6 +1774,9 @@ mod lifecycle_event_tests {
             accepted_count: 0,
             chain_state_lookup_fails: false,
             shortfall_active: std::sync::Mutex::new(false),
+            marked_cancelled: Arc::default(),
+            marked_cancelling: Arc::default(),
+            held: Vec::new(),
         };
         let ctx = build_ctx(
             registry,
@@ -1809,7 +1784,7 @@ mod lifecycle_event_tests {
                 selected: vec![selected(new_idx)],
             },
             queue.clone(),
-            MockChainClient,
+            MockChainClient::default(),
             events.clone(),
             snapshot,
         );
@@ -1847,9 +1822,8 @@ mod lifecycle_event_tests {
     async fn never_accepted_unpaired_cancel_does_not_emit_terminated() {
         // Both old agreements were never accepted on-chain (Created). One add
         // pairs with the first old agreement; the second, unpaired old agreement
-        // reaches the cancel loop but, being never-accepted
-        // (`!needs_on_chain_cancel`), must NOT emit `terminated`. The add still
-        // emits `proposed`. Net: exactly one event, a `proposed`.
+        // reaches the cancel loop but, never accepted, must NOT emit `terminated`.
+        // The add still emits `proposed`. Net: exactly one event, a `proposed`.
         let new_idx = indexer_id(0x44);
         let old_paired = indexer_id(0x55);
         let old_unpaired = indexer_id(0x56);
@@ -1866,6 +1840,9 @@ mod lifecycle_event_tests {
             accepted_count: 0,
             chain_state_lookup_fails: false,
             shortfall_active: std::sync::Mutex::new(false),
+            marked_cancelled: Arc::default(),
+            marked_cancelling: Arc::default(),
+            held: Vec::new(),
         };
         let ctx = build_ctx(
             registry,
@@ -1873,7 +1850,7 @@ mod lifecycle_event_tests {
                 selected: vec![selected(new_idx)],
             },
             MockQueue::default(),
-            MockChainClient,
+            MockChainClient::default(),
             events.clone(),
             snapshot,
         );
@@ -1888,6 +1865,226 @@ mod lifecycle_event_tests {
         );
         assert!(matches!(captured[0], CapturedEvent::Proposed { .. }));
     }
+
+    /// Ctx whose only active agreement, in `status`, leaves the target group, with the
+    /// chain mock recording whether the row was already marked cancelling at each cancel.
+    fn ctx_cancelling_one(
+        status: IndexingAgreementStatus,
+    ) -> (
+        Ctx<MockRegistry, MockQueue, MockIisa, MockChainClient>,
+        IndexingAgreement,
+    ) {
+        let leaving = agreement(indexer_id(0x11), status);
+        let mut ctx = build_ctx(
+            MockRegistry {
+                active_agreements: vec![leaving.clone()],
+                ..MockRegistry::default()
+            },
+            MockIisa { selected: vec![] },
+            MockQueue::default(),
+            MockChainClient::default(),
+            CapturingEventsProducer::new(),
+            indexer_urls::Snapshot::new(),
+        );
+        ctx.chain_client.marked_cancelling = Some(ctx.registry.marked_cancelling.clone());
+        (ctx, leaving)
+    }
+
+    #[tokio::test]
+    async fn marks_an_unaccepted_agreement_cancelling_before_cancelling_it_on_chain() {
+        // Its offer may be in flight. An offer landing after the cancel can't be
+        // withdrawn by it, so its job must find the agreement already marked. It
+        // stays cancelling: the offer could still be accepted until its deadline.
+        let (ctx, leaving) = ctx_cancelling_one(IndexingAgreementStatus::Created);
+        let chain = ctx.chain_client.clone();
+        let cancelled = ctx.registry.marked_cancelled.clone();
+
+        let result = handle(ctx, &test_message(0)).await;
+
+        assert!(result.is_ok(), "got {result:?}");
+        assert_eq!(
+            *chain.cancelled.lock().unwrap(),
+            vec![*leaving.id.as_bytes()]
+        );
+        assert_eq!(*chain.marked_at_cancel.lock().unwrap(), vec![true]);
+        assert!(cancelled.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sends_no_cancel_for_an_offer_that_never_reached_the_chain() {
+        // A cancel of nothing still mines and costs gas. The mark made first means an
+        // offer still in flight withdraws itself when it lands.
+        let (mut ctx, leaving) = ctx_cancelling_one(IndexingAgreementStatus::Created);
+        ctx.chain_client.nothing_on_chain = true;
+        let chain = ctx.chain_client.clone();
+        let marked = ctx.registry.marked_cancelling.clone();
+
+        let result = handle(ctx, &test_message(0)).await;
+
+        assert!(result.is_ok(), "got {result:?}");
+        assert!(chain.cancelled.lock().unwrap().is_empty());
+        assert_eq!(*marked.lock().unwrap(), vec![leaving.id]);
+    }
+
+    #[tokio::test]
+    async fn marks_an_accepted_agreement_cancelled_once_its_cancel_lands() {
+        let (ctx, leaving) = ctx_cancelling_one(IndexingAgreementStatus::AcceptedOnChain);
+        let chain = ctx.chain_client.clone();
+        let cancelled = ctx.registry.marked_cancelled.clone();
+
+        let result = handle(ctx, &test_message(0)).await;
+
+        assert!(result.is_ok(), "got {result:?}");
+        assert_eq!(*chain.marked_at_cancel.lock().unwrap(), vec![true]);
+        assert_eq!(*cancelled.lock().unwrap(), vec![leaving.id]);
+    }
+
+    #[tokio::test]
+    async fn an_agreement_whose_cancel_fails_is_left_cancelling_for_the_retry() {
+        // The cancel retry re-sends the cancel of every cancelling agreement until
+        // the chain shows it ended, so nothing is queued here.
+        for status in [
+            IndexingAgreementStatus::Created,
+            IndexingAgreementStatus::AcceptedOnChain,
+        ] {
+            let (mut ctx, leaving) = ctx_cancelling_one(status);
+            ctx.chain_client.fail_cancel = true;
+            let cancelling = ctx.registry.marked_cancelling.clone();
+            let cancelled = ctx.registry.marked_cancelled.clone();
+
+            let result = handle(ctx, &test_message(0)).await;
+
+            assert!(result.is_ok(), "got {result:?}");
+            assert_eq!(*cancelling.lock().unwrap(), vec![leaving.id]);
+            assert!(cancelled.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_unaccepted_agreement_revokes_its_offer_on_chain() {
+        // A Created agreement's offer can already be on-chain, where the indexer
+        // can still accept it. Cancelling the request must revoke that offer, not
+        // only mark the local row cancelled.
+        let leaving = agreement(indexer_id(0x11), IndexingAgreementStatus::Created);
+        let leaving_id = *leaving.id.as_bytes();
+        let chain_client = MockChainClient::default();
+        let registry = MockRegistry {
+            active_agreements: vec![leaving],
+            accepted_count: 0,
+            chain_state_lookup_fails: false,
+            shortfall_active: std::sync::Mutex::new(false),
+            marked_cancelled: Arc::default(),
+            marked_cancelling: Arc::default(),
+            held: Vec::new(),
+        };
+        let ctx = build_ctx(
+            registry,
+            MockIisa { selected: vec![] },
+            MockQueue::default(),
+            chain_client.clone(),
+            CapturingEventsProducer::new(),
+            indexer_urls::Snapshot::new(),
+        );
+
+        handle(ctx, &test_message(0)).await.expect("handler ok");
+
+        assert_eq!(*chain_client.cancelled.lock().unwrap(), vec![leaving_id]);
+    }
+
+    #[test]
+    fn an_agreement_that_ended_since_it_was_listed_is_not_a_failure() {
+        let agreement = crate::cancel_dispatch::tests::agreement(
+            crate::registry::IndexingAgreementStatus::AcceptedOnChain,
+            None,
+        );
+        let backend_down = crate::registry::Error::BackendError(dipper_pgregistry::Error::DbError(
+            sqlx::Error::PoolTimedOut,
+        ));
+
+        assert_eq!(
+            super::unmarked(&agreement, &crate::registry::Error::NoRecordsUpdated),
+            super::Unpaired::AlreadyEnding
+        );
+        assert_eq!(
+            super::unmarked(&agreement, &backend_down),
+            super::Unpaired::Failed
+        );
+    }
+}
+
+/// What became of an old agreement taken out of the target group.
+#[derive(Debug, PartialEq, Eq)]
+enum Unpaired {
+    /// Moved to this status.
+    Moved(IndexingAgreementStatus),
+    /// Already ended or being cancelled, as a race with another path can leave it.
+    AlreadyEnding,
+    /// Couldn't be marked; logged.
+    Failed,
+}
+
+/// Take an old agreement out of the target group. One that may be live on-chain is cancelled
+/// there too, which the cancel retry re-sends until it ends.
+async fn cancel_unpaired<R, W, I, T>(
+    ctx: &Ctx<R, W, I, T>,
+    agreement: &crate::registry::IndexingAgreement,
+) -> Unpaired
+where
+    R: AgreementRegistry + Sync,
+    T: ChainClient,
+{
+    let may_be_live = agreement.status == crate::registry::IndexingAgreementStatus::AcceptedOnChain
+        || (agreement.status == crate::registry::IndexingAgreementStatus::Created
+            && agreement.terms_version_hash.is_some());
+    if !may_be_live {
+        return match ctx
+            .registry
+            .mark_indexing_agreement_as_canceled_by_requester(&agreement.id)
+            .await
+        {
+            Ok(()) => Unpaired::Moved(IndexingAgreementStatus::CanceledByRequester),
+            Err(err) => unmarked(agreement, &err),
+        };
+    }
+    match crate::cancel_dispatch::start_cancel(
+        &ctx.registry,
+        &ctx.chain_client,
+        agreement,
+        crate::cancel_dispatch::CancelReason::NotWanted,
+        &ctx.agreement_conf,
+    )
+    .await
+    {
+        Ok(crate::cancel_dispatch::CancelStarted::Ended) => {
+            Unpaired::Moved(IndexingAgreementStatus::CanceledByRequester)
+        }
+        Ok(
+            crate::cancel_dispatch::CancelStarted::NotLive
+            | crate::cancel_dispatch::CancelStarted::MayBeLive,
+        ) => Unpaired::Moved(IndexingAgreementStatus::Cancelling),
+        Err(err) => unmarked(agreement, &err),
+    }
+}
+
+/// Why an unpaired old agreement couldn't be marked, logged at the level it deserves: one that
+/// ended, or started cancelling, since it was listed is expected and needs nothing more.
+fn unmarked(
+    agreement: &crate::registry::IndexingAgreement,
+    err: &crate::registry::Error,
+) -> Unpaired {
+    if matches!(err, crate::registry::Error::NoRecordsUpdated) {
+        tracing::debug!(
+            agreement_id = %agreement.id,
+            "Unpaired old agreement already ended or being cancelled"
+        );
+        return Unpaired::AlreadyEnding;
+    }
+    tracing::error!(
+        error = %err,
+        agreement_id = %agreement.id,
+        "Failed to mark unpaired old agreement as ended in local DB"
+    );
+    Unpaired::Failed
 }
 
 /// Olds reserved from cancellation: one per add-cancel pairing lost to a
@@ -2244,7 +2441,7 @@ mod deadline_clock_tests {
 
     use super::{JobError, resolve_deadline_clock};
     use crate::{
-        chain_client::{ChainClient, ChainClientError},
+        chain_client::{AgreementOnChain, ChainClient, ChainClientError},
         network::service::{
             chain_events::Cursor,
             chain_listener::{ChainListenerState, ChainListenerStateRegistry},
@@ -2287,12 +2484,19 @@ mod deadline_clock_tests {
         ) -> Result<Option<B256>, ChainClientError> {
             Ok(None)
         }
+        async fn reconcile_agreement(
+            &self,
+            _collector: Address,
+            _agreement_id: &[u8; 16],
+        ) -> Result<Option<B256>, ChainClientError> {
+            unimplemented!()
+        }
 
-        async fn agreement_still_active(
+        async fn agreement_on_chain(
             &self,
             _agreement_id: &[u8; 16],
-        ) -> Result<bool, ChainClientError> {
-            Ok(false)
+        ) -> Result<AgreementOnChain, ChainClientError> {
+            Ok(AgreementOnChain::NotLive)
         }
     }
 

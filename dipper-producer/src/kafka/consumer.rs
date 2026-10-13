@@ -163,7 +163,9 @@ impl KafkaConsumer {
         max_wait_ms: i32,
     ) -> Result<(Vec<RecordAndOffset>, i64), ConsumerError> {
         let partition_client = self.partition_client(partition)?;
-        let timeout = Duration::from_millis(max_wait_ms.max(0) as u64) + Self::FETCH_TIMEOUT_MARGIN;
+        // A negative wait means no wait.
+        let max_wait = Duration::from_millis(u64::try_from(max_wait_ms).unwrap_or(0));
+        let timeout = max_wait + Self::FETCH_TIMEOUT_MARGIN;
 
         // rskafka encodes the range's exclusive end minus 1 as the wire-level
         // max_bytes, so widen by 1 to request the full `max_bytes` budget.

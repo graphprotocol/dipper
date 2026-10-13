@@ -95,6 +95,9 @@ struct CliConfig {
     /// The secret key to sign requests with
     #[serde_as(as = "Option<HiddenSecretKeyAsHexStr>")]
     pub signing_key: Option<Hidden<SecretKey>>,
+    /// The IPFS API to read subgraph manifests from
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    pub ipfs_url: Option<Url>,
 }
 
 impl FromArgMatches for CliConfig {
@@ -102,6 +105,8 @@ impl FromArgMatches for CliConfig {
         Ok(Self {
             server_url: matches.get_one("server-url").cloned(),
             signing_key: matches.get_one("signing-key").cloned(),
+            // Only some subcommands define this flag.
+            ipfs_url: matches.try_get_one("ipfs-url").ok().flatten().cloned(),
         })
     }
 

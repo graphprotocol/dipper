@@ -1,6 +1,6 @@
 services:
   dipper-service:
-    image: ghcr.io/edgeandnode/dipper-service:${DIPPER_TAG:-local}
+    image: ghcr.io/graphprotocol/dipper-service:${DIPPER_TAG:-local}
     build:
       context: .
       dockerfile: Dockerfile

@@ -98,7 +98,9 @@ data:
         "interval": 300,
         "max_tolerance_days": 4,
         "request_timeout": 10,
-        "batch_size": 500
+        "batch_size": 500,
+        "unreachable_trip_fraction": 0.5,
+        "unreachable_trip_min_indexers": 3
       },
       "chain_client": {
         "enabled": true,
@@ -117,6 +119,10 @@ data:
       "health": {
         "enabled": true,
         "listen_addr": "0.0.0.0:8546",
-        "threshold": 600
+        "threshold": 840
+      },
+      "alerts": {
+        "slack_webhook_url": "https://hooks.slack.com/services/REPLACE_ME_OR_REMOVE_FOR_NO_ALERTS",
+        "throttle": 900
       }
     }

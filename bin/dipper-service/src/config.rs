@@ -70,7 +70,7 @@ pub struct Config {
     /// The liveness checker service configuration (detects silent agreement abandonment)
     #[serde(default)]
     pub liveness_checker: Option<LivenessCheckerConfig>,
-    /// The escrow reconciler service configuration (AgreementManager mode only)
+    /// The escrow reconciler service configuration (runs only when this section is present)
     #[serde(default)]
     pub escrow_reconciler: Option<EscrowReconcilerConfig>,
     /// Additional chain ID to network name mappings for dev/test chains.
@@ -97,6 +97,55 @@ pub struct Config {
     /// the server off.
     #[serde(default)]
     pub health: HealthConfig,
+    /// Where to send alerts for the log lines an operator has to act on. Without a webhook,
+    /// none are sent.
+    #[serde(default)]
+    pub alerts: AlertsConfig,
+}
+
+/// Alerts for the log lines an operator has to act on, picked out by their `event` tag and
+/// posted to Slack, at most once per event in each throttle window.
+#[serde_as]
+#[derive(Debug, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AlertsConfig {
+    /// The Slack incoming-webhook URL to post alerts to. Without one, none are sent.
+    pub slack_webhook_url: Option<Hidden<Url>>,
+    /// The `event` tags of the log lines to alert on. Leave it out to alert on the defaults,
+    /// which grow as alerts are added; a list given here replaces them.
+    pub events: Vec<String>,
+    /// Least time, in seconds, between 2 messages for the same event; alerts in between are
+    /// counted into the next one.
+    #[serde_as(as = "serde_with::DurationSeconds")]
+    pub throttle: Duration,
+}
+
+impl AlertsConfig {
+    /// The events alerted on by default that `events` leaves out.
+    pub fn default_events_left_out(&self) -> Vec<String> {
+        let mut left_out = Self::default().events;
+        left_out.retain(|event| !self.events.contains(event));
+        left_out
+    }
+}
+
+impl Default for AlertsConfig {
+    fn default() -> Self {
+        Self {
+            slack_webhook_url: None,
+            events: [
+                "agreement_cancel_stuck",
+                "rpc_blocks_refused",
+                "nonce_gap_fill_failed",
+                "chain_listener_changes_skipped",
+                "stale_agreement_uncancellable",
+                "liveness_abandonment_paused",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            throttle: Duration::from_secs(15 * 60),
+        }
+    }
 }
 
 /// Configuration for the HTTP health endpoint used by orchestrator liveness probes. Omitting the
@@ -402,14 +451,15 @@ impl Default for ExpirationConfig {
     }
 }
 
-/// Escrow reconciler service config. Runs only in `AgreementManager` mode;
-/// each tick calls the manager's permissionless `reconcileProvider` for
-/// distinct providers with agreements needing escrow cleanup.
+/// Escrow reconciler service config. Each sweep checks what the RecurringAgreementManager
+/// tracks and calls its permissionless `reconcileAgreement` / `reconcileProvider` only
+/// where that would change something.
 #[serde_as]
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EscrowReconcilerConfig {
-    /// Whether the escrow reconciler is enabled (default: true).
+    /// Whether the escrow reconciler runs (default: true). This default only applies
+    /// once the section exists: without an `escrow_reconciler` section it does not run.
     #[serde(default = "default_escrow_reconciler_enabled")]
     pub enabled: bool,
 
@@ -418,9 +468,20 @@ pub struct EscrowReconcilerConfig {
     #[serde(default = "default_escrow_reconciler_interval")]
     pub interval: Duration,
 
-    /// Maximum distinct providers to reconcile per sweep (default: 500).
+    /// Maximum reconcile transactions to send per sweep (default: 500).
     #[serde(default = "default_escrow_reconciler_batch_size")]
     pub batch_size: i64,
+
+    /// How often each tracked provider gets a rebalance even when no thaw has finished,
+    /// so escrow is topped up once the manager can afford it (default: 86400s; 0 = never).
+    #[serde_as(as = "serde_with::DurationSeconds<u64>")]
+    #[serde(default = "default_escrow_reconciler_rebalance_interval")]
+    pub rebalance_interval: Duration,
+
+    /// How many tracked agreements to check for having ended per sweep; each sweep
+    /// carries on from where the last stopped (default: 500).
+    #[serde(default = "default_escrow_reconciler_agreements_per_sweep")]
+    pub agreements_per_sweep: u64,
 }
 
 fn default_escrow_reconciler_enabled() -> bool {
@@ -435,12 +496,22 @@ fn default_escrow_reconciler_batch_size() -> i64 {
     500
 }
 
+fn default_escrow_reconciler_rebalance_interval() -> Duration {
+    Duration::from_secs(86_400)
+}
+
+fn default_escrow_reconciler_agreements_per_sweep() -> u64 {
+    500
+}
+
 impl Default for EscrowReconcilerConfig {
     fn default() -> Self {
         Self {
             enabled: default_escrow_reconciler_enabled(),
             interval: default_escrow_reconciler_interval(),
             batch_size: default_escrow_reconciler_batch_size(),
+            rebalance_interval: default_escrow_reconciler_rebalance_interval(),
+            agreements_per_sweep: default_escrow_reconciler_agreements_per_sweep(),
         }
     }
 }
@@ -478,9 +549,22 @@ pub struct LivenessCheckerConfig {
     #[serde(default = "default_liveness_checker_request_timeout")]
     pub request_timeout: Duration,
 
-    /// Maximum agreements to fetch per cycle (default: 500).
+    /// Agreements to check per cycle, those longest without progress (default: 500). Every
+    /// other indexer holding an accepted agreement adds 1 more, so all are asked each cycle.
     #[serde(default = "default_liveness_checker_batch_size")]
     pub batch_size: i64,
+
+    /// Share of the indexers checked in a cycle that, when unreachable at once (status call
+    /// failed, or missing from the network registry), stops abandoning agreements for
+    /// unreachability, for at most `max_tolerance_days` days, since so many points to a fault on
+    /// dipper's side (default: 0.5).
+    #[serde(default = "default_liveness_checker_unreachable_trip_fraction")]
+    pub unreachable_trip_fraction: f64,
+
+    /// Fewest indexers checked in a cycle for that share to count; with fewer, 1 indexer going
+    /// down is too large a share to tell apart from a fault on dipper's side (default: 3).
+    #[serde(default = "default_liveness_checker_unreachable_trip_min_indexers")]
+    pub unreachable_trip_min_indexers: usize,
 }
 
 fn default_liveness_checker_enabled() -> bool {
@@ -503,6 +587,32 @@ fn default_liveness_checker_batch_size() -> i64 {
     500
 }
 
+fn default_liveness_checker_unreachable_trip_fraction() -> f64 {
+    0.5
+}
+
+fn default_liveness_checker_unreachable_trip_min_indexers() -> usize {
+    3
+}
+
+impl LivenessCheckerConfig {
+    /// Reject a trip share the breaker can't act on: at or below 0 it trips on every cycle with
+    /// enough indexers, and above 1 it never trips. Not-a-number is neither, so it is refused too.
+    /// A disabled checker uses none of it, so only an enabled one is checked.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let fraction = self.unreachable_trip_fraction;
+        if fraction.is_nan() || fraction <= 0.0 || fraction > 1.0 {
+            return Err(format!(
+                "unreachable_trip_fraction ({fraction}) must be above 0 and at most 1"
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Default for LivenessCheckerConfig {
     fn default() -> Self {
         Self {
@@ -511,6 +621,8 @@ impl Default for LivenessCheckerConfig {
             max_tolerance_days: default_liveness_checker_max_tolerance_days(),
             request_timeout: default_liveness_checker_request_timeout(),
             batch_size: default_liveness_checker_batch_size(),
+            unreachable_trip_fraction: default_liveness_checker_unreachable_trip_fraction(),
+            unreachable_trip_min_indexers: default_liveness_checker_unreachable_trip_min_indexers(),
         }
     }
 }
@@ -717,7 +829,7 @@ fn default_chain_client_enabled() -> bool {
     false
 }
 
-fn default_chain_client_request_timeout() -> Duration {
+pub(crate) fn default_chain_client_request_timeout() -> Duration {
     Duration::from_secs(10)
 }
 
@@ -725,7 +837,7 @@ fn default_domain_refresh_interval() -> Duration {
     Duration::from_secs(3600)
 }
 
-fn default_chain_client_max_retries() -> u32 {
+pub(crate) fn default_chain_client_max_retries() -> u32 {
     3
 }
 
@@ -795,8 +907,9 @@ pub struct DipsAgreementConfig {
     pub max_grt_per_billion_entities_per_30_days: f64,
 
     /// Number of days to look back for declined indexers (standard exclusion). Covers
-    /// CanceledByIndexer, expiries whose offer reached the chain, and structurally
-    /// persistent rejections (UNSUPPORTED_NETWORK, MANIFEST_TOO_LARGE). Default: 30 days.
+    /// CanceledByIndexer, AbandonedByIndexer, expiries whose offer reached the chain, and
+    /// structurally persistent rejections (UNSUPPORTED_NETWORK, MANIFEST_TOO_LARGE). Default: 30
+    /// days.
     #[serde(default = "default_declined_indexer_lookback_days")]
     pub declined_indexer_lookback_days: i32,
 
@@ -1180,6 +1293,37 @@ pub struct IndexingAgreementConfig {
     pub max_in_flight_offers_total: Option<u32>,
 }
 
+#[cfg(test)]
+impl IndexingAgreementConfig {
+    /// Addresses and limits all set to 0, with permissive breaker and cache settings, for tests
+    /// to adjust the fields they care about.
+    pub fn for_tests() -> Self {
+        Self {
+            data_service: Address::ZERO,
+            recurring_collector: Address::ZERO,
+            recurring_agreement_manager: Address::ZERO,
+            max_agreement_grt_per_30_days: 0.0,
+            max_seconds_per_collection: 0,
+            min_seconds_per_collection: 0,
+            duration_seconds: 0,
+            deadline_seconds: 0,
+            max_grt_per_30_days: BTreeMap::new(),
+            max_grt_per_billion_entities_per_30_days: 0.0,
+            declined_indexer_lookback_days: 0,
+            price_rejection_lookback_days: 0,
+            transient_rejection_lookback_minutes: 0,
+            uncertain_rejection_lookback_days: 0,
+            unresponsive_indexer_lookback_days: 0,
+            mass_unresponsive_trip_fraction: 0.5,
+            mass_unresponsive_reset_fraction: 0.25,
+            dips_accepting_snapshot_max_age_hours: 48,
+            dips_accepting_cache_ttl_seconds: 300,
+            max_in_flight_offers_per_indexer: None,
+            max_in_flight_offers_total: None,
+        }
+    }
+}
+
 /// Per-chain pricing for indexing agreements (runtime).
 #[derive(Debug)]
 pub struct IndexingAgreementChainPrices {
@@ -1365,6 +1509,10 @@ impl EventStreamingConfig {
     }
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "predates this lint; fix when next touched"
+)]
 pub fn default_event_queue_capacity() -> NonZeroUsize {
     NonZeroUsize::new(1024).expect("default event queue capacity is non-zero")
 }
@@ -1556,6 +1704,31 @@ mod tests {
         assert!(
             conf(60, 3600).validate().is_ok(),
             "a comfortably wide window is valid"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_an_unreachable_trip_share_the_breaker_cannot_act_on() {
+        fn conf(fraction: f64) -> LivenessCheckerConfig {
+            LivenessCheckerConfig {
+                enabled: true,
+                unreachable_trip_fraction: fraction,
+                ..LivenessCheckerConfig::default()
+            }
+        }
+        for fraction in [0.0, -0.5, 1.5, f64::NAN] {
+            assert!(conf(fraction).validate().is_err(), "{fraction}");
+        }
+        for fraction in [0.01, 0.5, 1.0] {
+            assert!(conf(fraction).validate().is_ok(), "{fraction}");
+        }
+        let disabled = LivenessCheckerConfig {
+            enabled: false,
+            ..conf(0.0)
+        };
+        assert!(
+            disabled.validate().is_ok(),
+            "a disabled checker uses no share"
         );
     }
 
@@ -2021,6 +2194,80 @@ mod tests {
             health.threshold,
             crate::health::DEFAULT_HEALTH_THRESHOLD,
             "the remaining fields keep their defaults"
+        );
+    }
+
+    /// The config.json in the example configmap.
+    fn example_config() -> serde_json::Value {
+        let example = include_str!("../../../k8s/configmap-example.yaml");
+        let json: String = example
+            .split_once("config.json: |\n")
+            .expect("the example holds a config.json")
+            .1
+            .lines()
+            .map(|line| format!("{}\n", line.strip_prefix("    ").unwrap_or(line)))
+            .collect();
+        serde_json::from_str(&json).expect("config.json is JSON")
+    }
+
+    #[test]
+    fn the_example_configmap_liveness_checker_section_parses() {
+        let liveness = serde_json::from_value::<LivenessCheckerConfig>(
+            example_config()["liveness_checker"].clone(),
+        )
+        .expect("the example's liveness_checker section is a valid liveness checker config");
+        let defaults = LivenessCheckerConfig::default();
+
+        assert_eq!(
+            liveness.unreachable_trip_fraction,
+            defaults.unreachable_trip_fraction
+        );
+        assert_eq!(
+            liveness.unreachable_trip_min_indexers,
+            defaults.unreachable_trip_min_indexers
+        );
+    }
+
+    #[test]
+    fn the_example_configmap_alerts_section_parses() {
+        let config = example_config();
+
+        let alerts = serde_json::from_value::<AlertsConfig>(config["alerts"].clone())
+            .expect("the example's alerts section is a valid alerts config");
+        assert!(alerts.slack_webhook_url.is_some());
+        assert!(
+            config["alerts"].get("events").is_none(),
+            "a deployment copied from the example keeps every event later added to the defaults"
+        );
+        assert_eq!(alerts.events, AlertsConfig::default().events);
+    }
+
+    #[test]
+    fn names_the_default_events_a_configured_list_leaves_out() {
+        let alerts = serde_json::from_str::<AlertsConfig>(
+            r#"{"events": ["rpc_blocks_refused", "some_other_event"]}"#,
+        )
+        .expect("alerts config");
+
+        let mut left_out = AlertsConfig::default().events;
+        left_out.retain(|event| event != "rpc_blocks_refused");
+        assert_eq!(alerts.default_events_left_out(), left_out);
+        assert!(AlertsConfig::default().default_events_left_out().is_empty());
+    }
+
+    #[test]
+    fn alerts_config_takes_a_webhook_and_keeps_the_default_events() {
+        let alerts = serde_json::from_str::<AlertsConfig>(
+            r#"{"slack_webhook_url": "https://hooks.slack.com/services/T/B/x", "throttle": 60}"#,
+        )
+        .expect("alerts config");
+
+        assert!(alerts.slack_webhook_url.is_some());
+        assert_eq!(alerts.throttle, Duration::from_secs(60));
+        assert_eq!(alerts.events, AlertsConfig::default().events);
+        assert!(
+            !format!("{alerts:?}").contains("hooks.slack.com"),
+            "the webhook is a secret, kept out of logs"
         );
     }
 

@@ -172,9 +172,10 @@ pub trait AgreementRegistry {
         indexer_ids: &[IndexerId],
     ) -> RegistryResult<std::collections::HashMap<DeploymentId, Vec<IndexerId>>>;
 
-    /// Get declined `CanceledByIndexer`/`Expired`/`Rejected` indexers grouped by
-    /// deployment. Each rejection reason gets its own exclusion window, as does an
-    /// expiry that never had an offer transaction; see the query for the details.
+    /// Get declined `CanceledByIndexer`/`Expired`/`Rejected` indexers, and those whose agreement
+    /// dipper ended `AbandonedByIndexer`, grouped by deployment. Each rejection reason gets its
+    /// own exclusion window, as does an expiry that never had an offer transaction; see the query
+    /// for the details.
     async fn get_declined_indexers_by_deployment(
         &self,
         default_lookback_days: i32,
@@ -246,10 +247,9 @@ pub trait AgreementRegistry {
         id: &IndexingAgreementId,
     ) -> RegistryResult<()>;
 
-    /// Record the on-chain tx hash of the most recent `offer()` submission
-    /// for this agreement. Observability-only; does not transition status.
-    /// Called once per submit (including resubmits after a dropped tx) so
-    /// the DB reflects the live hash rather than an evicted one.
+    /// Record the hash of the latest `offer()` transaction, unless the agreement has ended, so
+    /// a resubmit replaces a dropped one. [`NoRecordUpdated`](Error::NoRecordsUpdated) when no
+    /// row took it.
     async fn update_offer_tx_hash(
         &self,
         id: &IndexingAgreementId,
@@ -259,12 +259,66 @@ pub trait AgreementRegistry {
     /// Mark an indexing agreement as `CANCELED_BY_REQUESTER`.
     ///
     /// If there is no indexing agreement with the given ID, or if the agreement is not in the
-    /// `CREATED` or `ACCEPTED_ON_CHAIN` state, this method returns a
+    /// `CREATED`, `ACCEPTED_ON_CHAIN`, `REJECTED` or `CANCELLING` state, this method returns a
     /// [`NoRecordUpdated`](Error::NoRecordsUpdated) error.
     async fn mark_indexing_agreement_as_canceled_by_requester(
         &self,
         id: &IndexingAgreementId,
     ) -> RegistryResult<()>;
+
+    /// Mark a `CANCELLING` agreement dipper was ending because its indexer stopped serving it
+    /// `ABANDONED_BY_INDEXER`, once the chain confirms dipper's cancel;
+    /// [`NoRecordUpdated`](Error::NoRecordsUpdated) otherwise.
+    async fn mark_indexing_agreement_as_abandoned_by_indexer(
+        &self,
+        id: &IndexingAgreementId,
+    ) -> RegistryResult<()>;
+
+    /// Mark a `CREATED`, `ACCEPTED_ON_CHAIN`, `REJECTED` or `EXPIRED` agreement `CANCELLING`,
+    /// before its cancel is sent; [`NoRecordUpdated`](Error::NoRecordsUpdated) otherwise.
+    async fn mark_indexing_agreement_as_cancelling(
+        &self,
+        id: &IndexingAgreementId,
+    ) -> RegistryResult<()>;
+
+    /// Mark an `ACCEPTED_ON_CHAIN` agreement whose indexer stopped serving it `CANCELLING`,
+    /// before its cancel is sent, so it ends `ABANDONED_BY_INDEXER` once the chain confirms it;
+    /// [`NoRecordUpdated`](Error::NoRecordsUpdated) otherwise.
+    async fn mark_indexing_agreement_as_abandoning(
+        &self,
+        id: &IndexingAgreementId,
+    ) -> RegistryResult<()>;
+
+    /// Move a `CANCELED_BY_REQUESTER` or `REJECTED` agreement the chain shows live back to
+    /// `CANCELLING`, its cancel attempts reset; [`NoRecordUpdated`](Error::NoRecordsUpdated)
+    /// otherwise. `seen_live` when the chain was read and showed it live, which clears the end
+    /// on record and any announcement of it.
+    async fn reopen_indexing_agreement_cancel(
+        &self,
+        id: &IndexingAgreementId,
+        seen_live: bool,
+    ) -> RegistryResult<()>;
+
+    /// `CANCELLING` agreements marked over `min_age_minutes` ago, those checked longest ago
+    /// first; one whose cancel has failed `max_attempts` times only once an hour. One that may be paying
+    /// an indexer (accepted, or past the offer deadline, which only an accepted one outlives)
+    /// counts as checked an hour earlier, so it goes first without holding the rest back.
+    async fn get_cancelling_agreements(
+        &self,
+        batch_size: i64,
+        max_attempts: u32,
+        min_age_minutes: i32,
+    ) -> RegistryResult<Vec<CancellingAgreement>>;
+
+    /// Record a check of a `CANCELLING` agreement that left it cancelling, adding
+    /// `failed_attempts` to its failed cancels and returning the new count. `ended` says whether
+    /// the check found it no longer live on-chain, or `None` when the chain couldn't tell.
+    async fn record_cancel_check(
+        &self,
+        id: &IndexingAgreementId,
+        failed_attempts: u32,
+        ended: Option<bool>,
+    ) -> RegistryResult<u32>;
 
     /// Apply a reconciliation-driven state transition atomically.
     ///
@@ -277,7 +331,8 @@ pub trait AgreementRegistry {
     /// - `apply_accept`: attempt `Created | Expired → AcceptedOnChain`.
     ///   May be a no-op if the row is already in another status.
     /// - `cancel`: optionally apply `CanceledByRequester` or
-    ///   `CanceledByIndexer` from an accepting/pre-accept state.
+    ///   `CanceledByIndexer` from an accepting/pre-accept state. Dipper's cancel of one it was
+    ///   ending because its indexer stopped serving it applies `AbandonedByIndexer` instead.
     ///
     /// Returns which transitions actually affected a row so callers can
     /// gate post-commit side effects (e.g. running
@@ -312,86 +367,76 @@ pub trait AgreementRegistry {
     }
 
     /// Fetch agreements awaiting a `terminated` event: terminal-cancel status,
-    /// genuinely accepted on-chain, marker unset. Default returns empty so mocks
-    /// need not override; the production registry runs the real query.
+    /// genuinely accepted on-chain, marker unset.
     async fn get_agreements_pending_terminated_emission(
         &self,
-        _limit: i64,
-    ) -> RegistryResult<Vec<PendingTerminatedEvent>> {
-        Ok(Vec::new())
-    }
+        limit: i64,
+    ) -> RegistryResult<Vec<PendingTerminatedEvent>>;
 
     /// Stamp the `terminated` emission marker after a confirmed broker send.
-    /// Default no-op so mocks need not override.
     async fn mark_terminated_event_emitted(
         &self,
-        _agreement_id: &IndexingAgreementId,
-    ) -> RegistryResult<()> {
-        Ok(())
-    }
+        agreement_id: &IndexingAgreementId,
+    ) -> RegistryResult<()>;
 
     /// Fetch agreements awaiting an `accepted` event: `AcceptedOnChain`, accept
-    /// observed by the new reconcile path, marker unset. Default returns empty so
-    /// mocks need not override; the production registry runs the real query.
+    /// observed by the new reconcile path, marker unset.
     async fn get_agreements_pending_accepted_emission(
         &self,
-        _limit: i64,
-    ) -> RegistryResult<Vec<PendingAcceptedEvent>> {
-        Ok(Vec::new())
-    }
+        limit: i64,
+    ) -> RegistryResult<Vec<PendingAcceptedEvent>>;
 
     /// Stamp the `accepted` emission marker after a confirmed broker send.
-    /// Default no-op so mocks need not override.
     async fn mark_accepted_event_emitted(
         &self,
-        _agreement_id: &IndexingAgreementId,
-    ) -> RegistryResult<()> {
-        Ok(())
-    }
+        agreement_id: &IndexingAgreementId,
+    ) -> RegistryResult<()>;
 
     /// Fetch agreements awaiting a `request.expired` event: `Expired`, marker
-    /// unset. Default returns empty so mocks need not override; the production
-    /// registry runs the real query.
+    /// unset.
     async fn get_agreements_pending_expired_emission(
         &self,
-        _limit: i64,
-    ) -> RegistryResult<Vec<PendingExpiredEvent>> {
-        Ok(Vec::new())
-    }
+        limit: i64,
+    ) -> RegistryResult<Vec<PendingExpiredEvent>>;
 
     /// Stamp the `request.expired` emission marker after a confirmed broker send.
-    /// Default no-op so mocks need not override.
     async fn mark_expired_event_emitted(
         &self,
-        _agreement_id: &IndexingAgreementId,
-    ) -> RegistryResult<()> {
-        Ok(())
-    }
+        agreement_id: &IndexingAgreementId,
+    ) -> RegistryResult<()>;
 
     /// Record the accepted audit payload out-of-band (rejected-then-accepted
     /// anomaly), marking the row as genuinely accepted so its eventual
-    /// `terminated` is sweep-eligible. Default no-op so mocks need not override.
+    /// `terminated` is sweep-eligible.
     async fn record_accepted_audit(
         &self,
-        _agreement_id: &IndexingAgreementId,
-        _accepted_at: u64,
-        _accepted_tx: &str,
-    ) -> RegistryResult<()> {
-        Ok(())
-    }
+        agreement_id: &IndexingAgreementId,
+        accepted_at: u64,
+        accepted_tx: &str,
+    ) -> RegistryResult<()>;
+
+    /// Record an agreement's accept and its end together, in 1 write, so nothing reads one
+    /// without the other.
+    #[allow(clippy::too_many_arguments)]
+    async fn record_accept_and_cancel_audit(
+        &self,
+        agreement_id: &IndexingAgreementId,
+        accepted_at: u64,
+        accepted_tx: &str,
+        canceled_at: u64,
+        canceled_by: &str,
+        canceled_tx: Option<&str>,
+    ) -> RegistryResult<()>;
 
     /// Record the cancel audit payload for a dipper-initiated cancel so the
-    /// emission sweep can populate the `terminated` event fields. Default no-op
-    /// so mocks need not override.
+    /// emission sweep can populate the `terminated` event fields.
     async fn record_cancel_audit(
         &self,
-        _agreement_id: &IndexingAgreementId,
-        _canceled_at: u64,
-        _canceled_by: &str,
-        _canceled_tx: Option<&str>,
-    ) -> RegistryResult<()> {
-        Ok(())
-    }
+        agreement_id: &IndexingAgreementId,
+        canceled_at: u64,
+        canceled_by: &str,
+        canceled_tx: Option<&str>,
+    ) -> RegistryResult<()>;
 
     /// Get `Created` agreements whose deadline has passed (by block timestamp).
     async fn get_expired_created_agreements(
@@ -426,7 +471,8 @@ pub trait AgreementRegistry {
         rejection_reason: Option<&str>,
     ) -> RegistryResult<()>;
 
-    /// Get all `AcceptedOnChain` agreements for liveness checking.
+    /// Get `AcceptedOnChain` agreements for liveness checking: the `batch_size` longest without
+    /// progress, plus 1 of every other indexer holding one, so every such indexer is asked.
     ///
     /// Results are ordered by `last_progress_at` ascending (NULLs first) so agreements
     /// that have never been checked are processed first.
@@ -450,17 +496,22 @@ pub trait AgreementRegistry {
         batch_size: i64,
     ) -> RegistryResult<Vec<IndexingAgreement>>;
 
-    /// Distinct service-provider addresses whose protocol-manager escrow may
-    /// need on-chain reconciliation. Empty by default so mocks need not override.
-    async fn get_providers_for_escrow_reconciliation(
+    /// Agreements whose indexer stopped serving them that have ended, longest ended first,
+    /// whose replacement is yet to be queued.
+    async fn get_ended_agreements_awaiting_replacement(
         &self,
-        _limit: i64,
-    ) -> RegistryResult<Vec<Address>>
-    where
-        Self: Sync,
-    {
-        Ok(Vec::new())
-    }
+        batch_size: i64,
+    ) -> RegistryResult<Vec<IndexingAgreement>>;
+
+    /// Note that an agreement's replacement has been queued.
+    async fn mark_replacement_queued(&self, id: &IndexingAgreementId) -> RegistryResult<()>;
+
+    /// The indexers holding a slot in a request with an agreement they stopped serving that may
+    /// still be paid, so a reassessment fills only the rest and never picks them again.
+    async fn get_abandoned_indexers_holding_slots(
+        &self,
+        request_id: &IndexingRequestId,
+    ) -> RegistryResult<Vec<IndexerId>>;
 
     /// Update the sync progress for an agreement.
     ///
@@ -482,9 +533,9 @@ pub trait AgreementRegistry {
         &self,
     ) -> RegistryResult<std::collections::HashMap<DeploymentId, usize>>;
 
-    /// Count `Created` (in-flight, not yet accepted) agreements per indexer,
-    /// plus the global total. Offer pacing reads both to decide whether an
-    /// indexer or the network has spare acceptance capacity.
+    /// Count in-flight offers per indexer, plus the global total: `Created` agreements, and
+    /// `Cancelling` ones never accepted until their offer deadline. Offer pacing reads both to
+    /// decide whether an indexer or the network has spare acceptance capacity.
     async fn count_created_agreements_by_indexer(
         &self,
     ) -> RegistryResult<(std::collections::HashMap<IndexerId, u64>, u64)>;
@@ -502,17 +553,6 @@ pub trait AgreementRegistry {
             .await
             .map(|m| !m.is_empty())
     }
-
-    /// Mark an indexing agreement as `ABANDONED_BY_INDEXER`.
-    ///
-    /// Transitions `AcceptedOnChain → AbandonedByIndexer`. Returns the full agreement
-    /// for use in the subsequent reassessment call.
-    /// Returns [`NoRecordsUpdated`](Error::NoRecordsUpdated) if the agreement doesn't
-    /// exist or isn't in `AcceptedOnChain` status.
-    async fn mark_indexing_agreement_as_abandoned(
-        &self,
-        id: &IndexingAgreementId,
-    ) -> RegistryResult<IndexingAgreement>;
 
     /// Get per-agreement rate fields from active agreements.
     ///
@@ -532,6 +572,32 @@ pub struct AgreementFeeRate {
     pub tokens_per_second: f64,
     /// Entity rate in wei GRT per entity per second.
     pub tokens_per_entity_per_second: f64,
+}
+
+/// An agreement dipper is still cancelling on-chain.
+#[derive(Debug, Clone)]
+pub struct CancellingAgreement {
+    pub agreement: IndexingAgreement,
+    /// Whether dipper saw it accepted on-chain, so its end is announced.
+    pub accepted_on_chain: bool,
+    /// When a check first found it no longer live on-chain, if one has.
+    pub ended_seen_at: Option<OffsetDateTime>,
+    /// Whether it is being cancelled because its indexer stopped serving it, so it ends
+    /// `ABANDONED_BY_INDEXER`.
+    pub abandoned: bool,
+}
+
+impl TryFrom<dipper_pgregistry::CancellingAgreement> for CancellingAgreement {
+    type Error = anyhow::Error;
+
+    fn try_from(value: dipper_pgregistry::CancellingAgreement) -> Result<Self, Self::Error> {
+        Ok(Self {
+            agreement: value.agreement.try_into()?,
+            accepted_on_chain: value.accepted_on_chain,
+            ended_seen_at: value.ended_seen_at,
+            abandoned: value.abandoned,
+        })
+    }
 }
 
 /// An Indexing Agreement represents the contract between the DIPs Gateway (Dipper) and the indexer
@@ -696,11 +762,16 @@ pub enum Status {
 
     /// The liveness checker detected no indexing progress within the tolerance window.
     ///
-    /// Dipper canceled the agreement via `cancelIndexingAgreementByPayer` and will
-    /// trigger reassignment to find a replacement indexer.
+    /// Dipper cancelled the agreement on-chain, passing through `Cancelling` until the chain
+    /// confirmed it, and triggered reassignment to find a replacement indexer.
     ///
     /// This is a terminal state.
     AbandonedByIndexer,
+
+    /// Dipper decided to end the agreement and is cancelling it on-chain, where it may
+    /// still be live. It becomes `CanceledByRequester`, or `AbandonedByIndexer` when its
+    /// indexer stopped serving it, announced as ended, only once the chain confirms the end.
+    Cancelling,
 }
 
 impl std::fmt::Display for Status {
@@ -714,6 +785,7 @@ impl std::fmt::Display for Status {
             Status::AcceptedOnChain => "ACCEPTED_ON_CHAIN",
             Status::Rejected => "REJECTED",
             Status::AbandonedByIndexer => "ABANDONED_BY_INDEXER",
+            Status::Cancelling => "CANCELLING",
         };
         f.write_str(status)
     }
@@ -745,6 +817,7 @@ impl TryFrom<dipper_pgregistry::IndexingAgreement> for IndexingAgreement {
                 dipper_pgregistry::IndexingAgreementStatus::AbandonedByIndexer => {
                     Status::AbandonedByIndexer
                 }
+                dipper_pgregistry::IndexingAgreementStatus::Cancelling => Status::Cancelling,
                 _ => {
                     return Err(anyhow::anyhow!("Invalid status: {:?}", value.status));
                 }

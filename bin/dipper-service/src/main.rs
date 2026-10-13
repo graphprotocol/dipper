@@ -8,7 +8,10 @@ use dipper_producer::events::{
 use futures_lite::StreamExt;
 use thegraph_core::alloy::signers::local::PrivateKeySigner;
 use tokio::task::JoinSet;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{
+    EnvFilter, Layer as _, filter::LevelFilter, layer::SubscriberExt as _,
+    util::SubscriberInitExt as _,
+};
 
 use self::{
     config::DEFAULT_MAX_CANDIDATES, registry::RegistryProvider, signing::eip712::Eip712Signer,
@@ -17,6 +20,7 @@ use self::{
 use crate::config::EventStreamingConfig;
 
 mod admin_rpc_server;
+mod alerts;
 mod cancel_dispatch;
 mod chain_client;
 mod config;
@@ -55,21 +59,39 @@ const TEARDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(75);
 const STOP_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[tokio::main]
+#[expect(
+    clippy::expect_used,
+    clippy::too_many_lines,
+    reason = "predates this lint; fix when next touched"
+)]
 pub async fn main() -> anyhow::Result<()> {
-    // Set up logging
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
-
-    // Load the configuration
-    tracing::debug!("loading configuration");
+    // Load the configuration first, since logging needs it to know where to send alerts
     let conf_path = env::args()
         .nth(1)
         .expect("Missing argument for config path")
         .parse::<PathBuf>()
         .expect("Invalid path");
     let conf = config::load_from_file(&conf_path).expect("Failed to load config");
+
+    // Set up logging. Plain text, with no colour codes, so log stores can search it. Alerts see
+    // warnings and errors whatever the log level is set to.
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_filter(EnvFilter::from_default_env()),
+        )
+        .with(alerts::layer(&conf.alerts).map(|layer| layer.with_filter(LevelFilter::WARN)))
+        .init();
     tracing::debug!(conf=?conf, "configuration loaded");
+    let left_out = conf.alerts.default_events_left_out();
+    if conf.alerts.slack_webhook_url.is_some() && !left_out.is_empty() {
+        tracing::warn!(
+            ?left_out,
+            "alerts.events leaves out events alerted on by default; remove it from the config to \
+             alert on every default event"
+        );
+    }
 
     // Reject a config the protocol-managed path can't run with before building
     // anything from it.
@@ -84,6 +106,11 @@ pub async fn main() -> anyhow::Result<()> {
     if let Err(err) = conf.health.validate(conf.admin_rpc.listen_addr) {
         anyhow::bail!("invalid health config: {err}");
     }
+    if let Some(liveness_conf) = &conf.liveness_checker
+        && let Err(err) = liveness_conf.validate()
+    {
+        anyhow::bail!("invalid liveness checker config: {err}");
+    }
 
     // TODO: Decouple the config file format from the internal representation
     let (agreement_conf, pricing_table) = conf.dips.into();
@@ -93,6 +120,7 @@ pub async fn main() -> anyhow::Result<()> {
     let chain_listener_agreement_conf = agreement_conf.clone();
     let liveness_agreement_conf = agreement_conf.clone();
     let escrow_reconciler_agreement_conf = agreement_conf.clone();
+    let cancel_retry_agreement_conf = agreement_conf.clone();
 
     // Canonical chain id and RecurringCollector address, read once and shared by the
     // admin signer, the gRPC proposal signer, and the on-chain chain client so their
@@ -323,7 +351,8 @@ pub async fn main() -> anyhow::Result<()> {
     // Application services
 
     //- The chain client (for on-chain transactions). Required: presence validated above.
-    let chain_client: Arc<dyn chain_client::ChainClient + Send + Sync> = {
+    //  Kept concrete as well, for the escrow reconciler's reads of the manager.
+    let alloy_chain_client = {
         let cfg = conf
             .chain_client
             .as_ref()
@@ -344,6 +373,7 @@ pub async fn main() -> anyhow::Result<()> {
         );
         Arc::new(client)
     };
+    let chain_client: Arc<dyn chain_client::ChainClient + Send + Sync> = alloy_chain_client.clone();
 
     //- Protocol-managed mode requires dipper's signer to hold AGREEMENT_MANAGER_ROLE on
     //  the manager; without it every offer and cancel reverts on-chain. Fail fast at
@@ -515,7 +545,6 @@ pub async fn main() -> anyhow::Result<()> {
 
             let ctx = network::service::chain_listener::Ctx {
                 registry: registry.clone(),
-                worker_queue: worker_handle.queue().clone(),
                 event_source,
                 chain_client: chain_client.clone(),
                 agreement_conf: chain_listener_agreement_conf.clone(),
@@ -523,12 +552,22 @@ pub async fn main() -> anyhow::Result<()> {
                 chain_listener_notify: chain_listener_notify.clone(),
                 subgraph_indexing_agreements_events_emitter:
                     subgraph_indexing_agreements_events_emitter.clone(),
+                worker_queue: worker_handle.queue().clone(),
             };
             let (handle, service) = network::service::chain_listener::new(ctx);
             Some((handle, service))
         }
         _ => None,
     };
+
+    //- The cancel retry, always on: it alone finishes the cancels dipper starts
+    let (cancel_retry_handle, cancel_retry_service) =
+        network::service::cancel_retry::new(network::service::cancel_retry::Ctx {
+            registry: registry.clone(),
+            chain_client: chain_client.clone(),
+            agreement_conf: cancel_retry_agreement_conf,
+            worker_queue: worker_handle.queue().clone(),
+        });
 
     //- The liveness checker service (optional, enabled by config)
     // Detects indexers who silently stop indexing active AcceptedOnChain agreements
@@ -556,8 +595,7 @@ pub async fn main() -> anyhow::Result<()> {
     ) {
         let er_conf = conf.escrow_reconciler.clone().unwrap_or_default();
         let ctx = network::service::escrow_reconciler::Ctx {
-            registry: registry.clone(),
-            chain_client: chain_client.clone(),
+            chain_client: alloy_chain_client.clone(),
             config: er_conf,
             collector: escrow_reconciler_agreement_conf.recurring_collector(),
         };
@@ -669,6 +707,9 @@ pub async fn main() -> anyhow::Result<()> {
         None
     };
 
+    let cancel_retry_task_handle = task_tree.spawn(cancel_retry_service);
+    tracing::debug!(task_id=%cancel_retry_task_handle.id(), "Cancel retry service started");
+
     // Spawn the escrow reconciler service if enabled
     let escrow_reconciler_stop_handle = if let Some((handle, service)) = escrow_reconciler_handle {
         let task_handle = task_tree.spawn(service);
@@ -748,6 +789,9 @@ pub async fn main() -> anyhow::Result<()> {
         if let Some(handle) = chain_listener_stop_handle {
             all_stopped &= stop_service("Chain listener", handle.stop()).await;
         }
+
+        // Stop the cancel retry before worker (it queues replacements)
+        all_stopped &= stop_service("Cancel retry", cancel_retry_handle.stop()).await;
 
         // Stop escrow reconciler service before the DB pool closes
         if let Some(handle) = escrow_reconciler_stop_handle {

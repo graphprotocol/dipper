@@ -86,6 +86,12 @@ where
         )
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::too_many_lines,
+        reason = "predates this lint; fix when next touched"
+    )]
     async fn set_indexing_target_candidates(
         &self,
         req: SignedMessage<SetIndexingTargetCandidates>,
@@ -361,6 +367,7 @@ mod tests {
         async fn cancel_rejected_agreement_on_chain(
             &self,
             _agreement_id: IndexingAgreementId,
+            _accept: Option<crate::worker::service::ChainAccept>,
             _priority: crate::worker::queue::JobPriority,
         ) -> anyhow::Result<JobId> {
             unimplemented!()
@@ -430,6 +437,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "predates this lint; fix when next touched"
+    )]
     async fn inserted_emits_single_request_received_with_signer_chain_id() {
         let deployment = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
         let num_candidates = 7usize;

@@ -5,16 +5,13 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use dipper_core::ids::{IndexingAgreementId, IndexingRequestId};
-use thegraph_core::{
-    DeploymentId, IndexerId,
-    alloy::primitives::{Address, ChainId},
-};
+use thegraph_core::{DeploymentId, IndexerId, alloy::primitives::ChainId};
 
 use super::{
     agreement::{
-        AgreementFeeRate, AgreementRegistry, CancelKind, IndexingAgreement, NewAgreementParams,
-        PendingAcceptedEvent, PendingExpiredEvent, PendingTerminatedEvent, ReconciliationItem,
-        ReconciliationOutcome,
+        AgreementFeeRate, AgreementRegistry, CancelKind, CancellingAgreement, IndexingAgreement,
+        NewAgreementParams, PendingAcceptedEvent, PendingExpiredEvent, PendingTerminatedEvent,
+        ReconciliationItem, ReconciliationOutcome,
     },
     result::Result,
 };
@@ -136,6 +133,50 @@ pub trait StubAgreementRegistry: Send + Sync {
         unimplemented!("mark_indexing_agreement_as_canceled_by_requester")
     }
 
+    /// Defaults to the requester mark, so a mock that records only that dipper ended an
+    /// agreement sees both kinds of end; override it to tell them apart.
+    async fn mark_indexing_agreement_as_abandoned_by_indexer(
+        &self,
+        id: &IndexingAgreementId,
+    ) -> Result<()> {
+        self.mark_indexing_agreement_as_canceled_by_requester(id)
+            .await
+    }
+
+    async fn mark_indexing_agreement_as_cancelling(&self, _id: &IndexingAgreementId) -> Result<()> {
+        unimplemented!("mark_indexing_agreement_as_cancelling")
+    }
+
+    async fn mark_indexing_agreement_as_abandoning(&self, _id: &IndexingAgreementId) -> Result<()> {
+        unimplemented!("mark_indexing_agreement_as_abandoning")
+    }
+
+    async fn reopen_indexing_agreement_cancel(
+        &self,
+        _id: &IndexingAgreementId,
+        _seen_live: bool,
+    ) -> Result<()> {
+        unimplemented!("reopen_indexing_agreement_cancel")
+    }
+
+    async fn get_cancelling_agreements(
+        &self,
+        _batch_size: i64,
+        _max_attempts: u32,
+        _min_age_minutes: i32,
+    ) -> Result<Vec<CancellingAgreement>> {
+        Ok(Vec::new())
+    }
+
+    async fn record_cancel_check(
+        &self,
+        _id: &IndexingAgreementId,
+        failed_attempts: u32,
+        _ended: Option<bool>,
+    ) -> Result<u32> {
+        Ok(failed_attempts)
+    }
+
     async fn apply_reconciliation(
         &self,
         _id: &IndexingAgreementId,
@@ -194,9 +235,22 @@ pub trait StubAgreementRegistry: Send + Sync {
         unimplemented!("get_agreements_pending_chain_cancel")
     }
 
-    // Mirrors the trait's default (empty list).
-    async fn get_providers_for_escrow_reconciliation(&self, _limit: i64) -> Result<Vec<Address>> {
-        Ok(Vec::new())
+    async fn get_ended_agreements_awaiting_replacement(
+        &self,
+        _batch_size: i64,
+    ) -> Result<Vec<IndexingAgreement>> {
+        unimplemented!("get_ended_agreements_awaiting_replacement")
+    }
+
+    async fn mark_replacement_queued(&self, _id: &IndexingAgreementId) -> Result<()> {
+        unimplemented!("mark_replacement_queued")
+    }
+
+    async fn get_abandoned_indexers_holding_slots(
+        &self,
+        _request_id: &IndexingRequestId,
+    ) -> Result<Vec<IndexerId>> {
+        unimplemented!("get_abandoned_indexers_holding_slots")
     }
 
     async fn update_agreement_sync_progress(
@@ -223,13 +277,6 @@ pub trait StubAgreementRegistry: Send + Sync {
             .map(|m| !m.is_empty())
     }
 
-    async fn mark_indexing_agreement_as_abandoned(
-        &self,
-        _id: &IndexingAgreementId,
-    ) -> Result<IndexingAgreement> {
-        unimplemented!("mark_indexing_agreement_as_abandoned")
-    }
-
     async fn get_agreement_fee_rates(&self) -> Result<Vec<AgreementFeeRate>> {
         unimplemented!("get_agreement_fee_rates")
     }
@@ -241,8 +288,8 @@ pub trait StubAgreementRegistry: Send + Sync {
         unimplemented!("count_accepted_agreements_by_deployment")
     }
 
-    // The emission-sweep and audit methods mirror the real trait's defaults
-    // (empty batch / no-op) so only emission-focused mocks override them.
+    // The emission-sweep and audit methods default to an empty batch or a
+    // no-op, here only, so only emission-focused mocks override them.
     async fn get_agreements_pending_terminated_emission(
         &self,
         _limit: i64,
@@ -291,6 +338,19 @@ pub trait StubAgreementRegistry: Send + Sync {
     async fn record_cancel_audit(
         &self,
         _agreement_id: &IndexingAgreementId,
+        _canceled_at: u64,
+        _canceled_by: &str,
+        _canceled_tx: Option<&str>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn record_accept_and_cancel_audit(
+        &self,
+        _agreement_id: &IndexingAgreementId,
+        _accepted_at: u64,
+        _accepted_tx: &str,
         _canceled_at: u64,
         _canceled_by: &str,
         _canceled_tx: Option<&str>,
@@ -423,6 +483,53 @@ impl<T: StubAgreementRegistry> AgreementRegistry for T {
         StubAgreementRegistry::mark_indexing_agreement_as_canceled_by_requester(self, id).await
     }
 
+    async fn mark_indexing_agreement_as_abandoned_by_indexer(
+        &self,
+        id: &IndexingAgreementId,
+    ) -> Result<()> {
+        StubAgreementRegistry::mark_indexing_agreement_as_abandoned_by_indexer(self, id).await
+    }
+
+    async fn mark_indexing_agreement_as_cancelling(&self, id: &IndexingAgreementId) -> Result<()> {
+        StubAgreementRegistry::mark_indexing_agreement_as_cancelling(self, id).await
+    }
+
+    async fn mark_indexing_agreement_as_abandoning(&self, id: &IndexingAgreementId) -> Result<()> {
+        StubAgreementRegistry::mark_indexing_agreement_as_abandoning(self, id).await
+    }
+
+    async fn reopen_indexing_agreement_cancel(
+        &self,
+        id: &IndexingAgreementId,
+        seen_live: bool,
+    ) -> Result<()> {
+        StubAgreementRegistry::reopen_indexing_agreement_cancel(self, id, seen_live).await
+    }
+
+    async fn get_cancelling_agreements(
+        &self,
+        batch_size: i64,
+        max_attempts: u32,
+        min_age_minutes: i32,
+    ) -> Result<Vec<CancellingAgreement>> {
+        StubAgreementRegistry::get_cancelling_agreements(
+            self,
+            batch_size,
+            max_attempts,
+            min_age_minutes,
+        )
+        .await
+    }
+
+    async fn record_cancel_check(
+        &self,
+        id: &IndexingAgreementId,
+        failed_attempts: u32,
+        ended: Option<bool>,
+    ) -> Result<u32> {
+        StubAgreementRegistry::record_cancel_check(self, id, failed_attempts, ended).await
+    }
+
     async fn apply_reconciliation(
         &self,
         id: &IndexingAgreementId,
@@ -474,8 +581,22 @@ impl<T: StubAgreementRegistry> AgreementRegistry for T {
         StubAgreementRegistry::get_agreements_pending_chain_cancel(self, batch_size).await
     }
 
-    async fn get_providers_for_escrow_reconciliation(&self, limit: i64) -> Result<Vec<Address>> {
-        StubAgreementRegistry::get_providers_for_escrow_reconciliation(self, limit).await
+    async fn get_ended_agreements_awaiting_replacement(
+        &self,
+        batch_size: i64,
+    ) -> Result<Vec<IndexingAgreement>> {
+        StubAgreementRegistry::get_ended_agreements_awaiting_replacement(self, batch_size).await
+    }
+
+    async fn mark_replacement_queued(&self, id: &IndexingAgreementId) -> Result<()> {
+        StubAgreementRegistry::mark_replacement_queued(self, id).await
+    }
+
+    async fn get_abandoned_indexers_holding_slots(
+        &self,
+        request_id: &IndexingRequestId,
+    ) -> Result<Vec<IndexerId>> {
+        StubAgreementRegistry::get_abandoned_indexers_holding_slots(self, request_id).await
     }
 
     async fn update_agreement_sync_progress(
@@ -498,13 +619,6 @@ impl<T: StubAgreementRegistry> AgreementRegistry for T {
 
     async fn exists_active_agreements(&self) -> Result<bool> {
         StubAgreementRegistry::exists_active_agreements(self).await
-    }
-
-    async fn mark_indexing_agreement_as_abandoned(
-        &self,
-        id: &IndexingAgreementId,
-    ) -> Result<IndexingAgreement> {
-        StubAgreementRegistry::mark_indexing_agreement_as_abandoned(self, id).await
     }
 
     async fn get_agreement_fee_rates(&self) -> Result<Vec<AgreementFeeRate>> {
@@ -574,6 +688,27 @@ impl<T: StubAgreementRegistry> AgreementRegistry for T {
         StubAgreementRegistry::record_cancel_audit(
             self,
             agreement_id,
+            canceled_at,
+            canceled_by,
+            canceled_tx,
+        )
+        .await
+    }
+
+    async fn record_accept_and_cancel_audit(
+        &self,
+        agreement_id: &IndexingAgreementId,
+        accepted_at: u64,
+        accepted_tx: &str,
+        canceled_at: u64,
+        canceled_by: &str,
+        canceled_tx: Option<&str>,
+    ) -> Result<()> {
+        StubAgreementRegistry::record_accept_and_cancel_audit(
+            self,
+            agreement_id,
+            accepted_at,
+            accepted_tx,
             canceled_at,
             canceled_by,
             canceled_tx,

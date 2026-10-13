@@ -71,6 +71,11 @@ pub struct Ctx<R, W> {
 /// Returns a handle for controlling the service and a future that must be spawned
 /// on a runtime. The service periodically queries for open indexing requests older
 /// than the configured minimum age and queues them for reassessment.
+#[expect(
+    clippy::cast_possible_wrap,
+    clippy::too_many_lines,
+    reason = "predates this lint; fix when next touched"
+)]
 pub fn new<R, W>(ctx: Ctx<R, W>) -> (Handle, impl Future<Output = anyhow::Result<()>>)
 where
     R: IndexingRequestRegistry + Send + Sync,

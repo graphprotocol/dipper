@@ -42,6 +42,7 @@ All environment variables used by the CLI are prefixed with `DIPS_`. The main co
 
 - `DIPS_SERVER_URL`: The URL of the DIPs gateway server
 - `DIPS_SIGNING_KEY`: The secret key used to sign requests (in hex format)
+- `DIPS_IPFS_URL`: The IPFS API that subgraph manifests are read from (defaults to `https://ipfs.thegraph.com`)
 
 Environment variables take precedence over command-line arguments and can be used to avoid repeating common configuration:
 
