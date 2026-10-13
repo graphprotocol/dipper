@@ -6,7 +6,7 @@
 //! (and with which payloads) without a Kafka backend, and [`logged`], which captures what
 //! dipper logs.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use dipper_producer::{
@@ -14,6 +14,7 @@ use dipper_producer::{
     proto,
 };
 use thegraph_core::{DeploymentId, alloy::primitives::ChainId};
+use tracing::subscriber::Interest;
 
 /// One captured lifecycle event: the routing metadata plus the typed payload.
 #[derive(Clone, Debug, PartialEq)]
@@ -159,7 +160,7 @@ impl SubgraphIndexingAgreementEventsProducer for CapturingEventsProducer {
     }
 }
 
-/// What dipper logs, at every level, while `run` runs.
+/// What dipper logs, at DEBUG and above, while `run` runs.
 pub async fn logged(run: impl std::future::Future<Output = ()>) -> String {
     struct Buffer(Arc<Mutex<Vec<u8>>>);
     impl std::io::Write for Buffer {
@@ -185,28 +186,29 @@ pub async fn logged(run: impl std::future::Future<Output = ()>) -> String {
 }
 
 /// Installs, once per test binary, a global subscriber that answers "ask each
-/// time" for every log line. `tracing` caches that answer per log line for the
-/// whole process the first time any thread reaches the line, and its default
-/// answer is "never": a test that captures nothing can reach a line first and
-/// cache it as off, so a test capturing logs on another thread never sees it.
+/// time" for every log line and then declines them all. `tracing` caches that
+/// answer per log line for the whole process the first time any thread reaches
+/// the line, and with no global subscriber the answer is "never": a test that
+/// captures nothing can reach a line first and cache it as off, so a test
+/// capturing logs on another thread never sees it.
 fn keep_every_log_line_askable() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        tracing::subscriber::set_global_default(Askable)
-            .expect("the tests install no other global tracing subscriber");
-    });
+    static INSTALLED: OnceLock<bool> = OnceLock::new();
+    let installed =
+        *INSTALLED.get_or_init(|| tracing::subscriber::set_global_default(Askable).is_ok());
+    assert!(
+        installed,
+        "the tests install no other global tracing subscriber; capture logs through `logged`"
+    );
 }
 
-/// Logs nothing itself; it only keeps every log line's cached answer at "ask
-/// the subscriber in place on this thread".
+/// Answers "ask each time" for every log line and then declines them all, so it
+/// never sees a span or event; `new_span` is unreachable because `enabled` is
+/// always false.
 struct Askable;
 
 impl tracing::Subscriber for Askable {
-    fn register_callsite(
-        &self,
-        _: &'static tracing::Metadata<'static>,
-    ) -> tracing::subscriber::Interest {
-        tracing::subscriber::Interest::sometimes()
+    fn register_callsite(&self, _: &'static tracing::Metadata<'static>) -> Interest {
+        Interest::sometimes()
     }
     fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
         false
@@ -219,4 +221,27 @@ impl tracing::Subscriber for Askable {
     fn event(&self, _: &tracing::Event<'_>) {}
     fn enter(&self, _: &tracing::span::Id) {}
     fn exit(&self, _: &tracing::span::Id) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::logged;
+
+    fn reach_a_shared_line() {
+        tracing::info!("A line another thread reached first");
+    }
+
+    #[tokio::test]
+    async fn captures_a_line_that_a_thread_capturing_nothing_reached_first() {
+        let logs = logged(async {
+            std::thread::spawn(reach_a_shared_line).join().unwrap();
+            reach_a_shared_line();
+        })
+        .await;
+
+        assert!(
+            logs.contains("A line another thread reached first"),
+            "{logs}"
+        );
+    }
 }
