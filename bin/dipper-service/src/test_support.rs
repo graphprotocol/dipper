@@ -178,7 +178,45 @@ pub async fn logged(run: impl std::future::Future<Output = ()>) -> String {
         .with_max_level(tracing::Level::DEBUG)
         .with_writer(move || Buffer(Arc::clone(&writer)))
         .finish();
+    keep_every_log_line_askable();
     let _logging = tracing::subscriber::set_default(subscriber);
     run.await;
     String::from_utf8(lines.lock().unwrap().clone()).unwrap()
+}
+
+/// Installs, once per test binary, a global subscriber that answers "ask each
+/// time" for every log line. `tracing` caches that answer per log line for the
+/// whole process the first time any thread reaches the line, and its default
+/// answer is "never": a test that captures nothing can reach a line first and
+/// cache it as off, so a test capturing logs on another thread never sees it.
+fn keep_every_log_line_askable() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::subscriber::set_global_default(Askable)
+            .expect("the tests install no other global tracing subscriber");
+    });
+}
+
+/// Logs nothing itself; it only keeps every log line's cached answer at "ask
+/// the subscriber in place on this thread".
+struct Askable;
+
+impl tracing::Subscriber for Askable {
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        false
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, _: &tracing::Event<'_>) {}
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
 }
