@@ -22,6 +22,7 @@ webpki-roots = "1.0.8"
 
 [dev-dependencies]
 serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 # Protobuf code generation dependencies
 # Run with: RUSTFLAGS="--cfg gen_event_proto" cargo check -p dipper-producer
