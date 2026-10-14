@@ -20,6 +20,9 @@ tracing.workspace = true
 uuid = { workspace = true, features = ["v7"] }
 webpki-roots = "1.0.8"
 
+[dev-dependencies]
+serde_json.workspace = true
+
 # Protobuf code generation dependencies
 # Run with: RUSTFLAGS="--cfg gen_event_proto" cargo check -p dipper-producer
 [target.'cfg(gen_event_proto)'.build-dependencies]
