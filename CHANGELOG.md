@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.3](https://github.com/graphprotocol/dipper/compare/v0.2.2...v0.2.3) (2026-10-13)
+
+
+### Fixed
+
+* stop log-capture tests missing lines when run in parallel ([#756](https://github.com/graphprotocol/dipper/issues/756)) ([c591658](https://github.com/graphprotocol/dipper/commit/c591658df8ff557a31e7fa77ba39720c1cf056ec))
+
 ## [0.2.2](https://github.com/graphprotocol/dipper/compare/v0.2.1...v0.2.2) (2026-10-12)
 
 
