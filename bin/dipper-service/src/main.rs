@@ -118,6 +118,9 @@ pub async fn main() -> anyhow::Result<()> {
     {
         anyhow::bail!("invalid liveness checker config: {err}");
     }
+    if let Err(err) = conf.request_chain_check.validate() {
+        anyhow::bail!("invalid request chain check config: {err}");
+    }
 
     // TODO: Decouple the config file format from the internal representation
     let (agreement_conf, pricing_table) = conf.dips.into();
@@ -359,7 +362,7 @@ pub async fn main() -> anyhow::Result<()> {
     let request_chain_check: Arc<dyn request_chain_check::RequestChainCheck> =
         if conf.request_chain_check.enabled {
             tracing::info!(
-                ipfs_url = %conf.request_chain_check.ipfs_url,
+                ipfs = %conf.request_chain_check.ipfs_host(),
                 "checking each indexing request's chain against its subgraph manifest"
             );
             Arc::new(request_chain_check::ManifestChainCheck::new(

@@ -2,10 +2,80 @@
 //! this to pick the chain for a request, and the service to check the chain a request
 //! arrives with, so both read a manifest the same way.
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, time::Duration};
 
 use graph_networks_registry::NetworksRegistry;
-use thegraph_core::alloy::primitives::ChainId;
+use thegraph_core::{DeploymentId, alloy::primitives::ChainId};
+use url::Url;
+
+/// Larger manifests are refused rather than read into memory: real ones are a few KiB.
+pub const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
+
+/// Why a manifest could not be read from IPFS. Reqwest errors are kept without their URL,
+/// since an IPFS endpoint can carry credentials in it.
+#[derive(Debug, thiserror::Error)]
+pub enum ManifestFetchError {
+    /// IPFS answered, but with no manifest: unknown or malformed CIDs get a 4xx.
+    #[error("IPFS has no subgraph manifest for this deployment (HTTP {0})")]
+    NotFound(u16),
+    /// IPFS could not be reached, failed, or did not answer in time.
+    #[error("IPFS did not return the subgraph manifest")]
+    Unreachable(#[source] reqwest::Error),
+    #[error("the subgraph manifest is larger than {MAX_MANIFEST_BYTES} bytes")]
+    TooLarge,
+    #[error("the subgraph manifest is not UTF-8 text")]
+    NotUtf8,
+}
+
+impl ManifestFetchError {
+    /// Whether the same read could succeed later. A missing manifest counts as final:
+    /// IPFS only says so after searching for it.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::Unreachable(_))
+    }
+}
+
+/// The `cat` endpoint of the IPFS API at `ipfs_url`, which manifests are read from.
+pub fn ipfs_cat_url(mut ipfs_url: Url) -> Result<Url, url::ParseError> {
+    // Without the trailing slash, `join` would replace the last path segment.
+    if !ipfs_url.path().ends_with('/') {
+        ipfs_url.set_path(&format!("{}/", ipfs_url.path()));
+    }
+    ipfs_url.join("api/v0/cat")
+}
+
+/// Read `deployment`'s manifest through the IPFS `cat` endpoint `cat_url`.
+pub async fn fetch_manifest(
+    http: &reqwest::Client,
+    cat_url: &Url,
+    deployment: &DeploymentId,
+    timeout: Duration,
+) -> Result<String, ManifestFetchError> {
+    let unreachable = |err: reqwest::Error| ManifestFetchError::Unreachable(err.without_url());
+    let mut url = cat_url.clone();
+    url.query_pairs_mut()
+        .append_pair("arg", &deployment.to_string());
+    // The IPFS RPC API only answers POST.
+    let mut response = http
+        .post(url)
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(unreachable)?;
+    let status = response.status();
+    if status.is_client_error() {
+        return Err(ManifestFetchError::NotFound(status.as_u16()));
+    }
+    response = response.error_for_status().map_err(unreachable)?;
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(unreachable)? {
+        if body.len() + chunk.len() > MAX_MANIFEST_BYTES {
+            return Err(ManifestFetchError::TooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).map_err(|_| ManifestFetchError::NotUtf8)
+}
 
 /// Why a manifest does not name exactly 1 network.
 #[derive(Debug, thiserror::Error)]
@@ -78,11 +148,10 @@ pub fn chain_id_for_network(
         })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const REGISTRY_JSON: &str = r#"{
+/// A networks registry with an EVM mainnet (alias `ethereum`), an EVM testnet and a
+/// non-EVM network, for tests that look chains up.
+#[cfg(any(test, feature = "test-util"))]
+pub const TEST_REGISTRY_JSON: &str = r#"{
         "$schema": "https://networks-registry.thegraph.com/TheGraphNetworksRegistrySchema_v0_7.json",
         "version": "0.7.0",
         "title": "Test Registry",
@@ -120,8 +189,105 @@ mod tests {
         ]
     }"#;
 
+#[cfg(test)]
+mod tests {
+    use thegraph_core::deployment_id;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path, query_param},
+    };
+
+    use super::*;
+
+    const DEPLOYMENT: &str = "QmQ5w3LqJdBGZvHNYTWq7np2B1qbBQMpHP77ZKQPzGVTrg";
+
     fn registry() -> NetworksRegistry {
-        NetworksRegistry::from_json(REGISTRY_JSON).unwrap()
+        NetworksRegistry::from_json(TEST_REGISTRY_JSON).unwrap()
+    }
+
+    async fn fetch_from(response: ResponseTemplate) -> Result<String, ManifestFetchError> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ipfs/api/v0/cat"))
+            .and(query_param("arg", DEPLOYMENT))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+        let cat_url = ipfs_cat_url(Url::parse(&format!("{}/ipfs", server.uri())).unwrap()).unwrap();
+        fetch_manifest(
+            &reqwest::Client::new(),
+            &cat_url,
+            &deployment_id!(DEPLOYMENT),
+            Duration::from_secs(5),
+        )
+        .await
+    }
+
+    #[test]
+    fn test_ipfs_cat_url_keeps_a_path_prefix() {
+        let with_prefix = ipfs_cat_url(Url::parse("https://example.com/ipfs").unwrap()).unwrap();
+        let bare = ipfs_cat_url(Url::parse("https://example.com").unwrap()).unwrap();
+
+        assert_eq!(with_prefix.as_str(), "https://example.com/ipfs/api/v0/cat");
+        assert_eq!(bare.as_str(), "https://example.com/api/v0/cat");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_manifest_reads_the_manifest() {
+        let manifest = fetch_from(ResponseTemplate::new(200).set_body_string("specVersion: 1.0.0"))
+            .await
+            .unwrap();
+
+        assert_eq!(manifest, "specVersion: 1.0.0");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_manifest_tells_a_missing_manifest_from_a_failing_ipfs() {
+        let missing = fetch_from(ResponseTemplate::new(404)).await.unwrap_err();
+        let failing = fetch_from(ResponseTemplate::new(502)).await.unwrap_err();
+
+        assert!(
+            matches!(missing, ManifestFetchError::NotFound(404)),
+            "{missing:?}"
+        );
+        assert!(!missing.is_transient());
+        assert!(failing.is_transient(), "{failing:?}");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_manifest_refuses_a_manifest_too_large_to_read() {
+        let err = fetch_from(
+            ResponseTemplate::new(200).set_body_bytes(vec![b'a'; MAX_MANIFEST_BYTES + 1]),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, ManifestFetchError::TooLarge), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_manifest_errors_leave_the_url_out() {
+        //* Arrange - nothing listens on port 9, so the connection fails
+        let cat_url = ipfs_cat_url(Url::parse("http://user:secret@127.0.0.1:9").unwrap()).unwrap();
+
+        //* Act
+        let err = fetch_manifest(
+            &reqwest::Client::new(),
+            &cat_url,
+            &deployment_id!(DEPLOYMENT),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+
+        //* Assert
+        let mut text = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(cause) = source {
+            text.push_str(&cause.to_string());
+            source = cause.source();
+        }
+        assert!(!text.contains("secret"), "{text}");
     }
 
     #[test]

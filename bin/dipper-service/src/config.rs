@@ -125,9 +125,29 @@ pub struct RequestChainCheckConfig {
     #[serde_as(as = "serde_with::DisplayFromStr")]
     pub ipfs_url: Url,
 
-    /// How long to wait on IPFS for 1 manifest, in seconds.
+    /// How long to wait on IPFS for 1 manifest, in seconds. IPFS takes about 30 seconds
+    /// to say it has no such manifest, so a shorter wait turns that into a retry.
     #[serde_as(as = "serde_with::DurationSeconds")]
     pub timeout: Duration,
+}
+
+impl RequestChainCheckConfig {
+    /// Rejects a check that would fail every request.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.enabled && self.timeout.is_zero() {
+            return Err("request_chain_check.timeout must be greater than 0".to_string());
+        }
+        Ok(())
+    }
+
+    /// The IPFS endpoint named by host, for logs: an IPFS URL can carry credentials.
+    pub fn ipfs_host(&self) -> String {
+        match (self.ipfs_url.host_str(), self.ipfs_url.port()) {
+            (Some(host), Some(port)) => format!("{host}:{port}"),
+            (Some(host), None) => host.to_string(),
+            (None, _) => "unnamed endpoint".to_string(),
+        }
+    }
 }
 
 impl Default for RequestChainCheckConfig {
@@ -135,7 +155,7 @@ impl Default for RequestChainCheckConfig {
         Self {
             enabled: true,
             ipfs_url: default_ipfs_url(),
-            timeout: Duration::from_secs(10),
+            timeout: Duration::from_secs(45),
         }
     }
 }
@@ -2423,6 +2443,32 @@ mod tests {
         assert_eq!(check.enabled, defaults.enabled);
         assert_eq!(check.ipfs_url, defaults.ipfs_url);
         assert_eq!(check.timeout, defaults.timeout);
+    }
+
+    #[test]
+    fn a_request_chain_check_that_would_fail_every_request_is_rejected() {
+        let zero = RequestChainCheckConfig {
+            timeout: Duration::ZERO,
+            ..RequestChainCheckConfig::default()
+        };
+        let off = RequestChainCheckConfig {
+            enabled: false,
+            ..zero.clone()
+        };
+
+        assert!(zero.validate().is_err());
+        assert!(off.validate().is_ok(), "a check that is off never waits");
+        assert!(RequestChainCheckConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn the_ipfs_endpoint_is_logged_without_its_credentials() {
+        let config = RequestChainCheckConfig {
+            ipfs_url: Url::parse("https://project:secret@ipfs.example.com:5001/").unwrap(),
+            ..RequestChainCheckConfig::default()
+        };
+
+        assert_eq!(config.ipfs_host(), "ipfs.example.com:5001");
     }
 
     #[test]

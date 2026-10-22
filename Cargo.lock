@@ -2385,6 +2385,7 @@ dependencies = [
  "fake",
  "graph-networks-registry 0.7.0",
  "indoc",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "serde_with",
@@ -2392,7 +2393,10 @@ dependencies = [
  "sqlx",
  "thegraph-core",
  "thiserror 2.0.18",
+ "tokio",
+ "url",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

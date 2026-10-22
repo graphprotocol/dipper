@@ -5,22 +5,22 @@
 use std::{
     collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use async_trait::async_trait;
-use dipper_core::manifest::{chain_id_for_network, network_from_manifest};
+use dipper_core::manifest::{
+    ManifestFetchError, chain_id_for_network, fetch_manifest, ipfs_cat_url, network_from_manifest,
+};
 use graph_networks_registry::NetworksRegistry;
 use thegraph_core::{DeploymentId, alloy::primitives::ChainId};
 use url::Url;
 
 use crate::config::RequestChainCheckConfig;
 
-/// Larger manifests are refused rather than read into memory: real ones are a few KiB.
-const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
-
-/// Deployments whose network is remembered. A manifest never changes, so a hit
-/// needs no expiry; past this many the cache starts again from empty.
-const MAX_CACHED_NETWORKS: usize = 10_000;
+/// Deployments whose manifest result is remembered. A manifest never changes, so a
+/// hit needs no expiry; past this many the cache starts again from empty.
+const MAX_CACHED_MANIFESTS: usize = 10_000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ChainCheckError {
@@ -34,7 +34,7 @@ pub enum ChainCheckError {
         manifest_chain_id: ChainId,
         requested_chain_id: ChainId,
     },
-    /// The manifest can't be tied to a single chain ID, which won't change on a retry.
+    /// There is no manifest, or it can't be tied to a single chain ID; a retry won't change that.
     #[error("{0}")]
     Unresolvable(String),
     /// IPFS did not return the manifest; the same request may pass later.
@@ -73,9 +73,11 @@ impl RequestChainCheck for SkipChainCheck {
 pub struct ManifestChainCheck {
     http: reqwest::Client,
     ipfs_cat: Url,
+    timeout: Duration,
     registry: Arc<NetworksRegistry>,
     additional_networks: Arc<BTreeMap<ChainId, String>>,
-    networks: Mutex<HashMap<DeploymentId, String>>,
+    /// Each deployment's network, or why its manifest names none.
+    manifests: Mutex<HashMap<DeploymentId, Result<String, String>>>,
 }
 
 impl ManifestChainCheck {
@@ -84,66 +86,44 @@ impl ManifestChainCheck {
         registry: Arc<NetworksRegistry>,
         additional_networks: Arc<BTreeMap<ChainId, String>>,
     ) -> anyhow::Result<Self> {
-        let mut ipfs_url = config.ipfs_url.clone();
-        // Without the trailing slash, `join` would replace the last path segment.
-        if !ipfs_url.path().ends_with('/') {
-            ipfs_url.set_path(&format!("{}/", ipfs_url.path()));
-        }
-        let http = reqwest::Client::builder().timeout(config.timeout).build()?;
         Ok(Self {
-            http,
-            ipfs_cat: ipfs_url.join("api/v0/cat")?,
+            http: reqwest::Client::new(),
+            ipfs_cat: ipfs_cat_url(config.ipfs_url.clone())?,
+            timeout: config.timeout,
             registry,
             additional_networks,
-            networks: Mutex::new(HashMap::new()),
+            manifests: Mutex::new(HashMap::new()),
         })
     }
 
     async fn network(&self, deployment: &DeploymentId) -> Result<String, ChainCheckError> {
-        if let Some(network) = self.cached(deployment) {
-            return Ok(network);
+        let cached = self
+            .manifests
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(deployment)
+            .cloned();
+        if let Some(result) = cached {
+            return result.map_err(ChainCheckError::Unresolvable);
         }
-        let manifest = self.fetch_manifest(deployment).await?;
-        let network = network_from_manifest(&manifest)
-            .map_err(|err| ChainCheckError::Unresolvable(error_chain(&err)))?;
-        let mut networks = self.networks.lock().unwrap_or_else(|p| p.into_inner());
-        if networks.len() >= MAX_CACHED_NETWORKS {
-            networks.clear();
+        let result =
+            match fetch_manifest(&self.http, &self.ipfs_cat, deployment, self.timeout).await {
+                Ok(manifest) => network_from_manifest(&manifest).map_err(|err| error_chain(&err)),
+                // A manifest IPFS doesn't have may yet be added, so only its contents are remembered.
+                Err(err @ ManifestFetchError::NotFound(_)) => {
+                    return Err(ChainCheckError::Unresolvable(err.to_string()));
+                }
+                Err(err) if err.is_transient() => {
+                    return Err(ChainCheckError::Unavailable(error_chain(&err)));
+                }
+                Err(err) => Err(err.to_string()),
+            };
+        let mut manifests = self.manifests.lock().unwrap_or_else(|p| p.into_inner());
+        if manifests.len() >= MAX_CACHED_MANIFESTS {
+            manifests.clear();
         }
-        networks.insert(*deployment, network.clone());
-        Ok(network)
-    }
-
-    fn cached(&self, deployment: &DeploymentId) -> Option<String> {
-        let networks = self.networks.lock().unwrap_or_else(|p| p.into_inner());
-        networks.get(deployment).cloned()
-    }
-
-    async fn fetch_manifest(&self, deployment: &DeploymentId) -> Result<String, ChainCheckError> {
-        let unavailable = |err: reqwest::Error| ChainCheckError::Unavailable(error_chain(&err));
-        let mut url = self.ipfs_cat.clone();
-        url.query_pairs_mut()
-            .append_pair("arg", &deployment.to_string());
-        // The IPFS RPC API only answers POST.
-        let mut response = self
-            .http
-            .post(url)
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status)
-            .map_err(unavailable)?;
-        let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(unavailable)? {
-            if body.len() + chunk.len() > MAX_MANIFEST_BYTES {
-                return Err(ChainCheckError::Unresolvable(format!(
-                    "the subgraph manifest is larger than {MAX_MANIFEST_BYTES} bytes"
-                )));
-            }
-            body.extend_from_slice(&chunk);
-        }
-        String::from_utf8(body).map_err(|_| {
-            ChainCheckError::Unresolvable("the subgraph manifest is not UTF-8 text".to_string())
-        })
+        manifests.insert(*deployment, result.clone());
+        result.map_err(ChainCheckError::Unresolvable)
     }
 
     /// The chain ID of a manifest network: the registry first, then the
@@ -195,8 +175,7 @@ fn error_chain(err: &dyn std::error::Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
+    use dipper_core::manifest::TEST_REGISTRY_JSON;
     use thegraph_core::deployment_id;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
@@ -206,35 +185,6 @@ mod tests {
     use super::*;
 
     const DEPLOYMENT: &str = "QmQ5w3LqJdBGZvHNYTWq7np2B1qbBQMpHP77ZKQPzGVTrg";
-
-    const REGISTRY_JSON: &str = r#"{
-        "$schema": "https://networks-registry.thegraph.com/TheGraphNetworksRegistrySchema_v0_7.json",
-        "version": "0.7.0",
-        "title": "Test Registry",
-        "description": "Test Registry",
-        "updatedAt": "2026-01-01T00:00:00Z",
-        "networks": [
-            {
-                "id": "mainnet",
-                "fullName": "Ethereum Mainnet",
-                "shortName": "Ethereum",
-                "caip2Id": "eip155:1",
-                "networkType": "mainnet",
-                "aliases": ["ethereum"],
-                "issuanceRewards": true,
-                "services": {}
-            },
-            {
-                "id": "arbitrum-sepolia",
-                "fullName": "Arbitrum Sepolia",
-                "shortName": "Arbitrum Sepolia",
-                "caip2Id": "eip155:421614",
-                "networkType": "testnet",
-                "issuanceRewards": false,
-                "services": {}
-            }
-        ]
-    }"#;
 
     fn manifest(network: &str) -> String {
         format!("specVersion: 1.0.0\ndataSources:\n  - kind: ethereum\n    network: {network}\n")
@@ -249,17 +199,19 @@ mod tests {
         };
         ManifestChainCheck::new(
             &config,
-            Arc::new(NetworksRegistry::from_json(REGISTRY_JSON).unwrap()),
+            Arc::new(NetworksRegistry::from_json(TEST_REGISTRY_JSON).unwrap()),
             Arc::new(BTreeMap::from([(1337, "hardhat".to_string())])),
         )
         .unwrap()
     }
 
-    async fn serve_manifest(server: &MockServer, response: ResponseTemplate) {
+    /// Answer every manifest read for [`DEPLOYMENT`] with `response`, `times` times in all.
+    async fn serve_manifest(server: &MockServer, response: ResponseTemplate, times: u64) {
         Mock::given(method("POST"))
             .and(path("/ipfs/api/v0/cat"))
             .and(query_param("arg", DEPLOYMENT))
             .respond_with(response)
+            .expect(times)
             .mount(server)
             .await;
     }
@@ -267,11 +219,8 @@ mod tests {
     #[tokio::test]
     async fn passes_a_request_on_the_manifest_chain() {
         let server = MockServer::start().await;
-        serve_manifest(
-            &server,
-            ResponseTemplate::new(200).set_body_string(manifest("arbitrum-sepolia")),
-        )
-        .await;
+        let body = ResponseTemplate::new(200).set_body_string(manifest("arbitrum-sepolia"));
+        serve_manifest(&server, body, 1).await;
 
         let result = check_against(&server)
             .check(&deployment_id!(DEPLOYMENT), 421614)
@@ -283,11 +232,8 @@ mod tests {
     #[tokio::test]
     async fn refuses_a_request_on_another_chain() {
         let server = MockServer::start().await;
-        serve_manifest(
-            &server,
-            ResponseTemplate::new(200).set_body_string(manifest("arbitrum-sepolia")),
-        )
-        .await;
+        let body = ResponseTemplate::new(200).set_body_string(manifest("arbitrum-sepolia"));
+        serve_manifest(&server, body, 1).await;
 
         let err = check_against(&server)
             .check(&deployment_id!(DEPLOYMENT), 1)
@@ -322,27 +268,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refuses_a_manifest_without_a_single_network_for_good() {
+    async fn a_missing_manifest_is_final_but_read_again_next_time() {
+        //* Arrange - IPFS answers 404 once it has searched for the manifest
         let server = MockServer::start().await;
-        serve_manifest(
-            &server,
-            ResponseTemplate::new(200).set_body_string("dataSources:\n  - kind: ethereum\n"),
-        )
-        .await;
+        serve_manifest(&server, ResponseTemplate::new(404), 2).await;
+        let check = check_against(&server);
 
-        let err = check_against(&server)
-            .check(&deployment_id!(DEPLOYMENT), 1)
-            .await
-            .unwrap_err();
+        //* Act
+        let first = check.check(&deployment_id!(DEPLOYMENT), 1).await;
+        let second = check.check(&deployment_id!(DEPLOYMENT), 1).await;
 
-        assert!(matches!(err, ChainCheckError::Unresolvable(_)), "{err:?}");
-        assert!(!err.is_transient());
+        //* Assert - final, so the consumer moves on; not remembered, as it may yet be added
+        assert!(
+            matches!(first, Err(ChainCheckError::Unresolvable(_))),
+            "{first:?}"
+        );
+        assert!(
+            matches!(second, Err(ChainCheckError::Unresolvable(_))),
+            "{second:?}"
+        );
     }
 
     #[tokio::test]
-    async fn an_ipfs_failure_is_worth_retrying() {
+    async fn a_failing_ipfs_is_worth_retrying() {
         let server = MockServer::start().await;
-        serve_manifest(&server, ResponseTemplate::new(500)).await;
+        serve_manifest(&server, ResponseTemplate::new(502), 1).await;
 
         let err = check_against(&server)
             .check(&deployment_id!(DEPLOYMENT), 421614)
@@ -353,36 +303,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refuses_a_manifest_too_large_to_read() {
+    async fn a_slow_ipfs_is_worth_retrying() {
         let server = MockServer::start().await;
-        serve_manifest(
-            &server,
-            ResponseTemplate::new(200).set_body_bytes(vec![b'a'; MAX_MANIFEST_BYTES + 1]),
-        )
-        .await;
+        let slow = ResponseTemplate::new(200)
+            .set_body_string(manifest("mainnet"))
+            .set_delay(Duration::from_secs(10));
+        serve_manifest(&server, slow, 1).await;
 
         let err = check_against(&server)
-            .check(&deployment_id!(DEPLOYMENT), 421614)
+            .check(&deployment_id!(DEPLOYMENT), 1)
             .await
             .unwrap_err();
 
-        assert!(matches!(err, ChainCheckError::Unresolvable(_)), "{err:?}");
+        assert!(err.is_transient(), "{err:?}");
     }
 
     #[tokio::test]
     async fn reads_each_manifest_from_ipfs_once() {
         let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/ipfs/api/v0/cat"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(manifest("mainnet")))
-            .expect(1)
-            .mount(&server)
-            .await;
+        let body = ResponseTemplate::new(200).set_body_string(manifest("mainnet"));
+        serve_manifest(&server, body, 1).await;
         let check = check_against(&server);
 
         for _ in 0..3 {
             check.check(&deployment_id!(DEPLOYMENT), 1).await.unwrap();
         }
-        // The mock's `expect(1)` is verified when the server drops.
+        // The mock's `expect` is verified when the server drops.
+    }
+
+    #[tokio::test]
+    async fn remembers_a_manifest_that_names_no_single_network() {
+        let server = MockServer::start().await;
+        let body = ResponseTemplate::new(200).set_body_string("dataSources:\n  - kind: ethereum\n");
+        serve_manifest(&server, body, 1).await;
+        let check = check_against(&server);
+
+        for _ in 0..2 {
+            let err = check
+                .check(&deployment_id!(DEPLOYMENT), 1)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ChainCheckError::Unresolvable(_)), "{err:?}");
+        }
     }
 }

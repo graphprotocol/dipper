@@ -5,7 +5,9 @@
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
-use dipper_core::manifest::{chain_id_for_network, network_from_manifest};
+use dipper_core::manifest::{
+    chain_id_for_network, fetch_manifest, ipfs_cat_url, network_from_manifest,
+};
 use graph_networks_registry::NetworksRegistry;
 use thegraph_core::{DeploymentId, alloy::primitives::ChainId};
 use url::Url;
@@ -40,12 +42,8 @@ impl ChainResolver {
         Self::with_registry_url(ipfs_url, NetworksRegistry::get_latest_version_url())
     }
 
-    fn with_registry_url(mut ipfs_url: Url, registry_url: String) -> anyhow::Result<Self> {
-        // Without the trailing slash, `join` would replace the last path segment.
-        if !ipfs_url.path().ends_with('/') {
-            ipfs_url.set_path(&format!("{}/", ipfs_url.path()));
-        }
-        let ipfs_api = ipfs_url.join("api/v0/cat")?;
+    fn with_registry_url(ipfs_url: Url, registry_url: String) -> anyhow::Result<Self> {
+        let ipfs_api = ipfs_cat_url(ipfs_url)?;
         let http = reqwest::Client::builder()
             .timeout(HTTP_TIMEOUT)
             .build()
@@ -80,7 +78,8 @@ impl ChainResolver {
             self.fetch_manifest(deployment, manifest_timeout),
             self.fetch_registry(registry_timeout)
         );
-        let manifest_network = manifest.and_then(|manifest| Ok(network_from_manifest(&manifest)?));
+        let manifest_network = manifest
+            .and_then(|manifest| network_from_manifest(&manifest).map_err(anyhow::Error::from));
         let (chain_id, notice) = choose_chain_id(chain, manifest_network, registry)?;
         if let Some(notice) = notice {
             eprintln!("{notice}");
@@ -93,27 +92,14 @@ impl ChainResolver {
         deployment: &DeploymentId,
         timeout: Duration,
     ) -> anyhow::Result<String> {
-        let mut url = self.ipfs_api.clone();
-        url.query_pairs_mut()
-            .append_pair("arg", &deployment.to_string());
-        // The IPFS RPC API only answers POST.
-        let response = self
-            .http
-            .post(url)
-            .timeout(timeout)
-            .send()
+        fetch_manifest(&self.http, &self.ipfs_api, deployment, timeout)
             .await
-            .and_then(reqwest::Response::error_for_status)
             .with_context(|| {
                 format!(
                     "failed to read the subgraph manifest from {}",
                     self.ipfs_api
                 )
-            })?;
-        response
-            .text()
-            .await
-            .context("failed to read the subgraph manifest body")
+            })
     }
 
     async fn fetch_registry(&self, timeout: Duration) -> anyhow::Result<NetworksRegistry> {
@@ -140,7 +126,7 @@ impl ChainResolver {
 
 /// Pick the chain ID from an override or the manifest, with an optional message for
 /// the user. An override always wins, so a request made for the wrong chain can still
-/// be changed or cancelled, but a disagreement with the manifest is reported.
+/// be cancelled; the Dipper refuses it for anything else, so a disagreement is reported.
 fn choose_chain_id(
     chain: Option<ChainOverride>,
     manifest_network: anyhow::Result<String>,
@@ -155,7 +141,9 @@ fn choose_chain_id(
         })?;
         // The CLI prints only the outermost message, so the cause goes into it.
         let chain_id = registry
-            .and_then(|registry| Ok(chain_id_for_network(&registry, &network)?))
+            .and_then(|registry| {
+                chain_id_for_network(&registry, &network).map_err(anyhow::Error::from)
+            })
             .map_err(|err| {
                 anyhow!("could not look up the chain ID of {network} ({err:#}); pass --chain-id")
             })?;
@@ -179,7 +167,7 @@ fn choose_chain_id(
         Ok((_, manifest_chain_id)) if manifest_chain_id == chain_id => None,
         Ok((network, manifest_chain_id)) => Some(format!(
             "warning: the subgraph manifest indexes {network} (chain ID {manifest_chain_id}), \
-             but chain ID {chain_id} was given; using {chain_id}"
+             but chain ID {chain_id} was given; the Dipper accepts that only to cancel a request"
         )),
         Err(err) => Some(format!(
             "warning: could not check chain ID {chain_id} against the subgraph manifest: {err:#}"
@@ -190,6 +178,7 @@ fn choose_chain_id(
 
 #[cfg(test)]
 mod tests {
+    use dipper_core::manifest::TEST_REGISTRY_JSON;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{method, path, query_param},
@@ -199,46 +188,8 @@ mod tests {
 
     const DEPLOYMENT: &str = "QmQ5w3LqJdBGZvHNYTWq7np2B1qbBQMpHP77ZKQPzGVTrg";
 
-    const REGISTRY_JSON: &str = r#"{
-        "$schema": "https://networks-registry.thegraph.com/TheGraphNetworksRegistrySchema_v0_7.json",
-        "version": "0.7.0",
-        "title": "Test Registry",
-        "description": "Test Registry",
-        "updatedAt": "2026-01-01T00:00:00Z",
-        "networks": [
-            {
-                "id": "mainnet",
-                "fullName": "Ethereum Mainnet",
-                "shortName": "Ethereum",
-                "caip2Id": "eip155:1",
-                "networkType": "mainnet",
-                "aliases": ["ethereum"],
-                "issuanceRewards": true,
-                "services": {}
-            },
-            {
-                "id": "arbitrum-sepolia",
-                "fullName": "Arbitrum Sepolia",
-                "shortName": "Arbitrum Sepolia",
-                "caip2Id": "eip155:421614",
-                "networkType": "testnet",
-                "issuanceRewards": false,
-                "services": {}
-            },
-            {
-                "id": "solana-mainnet-beta",
-                "fullName": "Solana Mainnet Beta",
-                "shortName": "Solana",
-                "caip2Id": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
-                "networkType": "mainnet",
-                "issuanceRewards": false,
-                "services": {}
-            }
-        ]
-    }"#;
-
     fn registry() -> anyhow::Result<NetworksRegistry> {
-        Ok(NetworksRegistry::from_json(REGISTRY_JSON)?)
+        Ok(NetworksRegistry::from_json(TEST_REGISTRY_JSON)?)
     }
 
     fn manifest(network: &str) -> String {
@@ -370,7 +321,7 @@ mod tests {
             .mount(&server)
             .await;
         Mock::given(method("GET"))
-            .respond_with(slow(REGISTRY_JSON.to_string()))
+            .respond_with(slow(TEST_REGISTRY_JSON.to_string()))
             .mount(&server)
             .await;
         let mut resolver = ChainResolver::with_registry_url(
@@ -404,7 +355,7 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/registry.json"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(REGISTRY_JSON))
+            .respond_with(ResponseTemplate::new(200).set_body_string(TEST_REGISTRY_JSON))
             .mount(&server)
             .await;
         let resolver = ChainResolver::with_registry_url(
