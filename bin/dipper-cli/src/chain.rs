@@ -2,9 +2,10 @@
 //! the indexing request and decides which prices apply, so it is read from the
 //! deployment's manifest rather than typed by hand.
 
-use std::{collections::BTreeSet, time::Duration};
+use std::time::Duration;
 
-use anyhow::{Context, anyhow, bail};
+use anyhow::{Context, anyhow};
+use dipper_core::manifest::{chain_id_for_network, network_from_manifest};
 use graph_networks_registry::NetworksRegistry;
 use thegraph_core::{DeploymentId, alloy::primitives::ChainId};
 use url::Url;
@@ -79,7 +80,7 @@ impl ChainResolver {
             self.fetch_manifest(deployment, manifest_timeout),
             self.fetch_registry(registry_timeout)
         );
-        let manifest_network = manifest.and_then(|manifest| network_from_manifest(&manifest));
+        let manifest_network = manifest.and_then(|manifest| Ok(network_from_manifest(&manifest)?));
         let (chain_id, notice) = choose_chain_id(chain, manifest_network, registry)?;
         if let Some(notice) = notice {
             eprintln!("{notice}");
@@ -154,7 +155,7 @@ fn choose_chain_id(
         })?;
         // The CLI prints only the outermost message, so the cause goes into it.
         let chain_id = registry
-            .and_then(|registry| chain_id_for_network(&registry, &network))
+            .and_then(|registry| Ok(chain_id_for_network(&registry, &network)?))
             .map_err(|err| {
                 anyhow!("could not look up the chain ID of {network} ({err:#}); pass --chain-id")
             })?;
@@ -185,57 +186,6 @@ fn choose_chain_id(
         )),
     };
     Ok((chain_id, notice))
-}
-
-/// The one network a subgraph manifest indexes, across its data sources and templates.
-fn network_from_manifest(manifest: &str) -> anyhow::Result<String> {
-    #[derive(serde::Deserialize)]
-    struct Manifest {
-        #[serde(default, rename = "dataSources")]
-        data_sources: Vec<Source>,
-        #[serde(default)]
-        templates: Vec<Source>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct Source {
-        network: Option<String>,
-    }
-
-    let manifest: Manifest =
-        serde_yaml::from_str(manifest).context("the subgraph manifest is not valid YAML")?;
-    let networks: BTreeSet<String> = manifest
-        .data_sources
-        .into_iter()
-        .chain(manifest.templates)
-        .filter_map(|source| source.network)
-        .collect();
-    let mut iter = networks.iter();
-    match (iter.next(), iter.next()) {
-        (Some(network), None) => Ok(network.clone()),
-        (None, _) => bail!("the subgraph manifest names no network"),
-        (Some(_), Some(_)) => bail!(
-            "the subgraph manifest names more than 1 network: {}",
-            networks.into_iter().collect::<Vec<_>>().join(", ")
-        ),
-    }
-}
-
-/// The EVM chain ID for a network name or alias in the networks registry.
-fn chain_id_for_network(registry: &NetworksRegistry, network: &str) -> anyhow::Result<ChainId> {
-    let entry = registry
-        .get_network_by_graph_id(network)
-        .ok_or_else(|| anyhow!("network '{network}' is not in the networks registry"))?;
-    entry
-        .caip2_id
-        .strip_prefix("eip155:")
-        .and_then(|id| id.parse().ok())
-        .ok_or_else(|| {
-            anyhow!(
-                "network '{network}' has no EVM chain ID (its CAIP-2 ID is '{}')",
-                entry.caip2_id
-            )
-        })
 }
 
 #[cfg(test)]
@@ -293,56 +243,6 @@ mod tests {
 
     fn manifest(network: &str) -> String {
         format!("specVersion: 1.0.0\ndataSources:\n  - kind: ethereum\n    network: {network}\n")
-    }
-
-    #[test]
-    fn test_network_from_manifest_reads_data_sources_and_templates() {
-        let manifest = indoc::indoc! {"
-            dataSources:
-              - kind: ethereum
-                network: arbitrum-sepolia
-            templates:
-              - kind: ethereum
-                network: arbitrum-sepolia
-        "};
-
-        assert_eq!(network_from_manifest(manifest).unwrap(), "arbitrum-sepolia");
-    }
-
-    #[test]
-    fn test_network_from_manifest_rejects_mixed_or_missing_networks() {
-        let mixed = indoc::indoc! {"
-            dataSources:
-              - network: mainnet
-            templates:
-              - network: arbitrum-sepolia
-        "};
-        let err = network_from_manifest(mixed).unwrap_err().to_string();
-        assert!(err.contains("arbitrum-sepolia, mainnet"), "{err}");
-
-        let none = "dataSources:\n  - kind: ethereum\n";
-        assert!(network_from_manifest(none).is_err());
-        assert!(network_from_manifest("not: [valid").is_err());
-    }
-
-    #[test]
-    fn test_chain_id_for_network_accepts_ids_and_aliases() {
-        let registry = registry().unwrap();
-
-        assert_eq!(chain_id_for_network(&registry, "mainnet").unwrap(), 1);
-        assert_eq!(chain_id_for_network(&registry, "ethereum").unwrap(), 1);
-        assert_eq!(
-            chain_id_for_network(&registry, "arbitrum-sepolia").unwrap(),
-            421614
-        );
-    }
-
-    #[test]
-    fn test_chain_id_for_network_rejects_unknown_and_non_evm_networks() {
-        let registry = registry().unwrap();
-
-        assert!(chain_id_for_network(&registry, "hardhat").is_err());
-        assert!(chain_id_for_network(&registry, "solana-mainnet-beta").is_err());
     }
 
     #[test]

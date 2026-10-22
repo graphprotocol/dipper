@@ -5,19 +5,24 @@ edition = "2024"
 
 [features]
 fake = ["dep:fake", "thegraph-core/fake"]
+manifest = ["dep:graph-networks-registry", "dep:serde", "dep:serde_yaml"]
 serde = ["dep:serde", "dep:serde_with", "thegraph-core/serde", "uuid/serde"]
 sqlx = ["dep:sqlx"]
 
 [dependencies]
 fake = { workspace = true, optional = true, features = ["uuid"] }
+# Without its fetch feature: that pulls in OpenSSL, which the CLI image does not ship.
+graph-networks-registry = { version = "0.7", default-features = false, optional = true }
 serde = { workspace = true, optional = true }
 serde_with = { workspace = true, optional = true, features = ["base64"] }
+serde_yaml = { version = "0.9", optional = true }
 sqlx = { workspace = true, optional = true }
 thegraph-core = { workspace = true, features = ["alloy-eip712", "alloy-signers", "alloy-sol-types"] }
 thiserror.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+indoc = "2.0"
 serde_json.workspace = true
 thegraph-core = { workspace = true, features = ["alloy-signer-local"] }
 

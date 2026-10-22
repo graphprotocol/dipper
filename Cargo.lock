@@ -2367,7 +2367,6 @@ dependencies = [
  "serde-envfile",
  "serde_json",
  "serde_with",
- "serde_yaml",
  "snmalloc-rs",
  "thegraph-core",
  "thiserror 2.0.18",
@@ -2384,9 +2383,12 @@ name = "dipper-core"
 version = "0.1.0"
 dependencies = [
  "fake",
+ "graph-networks-registry 0.7.0",
+ "indoc",
  "serde",
  "serde_json",
  "serde_with",
+ "serde_yaml",
  "sqlx",
  "thegraph-core",
  "thiserror 2.0.18",
