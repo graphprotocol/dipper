@@ -223,6 +223,10 @@ where
         .max_grt_per_30_days()
         .get(&chain_name)
         .copied();
+    let max_grt_per_billion_entities_per_30_days = Some(
+        ctx.agreement_conf
+            .max_grt_per_billion_entities_per_30_days(),
+    );
 
     // Per-chain mass-unresponsive breaker: when a large fraction of this chain's
     // DIPs-accepting pool is unresponsive at once it's a dipper-side outage, so
@@ -230,7 +234,12 @@ where
     if !unresponsive.is_empty() {
         let snapshot = ctx
             .dips_accepting_cache
-            .get_or_fetch(&ctx.iisa, &chain_name, max_grt_per_30_days)
+            .get_or_fetch(
+                &ctx.iisa,
+                &chain_name,
+                max_grt_per_30_days,
+                max_grt_per_billion_entities_per_30_days,
+            )
             .await;
         let suppress = ctx.unresponsive_breaker.evaluate(
             &chain_name,
@@ -253,6 +262,7 @@ where
 
     context.chain_id = Some(chain_name.clone());
     context.max_grt_per_30_days = max_grt_per_30_days;
+    context.max_grt_per_billion_entities_per_30_days = max_grt_per_billion_entities_per_30_days;
 
     // Select the target group of indexers via IISA. If IISA is unreachable
     // we retry with exponential backoff rather than falling back to a
@@ -895,9 +905,12 @@ mod lifecycle_event_tests {
 
     // ---- Mock: IISA candidate selection -------------------------------------
 
-    /// Returns a fixed list of [`SelectedIndexer`], at most as many as asked for.
+    /// Returns a fixed list of [`SelectedIndexer`], at most as many as asked for, and
+    /// records every selection context it receives.
+    #[derive(Default)]
     struct MockIisa {
         selected: Vec<SelectedIndexer>,
+        contexts: Arc<Mutex<Vec<SelectionContext>>>,
     }
 
     #[async_trait]
@@ -906,8 +919,9 @@ mod lifecycle_event_tests {
             &self,
             _deployment_id: DeploymentId,
             num_candidates: usize,
-            _context: &SelectionContext,
+            context: &SelectionContext,
         ) -> std::result::Result<Vec<SelectedIndexer>, SelectionError> {
+            self.contexts.lock().unwrap().push(context.clone());
             Ok(self.selected.iter().take(num_candidates).cloned().collect())
         }
 
@@ -915,6 +929,7 @@ mod lifecycle_event_tests {
             &self,
             _chain: &str,
             _max_grt_per_30_days: Option<f64>,
+            _max_grt_per_billion_entities_per_30_days: Option<f64>,
         ) -> std::result::Result<dipper_iisa::DipsAcceptingSnapshot, SelectionError> {
             Ok(dipper_iisa::DipsAcceptingSnapshot {
                 computed_at: None,
@@ -1301,6 +1316,7 @@ mod lifecycle_event_tests {
             price_rejection_lookback_days: 1,
             transient_rejection_lookback_minutes: 30,
             uncertain_rejection_lookback_days: 1,
+            max_grt_per_billion_entities_per_30_days: 2000.0,
             ..IndexingAgreementConfig::for_tests()
         }
     }
@@ -1427,6 +1443,31 @@ mod lifecycle_event_tests {
         }
     }
 
+    // ---- Scenario 0: price ceilings reach IISA ------------------------------
+
+    #[tokio::test]
+    async fn sends_per_entity_price_ceiling_to_iisa() {
+        let iisa = MockIisa::default();
+        let contexts = Arc::clone(&iisa.contexts);
+        let ctx = build_ctx(
+            MockRegistry::default(),
+            iisa,
+            MockQueue::default(),
+            MockChainClient::default(),
+            CapturingEventsProducer::new(),
+            indexer_urls::Snapshot::new(),
+        );
+
+        handle(ctx, &test_message(1)).await.expect("handler ok");
+
+        let contexts = contexts.lock().unwrap();
+        assert_eq!(contexts.len(), 1, "IISA asked once: {contexts:?}");
+        assert_eq!(
+            contexts[0].max_grt_per_billion_entities_per_30_days,
+            Some(2000.0)
+        );
+    }
+
     // ---- Scenario 1: n_indexers_unavailable ---------------------------------
 
     #[tokio::test]
@@ -1444,6 +1485,7 @@ mod lifecycle_event_tests {
             MockRegistry::default(),
             MockIisa {
                 selected: vec![selected(new_idx)],
+                ..Default::default()
             },
             MockQueue::default(),
             MockChainClient::default(),
@@ -1497,6 +1539,7 @@ mod lifecycle_event_tests {
             },
             MockIisa {
                 selected: vec![selected(new_idx)],
+                ..Default::default()
             },
             MockQueue::default(),
             MockChainClient::default(),
@@ -1547,6 +1590,7 @@ mod lifecycle_event_tests {
             registry,
             MockIisa {
                 selected: vec![selected(idx)],
+                ..Default::default()
             },
             MockQueue::default(),
             MockChainClient::default(),
@@ -1586,6 +1630,7 @@ mod lifecycle_event_tests {
             registry,
             MockIisa {
                 selected: vec![selected(idx)],
+                ..Default::default()
             },
             MockQueue::default(),
             MockChainClient::default(),
@@ -1610,8 +1655,11 @@ mod lifecycle_event_tests {
         // entering shortfall regardless of the empty diff.
         let events = CapturingEventsProducer::new();
         let ctx = build_ctx(
-            MockRegistry::default(),       // no current agreements, latch false
-            MockIisa { selected: vec![] }, // zero available
+            MockRegistry::default(), // no current agreements, latch false
+            MockIisa {
+                selected: vec![],
+                ..Default::default()
+            }, // zero available
             MockQueue::default(),
             MockChainClient::default(),
             events.clone(),
@@ -1656,6 +1704,7 @@ mod lifecycle_event_tests {
             },
             MockIisa {
                 selected: candidates.iter().copied().map(selected).collect(),
+                ..Default::default()
             },
             queue.clone(),
             MockChainClient::default(),
@@ -1690,6 +1739,7 @@ mod lifecycle_event_tests {
             registry,
             MockIisa {
                 selected: vec![selected(healthy)],
+                ..Default::default()
             },
             queue.clone(),
             chain_client.clone(),
@@ -1724,7 +1774,10 @@ mod lifecycle_event_tests {
         };
         let ctx = build_ctx(
             registry,
-            MockIisa { selected: vec![] }, // IISA returns nothing -> coverage drops
+            MockIisa {
+                selected: vec![],
+                ..Default::default()
+            }, // IISA returns nothing -> coverage drops
             MockQueue::default(),
             MockChainClient::default(),
             events.clone(),
@@ -1782,6 +1835,7 @@ mod lifecycle_event_tests {
             registry,
             MockIisa {
                 selected: vec![selected(new_idx)],
+                ..Default::default()
             },
             queue.clone(),
             MockChainClient::default(),
@@ -1848,6 +1902,7 @@ mod lifecycle_event_tests {
             registry,
             MockIisa {
                 selected: vec![selected(new_idx)],
+                ..Default::default()
             },
             MockQueue::default(),
             MockChainClient::default(),
@@ -1880,7 +1935,10 @@ mod lifecycle_event_tests {
                 active_agreements: vec![leaving.clone()],
                 ..MockRegistry::default()
             },
-            MockIisa { selected: vec![] },
+            MockIisa {
+                selected: vec![],
+                ..Default::default()
+            },
             MockQueue::default(),
             MockChainClient::default(),
             CapturingEventsProducer::new(),
@@ -1979,7 +2037,10 @@ mod lifecycle_event_tests {
         };
         let ctx = build_ctx(
             registry,
-            MockIisa { selected: vec![] },
+            MockIisa {
+                selected: vec![],
+                ..Default::default()
+            },
             MockQueue::default(),
             chain_client.clone(),
             CapturingEventsProducer::new(),

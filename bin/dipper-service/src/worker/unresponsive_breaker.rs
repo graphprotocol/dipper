@@ -133,6 +133,7 @@ impl DipsAcceptingCache {
         iisa: &I,
         chain: &str,
         max_grt_per_30_days: Option<f64>,
+        max_grt_per_billion_entities_per_30_days: Option<f64>,
     ) -> Option<Arc<DipsAcceptingSnapshot>> {
         {
             let guard = self.inner.lock().await;
@@ -143,7 +144,11 @@ impl DipsAcceptingCache {
             }
         }
         match iisa
-            .dips_accepting_indexers(chain, max_grt_per_30_days)
+            .dips_accepting_indexers(
+                chain,
+                max_grt_per_30_days,
+                max_grt_per_billion_entities_per_30_days,
+            )
             .await
         {
             Ok(snapshot) => {

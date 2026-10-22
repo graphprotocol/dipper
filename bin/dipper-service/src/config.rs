@@ -902,7 +902,9 @@ pub struct DipsAgreementConfig {
     #[serde(default = "default_max_grt_per_30_days")]
     pub max_grt_per_30_days: BTreeMap<String, f64>,
 
-    /// Maximum GRT per billion entities per 30 days.
+    /// Maximum GRT per billion entities per 30 days Dipper will pay, on every chain.
+    ///
+    /// Sent to IISA, which excludes indexers advertising a higher per-entity price.
     #[serde(default = "default_max_grt_per_billion_entities_per_30_days")]
     pub max_grt_per_billion_entities_per_30_days: f64,
 
