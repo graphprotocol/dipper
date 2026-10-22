@@ -23,7 +23,7 @@ use tokio::{
 use crate::{
     config::IndexingRequestConsumerConfig,
     registry::IndexingRequestRegistry,
-    request_chain_check::RequestChainCheck,
+    request_chain_check::{ChainCheckError, RequestChainCheck},
     set_indexing_target::{ApplyError, SetIndexingTarget, apply_set_indexing_target},
     worker::service::{JobPriority, WorkerQueue},
 };
@@ -538,9 +538,12 @@ where
 
         match result {
             Ok(_) => return true,
-            // The apply already logged the refusal. The same record can never pass,
-            // so it is skipped rather than holding up the partition.
-            Err(ApplyError::WrongChain(_)) => return true,
+            // The same record can never pass, so it is skipped rather than holding
+            // up the partition, and flagged, since Studio is never told.
+            Err(ApplyError::WrongChain(err)) => {
+                alert_refused_record(partition, offset, target, &err);
+                return true;
+            }
             Err(err @ (ApplyError::Registry(_) | ApplyError::ChainCheckUnavailable(_))) => {
                 tracing::error!(
                     partition,
@@ -567,6 +570,26 @@ where
             return true;
         }
     }
+}
+
+/// Raise an alert for a Studio request dropped because its chain is wrong: Studio
+/// gets no reply, so without this the developer's request vanishes unseen.
+fn alert_refused_record(
+    partition: i32,
+    offset: i64,
+    target: &ProposedTarget,
+    err: &ChainCheckError,
+) {
+    tracing::error!(
+        event = "studio_request_chain_refused",
+        partition,
+        offset,
+        event_id = %target.event_id,
+        deployment_id = %target.deployment_id,
+        chain_id = target.deployment_chain_id,
+        error = %err,
+        "Dropped a Studio indexing request whose chain does not match its subgraph manifest"
+    );
 }
 
 /// One attempt at the reassessment push that failed inside the apply.
@@ -684,7 +707,7 @@ mod tests {
             IndexingRequest as IndexingRequestRecord, Result as RegistryResult, SetTargetOutcome,
         },
         request_chain_check::SkipChainCheck,
-        test_support::{CapturedEvent, CapturingEventsProducer, RefusingChainCheck},
+        test_support::{CapturedEvent, CapturingEventsProducer, RefusingChainCheck, logged},
         worker::queue::JobId,
     };
 
@@ -1299,8 +1322,17 @@ mod tests {
         let worker = MockWorker::new();
         let check = RefusingChainCheck::wrong_chain();
 
-        let (applied, events) = run_apply_checked(&registry, &worker, 3, &check).await;
+        let mut outcome = None;
+        let logs = logged(async {
+            outcome = Some(run_apply_checked(&registry, &worker, 3, &check).await);
+        })
+        .await;
+        let (applied, events) = outcome.expect("the apply ran");
 
+        assert!(
+            logs.contains("studio_request_chain_refused"),
+            "the dropped request raises an alert: {logs}"
+        );
         assert!(applied, "the record is done with, so its offset moves on");
         assert_eq!(check.calls(), 1, "a wrong chain is not retried");
         assert!(registry.calls().is_empty());
