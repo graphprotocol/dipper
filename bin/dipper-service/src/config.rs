@@ -990,6 +990,14 @@ impl DipsAgreementConfig {
                 "recurring_agreement_manager must be set to a non-zero address".to_string(),
             );
         }
+        // IISA drops every indexer priced above this per entity, so 0, a negative or a
+        // non-finite value would exclude nearly everyone; refuse to start instead.
+        let entity_ceiling = self.max_grt_per_billion_entities_per_30_days;
+        if !(entity_ceiling.is_finite() && entity_ceiling > 0.0) {
+            return Err(format!(
+                "max_grt_per_billion_entities_per_30_days ({entity_ceiling}) must be a positive number"
+            ));
+        }
         if self.mass_unresponsive_reset_fraction >= self.mass_unresponsive_trip_fraction {
             return Err(format!(
                 "mass_unresponsive_reset_fraction ({}) must be below mass_unresponsive_trip_fraction ({})",
@@ -1666,6 +1674,29 @@ mod tests {
                 .is_ok(),
             "a non-zero manager address is valid"
         );
+    }
+
+    #[test]
+    fn validate_rejects_a_per_entity_ceiling_that_excludes_every_priced_indexer() {
+        let mut conf: DipsAgreementConfig = serde_json::from_str(
+            r#"{
+                "data_service": "0x1111111111111111111111111111111111111111",
+                "recurring_collector": "0x2222222222222222222222222222222222222222",
+                "recurring_agreement_manager": "0x3333333333333333333333333333333333333333",
+                "min_seconds_per_collection": 60,
+                "max_seconds_per_collection": 3600,
+                "pricing_table": {}
+            }"#,
+        )
+        .expect("deserialization");
+        for ceiling in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            conf.max_grt_per_billion_entities_per_30_days = ceiling;
+            assert!(conf.validate().is_err(), "{ceiling}");
+        }
+        for ceiling in [0.01, 2000.0] {
+            conf.max_grt_per_billion_entities_per_30_days = ceiling;
+            assert!(conf.validate().is_ok(), "{ceiling}");
+        }
     }
 
     #[test]
