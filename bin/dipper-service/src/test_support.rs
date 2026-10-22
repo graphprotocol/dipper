@@ -6,7 +6,10 @@
 //! (and with which payloads) without a Kafka backend, and [`logged`], which captures what
 //! dipper logs.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use async_trait::async_trait;
 use dipper_producer::{
@@ -14,6 +17,8 @@ use dipper_producer::{
     proto,
 };
 use thegraph_core::{DeploymentId, alloy::primitives::ChainId};
+
+use crate::request_chain_check::{ChainCheckError, RequestChainCheck};
 
 /// One captured lifecycle event: the routing metadata plus the typed payload.
 #[derive(Clone, Debug, PartialEq)]
@@ -156,6 +161,51 @@ impl SubgraphIndexingAgreementEventsProducer for CapturingEventsProducer {
             event,
         });
         Ok(())
+    }
+}
+
+/// A chain check that refuses every request, as a wrong chain or (when
+/// `transient`) as if IPFS were down, and counts how often it was asked.
+#[derive(Default)]
+pub struct RefusingChainCheck {
+    transient: bool,
+    calls: AtomicUsize,
+}
+
+impl RefusingChainCheck {
+    pub fn wrong_chain() -> Self {
+        Self::default()
+    }
+
+    pub fn unavailable() -> Self {
+        Self {
+            transient: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl RequestChainCheck for RefusingChainCheck {
+    async fn check(
+        &self,
+        _deployment: &DeploymentId,
+        requested_chain_id: ChainId,
+    ) -> Result<(), ChainCheckError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(if self.transient {
+            ChainCheckError::Unavailable("IPFS is down".to_string())
+        } else {
+            ChainCheckError::Mismatch {
+                network: "arbitrum-sepolia".to_string(),
+                manifest_chain_id: 421614,
+                requested_chain_id,
+            }
+        })
     }
 }
 

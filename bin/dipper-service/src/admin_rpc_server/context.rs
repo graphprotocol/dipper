@@ -5,7 +5,7 @@ use dipper_producer::events::SubgraphIndexingAgreementEventsProducer;
 use thegraph_core::alloy::primitives::Address;
 
 use super::handlers::{IndexingAgreementsCtx, IndexingRequestsCtx};
-use crate::signing::eip712::Eip712Signer;
+use crate::{request_chain_check::RequestChainCheck, signing::eip712::Eip712Signer};
 
 /// Shared context for the gateway operator API.
 #[derive(Clone)]
@@ -28,6 +28,9 @@ pub struct Ctx<R, W> {
     /// Subgraph Indexing Agreements Events emitter for sending on the topic, if configured and enabled
     pub subgraph_indexing_agreements_events_emitter:
         Arc<dyn SubgraphIndexingAgreementEventsProducer>,
+
+    /// Refuses indexing requests whose chain is not their subgraph manifest's
+    pub request_chain_check: Arc<dyn RequestChainCheck>,
 }
 
 impl<R, W> FromState<Ctx<R, W>> for IndexingRequestsCtx<R, W>
@@ -45,6 +48,7 @@ where
             subgraph_indexing_agreements_events_emitter: ctx
                 .subgraph_indexing_agreements_events_emitter
                 .clone(),
+            request_chain_check: ctx.request_chain_check.clone(),
         }
     }
 }

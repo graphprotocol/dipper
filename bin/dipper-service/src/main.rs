@@ -29,6 +29,7 @@ mod health;
 mod indexer_rpc_client;
 mod network;
 mod registry;
+mod request_chain_check;
 mod set_indexing_target;
 mod signing;
 mod supervisor;
@@ -354,6 +355,25 @@ pub async fn main() -> anyhow::Result<()> {
 
     let additional_networks = Arc::new(conf.additional_networks);
 
+    //- The check that refuses indexing requests for a chain their subgraph doesn't index
+    let request_chain_check: Arc<dyn request_chain_check::RequestChainCheck> =
+        if conf.request_chain_check.enabled {
+            tracing::info!(
+                ipfs_url = %conf.request_chain_check.ipfs_url,
+                "checking each indexing request's chain against its subgraph manifest"
+            );
+            Arc::new(request_chain_check::ManifestChainCheck::new(
+                &conf.request_chain_check,
+                Arc::clone(&networks_registry),
+                Arc::clone(&additional_networks),
+            )?)
+        } else {
+            tracing::warn!(
+                "request_chain_check is disabled: indexing requests are accepted for any chain"
+            );
+            Arc::new(request_chain_check::SkipChainCheck)
+        };
+
     // Application services
 
     //- The chain client (for on-chain transactions). Required: presence validated above.
@@ -622,6 +642,7 @@ pub async fn main() -> anyhow::Result<()> {
                 events: subgraph_indexing_agreements_events_emitter.clone(),
                 protocol_chain_id: chain_id,
                 max_candidates: DEFAULT_MAX_CANDIDATES,
+                chain_check: Arc::clone(&request_chain_check),
                 config: consumer_conf.clone(),
             };
             let (handle, service) = network::service::indexing_request_consumer::new(ctx);
@@ -653,6 +674,7 @@ pub async fn main() -> anyhow::Result<()> {
             worker: worker_handle.queue().clone(),
             subgraph_indexing_agreements_events_emitter:
                 subgraph_indexing_agreements_events_emitter.clone(),
+            request_chain_check,
         };
 
         admin_rpc_server::service::new(config, ctx)

@@ -105,6 +105,44 @@ pub struct Config {
     /// none are sent.
     #[serde(default)]
     pub alerts: AlertsConfig,
+    /// Refusing indexing requests whose chain is not the one their subgraph manifest
+    /// indexes. On by default, so omitting the section keeps the check.
+    #[serde(default)]
+    pub request_chain_check: RequestChainCheckConfig,
+}
+
+/// How indexing requests are checked against their subgraph manifest's chain. A request
+/// whose manifest can't be read is refused, so a check that can't run never waves it through.
+#[serde_as]
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RequestChainCheckConfig {
+    /// Whether to check at all. Turn it off only where manifests can't be read, or for a
+    /// chain neither the networks registry nor `additional_networks` names.
+    pub enabled: bool,
+
+    /// The IPFS API subgraph manifests are read from.
+    #[serde_as(as = "serde_with::DisplayFromStr")]
+    pub ipfs_url: Url,
+
+    /// How long to wait on IPFS for 1 manifest, in seconds.
+    #[serde_as(as = "serde_with::DurationSeconds")]
+    pub timeout: Duration,
+}
+
+impl Default for RequestChainCheckConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ipfs_url: default_ipfs_url(),
+            timeout: Duration::from_secs(10),
+        }
+    }
+}
+
+#[expect(clippy::expect_used, reason = "a fixed URL that always parses")]
+fn default_ipfs_url() -> Url {
+    Url::parse("https://ipfs.thegraph.com").expect("a valid URL")
 }
 
 /// Alerts for the log lines an operator has to act on, picked out by their `event` tag and
@@ -2372,6 +2410,19 @@ mod tests {
             liveness.unreachable_trip_min_indexers,
             defaults.unreachable_trip_min_indexers
         );
+    }
+
+    #[test]
+    fn the_example_configmap_request_chain_check_section_parses() {
+        let check = serde_json::from_value::<RequestChainCheckConfig>(
+            example_config()["request_chain_check"].clone(),
+        )
+        .expect("the example's request_chain_check section is a valid config");
+        let defaults = RequestChainCheckConfig::default();
+
+        assert_eq!(check.enabled, defaults.enabled);
+        assert_eq!(check.ipfs_url, defaults.ipfs_url);
+        assert_eq!(check.timeout, defaults.timeout);
     }
 
     #[test]
