@@ -7,7 +7,7 @@ edition = "2024"
 anyhow.workspace = true
 clap = { workspace = true, features = ["cargo", "env"] }
 custom_debug = "0.6.1"
-dipper-core = { version = "0.1.0", path = "../../dipper-core" }
+dipper-core = { version = "0.1.0", path = "../../dipper-core", features = ["manifest"] }
 dipper-rpc = { version = "0.1.0", path = "../../dipper-rpc", features = ["admin-rpc"] }
 dotenvy = "0.15.7"
 figment = { version = "0.10.19", features = ["env"] }
@@ -21,7 +21,6 @@ serde.workspace = true
 serde_json.workspace = true
 serde_with.workspace = true
 serde-envfile = { version = "0.3.0", features = ["preserve_order"] }
-serde_yaml = "0.9"
 snmalloc-rs = "0.3.6"
 thegraph-core = { workspace = true, features = ["alloy-signer-local", "signed-message"] }
 thiserror.workspace = true
@@ -32,6 +31,7 @@ url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+dipper-core = { version = "0.1.0", path = "../../dipper-core", features = ["test-util"] }
 wiremock.workspace = true
 
 [lints]

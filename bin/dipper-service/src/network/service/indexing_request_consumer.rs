@@ -23,6 +23,7 @@ use tokio::{
 use crate::{
     config::IndexingRequestConsumerConfig,
     registry::IndexingRequestRegistry,
+    request_chain_check::{ChainCheckError, RequestChainCheck},
     set_indexing_target::{ApplyError, SetIndexingTarget, apply_set_indexing_target},
     worker::service::{JobPriority, WorkerQueue},
 };
@@ -103,6 +104,8 @@ pub struct Ctx<R, W> {
     /// counts are clamped with a warning. Kafka records carry no signature,
     /// so this door gets a cap the signed admin RPC does not need.
     pub max_candidates: usize,
+    /// Refuses requests whose chain is not their subgraph manifest's
+    pub chain_check: Arc<dyn RequestChainCheck>,
     /// Service configuration
     pub config: IndexingRequestConsumerConfig,
 }
@@ -144,6 +147,7 @@ where
                 Arc::clone(&ctx.events),
                 ctx.protocol_chain_id,
                 ctx.max_candidates,
+                Arc::clone(&ctx.chain_check),
                 ctx.config.clone(),
                 shutdown_rx.clone(),
             ));
@@ -276,6 +280,7 @@ async fn partition_loop<R, W>(
     events: Arc<dyn SubgraphIndexingAgreementEventsProducer>,
     protocol_chain_id: ChainId,
     max_candidates: usize,
+    chain_check: Arc<dyn RequestChainCheck>,
     config: IndexingRequestConsumerConfig,
     mut shutdown_rx: watch::Receiver<bool>,
 ) where
@@ -403,6 +408,7 @@ async fn partition_loop<R, W>(
                         &registry,
                         &worker_queue,
                         &events,
+                        chain_check.as_ref(),
                         protocol_chain_id,
                         config.requested_by,
                         max_candidates,
@@ -473,8 +479,9 @@ async fn sleep_or_shutdown(shutdown_rx: &mut watch::Receiver<bool>, delay: Durat
 }
 
 /// Apply a decoded propose until it fully takes effect, returning `false` if
-/// shutdown was requested first. A registry failure retries the whole apply
-/// (nothing was committed); a queue failure retries only the job push, because
+/// shutdown was requested first. A registry failure or an unreadable manifest
+/// retries the whole apply (nothing was committed), and a wrong chain skips the
+/// record; a queue failure retries only the job push, because
 /// the row change is already committed and re-running the apply would land on
 /// the registry's no-op path and silently drop the reassessment.
 #[allow(clippy::too_many_arguments)]
@@ -482,6 +489,7 @@ async fn apply_target_with_retries<R, W>(
     registry: &R,
     worker_queue: &W,
     events: &Arc<dyn SubgraphIndexingAgreementEventsProducer>,
+    chain_check: &dyn RequestChainCheck,
     protocol_chain_id: ChainId,
     requested_by: Address,
     max_candidates: usize,
@@ -515,6 +523,7 @@ where
             registry,
             worker_queue,
             events,
+            chain_check,
             protocol_chain_id,
             SetIndexingTarget {
                 requested_by,
@@ -529,7 +538,13 @@ where
 
         match result {
             Ok(_) => return true,
-            Err(err @ ApplyError::Registry(_)) => {
+            // The same record can never pass, so it is skipped rather than holding
+            // up the partition, and flagged, since Studio is never told.
+            Err(ApplyError::WrongChain(err)) => {
+                alert_refused_record(partition, offset, target, &err);
+                return true;
+            }
+            Err(err @ (ApplyError::Registry(_) | ApplyError::ChainCheckUnavailable(_))) => {
                 tracing::error!(
                     partition,
                     offset,
@@ -555,6 +570,26 @@ where
             return true;
         }
     }
+}
+
+/// Raise an alert for a Studio request dropped because its chain is wrong: Studio
+/// gets no reply, so without this the developer's request vanishes unseen.
+fn alert_refused_record(
+    partition: i32,
+    offset: i64,
+    target: &ProposedTarget,
+    err: &ChainCheckError,
+) {
+    tracing::error!(
+        event = "studio_request_chain_refused",
+        partition,
+        offset,
+        event_id = %target.event_id,
+        deployment_id = %target.deployment_id,
+        chain_id = target.deployment_chain_id,
+        error = %err,
+        "Dropped a Studio indexing request whose chain does not match its subgraph manifest"
+    );
 }
 
 /// One attempt at the reassessment push that failed inside the apply.
@@ -671,7 +706,8 @@ mod tests {
         registry::{
             IndexingRequest as IndexingRequestRecord, Result as RegistryResult, SetTargetOutcome,
         },
-        test_support::{CapturedEvent, CapturingEventsProducer},
+        request_chain_check::SkipChainCheck,
+        test_support::{CapturedEvent, CapturingEventsProducer, RefusingChainCheck, logged},
         worker::queue::JobId,
     };
 
@@ -1056,6 +1092,16 @@ mod tests {
         worker: &MockWorker,
         num_candidates: usize,
     ) -> (bool, Vec<CapturedEvent>) {
+        run_apply_checked(registry, worker, num_candidates, &SkipChainCheck).await
+    }
+
+    /// As [`run_apply`], with `chain_check` deciding which chains are accepted.
+    async fn run_apply_checked(
+        registry: &MockRegistry,
+        worker: &MockWorker,
+        num_candidates: usize,
+        chain_check: &dyn RequestChainCheck,
+    ) -> (bool, Vec<CapturedEvent>) {
         let events_capture = CapturingEventsProducer::new();
         let events: Arc<dyn SubgraphIndexingAgreementEventsProducer> =
             Arc::new(events_capture.clone());
@@ -1072,6 +1118,7 @@ mod tests {
             registry,
             worker,
             &events,
+            chain_check,
             PROTOCOL_CHAIN_ID,
             requester(),
             TEST_MAX_CANDIDATES,
@@ -1251,6 +1298,7 @@ mod tests {
             &registry,
             &worker,
             &events,
+            &SkipChainCheck,
             PROTOCOL_CHAIN_ID,
             requester(),
             TEST_MAX_CANDIDATES,
@@ -1264,6 +1312,88 @@ mod tests {
         assert!(!applied, "shutdown must win over the retry loop");
         assert!(worker.reassessments().is_empty());
         assert!(events_capture.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_record_on_another_chain_is_skipped_without_touching_the_registry() {
+        let registry = MockRegistry::returning(SetTargetOutcome::Inserted {
+            id: IndexingRequestId::new(),
+        });
+        let worker = MockWorker::new();
+        let check = RefusingChainCheck::wrong_chain();
+
+        let mut outcome = None;
+        let logs = logged(async {
+            outcome = Some(run_apply_checked(&registry, &worker, 3, &check).await);
+        })
+        .await;
+        let (applied, events) = outcome.expect("the apply ran");
+
+        assert!(
+            logs.contains("studio_request_chain_refused"),
+            "the dropped request raises an alert: {logs}"
+        );
+        assert!(applied, "the record is done with, so its offset moves on");
+        assert_eq!(check.calls(), 1, "a wrong chain is not retried");
+        assert!(registry.calls().is_empty());
+        assert!(worker.reassessments().is_empty());
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_manifest_is_retried_not_skipped() {
+        //* Arrange - shutdown is already pending, so the 1st backoff ends the loop
+        let registry = MockRegistry::returning(SetTargetOutcome::Inserted {
+            id: IndexingRequestId::new(),
+        });
+        let worker = MockWorker::new();
+        let check = RefusingChainCheck::unavailable();
+        let events: Arc<dyn SubgraphIndexingAgreementEventsProducer> =
+            Arc::new(CapturingEventsProducer::new());
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        shutdown_tx.send(true).expect("send shutdown");
+        let target = ProposedTarget {
+            event_id: "e".to_string(),
+            deployment_id: deployment_id!(QM_HASH),
+            deployment_chain_id: INDEXED_CHAIN_ID,
+            num_candidates: 3,
+        };
+
+        //* Act
+        let applied = apply_target_with_retries(
+            &registry,
+            &worker,
+            &events,
+            &check,
+            PROTOCOL_CHAIN_ID,
+            requester(),
+            TEST_MAX_CANDIDATES,
+            &target,
+            0,
+            0,
+            &mut shutdown_rx,
+        )
+        .await;
+
+        //* Assert - unapplied, so the record is redelivered rather than lost
+        assert!(!applied);
+        assert_eq!(check.calls(), 1);
+        assert!(registry.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cancel_record_is_not_checked_against_the_manifest() {
+        let registry = MockRegistry::returning(SetTargetOutcome::Canceled {
+            id: IndexingRequestId::new(),
+        });
+        let worker = MockWorker::new();
+        let check = RefusingChainCheck::wrong_chain();
+
+        let (applied, _) = run_apply_checked(&registry, &worker, 0, &check).await;
+
+        assert!(applied);
+        assert_eq!(check.calls(), 0);
+        assert_eq!(registry.calls().len(), 1);
     }
 
     // -------- Redpanda-backed service test --------
@@ -1410,6 +1540,7 @@ mod tests {
                 events,
                 protocol_chain_id: 42161,
                 max_candidates: 10,
+                chain_check: Arc::new(SkipChainCheck),
                 config: consumer_config.clone(),
             });
             (handle, tokio::spawn(service))
