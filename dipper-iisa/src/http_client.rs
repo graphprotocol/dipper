@@ -19,7 +19,8 @@ use serde::{Deserialize, Serialize};
 use thegraph_core::{DeploymentId, IndexerId};
 
 use crate::api::{
-    CandidateSelection, DipsAcceptingSnapshot, SelectedIndexer, SelectionContext, SelectionError,
+    CandidateSelection, DipsAcceptingSnapshot, PriceCeilings, SelectedIndexer, SelectionContext,
+    SelectionError,
 };
 
 /// Configuration for the HTTP client.
@@ -240,8 +241,7 @@ impl HttpIisaClient {
     async fn get_dips_indexers(
         &self,
         chain: &str,
-        max_grt_per_30_days: Option<f64>,
-        max_grt_per_billion_entities_per_30_days: Option<f64>,
+        ceilings: PriceCeilings,
     ) -> Result<DipsIndexersResponse, SelectionError> {
         let url = format!("{}dips-indexers", self.endpoint);
         let mut last_error = SelectionError::IisaServiceUnavailable;
@@ -251,10 +251,10 @@ impl HttpIisaClient {
                 tokio::time::sleep(calculate_retry_delay(attempt)).await;
             }
             let mut req = self.client.get(&url).query(&[("chain", chain)]);
-            if let Some(max_grt) = max_grt_per_30_days {
+            if let Some(max_grt) = ceilings.max_grt_per_30_days {
                 req = req.query(&[("max_grt_per_30_days", max_grt.to_string().as_str())]);
             }
-            if let Some(max_entity_grt) = max_grt_per_billion_entities_per_30_days {
+            if let Some(max_entity_grt) = ceilings.max_grt_per_billion_entities_per_30_days {
                 req = req.query(&[(
                     "max_grt_per_billion_entities_per_30_days",
                     max_entity_grt.to_string().as_str(),
@@ -526,16 +526,9 @@ impl CandidateSelection for HttpIisaClient {
     async fn dips_accepting_indexers(
         &self,
         chain: &str,
-        max_grt_per_30_days: Option<f64>,
-        max_grt_per_billion_entities_per_30_days: Option<f64>,
+        ceilings: PriceCeilings,
     ) -> Result<DipsAcceptingSnapshot, SelectionError> {
-        let response = self
-            .get_dips_indexers(
-                chain,
-                max_grt_per_30_days,
-                max_grt_per_billion_entities_per_30_days,
-            )
-            .await?;
+        let response = self.get_dips_indexers(chain, ceilings).await?;
         let mut indexers = Vec::with_capacity(response.indexers.len());
         for id_str in response.indexers {
             match id_str.parse::<IndexerId>() {
@@ -1078,7 +1071,13 @@ mod tests {
 
         let client = HttpIisaClient::new(mock_server.uri());
         let snap = client
-            .dips_accepting_indexers("arbitrum-one", Some(4500.0), None)
+            .dips_accepting_indexers(
+                "arbitrum-one",
+                PriceCeilings {
+                    max_grt_per_30_days: Some(4500.0),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1108,7 +1107,13 @@ mod tests {
 
         let client = HttpIisaClient::new(mock_server.uri());
         let result = client
-            .dips_accepting_indexers("arbitrum-one", None, Some(2000.0))
+            .dips_accepting_indexers(
+                "arbitrum-one",
+                PriceCeilings {
+                    max_grt_per_billion_entities_per_30_days: Some(2000.0),
+                    ..Default::default()
+                },
+            )
             .await;
         assert!(result.is_ok(), "per-entity ceiling not sent: {result:?}");
     }
@@ -1172,7 +1177,7 @@ mod tests {
         let client = HttpIisaClient::with_config(mock_server.uri(), config);
         assert!(
             client
-                .dips_accepting_indexers("mainnet", None, None)
+                .dips_accepting_indexers("mainnet", PriceCeilings::default())
                 .await
                 .unwrap()
                 .indexers
@@ -1195,7 +1200,7 @@ mod tests {
 
         let client = HttpIisaClient::new(mock_server.uri());
         let snap = client
-            .dips_accepting_indexers("mainnet", None, None)
+            .dips_accepting_indexers("mainnet", PriceCeilings::default())
             .await
             .unwrap();
         assert!(snap.computed_at.is_none());
@@ -1232,7 +1237,7 @@ mod tests {
         let client = HttpIisaClient::with_config(mock_server.uri(), config);
         assert!(
             client
-                .dips_accepting_indexers("mainnet", None, None)
+                .dips_accepting_indexers("mainnet", PriceCeilings::default())
                 .await
                 .unwrap()
                 .indexers

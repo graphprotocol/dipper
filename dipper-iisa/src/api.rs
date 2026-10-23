@@ -58,6 +58,16 @@ pub struct SelectionContext {
     pub optimistic_dips_fees: HashMap<IndexerId, f64>,
 }
 
+/// The most Dipper will pay, so IISA can drop indexers asking more. Named fields keep
+/// the 2 prices, which are in different units, from being swapped. `None` skips one.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PriceCeilings {
+    /// Base price for the chain, in GRT per 30 days.
+    pub max_grt_per_30_days: Option<f64>,
+    /// Per-entity price, in GRT per billion entities per 30 days.
+    pub max_grt_per_billion_entities_per_30_days: Option<f64>,
+}
+
 /// An indexer selected by IISA with its advertised pricing.
 #[derive(Debug, Clone)]
 pub struct SelectedIndexer {
@@ -121,12 +131,10 @@ pub trait CandidateSelection {
     ) -> Result<Vec<SelectedIndexer>, SelectionError>;
 
     /// Fetch the indexers that currently accept DIPs on `chain`, a required chain *name*
-    /// (stricter than "IISA scores it"), optionally capped to those priced at or under
-    /// `max_grt_per_30_days` and `max_grt_per_billion_entities_per_30_days`.
+    /// (stricter than "IISA scores it"), capped to those priced at or under `ceilings`.
     async fn dips_accepting_indexers(
         &self,
         chain: &str,
-        max_grt_per_30_days: Option<f64>,
-        max_grt_per_billion_entities_per_30_days: Option<f64>,
+        ceilings: PriceCeilings,
     ) -> Result<DipsAcceptingSnapshot, SelectionError>;
 }

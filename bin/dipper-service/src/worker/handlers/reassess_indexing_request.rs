@@ -5,7 +5,7 @@ use std::{
 };
 
 use dipper_core::{ids::IndexingRequestId, time::now_secs};
-use dipper_iisa::{CandidateSelection, SelectedIndexer, SelectionError};
+use dipper_iisa::{CandidateSelection, PriceCeilings, SelectedIndexer, SelectionError};
 use dipper_producer::{events::SubgraphIndexingAgreementEventsProducer, proto};
 use graph_networks_registry::NetworksRegistry;
 use jsonrpsee::core::Serialize;
@@ -218,15 +218,17 @@ where
 
     // Cap the breaker's pool to indexers dipper could actually pay on this chain, so
     // the denominator matches the indexers the unresponsive numerator is drawn from.
-    let max_grt_per_30_days = ctx
-        .agreement_conf
-        .max_grt_per_30_days()
-        .get(&chain_name)
-        .copied();
-    let max_grt_per_billion_entities_per_30_days = Some(
-        ctx.agreement_conf
-            .max_grt_per_billion_entities_per_30_days(),
-    );
+    let ceilings = PriceCeilings {
+        max_grt_per_30_days: ctx
+            .agreement_conf
+            .max_grt_per_30_days()
+            .get(&chain_name)
+            .copied(),
+        max_grt_per_billion_entities_per_30_days: Some(
+            ctx.agreement_conf
+                .max_grt_per_billion_entities_per_30_days(),
+        ),
+    };
 
     // Per-chain mass-unresponsive breaker: when a large fraction of this chain's
     // DIPs-accepting pool is unresponsive at once it's a dipper-side outage, so
@@ -234,12 +236,7 @@ where
     if !unresponsive.is_empty() {
         let snapshot = ctx
             .dips_accepting_cache
-            .get_or_fetch(
-                &ctx.iisa,
-                &chain_name,
-                max_grt_per_30_days,
-                max_grt_per_billion_entities_per_30_days,
-            )
+            .get_or_fetch(&ctx.iisa, &chain_name, ceilings)
             .await;
         let suppress = ctx.unresponsive_breaker.evaluate(
             &chain_name,
@@ -261,8 +258,9 @@ where
     }
 
     context.chain_id = Some(chain_name.clone());
-    context.max_grt_per_30_days = max_grt_per_30_days;
-    context.max_grt_per_billion_entities_per_30_days = max_grt_per_billion_entities_per_30_days;
+    context.max_grt_per_30_days = ceilings.max_grt_per_30_days;
+    context.max_grt_per_billion_entities_per_30_days =
+        ceilings.max_grt_per_billion_entities_per_30_days;
 
     // Select the target group of indexers via IISA. If IISA is unreachable
     // we retry with exponential backoff rather than falling back to a
@@ -853,7 +851,9 @@ mod lifecycle_event_tests {
 
     use async_trait::async_trait;
     use dipper_core::ids::{IndexingAgreementId, IndexingRequestId};
-    use dipper_iisa::{CandidateSelection, SelectedIndexer, SelectionContext, SelectionError};
+    use dipper_iisa::{
+        CandidateSelection, PriceCeilings, SelectedIndexer, SelectionContext, SelectionError,
+    };
     use dipper_rpc::indexer::indexer_client::sol::RecurringCollectionAgreement;
     use thegraph_core::{
         DeploymentId, IndexerId,
@@ -928,8 +928,7 @@ mod lifecycle_event_tests {
         async fn dips_accepting_indexers(
             &self,
             _chain: &str,
-            _max_grt_per_30_days: Option<f64>,
-            _max_grt_per_billion_entities_per_30_days: Option<f64>,
+            _ceilings: PriceCeilings,
         ) -> std::result::Result<dipper_iisa::DipsAcceptingSnapshot, SelectionError> {
             Ok(dipper_iisa::DipsAcceptingSnapshot {
                 computed_at: None,
