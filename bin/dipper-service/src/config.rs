@@ -1122,11 +1122,12 @@ fn default_max_grt_per_30_days() -> BTreeMap<String, f64> {
         .collect()
 }
 
-/// Default ceiling for chains outside the rollout set: the highest default chain ceiling, so
-/// an unlisted chain is capped no looser than the priciest listed one.
+/// Default ceiling for chains outside the rollout set: the highest of the default chain
+/// ceilings, whatever `max_grt_per_30_days` an operator configures.
 fn default_fallback_max_grt_per_30_days() -> f64 {
-    default_max_grt_per_30_days()
-        .into_values()
+    INDEXER_RS_MIN_GRT_PER_30_DAYS
+        .iter()
+        .map(|(_, min)| min * PAYMENT_CEILING_MULTIPLIER)
         .fold(0.0, f64::max)
 }
 
