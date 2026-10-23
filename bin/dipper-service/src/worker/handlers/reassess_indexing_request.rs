@@ -906,11 +906,12 @@ mod lifecycle_event_tests {
     // ---- Mock: IISA candidate selection -------------------------------------
 
     /// Returns a fixed list of [`SelectedIndexer`], at most as many as asked for, and
-    /// records every selection context it receives.
+    /// records every selection context and DIPs-accepting price ceiling it receives.
     #[derive(Default)]
     struct MockIisa {
         selected: Vec<SelectedIndexer>,
         contexts: Arc<Mutex<Vec<SelectionContext>>>,
+        dips_ceilings: Arc<Mutex<Vec<PriceCeilings>>>,
     }
 
     #[async_trait]
@@ -928,8 +929,9 @@ mod lifecycle_event_tests {
         async fn dips_accepting_indexers(
             &self,
             _chain: &str,
-            _ceilings: PriceCeilings,
+            ceilings: PriceCeilings,
         ) -> std::result::Result<dipper_iisa::DipsAcceptingSnapshot, SelectionError> {
+            self.dips_ceilings.lock().unwrap().push(ceilings);
             Ok(dipper_iisa::DipsAcceptingSnapshot {
                 computed_at: None,
                 indexers: Vec::new(),
@@ -1088,6 +1090,8 @@ mod lifecycle_event_tests {
         marked_cancelling: Arc<Mutex<Vec<IndexingAgreementId>>>,
         /// Indexers holding a slot with an agreement they stopped serving.
         held: Vec<IndexerId>,
+        /// Indexers reported as recently unresponsive, which wakes the breaker.
+        unresponsive: Vec<IndexerId>,
     }
 
     #[async_trait]
@@ -1199,7 +1203,7 @@ mod lifecycle_event_tests {
             _lookback_days: i32,
             _chain_id: ChainId,
         ) -> RegistryResult<Vec<IndexerId>> {
-            Ok(Vec::new())
+            Ok(self.unresponsive.clone())
         }
         async fn count_created_agreements_by_indexer(
             &self,
@@ -1315,6 +1319,10 @@ mod lifecycle_event_tests {
             price_rejection_lookback_days: 1,
             transient_rejection_lookback_minutes: 30,
             uncertain_rejection_lookback_days: 1,
+            max_grt_per_30_days: std::collections::BTreeMap::from([(
+                "test-chain".to_string(),
+                450.0,
+            )]),
             max_grt_per_billion_entities_per_30_days: 2000.0,
             ..IndexingAgreementConfig::for_tests()
         }
@@ -1467,6 +1475,35 @@ mod lifecycle_event_tests {
         );
     }
 
+    #[tokio::test]
+    async fn sends_both_price_ceilings_to_the_breaker_pool_lookup() {
+        // The breaker's pool must be priced like selection, so its lookup carries
+        // the same 2 ceilings. An unresponsive indexer wakes the breaker.
+        let iisa = MockIisa::default();
+        let dips_ceilings = Arc::clone(&iisa.dips_ceilings);
+        let ctx = build_ctx(
+            MockRegistry {
+                unresponsive: vec![indexer_id(0x31)],
+                ..Default::default()
+            },
+            iisa,
+            MockQueue::default(),
+            MockChainClient::default(),
+            CapturingEventsProducer::new(),
+            indexer_urls::Snapshot::new(),
+        );
+
+        handle(ctx, &test_message(1)).await.expect("handler ok");
+
+        assert_eq!(
+            *dips_ceilings.lock().unwrap(),
+            vec![PriceCeilings {
+                max_grt_per_30_days: Some(450.0),
+                max_grt_per_billion_entities_per_30_days: Some(2000.0),
+            }]
+        );
+    }
+
     // ---- Scenario 1: n_indexers_unavailable ---------------------------------
 
     #[tokio::test]
@@ -1584,6 +1621,7 @@ mod lifecycle_event_tests {
             marked_cancelled: Arc::default(),
             marked_cancelling: Arc::default(),
             held: Vec::new(),
+            unresponsive: Vec::new(),
         };
         let ctx = build_ctx(
             registry,
@@ -1624,6 +1662,7 @@ mod lifecycle_event_tests {
             marked_cancelled: Arc::default(),
             marked_cancelling: Arc::default(),
             held: Vec::new(),
+            unresponsive: Vec::new(),
         };
         let ctx = build_ctx(
             registry,
@@ -1770,6 +1809,7 @@ mod lifecycle_event_tests {
             marked_cancelled: Arc::default(),
             marked_cancelling: Arc::default(),
             held: Vec::new(),
+            unresponsive: Vec::new(),
         };
         let ctx = build_ctx(
             registry,
@@ -1829,6 +1869,7 @@ mod lifecycle_event_tests {
             marked_cancelled: Arc::default(),
             marked_cancelling: Arc::default(),
             held: Vec::new(),
+            unresponsive: Vec::new(),
         };
         let ctx = build_ctx(
             registry,
@@ -1896,6 +1937,7 @@ mod lifecycle_event_tests {
             marked_cancelled: Arc::default(),
             marked_cancelling: Arc::default(),
             held: Vec::new(),
+            unresponsive: Vec::new(),
         };
         let ctx = build_ctx(
             registry,
@@ -2033,6 +2075,7 @@ mod lifecycle_event_tests {
             marked_cancelled: Arc::default(),
             marked_cancelling: Arc::default(),
             held: Vec::new(),
+            unresponsive: Vec::new(),
         };
         let ctx = build_ctx(
             registry,
