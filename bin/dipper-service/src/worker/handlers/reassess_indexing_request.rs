@@ -467,14 +467,15 @@ where
             }
         };
 
-        // Use per-indexer pricing from IISA when available, otherwise fall back
-        // to the static pricing_table config
+        // Use per-indexer pricing from IISA when available and within the caps sent to it,
+        // otherwise fall back to the static pricing_table config
         let selected = target_pricing
             .get(indexer_id)
             .expect("ID from to_add must exist in target_pricing");
         let (tokens_per_second, tokens_per_entity_per_second) =
             match super::selection_helpers::resolve_pricing(
                 selected,
+                &ceilings,
                 fallback_prices,
                 deployment_chain_id,
             ) {
@@ -483,7 +484,7 @@ where
                     tracing::warn!(
                         indexing_request_id=%indexing_request_id,
                         indexer_id=%indexer_id,
-                        "No pricing available, skipping indexer"
+                        "No usable pricing, skipping indexer"
                     );
                     add_failures += 1;
                     continue;
@@ -855,7 +856,7 @@ mod lifecycle_event_tests {
     //! emitted (and with which payloads), and that no others fire.
 
     use std::{
-        collections::HashMap,
+        collections::{BTreeMap, HashMap, HashSet},
         sync::{Arc, Mutex},
     };
 
@@ -878,7 +879,7 @@ mod lifecycle_event_tests {
     use super::{Ctx, JobError, Message, handle};
     use crate::{
         chain_client::{AgreementOnChain, ChainClient, ChainClientError},
-        config::IndexingAgreementConfig,
+        config::{IndexingAgreementChainPrices, IndexingAgreementConfig},
         network::{
             provider::NetworkProviderService,
             service::{
@@ -1563,6 +1564,132 @@ mod lifecycle_event_tests {
         );
         assert!(logs.contains("num_candidates must be positive"), "{logs}");
         assert!(!logs.contains("unavailable"), "{logs}");
+    }
+
+    // ---- Scenario 0b: dipper checks IISA's prices against its own caps ------
+
+    fn priced(id: IndexerId, base: f64, per_entity: f64) -> SelectedIndexer {
+        SelectedIndexer {
+            id,
+            min_grt_per_30_days: Some(base),
+            min_grt_per_billion_entities_per_30_days: Some(per_entity),
+        }
+    }
+
+    fn url_of(id: IndexerId) -> Url {
+        Url::parse(&format!("https://{id}.example")).unwrap()
+    }
+
+    /// Reassess a request for every indexer IISA returns, each at its own URL, with
+    /// `fallback` as the chain's pricing_table entry. Returns the URLs offered and the logs.
+    async fn offers_and_logs(
+        selected: Vec<SelectedIndexer>,
+        fallback: Option<IndexingAgreementChainPrices>,
+    ) -> (HashSet<Url>, String) {
+        let mut snapshot = indexer_urls::Snapshot::new();
+        for indexer in &selected {
+            snapshot.insert(indexer.id, url_of(indexer.id));
+        }
+        let message = test_message(selected.len());
+        let queue = MockQueue::default();
+        let mut ctx = build_ctx(
+            MockRegistry::default(),
+            MockIisa {
+                selected,
+                ..Default::default()
+            },
+            queue.clone(),
+            MockChainClient::default(),
+            CapturingEventsProducer::new(),
+            snapshot,
+        );
+        if let Some(prices) = fallback {
+            ctx.chain_price = Arc::new(BTreeMap::from([(TEST_DEPLOYMENT_CHAIN_ID, prices)]));
+        }
+
+        let logs = crate::test_support::logged(async {
+            handle(ctx, &message).await.expect("handler ok");
+        })
+        .await;
+        let offered = queue.proposals.lock().unwrap().iter().cloned().collect();
+        (offered, logs)
+    }
+
+    /// The log line that names `id`, which must also name every text in `expected`.
+    fn assert_logged(logs: &str, id: IndexerId, expected: &[&str]) {
+        let id = id.to_string();
+        let line = logs
+            .lines()
+            .find(|line| line.contains(&id))
+            .unwrap_or_else(|| panic!("nothing logged for {id}: {logs}"));
+        for text in expected {
+            assert!(line.contains(text), "{text} missing from: {line}");
+        }
+    }
+
+    #[tokio::test]
+    async fn skips_an_indexer_iisa_prices_above_a_cap() {
+        // An older, rolled-back or faulty IISA may not drop these. The test caps are
+        // 450 GRT per 30 days and 2,000 GRT per billion entities, and a price equal to one passes.
+        let within = indexer_id(0x41);
+        let base_over = indexer_id(0x42);
+        let entity_over = indexer_id(0x43);
+
+        let (offered, logs) = offers_and_logs(
+            vec![
+                priced(within, 450.0, 2000.0),
+                priced(base_over, 450.5, 1.0),
+                priced(entity_over, 100.0, 2000.5),
+            ],
+            None,
+        )
+        .await;
+
+        assert_eq!(offered, HashSet::from([url_of(within)]), "{logs}");
+        assert_logged(&logs, base_over, &["WARN", "450.5", "Some(450.0)"]);
+        assert_logged(&logs, entity_over, &["WARN", "2000.5", "Some(2000.0)"]);
+        assert!(logs.contains("add_failures=2"), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn skips_an_indexer_iisa_prices_below_zero_or_not_as_a_number() {
+        // Turned into wei as they stand, these prices would become offers at 0 GRT.
+        let within = indexer_id(0x51);
+        let refused = [
+            priced(indexer_id(0x52), -1.0, 1.0),
+            priced(indexer_id(0x53), f64::NAN, 1.0),
+            priced(indexer_id(0x54), 100.0, -1.0),
+            priced(indexer_id(0x55), 100.0, f64::NAN),
+        ];
+        let mut selected = vec![priced(within, 100.0, 1.0)];
+        selected.extend(refused.iter().cloned());
+
+        let (offered, logs) = offers_and_logs(selected, None).await;
+
+        assert_eq!(offered, HashSet::from([url_of(within)]), "{logs}");
+        for (indexer, price) in refused.iter().zip(["-1", "NaN", "-1", "NaN"]) {
+            assert_logged(&logs, indexer.id, &["WARN", price]);
+        }
+        assert!(logs.contains("add_failures=4"), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn offers_a_pricing_table_price_without_checking_it_against_the_caps() {
+        // The pricing_table is dipper's own config, used for an indexer IISA has no price for.
+        let unpriced = SelectedIndexer {
+            id: indexer_id(0x61),
+            min_grt_per_30_days: None,
+            min_grt_per_billion_entities_per_30_days: None,
+        };
+        // 1 GRT a second, far above the 450 GRT per 30 days cap.
+        let fallback = IndexingAgreementChainPrices {
+            tokens_per_second: U256::from(10u128.pow(18)),
+            tokens_per_entity_per_second: U256::ZERO,
+        };
+
+        let (offered, logs) = offers_and_logs(vec![unpriced.clone()], Some(fallback)).await;
+
+        assert_eq!(offered, HashSet::from([url_of(unpriced.id)]), "{logs}");
     }
 
     // ---- Scenario 1: n_indexers_unavailable ---------------------------------

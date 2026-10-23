@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use dipper_iisa::SelectedIndexer;
+use dipper_iisa::{PriceCeilings, SelectedIndexer};
 use graph_networks_registry::NetworksRegistry;
 use thegraph_core::alloy::primitives::{ChainId, U256};
 
@@ -41,20 +41,37 @@ fn grt_per_billion_entities_per_30_days_to_wei_per_entity_per_second(grt: f64) -
     U256::from(wei_per_second)
 }
 
-/// Resolve pricing for a selected indexer.
-///
-/// Uses per-indexer pricing from IISA when available, otherwise falls back to
-/// the static pricing_table config. Returns `None` if neither source has pricing.
+/// Resolve pricing for a selected indexer: IISA's per-indexer price when it has one, else the
+/// static pricing_table. `None` when neither has a price, or IISA's is outside `ceilings`.
 pub(crate) fn resolve_pricing(
     selected: &SelectedIndexer,
+    ceilings: &PriceCeilings,
     fallback_prices: Option<&IndexingAgreementChainPrices>,
     chain_id: &ChainId,
 ) -> Option<(U256, U256)> {
     // Prefer IISA-reported per-indexer prices
     if let Some(grt_per_30d) = selected.min_grt_per_30_days {
+        let grt_per_billion = selected.min_grt_per_billion_entities_per_30_days;
+        // IISA should have dropped this indexer, but an older, rolled-back or faulty one may
+        // not have, and the wei conversion below turns a negative or NaN price into 0.
+        if !within_cap(grt_per_30d, ceilings.max_grt_per_30_days)
+            || grt_per_billion.is_some_and(|price| {
+                !within_cap(price, ceilings.max_grt_per_billion_entities_per_30_days)
+            })
+        {
+            tracing::warn!(
+                indexer_id=%selected.id,
+                chain_id=%chain_id,
+                min_grt_per_30_days=grt_per_30d,
+                max_grt_per_30_days=?ceilings.max_grt_per_30_days,
+                min_grt_per_billion_entities_per_30_days=?grt_per_billion,
+                max_grt_per_billion_entities_per_30_days=?ceilings.max_grt_per_billion_entities_per_30_days,
+                "IISA priced the indexer above dipper's cap, below zero or not as a number"
+            );
+            return None;
+        }
         let tokens_per_second = grt_per_30_days_to_wei_per_second(grt_per_30d);
-        let tokens_per_entity_per_second = selected
-            .min_grt_per_billion_entities_per_30_days
+        let tokens_per_entity_per_second = grt_per_billion
             .map(grt_per_billion_entities_per_30_days_to_wei_per_entity_per_second)
             .unwrap_or(U256::ZERO);
         return Some((tokens_per_second, tokens_per_entity_per_second));
@@ -81,6 +98,12 @@ pub(crate) fn resolve_pricing(
         "No pricing from IISA and no fallback in pricing_table"
     );
     None
+}
+
+/// Whether dipper may offer an IISA price: finite, not below zero, and at most `cap`
+/// (`None` is no cap). A price equal to the cap passes, as it does in IISA.
+fn within_cap(price: f64, cap: Option<f64>) -> bool {
+    price.is_finite() && price >= 0.0 && cap.is_none_or(|cap| price <= cap)
 }
 
 /// Resolve a numeric chain ID to the canonical network name used by The Graph ecosystem.
