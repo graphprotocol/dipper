@@ -249,7 +249,14 @@ where
                 "unresponsive breaker tripped; skipping this chain's unresponsive exclusion"
             );
         } else {
-            context.indexer_denylist.extend(unresponsive);
+            // IISA drops a group member on the denylist, cancelling its agreement here, so a
+            // member that only missed an offer elsewhere stays off it.
+            let members: HashSet<IndexerId> = context.existing_indexers.iter().copied().collect();
+            context.indexer_denylist.extend(
+                unresponsive
+                    .into_iter()
+                    .filter(|indexer| !members.contains(indexer)),
+            );
         }
     }
 
@@ -1585,6 +1592,38 @@ mod lifecycle_event_tests {
                 max_grt_per_billion_entities_per_30_days: Some(2000.0),
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn keeps_a_member_that_missed_an_offer_elsewhere_off_the_denylist() {
+        // IISA drops a group member on the denylist, which cancels its agreement here, so a
+        // member that only missed an offer for another deployment must stay off it.
+        let member = indexer_id(0x40);
+        let outsider = indexer_id(0x41);
+        let iisa = MockIisa::default();
+        let contexts = Arc::clone(&iisa.contexts);
+        let ctx = build_ctx(
+            MockRegistry {
+                active_agreements: vec![agreement(
+                    member,
+                    IndexingAgreementStatus::AcceptedOnChain,
+                )],
+                unresponsive: vec![member, outsider],
+                ..Default::default()
+            },
+            iisa,
+            MockQueue::default(),
+            MockChainClient::default(),
+            CapturingEventsProducer::new(),
+            indexer_urls::Snapshot::new(),
+        );
+
+        handle(ctx, &test_message(1)).await.expect("handler ok");
+
+        let contexts = contexts.lock().unwrap();
+        assert_eq!(contexts.len(), 1, "IISA asked once: {contexts:?}");
+        assert_eq!(contexts[0].existing_indexers, vec![member]);
+        assert_eq!(contexts[0].indexer_denylist, vec![outsider]);
     }
 
     #[tokio::test]
