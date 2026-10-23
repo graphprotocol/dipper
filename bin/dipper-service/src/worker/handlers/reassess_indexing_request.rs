@@ -249,7 +249,14 @@ where
                 "unresponsive breaker tripped; skipping this chain's unresponsive exclusion"
             );
         } else {
-            context.indexer_denylist.extend(unresponsive);
+            // Sent as declined, which only stops new offers. IISA drops a group member on the
+            // denylist, which would cancel an agreement it still serves.
+            let declined = context.declined_indexers.entry(*deployment_id).or_default();
+            for indexer in unresponsive {
+                if !declined.contains(&indexer) {
+                    declined.push(indexer);
+                }
+            }
         }
     }
 
@@ -1585,6 +1592,40 @@ mod lifecycle_event_tests {
                 max_grt_per_billion_entities_per_30_days: Some(2000.0),
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn sends_indexers_that_missed_an_offer_as_declined_not_denylisted() {
+        // IISA drops a group member on the denylist, which cancels its agreement here, so a
+        // missed offer only stops new offers, for members and outsiders alike.
+        let member = indexer_id(0x40);
+        let outsider = indexer_id(0x41);
+        let iisa = MockIisa::default();
+        let contexts = Arc::clone(&iisa.contexts);
+        let ctx = build_ctx(
+            MockRegistry {
+                active_agreements: vec![agreement(
+                    member,
+                    IndexingAgreementStatus::AcceptedOnChain,
+                )],
+                unresponsive: vec![member, outsider],
+                ..Default::default()
+            },
+            iisa,
+            MockQueue::default(),
+            MockChainClient::default(),
+            CapturingEventsProducer::new(),
+            indexer_urls::Snapshot::new(),
+        );
+
+        handle(ctx, &test_message(1)).await.expect("handler ok");
+
+        let contexts = contexts.lock().unwrap();
+        assert_eq!(contexts.len(), 1, "IISA asked once: {contexts:?}");
+        assert_eq!(contexts[0].existing_indexers, vec![member]);
+        assert!(contexts[0].indexer_denylist.is_empty());
+        let declined: Vec<_> = contexts[0].declined_indexers.values().flatten().collect();
+        assert_eq!(declined, vec![&member, &outsider]);
     }
 
     #[tokio::test]

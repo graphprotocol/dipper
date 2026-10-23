@@ -92,7 +92,7 @@ When an offer fails, dipper temporarily stops offering that indexer new work. Ho
 | Your price was too high for the deployment | 1 day |
 | You never replied to the offer | 1 day, on every deployment on that chain |
 | A transient failure, including offers that never reached the chain | 5 minutes |
-| The operator denylist | Until removed |
+| The operator denylist | Until removed, and agreements you hold are cancelled |
 
 Two safeguards keep this honest. If more than 50% of the DIPs-accepting indexers on a chain stop replying at once, dipper assumes the fault is on its side and suspends the network-wide exclusion until the situation recovers. And a liveness checker (disabled by default) watches accepted agreements for indexers that stop making progress; an abandoned agreement is cancelled on-chain and reassigned.
 
