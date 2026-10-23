@@ -363,7 +363,8 @@ where
     // persistently short request. The atomic latch update makes this retry-safe:
     // a re-run after a later failure sees the latch already set and does not
     // re-emit.
-    let in_shortfall = target_selected.len() < *num_candidates;
+    let offerable_picks = target_selected.len() - unofferable as usize;
+    let in_shortfall = offerable_picks < *num_candidates;
     let shortfall_changed = ctx
         .registry
         .set_indexing_request_shortfall_active(indexing_request_id, in_shortfall)
@@ -383,7 +384,7 @@ where
                 ctx.signer.chain_id(),
                 proto::SubgraphIndexingAgreementNIndexersUnavailable {
                     agreements_requested: *num_candidates as i32,
-                    candidates_returned: target_selected.len() as i32,
+                    candidates_returned: offerable_picks as i32,
                 },
             );
     }
@@ -1789,6 +1790,45 @@ mod lifecycle_event_tests {
             assert!(cancelling.lock().unwrap().is_empty(), "{case}");
             assert!(cancelled.lock().unwrap().is_empty(), "{case}");
         }
+    }
+
+    #[tokio::test]
+    async fn signals_a_shortfall_when_dipper_cannot_offer_to_every_iisa_pick() {
+        // IISA returns as many as asked for, but 1 is priced over a cap, so the request can only
+        // be part covered while IISA keeps picking it.
+        let within = indexer_id(0x81);
+        let refused = indexer_id(0x82);
+        let mut snapshot = indexer_urls::Snapshot::new();
+        snapshot.insert(within, url_of(within));
+        snapshot.insert(refused, url_of(refused));
+        let events = CapturingEventsProducer::new();
+        let queue = MockQueue::default();
+        let ctx = build_ctx(
+            MockRegistry::default(),
+            MockIisa {
+                selected: vec![selected(within), priced(refused, 100.0, 2000.5)],
+                ..Default::default()
+            },
+            queue.clone(),
+            MockChainClient::default(),
+            events.clone(),
+            snapshot,
+        );
+
+        handle(ctx, &test_message(2)).await.expect("handler ok");
+
+        let captured = events.events();
+        let unavailable: Vec<_> = captured
+            .iter()
+            .filter_map(|e| match e {
+                CapturedEvent::NIndexersUnavailable { event, .. } => Some(event),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(unavailable.len(), 1, "{captured:?}");
+        assert_eq!(unavailable[0].agreements_requested, 2);
+        assert_eq!(unavailable[0].candidates_returned, 1);
+        assert_eq!(*queue.proposals.lock().unwrap(), vec![url_of(within)]);
     }
 
     // ---- Scenario 1: n_indexers_unavailable ---------------------------------
