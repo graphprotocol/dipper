@@ -40,6 +40,7 @@ data:
           "base-sepolia": 150,
           "sepolia": 50
         },
+        "fallback_max_grt_per_30_days": 4500,
         "max_grt_per_billion_entities_per_30_days": 2000
       },
       "admin_rpc": {
