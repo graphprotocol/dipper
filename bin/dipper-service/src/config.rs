@@ -998,6 +998,15 @@ impl DipsAgreementConfig {
                 "max_grt_per_billion_entities_per_30_days ({entity_ceiling}) must be a positive number"
             ));
         }
+        // A chain's cap of 0 excludes every priced indexer there, and IISA refuses a negative
+        // one, which dipper takes for an outage and retries forever; refuse to start instead.
+        for (chain, cap) in &self.max_grt_per_30_days {
+            if !(cap.is_finite() && *cap > 0.0) {
+                return Err(format!(
+                    "max_grt_per_30_days for chain {chain} ({cap}) must be a positive number"
+                ));
+            }
+        }
         if self.mass_unresponsive_reset_fraction >= self.mass_unresponsive_trip_fraction {
             return Err(format!(
                 "mass_unresponsive_reset_fraction ({}) must be below mass_unresponsive_trip_fraction ({})",
@@ -1695,6 +1704,33 @@ mod tests {
         }
         for ceiling in [0.01, 2000.0] {
             conf.max_grt_per_billion_entities_per_30_days = ceiling;
+            assert!(conf.validate().is_ok(), "{ceiling}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_a_per_chain_ceiling_that_excludes_every_priced_indexer() {
+        let mut conf: DipsAgreementConfig = serde_json::from_str(
+            r#"{
+                "data_service": "0x1111111111111111111111111111111111111111",
+                "recurring_collector": "0x2222222222222222222222222222222222222222",
+                "recurring_agreement_manager": "0x3333333333333333333333333333333333333333",
+                "min_seconds_per_collection": 60,
+                "max_seconds_per_collection": 3600,
+                "pricing_table": {}
+            }"#,
+        )
+        .expect("deserialization");
+        for ceiling in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            conf.max_grt_per_30_days
+                .insert("arbitrum-one".to_string(), ceiling);
+            let err = conf.validate().expect_err(&format!("{ceiling}"));
+            assert!(err.contains("arbitrum-one"), "{err}");
+            assert!(err.contains(&format!("({ceiling})")), "{err}");
+        }
+        for ceiling in [0.01, 4500.0] {
+            conf.max_grt_per_30_days
+                .insert("arbitrum-one".to_string(), ceiling);
             assert!(conf.validate().is_ok(), "{ceiling}");
         }
     }
