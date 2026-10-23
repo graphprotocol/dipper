@@ -150,7 +150,11 @@ impl DipsAcceptingCache {
                 Some(snapshot)
             }
             Err(err) => {
-                tracing::warn!(error = %err, "DIPs-accepting fetch failed; breaker inactive this pass");
+                tracing::warn!(
+                    chain,
+                    error = %err,
+                    "DIPs-accepting fetch failed; breaker inactive this pass"
+                );
                 None
             }
         }
@@ -172,6 +176,51 @@ mod tests {
         DipsAcceptingSnapshot {
             computed_at: Some(ts),
             indexers: pool.to_vec(),
+        }
+    }
+
+    /// Refuses every DIPs-accepting lookup the way IISA answers a stale token.
+    struct RejectingIisa;
+
+    #[async_trait::async_trait]
+    impl CandidateSelection for RejectingIisa {
+        async fn select_indexers(
+            &self,
+            _deployment_id: thegraph_core::DeploymentId,
+            _num_candidates: usize,
+            _context: &dipper_iisa::SelectionContext,
+        ) -> Result<Vec<dipper_iisa::SelectedIndexer>, dipper_iisa::SelectionError> {
+            Ok(Vec::new())
+        }
+
+        async fn dips_accepting_indexers(
+            &self,
+            _chain: &str,
+            _ceilings: PriceCeilings,
+        ) -> Result<DipsAcceptingSnapshot, dipper_iisa::SelectionError> {
+            Err(dipper_iisa::SelectionError::IisaRejected {
+                status: 401,
+                body: "invalid token".to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rejected_pool_lookup_leaves_the_breaker_inactive_and_says_why() {
+        let cache = DipsAcceptingCache::new(Duration::from_secs(300));
+        let mut snapshot = None;
+        let logs = crate::test_support::logged(async {
+            snapshot = Some(
+                cache
+                    .get_or_fetch(&RejectingIisa, "arbitrum-one", PriceCeilings::default())
+                    .await,
+            );
+        })
+        .await;
+
+        assert!(snapshot.unwrap().is_none());
+        for expected in ["arbitrum-one", "401", "invalid token"] {
+            assert!(logs.contains(expected), "no {expected:?} in {logs}");
         }
     }
 

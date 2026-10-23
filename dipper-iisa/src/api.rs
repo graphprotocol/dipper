@@ -100,6 +100,12 @@ pub enum SelectionError {
     #[error("IISA service is not available")]
     IisaServiceUnavailable,
 
+    /// IISA answered with a status that resending the same request won't change
+    /// (in practice a 4xx), usually bad config, a rotated token or a version
+    /// mismatch mid-rollout. `body` is IISA's response, cut short if long.
+    #[error("IISA rejected the request with HTTP {status}: {body}")]
+    IisaRejected { status: u16, body: String },
+
     /// An error occurred during the selection process.
     #[error(transparent)]
     Error(#[from] anyhow::Error),
