@@ -219,11 +219,7 @@ where
     // Cap the breaker's pool to indexers dipper could actually pay on this chain, so
     // the denominator matches the indexers the unresponsive numerator is drawn from.
     let ceilings = PriceCeilings {
-        max_grt_per_30_days: ctx
-            .agreement_conf
-            .max_grt_per_30_days()
-            .get(&chain_name)
-            .copied(),
+        max_grt_per_30_days: Some(ctx.agreement_conf.max_grt_per_30_days_for(&chain_name)),
         max_grt_per_billion_entities_per_30_days: Some(
             ctx.agreement_conf
                 .max_grt_per_billion_entities_per_30_days(),
@@ -1532,6 +1528,34 @@ mod lifecycle_event_tests {
             contexts[0].max_grt_per_billion_entities_per_30_days,
             Some(2000.0)
         );
+    }
+
+    #[tokio::test]
+    async fn sends_the_fallback_base_price_ceiling_for_a_chain_without_its_own() {
+        let iisa = MockIisa::default();
+        let contexts = Arc::clone(&iisa.contexts);
+        let mut ctx = build_ctx(
+            MockRegistry::default(),
+            iisa,
+            MockQueue::default(),
+            MockChainClient::default(),
+            CapturingEventsProducer::new(),
+            indexer_urls::Snapshot::new(),
+        );
+        ctx.agreement_conf = Arc::new(IndexingAgreementConfig {
+            max_grt_per_30_days: std::collections::BTreeMap::from([(
+                "other-chain".to_string(),
+                450.0,
+            )]),
+            fallback_max_grt_per_30_days: 900.0,
+            ..test_agreement_conf()
+        });
+
+        handle(ctx, &test_message(1)).await.expect("handler ok");
+
+        let contexts = contexts.lock().unwrap();
+        assert_eq!(contexts.len(), 1, "IISA asked once: {contexts:?}");
+        assert_eq!(contexts[0].max_grt_per_30_days, Some(900.0));
     }
 
     #[tokio::test]
