@@ -1088,6 +1088,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_dips_accepting_indexers_leaves_out_unset_ceilings() {
+        let mock_server = MockServer::start().await;
+        // An empty value would be a 422 from IISA, so an unset ceiling must be left out.
+        Mock::given(method("GET"))
+            .and(path("/dips-indexers"))
+            .and(wiremock::matchers::query_param_is_missing(
+                "max_grt_per_30_days",
+            ))
+            .and(wiremock::matchers::query_param_is_missing(
+                "max_grt_per_billion_entities_per_30_days",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "computed_at": null,
+                "count": 0,
+                "indexers": []
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = HttpIisaClient::new(mock_server.uri());
+        let result = client
+            .dips_accepting_indexers("arbitrum-one", PriceCeilings::default())
+            .await;
+        assert!(result.is_ok(), "an unset ceiling was sent: {result:?}");
+    }
+
+    #[tokio::test]
     async fn test_dips_accepting_indexers_sends_per_entity_ceiling() {
         let mock_server = MockServer::start().await;
         // Matches only when the per-entity ceiling is in the query string.
