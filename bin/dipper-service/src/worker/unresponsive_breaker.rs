@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dipper_iisa::{CandidateSelection, DipsAcceptingSnapshot};
+use dipper_iisa::{CandidateSelection, DipsAcceptingSnapshot, PriceCeilings};
 use thegraph_core::IndexerId;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -132,7 +132,7 @@ impl DipsAcceptingCache {
         &self,
         iisa: &I,
         chain: &str,
-        max_grt_per_30_days: Option<f64>,
+        ceilings: PriceCeilings,
     ) -> Option<Arc<DipsAcceptingSnapshot>> {
         {
             let guard = self.inner.lock().await;
@@ -142,10 +142,7 @@ impl DipsAcceptingCache {
                 return Some(Arc::clone(snapshot));
             }
         }
-        match iisa
-            .dips_accepting_indexers(chain, max_grt_per_30_days)
-            .await
-        {
+        match iisa.dips_accepting_indexers(chain, ceilings).await {
             Ok(snapshot) => {
                 let snapshot = Arc::new(snapshot);
                 let mut guard = self.inner.lock().await;
