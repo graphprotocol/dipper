@@ -44,6 +44,11 @@ pub struct SelectionContext {
     /// Indexers with advertised prices above this ceiling are excluded from selection.
     pub max_grt_per_30_days: Option<f64>,
 
+    /// Maximum GRT per billion entities per 30 days (per-entity payment ceiling).
+    ///
+    /// Indexers with an advertised per-entity price above this ceiling are excluded.
+    pub max_grt_per_billion_entities_per_30_days: Option<f64>,
+
     /// Expected DIPs fees per indexer in GRT per 30 days.
     ///
     /// Derived from the base rate (`tokens_per_second`) in accepted agreement vouchers,
@@ -53,6 +58,16 @@ pub struct SelectionContext {
     pub optimistic_dips_fees: HashMap<IndexerId, f64>,
 }
 
+/// The most Dipper will pay, so IISA can drop indexers asking more. Named fields keep
+/// the 2 prices, which are in different units, from being swapped. `None` skips one.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PriceCeilings {
+    /// Base price for the chain, in GRT per 30 days.
+    pub max_grt_per_30_days: Option<f64>,
+    /// Per-entity price, in GRT per billion entities per 30 days.
+    pub max_grt_per_billion_entities_per_30_days: Option<f64>,
+}
+
 /// An indexer selected by IISA with its advertised pricing.
 #[derive(Debug, Clone)]
 pub struct SelectedIndexer {
@@ -60,7 +75,7 @@ pub struct SelectedIndexer {
     /// Minimum GRT per 30 days the indexer charges for this chain.
     /// `None` if the indexer has no advertised price (legacy indexer).
     pub min_grt_per_30_days: Option<f64>,
-    /// Minimum GRT per million entities per 30 days.
+    /// Minimum GRT per billion entities per 30 days.
     pub min_grt_per_billion_entities_per_30_days: Option<f64>,
 }
 
@@ -115,12 +130,11 @@ pub trait CandidateSelection {
         context: &SelectionContext,
     ) -> Result<Vec<SelectedIndexer>, SelectionError>;
 
-    /// Fetch the indexers that currently accept DIPs on `chain` (stricter than
-    /// "IISA scores it"). `chain` is a required chain *name*; `max_grt_per_30_days`
-    /// optionally caps the set to indexers priced at or under that ceiling.
+    /// Fetch the indexers that currently accept DIPs on `chain`, a required chain *name*
+    /// (stricter than "IISA scores it"), capped to those priced at or under `ceilings`.
     async fn dips_accepting_indexers(
         &self,
         chain: &str,
-        max_grt_per_30_days: Option<f64>,
+        ceilings: PriceCeilings,
     ) -> Result<DipsAcceptingSnapshot, SelectionError>;
 }

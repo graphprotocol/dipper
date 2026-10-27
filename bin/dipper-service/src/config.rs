@@ -902,7 +902,9 @@ pub struct DipsAgreementConfig {
     #[serde(default = "default_max_grt_per_30_days")]
     pub max_grt_per_30_days: BTreeMap<String, f64>,
 
-    /// Maximum GRT per billion entities per 30 days.
+    /// Maximum GRT per billion entities per 30 days Dipper will pay, on every chain.
+    ///
+    /// Sent to IISA, which excludes indexers advertising a higher per-entity price.
     #[serde(default = "default_max_grt_per_billion_entities_per_30_days")]
     pub max_grt_per_billion_entities_per_30_days: f64,
 
@@ -987,6 +989,15 @@ impl DipsAgreementConfig {
             return Err(
                 "recurring_agreement_manager must be set to a non-zero address".to_string(),
             );
+        }
+        // IISA drops every indexer priced above this per entity, so a cap of 0 shuts out every
+        // priced indexer, and a negative or non-finite one makes IISA reject the request or
+        // ignore the cap; refuse to start instead.
+        let entity_ceiling = self.max_grt_per_billion_entities_per_30_days;
+        if !(entity_ceiling.is_finite() && entity_ceiling > 0.0) {
+            return Err(format!(
+                "max_grt_per_billion_entities_per_30_days ({entity_ceiling}) must be a positive number"
+            ));
         }
         if self.mass_unresponsive_reset_fraction >= self.mass_unresponsive_trip_fraction {
             return Err(format!(
@@ -1296,7 +1307,8 @@ pub struct IndexingAgreementConfig {
 #[cfg(test)]
 impl IndexingAgreementConfig {
     /// Addresses and limits all set to 0, with permissive breaker and cache settings, for tests
-    /// to adjust the fields they care about.
+    /// to adjust the fields they care about. The per-entity price cap keeps its default, since
+    /// the service refuses to start with 0.
     pub fn for_tests() -> Self {
         Self {
             data_service: Address::ZERO,
@@ -1308,7 +1320,8 @@ impl IndexingAgreementConfig {
             duration_seconds: 0,
             deadline_seconds: 0,
             max_grt_per_30_days: BTreeMap::new(),
-            max_grt_per_billion_entities_per_30_days: 0.0,
+            max_grt_per_billion_entities_per_30_days:
+                default_max_grt_per_billion_entities_per_30_days(),
             declined_indexer_lookback_days: 0,
             price_rejection_lookback_days: 0,
             transient_rejection_lookback_minutes: 0,
@@ -1664,6 +1677,29 @@ mod tests {
                 .is_ok(),
             "a non-zero manager address is valid"
         );
+    }
+
+    #[test]
+    fn validate_rejects_an_unusable_per_entity_ceiling() {
+        let mut conf: DipsAgreementConfig = serde_json::from_str(
+            r#"{
+                "data_service": "0x1111111111111111111111111111111111111111",
+                "recurring_collector": "0x2222222222222222222222222222222222222222",
+                "recurring_agreement_manager": "0x3333333333333333333333333333333333333333",
+                "min_seconds_per_collection": 60,
+                "max_seconds_per_collection": 3600,
+                "pricing_table": {}
+            }"#,
+        )
+        .expect("deserialization");
+        for ceiling in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            conf.max_grt_per_billion_entities_per_30_days = ceiling;
+            assert!(conf.validate().is_err(), "{ceiling}");
+        }
+        for ceiling in [0.01, 2000.0] {
+            conf.max_grt_per_billion_entities_per_30_days = ceiling;
+            assert!(conf.validate().is_ok(), "{ceiling}");
+        }
     }
 
     #[test]
