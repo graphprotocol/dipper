@@ -750,7 +750,7 @@ mod tests {
             duration_seconds: 0,
             deadline_seconds: 0,
             max_grt_per_30_days: std::collections::BTreeMap::new(),
-            fallback_max_grt_per_30_days: 0.0,
+            fallback_max_grt_per_30_days: 4500.0,
             max_grt_per_billion_entities_per_30_days: 2000.0,
             declined_indexer_lookback_days: 0,
             price_rejection_lookback_days: 0,
