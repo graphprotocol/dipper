@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.4](https://github.com/graphprotocol/dipper/compare/v0.2.3...v0.2.4) (2026-10-27)
+
+
+### Fixed
+
+* cap the base price on chains without their own ceiling ([#763](https://github.com/graphprotocol/dipper/issues/763)) ([dd721a8](https://github.com/graphprotocol/dipper/commit/dd721a869ac04c36d83860b13abf3e5acce34c81))
+* **config:** refuse to start with an unusable chain price cap ([#760](https://github.com/graphprotocol/dipper/issues/760)) ([dd404b2](https://github.com/graphprotocol/dipper/commit/dd404b21e6d51ff66d7352641b7c4269ee8c839d))
+* **iisa:** report IISA refusing a request apart from an outage ([#761](https://github.com/graphprotocol/dipper/issues/761)) ([4847399](https://github.com/graphprotocol/dipper/commit/4847399daf92d94c5179ebdeda016a981919c443))
+* **pricing:** never offer above the caps dipper sends to IISA ([#762](https://github.com/graphprotocol/dipper/issues/762)) ([d38379e](https://github.com/graphprotocol/dipper/commit/d38379e2a7f9975449c75e356ffdc3c35ed0aa21))
+* **pricing:** send the per-entity price ceiling to IISA ([#759](https://github.com/graphprotocol/dipper/issues/759)) ([0d39bdd](https://github.com/graphprotocol/dipper/commit/0d39bdd726bd381d9de0e99be6bd6d53f826802b))
+* send indexers that missed an offer as declined ([#764](https://github.com/graphprotocol/dipper/issues/764)) ([caec2ac](https://github.com/graphprotocol/dipper/commit/caec2ac3d43e5e2d61e601731c9e4f7533697ff4))
+
 ## [0.2.3](https://github.com/graphprotocol/dipper/compare/v0.2.2...v0.2.3) (2026-10-13)
 
 
