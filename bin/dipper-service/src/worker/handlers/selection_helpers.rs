@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use dipper_iisa::SelectedIndexer;
+use dipper_iisa::{PriceCeilings, SelectedIndexer};
 use graph_networks_registry::NetworksRegistry;
 use thegraph_core::alloy::primitives::{ChainId, U256};
 
@@ -41,20 +41,37 @@ fn grt_per_billion_entities_per_30_days_to_wei_per_entity_per_second(grt: f64) -
     U256::from(wei_per_second)
 }
 
-/// Resolve pricing for a selected indexer.
-///
-/// Uses per-indexer pricing from IISA when available, otherwise falls back to
-/// the static pricing_table config. Returns `None` if neither source has pricing.
+/// Resolve pricing for a selected indexer: IISA's per-indexer price when it has one, else the
+/// static pricing_table. `None` when neither has a price, or IISA's is outside `ceilings`.
 pub(crate) fn resolve_pricing(
     selected: &SelectedIndexer,
+    ceilings: &PriceCeilings,
     fallback_prices: Option<&IndexingAgreementChainPrices>,
     chain_id: &ChainId,
 ) -> Option<(U256, U256)> {
     // Prefer IISA-reported per-indexer prices
     if let Some(grt_per_30d) = selected.min_grt_per_30_days {
+        let grt_per_billion = selected.min_grt_per_billion_entities_per_30_days;
+        // IISA should have dropped this indexer, but an older, rolled-back or faulty one may
+        // not have, and the wei conversion below turns a negative or NaN price into 0.
+        if !within_cap(grt_per_30d, ceilings.max_grt_per_30_days)
+            || grt_per_billion.is_some_and(|price| {
+                !within_cap(price, ceilings.max_grt_per_billion_entities_per_30_days)
+            })
+        {
+            tracing::warn!(
+                indexer_id=%selected.id,
+                chain_id=%chain_id,
+                min_grt_per_30_days=grt_per_30d,
+                max_grt_per_30_days=?ceilings.max_grt_per_30_days,
+                min_grt_per_billion_entities_per_30_days=?grt_per_billion,
+                max_grt_per_billion_entities_per_30_days=?ceilings.max_grt_per_billion_entities_per_30_days,
+                "IISA priced the indexer above dipper's cap, below zero or not as a number"
+            );
+            return None;
+        }
         let tokens_per_second = grt_per_30_days_to_wei_per_second(grt_per_30d);
-        let tokens_per_entity_per_second = selected
-            .min_grt_per_billion_entities_per_30_days
+        let tokens_per_entity_per_second = grt_per_billion
             .map(grt_per_billion_entities_per_30_days_to_wei_per_entity_per_second)
             .unwrap_or(U256::ZERO);
         return Some((tokens_per_second, tokens_per_entity_per_second));
@@ -83,6 +100,12 @@ pub(crate) fn resolve_pricing(
     None
 }
 
+/// Whether dipper may offer an IISA price: finite, not below zero, and at most `cap`
+/// (`None` is no cap). A price equal to the cap passes, as it does in IISA.
+fn within_cap(price: f64, cap: Option<f64>) -> bool {
+    price.is_finite() && price >= 0.0 && cap.is_none_or(|cap| price <= cap)
+}
+
 /// Resolve a numeric chain ID to the canonical network name used by The Graph ecosystem.
 ///
 /// Looks up the chain in the official graph-networks-registry first (using CAIP-2 format
@@ -102,4 +125,118 @@ pub(crate) fn resolve_chain_name(
     }
     tracing::debug!(chain_id=%chain_id, "No network name found in registry or additional_networks");
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use thegraph_core::{IndexerId, alloy::primitives::Address};
+
+    use super::*;
+
+    const CHAIN: ChainId = 42161;
+
+    fn priced(base: Option<f64>, per_entity: Option<f64>) -> SelectedIndexer {
+        SelectedIndexer {
+            id: IndexerId::from(Address::repeat_byte(1)),
+            min_grt_per_30_days: base,
+            min_grt_per_billion_entities_per_30_days: per_entity,
+        }
+    }
+
+    fn caps(base: Option<f64>, per_entity: Option<f64>) -> PriceCeilings {
+        PriceCeilings {
+            max_grt_per_30_days: base,
+            max_grt_per_billion_entities_per_30_days: per_entity,
+        }
+    }
+
+    #[test]
+    fn within_cap_takes_any_finite_price_from_0_up_to_the_cap() {
+        assert!(within_cap(0.0, Some(450.0)));
+        assert!(
+            within_cap(450.0, Some(450.0)),
+            "a price equal to the cap passes"
+        );
+        assert!(!within_cap(450.01, Some(450.0)));
+        assert!(within_cap(1e9, None), "no cap takes any finite price");
+        for price in [-1.0, f64::NAN, f64::INFINITY] {
+            assert!(!within_cap(price, None), "{price}");
+            assert!(!within_cap(price, Some(450.0)), "{price}");
+        }
+    }
+
+    #[test]
+    fn prices_an_indexer_within_both_caps() {
+        let pricing = resolve_pricing(
+            &priced(Some(450.0), Some(2000.0)),
+            &caps(Some(450.0), Some(2000.0)),
+            None,
+            &CHAIN,
+        );
+        assert_eq!(
+            pricing,
+            Some((
+                grt_per_30_days_to_wei_per_second(450.0),
+                grt_per_billion_entities_per_30_days_to_wei_per_entity_per_second(2000.0),
+            ))
+        );
+    }
+
+    #[test]
+    fn prices_a_base_price_without_a_per_entity_price() {
+        let pricing = resolve_pricing(
+            &priced(Some(100.0), None),
+            &caps(Some(450.0), Some(2000.0)),
+            None,
+            &CHAIN,
+        );
+        assert_eq!(
+            pricing,
+            Some((grt_per_30_days_to_wei_per_second(100.0), U256::ZERO))
+        );
+    }
+
+    #[test]
+    fn skips_an_indexer_priced_over_either_cap() {
+        let ceilings = caps(Some(450.0), Some(2000.0));
+        assert_eq!(
+            resolve_pricing(&priced(Some(451.0), Some(1.0)), &ceilings, None, &CHAIN),
+            None
+        );
+        assert_eq!(
+            resolve_pricing(&priced(Some(1.0), Some(2001.0)), &ceilings, None, &CHAIN),
+            None
+        );
+    }
+
+    #[test]
+    fn a_missing_cap_checks_only_that_the_price_is_usable() {
+        let no_caps = caps(None, None);
+        assert!(resolve_pricing(&priced(Some(1e6), Some(1e6)), &no_caps, None, &CHAIN).is_some());
+        assert_eq!(
+            resolve_pricing(&priced(Some(-1.0), None), &no_caps, None, &CHAIN),
+            None
+        );
+        assert_eq!(
+            resolve_pricing(&priced(Some(1.0), Some(f64::NAN)), &no_caps, None, &CHAIN),
+            None
+        );
+    }
+
+    #[test]
+    fn falls_back_to_the_pricing_table_only_when_iisa_has_no_price() {
+        let ceilings = caps(Some(450.0), Some(2000.0));
+        let table = IndexingAgreementChainPrices {
+            tokens_per_second: U256::from(7),
+            tokens_per_entity_per_second: U256::from(3),
+        };
+        assert_eq!(
+            resolve_pricing(&priced(None, None), &ceilings, Some(&table), &CHAIN),
+            Some((U256::from(7), U256::from(3)))
+        );
+        assert_eq!(
+            resolve_pricing(&priced(None, None), &ceilings, None, &CHAIN),
+            None
+        );
+    }
 }

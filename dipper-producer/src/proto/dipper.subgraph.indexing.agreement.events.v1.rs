@@ -140,7 +140,8 @@ pub struct SubgraphIndexingAgreementRequestExpired {
     #[prost(uint64, tag = "3")]
     pub request_expired_at: u64,
 }
-/// SubgraphIndexingAgreementNIndexersUnavailable is emitted when the IISA selection returns fewer Indexer candidates than requested
+/// SubgraphIndexingAgreementNIndexersUnavailable is emitted when dipper has fewer Indexer candidates it can offer to than
+/// requested: the IISA selection returned fewer, or dipper could not price or reach some of those it returned
 ///
 /// Event type: subgraph.indexing.agreement.n_indexers_unavailable
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -148,7 +149,7 @@ pub struct SubgraphIndexingAgreementNIndexersUnavailable {
     /// Number of indexing agreements requested by the Subgraph developer.
     #[prost(int32, tag = "1")]
     pub agreements_requested: i32,
-    /// Number of indexer candidates selected by the IISA
+    /// Number of indexer candidates dipper can offer to: those the IISA selected, less any it could not price or reach
     #[prost(int32, tag = "2")]
     pub candidates_returned: i32,
 }

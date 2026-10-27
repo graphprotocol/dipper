@@ -136,14 +136,15 @@ message SubgraphIndexingAgreementRequestExpired {
     uint64 request_expired_at = 3;
 }
 
-// SubgraphIndexingAgreementNIndexersUnavailable is emitted when the IISA selection returns fewer Indexer candidates than requested
+// SubgraphIndexingAgreementNIndexersUnavailable is emitted when dipper has fewer Indexer candidates it can offer to than
+// requested: the IISA selection returned fewer, or dipper could not price or reach some of those it returned
 //
 // Event type: subgraph.indexing.agreement.n_indexers_unavailable
 message SubgraphIndexingAgreementNIndexersUnavailable {
     // Number of indexing agreements requested by the Subgraph developer.
     int32 agreements_requested = 1;
 
-    // Number of indexer candidates selected by the IISA
+    // Number of indexer candidates dipper can offer to: those the IISA selected, less any it could not price or reach
     int32 candidates_returned = 2;
 }
 
