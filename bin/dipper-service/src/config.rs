@@ -140,6 +140,7 @@ impl Default for AlertsConfig {
                 "chain_listener_changes_skipped",
                 "stale_agreement_uncancellable",
                 "liveness_abandonment_paused",
+                "iisa_request_rejected",
             ]
             .map(str::to_owned)
             .to_vec(),
