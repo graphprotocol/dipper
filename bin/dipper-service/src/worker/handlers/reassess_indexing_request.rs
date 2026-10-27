@@ -249,7 +249,14 @@ where
                 "unresponsive breaker tripped; skipping this chain's unresponsive exclusion"
             );
         } else {
-            context.indexer_denylist.extend(unresponsive);
+            // Sent as declined, which only stops new offers. IISA drops a group member on the
+            // denylist, which would cancel an agreement it still serves.
+            let declined = context.declined_indexers.entry(*deployment_id).or_default();
+            for indexer in unresponsive {
+                if !declined.contains(&indexer) {
+                    declined.push(indexer);
+                }
+            }
         }
     }
 
@@ -964,6 +971,9 @@ mod lifecycle_event_tests {
         rejects_with: Option<(u16, &'static str)>,
         contexts: Arc<Mutex<Vec<SelectionContext>>>,
         dips_ceilings: Arc<Mutex<Vec<PriceCeilings>>>,
+        /// The chain's DIPs-accepting pool, reported as just computed. Empty reports no
+        /// scores loaded, which leaves the unresponsive breaker inactive.
+        dips_pool: Vec<IndexerId>,
     }
 
     #[async_trait]
@@ -990,9 +1000,14 @@ mod lifecycle_event_tests {
             ceilings: PriceCeilings,
         ) -> std::result::Result<dipper_iisa::DipsAcceptingSnapshot, SelectionError> {
             self.dips_ceilings.lock().unwrap().push(ceilings);
+            let computed_at = (!self.dips_pool.is_empty()).then(|| {
+                time::OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap()
+            });
             Ok(dipper_iisa::DipsAcceptingSnapshot {
-                computed_at: None,
-                indexers: Vec::new(),
+                computed_at,
+                indexers: self.dips_pool.clone(),
             })
         }
     }
@@ -1588,6 +1603,71 @@ mod lifecycle_event_tests {
                 max_grt_per_billion_entities_per_30_days: Some(2000.0),
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn sends_indexers_that_missed_an_offer_as_declined_not_denylisted() {
+        // IISA drops a group member on the denylist, which cancels its agreement here, so a
+        // missed offer only stops new offers, for members and outsiders alike.
+        let member = indexer_id(0x40);
+        let outsider = indexer_id(0x41);
+        let iisa = MockIisa::default();
+        let contexts = Arc::clone(&iisa.contexts);
+        let ctx = build_ctx(
+            MockRegistry {
+                active_agreements: vec![agreement(
+                    member,
+                    IndexingAgreementStatus::AcceptedOnChain,
+                )],
+                unresponsive: vec![member, outsider],
+                ..Default::default()
+            },
+            iisa,
+            MockQueue::default(),
+            MockChainClient::default(),
+            CapturingEventsProducer::new(),
+            indexer_urls::Snapshot::new(),
+        );
+
+        handle(ctx, &test_message(1)).await.expect("handler ok");
+
+        let contexts = contexts.lock().unwrap();
+        assert_eq!(contexts.len(), 1, "IISA asked once: {contexts:?}");
+        assert_eq!(contexts[0].existing_indexers, vec![member]);
+        assert!(contexts[0].indexer_denylist.is_empty());
+        let declined: Vec<_> = contexts[0].declined_indexers.values().flatten().collect();
+        assert_eq!(declined, vec![&member, &outsider]);
+    }
+
+    #[tokio::test]
+    async fn holds_back_no_unresponsive_indexer_while_the_breaker_is_tripped() {
+        // 2 of the chain's 3 DIPs-accepting indexers stopped replying at once, which points at
+        // dipper rather than at them, so neither is held back from new offers.
+        let unresponsive = vec![indexer_id(0x50), indexer_id(0x51)];
+        let iisa = MockIisa {
+            dips_pool: vec![indexer_id(0x50), indexer_id(0x51), indexer_id(0x52)],
+            ..Default::default()
+        };
+        let contexts = Arc::clone(&iisa.contexts);
+        let ctx = build_ctx(
+            MockRegistry {
+                unresponsive,
+                ..Default::default()
+            },
+            iisa,
+            MockQueue::default(),
+            MockChainClient::default(),
+            CapturingEventsProducer::new(),
+            indexer_urls::Snapshot::new(),
+        );
+
+        handle(ctx, &test_message(1)).await.expect("handler ok");
+
+        let contexts = contexts.lock().unwrap();
+        assert_eq!(contexts.len(), 1, "IISA asked once: {contexts:?}");
+        assert!(contexts[0].indexer_denylist.is_empty());
+        let declined: Vec<_> = contexts[0].declined_indexers.values().flatten().collect();
+        assert!(declined.is_empty(), "{declined:?}");
     }
 
     #[tokio::test]

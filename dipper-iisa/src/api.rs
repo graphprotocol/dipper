@@ -27,10 +27,12 @@ pub struct SelectionContext {
     /// Mapped to `blocklist` in the IISA request.
     pub indexer_denylist: Vec<IndexerId>,
 
-    /// For each deployment, indexers that have recently declined agreements.
+    /// For each deployment, indexers to offer no new agreement for now: those that recently
+    /// declined or missed an offer on the deployment's chain, and those whose agreement on the
+    /// deployment dipper is still cancelling.
     ///
-    /// Used to avoid re-offering agreements to indexers that recently declined.
-    /// Key: Deployment ID, Value: List of indexer IDs that declined.
+    /// Unlike the denylist, IISA leaves an indexer already in the group in place.
+    /// Key: Deployment ID, Value: those indexers' IDs.
     pub declined_indexers: HashMap<DeploymentId, Vec<IndexerId>>,
 
     /// Chain ID of the deployment (e.g., "arbitrum-one").
