@@ -744,7 +744,7 @@ mod tests {
             data_service: Address::ZERO,
             recurring_collector: Address::ZERO,
             recurring_agreement_manager: Address::ZERO,
-            max_agreement_grt_per_30_days: 0.0,
+            max_agreement_grt_per_30_days: 20_000.0,
             max_seconds_per_collection: 0,
             min_seconds_per_collection: 0,
             duration_seconds: 0,

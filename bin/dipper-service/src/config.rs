@@ -990,6 +990,14 @@ impl DipsAgreementConfig {
                 "recurring_agreement_manager must be set to a non-zero address".to_string(),
             );
         }
+        // Every offer's on-chain payment limit comes from this, so 0, a negative or NaN would offer
+        // indexers nothing and infinity would lift the limit; refuse to start instead.
+        let agreement_cap = self.max_agreement_grt_per_30_days;
+        if !(agreement_cap.is_finite() && agreement_cap > 0.0) {
+            return Err(format!(
+                "max_agreement_grt_per_30_days ({agreement_cap}) must be a positive number"
+            ));
+        }
         // IISA drops every indexer priced above this per entity, so a cap of 0 shuts out every
         // priced indexer, and a negative or non-finite one makes IISA reject the request or
         // ignore the cap; refuse to start instead.
@@ -1316,14 +1324,14 @@ pub struct IndexingAgreementConfig {
 #[cfg(test)]
 impl IndexingAgreementConfig {
     /// Addresses and limits all set to 0, with permissive breaker and cache settings, for tests
-    /// to adjust the fields they care about. The per-entity price cap keeps its default, since
-    /// the service refuses to start with 0.
+    /// to adjust the fields they care about. The agreement and per-entity price caps keep their
+    /// defaults, since dipper refuses to start with either at 0.
     pub fn for_tests() -> Self {
         Self {
             data_service: Address::ZERO,
             recurring_collector: Address::ZERO,
             recurring_agreement_manager: Address::ZERO,
-            max_agreement_grt_per_30_days: 0.0,
+            max_agreement_grt_per_30_days: default_max_agreement_grt_per_30_days(),
             max_seconds_per_collection: 0,
             min_seconds_per_collection: 0,
             duration_seconds: 0,
@@ -1686,6 +1694,30 @@ mod tests {
                 .is_ok(),
             "a non-zero manager address is valid"
         );
+    }
+
+    #[test]
+    fn validate_rejects_an_unusable_agreement_cap() {
+        let mut conf: DipsAgreementConfig = serde_json::from_str(
+            r#"{
+                "data_service": "0x1111111111111111111111111111111111111111",
+                "recurring_collector": "0x2222222222222222222222222222222222222222",
+                "recurring_agreement_manager": "0x3333333333333333333333333333333333333333",
+                "min_seconds_per_collection": 60,
+                "max_seconds_per_collection": 3600,
+                "pricing_table": {}
+            }"#,
+        )
+        .expect("deserialization");
+        for cap in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            conf.max_agreement_grt_per_30_days = cap;
+            let err = conf.validate().expect_err(&format!("{cap}"));
+            assert!(err.contains("max_agreement_grt_per_30_days"), "{err}");
+        }
+        for cap in [0.01, 20_000.0] {
+            conf.max_agreement_grt_per_30_days = cap;
+            assert!(conf.validate().is_ok(), "{cap}");
+        }
     }
 
     #[test]
