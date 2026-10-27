@@ -341,7 +341,8 @@ where
     // "everyone is declined" apart from "we're already synced" without
     // cross-referencing IISA logs. `requested_num_candidates` vs
     // `iisa_returned_count` is the key diagnostic — a shortfall means
-    // IISA filtered candidates out (typically the declined/denylist sets).
+    // IISA filtered candidates out (typically the declined/denylist sets),
+    // and `unofferable_count` counts the picks dipper could not offer to.
     tracing::info!(
         indexing_request_id=%indexing_request_id,
         deployment_id=%deployment_id,
@@ -355,8 +356,9 @@ where
         "reassessment diff computed"
     );
 
-    // Coverage-shortfall signal (transition-based). IISA returning fewer
-    // candidates than requested means the request cannot be fully covered. We
+    // Coverage-shortfall signal (transition-based). Fewer picks dipper can offer
+    // to than requested, because IISA returned fewer or some of its picks have no
+    // usable price or URL, means the request cannot be fully covered. We
     // fire `n_indexers_unavailable` ONCE, on the transition INTO shortfall, and
     // clear the latch on recovery -- so it covers the zero-available and
     // coverage-drop cases (which produce an empty diff and would otherwise be
