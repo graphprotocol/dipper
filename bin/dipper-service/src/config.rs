@@ -990,8 +990,9 @@ impl DipsAgreementConfig {
                 "recurring_agreement_manager must be set to a non-zero address".to_string(),
             );
         }
-        // IISA drops every indexer priced above this per entity, so 0, a negative or a
-        // non-finite value would exclude nearly everyone; refuse to start instead.
+        // IISA drops every indexer priced above this per entity, so a cap of 0 shuts out every
+        // priced indexer, and a negative or non-finite one makes IISA reject the request or
+        // ignore the cap; refuse to start instead.
         let entity_ceiling = self.max_grt_per_billion_entities_per_30_days;
         if !(entity_ceiling.is_finite() && entity_ceiling > 0.0) {
             return Err(format!(
@@ -1315,7 +1316,8 @@ pub struct IndexingAgreementConfig {
 #[cfg(test)]
 impl IndexingAgreementConfig {
     /// Addresses and limits all set to 0, with permissive breaker and cache settings, for tests
-    /// to adjust the fields they care about.
+    /// to adjust the fields they care about. The per-entity price cap keeps its default, since
+    /// the service refuses to start with 0.
     pub fn for_tests() -> Self {
         Self {
             data_service: Address::ZERO,
@@ -1327,7 +1329,8 @@ impl IndexingAgreementConfig {
             duration_seconds: 0,
             deadline_seconds: 0,
             max_grt_per_30_days: BTreeMap::new(),
-            max_grt_per_billion_entities_per_30_days: 0.0,
+            max_grt_per_billion_entities_per_30_days:
+                default_max_grt_per_billion_entities_per_30_days(),
             declined_indexer_lookback_days: 0,
             price_rejection_lookback_days: 0,
             transient_rejection_lookback_minutes: 0,
@@ -1686,7 +1689,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_a_per_entity_ceiling_that_excludes_every_priced_indexer() {
+    fn validate_rejects_an_unusable_per_entity_ceiling() {
         let mut conf: DipsAgreementConfig = serde_json::from_str(
             r#"{
                 "data_service": "0x1111111111111111111111111111111111111111",
