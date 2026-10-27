@@ -1306,7 +1306,8 @@ pub struct IndexingAgreementConfig {
 #[cfg(test)]
 impl IndexingAgreementConfig {
     /// Addresses and limits all set to 0, with permissive breaker and cache settings, for tests
-    /// to adjust the fields they care about.
+    /// to adjust the fields they care about. The per-entity price cap keeps its default, since
+    /// the service refuses to start with 0.
     pub fn for_tests() -> Self {
         Self {
             data_service: Address::ZERO,
@@ -1318,7 +1319,8 @@ impl IndexingAgreementConfig {
             duration_seconds: 0,
             deadline_seconds: 0,
             max_grt_per_30_days: BTreeMap::new(),
-            max_grt_per_billion_entities_per_30_days: 0.0,
+            max_grt_per_billion_entities_per_30_days:
+                default_max_grt_per_billion_entities_per_30_days(),
             declined_indexer_lookback_days: 0,
             price_rejection_lookback_days: 0,
             transient_rejection_lookback_minutes: 0,
