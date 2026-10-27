@@ -1744,7 +1744,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_a_per_chain_ceiling_that_excludes_every_priced_indexer() {
+    fn validate_rejects_an_unusable_per_chain_ceiling() {
         let mut conf: DipsAgreementConfig = serde_json::from_str(
             r#"{
                 "data_service": "0x1111111111111111111111111111111111111111",
