@@ -903,6 +903,11 @@ pub struct DipsAgreementConfig {
     #[serde(default = "default_max_grt_per_30_days")]
     pub max_grt_per_30_days: BTreeMap<String, f64>,
 
+    /// Maximum GRT per 30 days Dipper will pay on a chain with no entry in
+    /// `max_grt_per_30_days`, so every chain has a base-price ceiling.
+    #[serde(default = "default_fallback_max_grt_per_30_days")]
+    pub fallback_max_grt_per_30_days: f64,
+
     /// Maximum GRT per billion entities per 30 days Dipper will pay, on every chain.
     ///
     /// Sent to IISA, which excludes indexers advertising a higher per-entity price.
@@ -1017,6 +1022,12 @@ impl DipsAgreementConfig {
                 ));
             }
         }
+        let fallback = self.fallback_max_grt_per_30_days;
+        if !(fallback.is_finite() && fallback > 0.0) {
+            return Err(format!(
+                "fallback_max_grt_per_30_days ({fallback}) must be a positive number"
+            ));
+        }
         if self.mass_unresponsive_reset_fraction >= self.mass_unresponsive_trip_fraction {
             return Err(format!(
                 "mass_unresponsive_reset_fraction ({}) must be below mass_unresponsive_trip_fraction ({})",
@@ -1088,10 +1099,9 @@ fn default_deadline_seconds() -> u64 {
 /// indexer-rs published minimum on a given chain.
 ///
 /// **Scope**: only the chains in the initial DIPs rollout set are
-/// listed here. Other chains carry no default filter — an indexer
-/// can offer any base price on them and still pass selection.
-/// Operators who want filter coverage on additional chains must
-/// add explicit entries to `max_grt_per_30_days` in their config.
+/// listed here. Other chains get `fallback_max_grt_per_30_days`;
+/// operators can give one its own ceiling with an explicit entry in
+/// `max_grt_per_30_days`.
 ///
 /// Synced from <https://github.com/graphprotocol/indexer-rs/blob/mb9/dips-signalling-endpoint/crates/config/maximal-config-example.toml#L201-L210>
 /// (the rollout-trimmed `[dips.min_grt_per_30_days]` section).
@@ -1120,6 +1130,15 @@ fn default_max_grt_per_30_days() -> BTreeMap<String, f64> {
         .iter()
         .map(|(name, min)| ((*name).to_string(), min * PAYMENT_CEILING_MULTIPLIER))
         .collect()
+}
+
+/// Default ceiling for chains outside the rollout set: the highest of the default chain
+/// ceilings, whatever `max_grt_per_30_days` an operator configures.
+fn default_fallback_max_grt_per_30_days() -> f64 {
+    INDEXER_RS_MIN_GRT_PER_30_DAYS
+        .iter()
+        .map(|(_, min)| min * PAYMENT_CEILING_MULTIPLIER)
+        .fold(0.0, f64::max)
 }
 
 fn default_max_grt_per_billion_entities_per_30_days() -> f64 {
@@ -1294,6 +1313,8 @@ pub struct IndexingAgreementConfig {
     pub deadline_seconds: u64,
     /// Payment ceiling per chain (GRT per 30 days).
     pub max_grt_per_30_days: BTreeMap<String, f64>,
+    /// Payment ceiling (GRT per 30 days) for a chain with no entry in `max_grt_per_30_days`.
+    pub fallback_max_grt_per_30_days: f64,
     /// Payment ceiling for entity pricing (GRT per billion entities per 30 days).
     pub max_grt_per_billion_entities_per_30_days: f64,
     /// Number of days to look back for declined indexers (standard exclusion).
@@ -1325,8 +1346,8 @@ pub struct IndexingAgreementConfig {
 #[cfg(test)]
 impl IndexingAgreementConfig {
     /// Addresses and limits all set to 0, with permissive breaker and cache settings, for tests
-    /// to adjust the fields they care about. The agreement and per-entity price caps keep their
-    /// defaults, since dipper refuses to start with either at 0.
+    /// to adjust the fields they care about. The agreement, fallback and per-entity price caps
+    /// keep their defaults, since dipper refuses to start with any of them at 0.
     pub fn for_tests() -> Self {
         Self {
             data_service: Address::ZERO,
@@ -1338,6 +1359,7 @@ impl IndexingAgreementConfig {
             duration_seconds: 0,
             deadline_seconds: 0,
             max_grt_per_30_days: BTreeMap::new(),
+            fallback_max_grt_per_30_days: default_fallback_max_grt_per_30_days(),
             max_grt_per_billion_entities_per_30_days:
                 default_max_grt_per_billion_entities_per_30_days(),
             declined_indexer_lookback_days: 0,
@@ -1397,8 +1419,12 @@ impl IndexingAgreementConfig {
         self.deadline_seconds
     }
 
-    pub fn max_grt_per_30_days(&self) -> &BTreeMap<String, f64> {
-        &self.max_grt_per_30_days
+    /// The base-price ceiling for a chain: its own entry, or the fallback when it has none.
+    pub fn max_grt_per_30_days_for(&self, chain: &str) -> f64 {
+        self.max_grt_per_30_days
+            .get(chain)
+            .copied()
+            .unwrap_or(self.fallback_max_grt_per_30_days)
     }
 
     pub fn max_grt_per_billion_entities_per_30_days(&self) -> f64 {
@@ -1467,6 +1493,7 @@ impl From<DipsAgreementConfig>
             duration_seconds: value.duration_seconds.unwrap_or(u64::MAX),
             deadline_seconds: value.deadline_seconds,
             max_grt_per_30_days: value.max_grt_per_30_days,
+            fallback_max_grt_per_30_days: value.fallback_max_grt_per_30_days,
             max_grt_per_billion_entities_per_30_days: value
                 .max_grt_per_billion_entities_per_30_days,
             declined_indexer_lookback_days: value.declined_indexer_lookback_days,
@@ -1767,6 +1794,52 @@ mod tests {
         for ceiling in [0.01, 4500.0] {
             conf.max_grt_per_30_days
                 .insert("arbitrum-one".to_string(), ceiling);
+            assert!(conf.validate().is_ok(), "{ceiling}");
+        }
+    }
+
+    #[test]
+    fn caps_a_chain_without_its_own_ceiling_at_the_fallback() {
+        let conf: DipsAgreementConfig = serde_json::from_str(
+            r#"{
+                "data_service": "0x1111111111111111111111111111111111111111",
+                "recurring_collector": "0x2222222222222222222222222222222222222222",
+                "recurring_agreement_manager": "0x3333333333333333333333333333333333333333",
+                "min_seconds_per_collection": 60,
+                "max_seconds_per_collection": 3600,
+                "pricing_table": {},
+                "max_grt_per_30_days": {"mainnet": 450}
+            }"#,
+        )
+        .expect("deserialization");
+        // Unset, the fallback is the highest default chain ceiling (arbitrum-one's).
+        assert_eq!(conf.fallback_max_grt_per_30_days, 4500.0);
+        let (agreement_conf, _) =
+            <(Arc<IndexingAgreementConfig>, Arc<BTreeMap<ChainId, _>>)>::from(conf);
+        assert_eq!(agreement_conf.max_grt_per_30_days_for("mainnet"), 450.0);
+        assert_eq!(agreement_conf.max_grt_per_30_days_for("gnosis"), 4500.0);
+    }
+
+    #[test]
+    fn validate_rejects_a_fallback_ceiling_that_is_not_a_positive_number() {
+        let mut conf: DipsAgreementConfig = serde_json::from_str(
+            r#"{
+                "data_service": "0x1111111111111111111111111111111111111111",
+                "recurring_collector": "0x2222222222222222222222222222222222222222",
+                "recurring_agreement_manager": "0x3333333333333333333333333333333333333333",
+                "min_seconds_per_collection": 60,
+                "max_seconds_per_collection": 3600,
+                "pricing_table": {}
+            }"#,
+        )
+        .expect("deserialization");
+        for ceiling in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            conf.fallback_max_grt_per_30_days = ceiling;
+            let err = conf.validate().expect_err(&format!("{ceiling}"));
+            assert!(err.contains("fallback_max_grt_per_30_days"), "{err}");
+        }
+        for ceiling in [0.01, 4500.0] {
+            conf.fallback_max_grt_per_30_days = ceiling;
             assert!(conf.validate().is_ok(), "{ceiling}");
         }
     }
