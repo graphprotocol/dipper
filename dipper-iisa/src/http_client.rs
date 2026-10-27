@@ -163,6 +163,35 @@ fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     status.is_server_error()
 }
 
+/// How much of a rejection's response body to keep. A validation error leads with
+/// the field at fault, then echoes the whole request, which can be large.
+const MAX_REJECTION_BODY_BYTES: usize = 1024;
+
+/// Cut `body` to [`MAX_REJECTION_BODY_BYTES`] on a character boundary, noting its full length
+/// after the cut.
+fn truncate_rejection_body(body: String) -> String {
+    if body.len() <= MAX_REJECTION_BODY_BYTES {
+        return body;
+    }
+    let mut cut = MAX_REJECTION_BODY_BYTES;
+    while !body.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}... ({} bytes in total)", &body[..cut], body.len())
+}
+
+/// Turn a response IISA refused (a status retrying won't change) into
+/// [`SelectionError::IisaRejected`], logging the status and body that explain why.
+async fn rejection(endpoint: &str, response: reqwest::Response) -> SelectionError {
+    let status = response.status().as_u16();
+    let body = match response.text().await {
+        Ok(body) => truncate_rejection_body(body),
+        Err(e) => format!("<could not read the response body: {e}>"),
+    };
+    tracing::error!(endpoint, status, body = %body, "IISA rejected the request");
+    SelectionError::IisaRejected { status, body }
+}
+
 /// Calculate retry delay with exponential backoff and jitter.
 ///
 /// Base delay is 100ms, capped at 5s. Jitter adds +/- 25% variance to prevent
@@ -275,13 +304,7 @@ impl HttpIisaClient {
                 Ok(response) if is_retryable_status(response.status()) => {
                     last_error = SelectionError::IisaServiceUnavailable;
                 }
-                Ok(response) => {
-                    tracing::error!(
-                        "IISA /dips-indexers returned client error status: {}",
-                        response.status()
-                    );
-                    return Err(SelectionError::IisaServiceUnavailable);
-                }
+                Ok(response) => return Err(rejection("/dips-indexers", response).await),
                 Err(e) if is_retryable_error(&e) => {
                     last_error = SelectionError::IisaServiceUnavailable;
                 }
@@ -336,11 +359,7 @@ impl HttpIisaClient {
                     );
                     last_error = SelectionError::IisaServiceUnavailable;
                 }
-                Ok(response) => {
-                    // Non-retryable status (4xx)
-                    tracing::error!("IISA returned client error status: {}", response.status());
-                    return Err(SelectionError::IisaServiceUnavailable);
-                }
+                Ok(response) => return Err(rejection("/select-indexers", response).await),
                 Err(e) if is_retryable_error(&e) => {
                     tracing::debug!(
                         attempt = attempt,
@@ -936,6 +955,80 @@ mod tests {
         // Should fail immediately without retry
         assert!(result.is_err());
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
+
+    /// A FastAPI-style validation error, the body IISA sends with a 422.
+    fn validation_error() -> serde_json::Value {
+        serde_json::json!({
+            "detail": [{"loc": ["body", "num_candidates"], "msg": "Input should be greater than 0"}]
+        })
+    }
+
+    /// Asserts `err` is a rejection carrying a 422 and the validation error body.
+    fn assert_rejected_with_validation_error(err: SelectionError) {
+        match err {
+            SelectionError::IisaRejected { status, body } => {
+                assert_eq!(status, 422);
+                let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(body, validation_error());
+            }
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_select_indexers_reports_a_rejection_with_its_status_and_body() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/select-indexers"))
+            .respond_with(ResponseTemplate::new(422).set_body_json(validation_error()))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = HttpIisaClient::new(mock_server.uri());
+        let err = client
+            .select_indexers(
+                "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"
+                    .parse()
+                    .unwrap(),
+                1,
+                &SelectionContext::default(),
+            )
+            .await
+            .unwrap_err();
+        assert_rejected_with_validation_error(err);
+    }
+
+    #[tokio::test]
+    async fn test_dips_accepting_reports_a_rejection_with_its_status_and_body() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/dips-indexers"))
+            .respond_with(ResponseTemplate::new(422).set_body_json(validation_error()))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = HttpIisaClient::new(mock_server.uri());
+        let err = client
+            .dips_accepting_indexers("mainnet", PriceCeilings::default())
+            .await
+            .unwrap_err();
+        assert_rejected_with_validation_error(err);
+    }
+
+    #[test]
+    fn test_rejection_body_is_cut_short_on_a_character_boundary() {
+        // 3-byte characters, so a cut at the byte limit would land mid-character.
+        let long = "\u{20ac}".repeat(MAX_REJECTION_BODY_BYTES);
+        let cut = truncate_rejection_body(long.clone());
+        assert!(cut.len() < long.len());
+        assert!(cut.starts_with(&"\u{20ac}".repeat(MAX_REJECTION_BODY_BYTES / 3)));
+        assert!(cut.ends_with(&format!("({} bytes in total)", long.len())));
+
+        let short = "short body".to_string();
+        assert_eq!(truncate_rejection_body(short.clone()), short);
     }
 
     #[tokio::test]

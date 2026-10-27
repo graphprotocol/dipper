@@ -284,6 +284,17 @@ where
                 Duration::from_secs(60),
             ));
         }
+        // Retried like an outage, not dropped: a rejection is usually fixed by a
+        // deploy (bad config, a rotated token, a version mismatch mid-rollout).
+        Err(err @ SelectionError::IisaRejected { .. }) => {
+            tracing::warn!(
+                event = "iisa_request_rejected",
+                indexing_request_id=%indexing_request_id,
+                error=%err,
+                "IISA rejected the selection request for reassessment, will retry"
+            );
+            return Err(JobError::Retryable(err.into(), Duration::from_secs(60)));
+        }
         Err(SelectionError::Error(e)) => return Err(JobError::Fatal(e)),
     };
 
@@ -865,7 +876,7 @@ mod lifecycle_event_tests {
     use time::OffsetDateTime;
     use url::Url;
 
-    use super::{Ctx, Message, handle};
+    use super::{Ctx, JobError, Message, handle};
     use crate::{
         chain_client::{AgreementOnChain, ChainClient, ChainClientError},
         config::IndexingAgreementConfig,
@@ -910,6 +921,8 @@ mod lifecycle_event_tests {
     #[derive(Default)]
     struct MockIisa {
         selected: Vec<SelectedIndexer>,
+        /// When set, selection is refused with this HTTP status and response body.
+        rejects_with: Option<(u16, &'static str)>,
         contexts: Arc<Mutex<Vec<SelectionContext>>>,
         dips_ceilings: Arc<Mutex<Vec<PriceCeilings>>>,
     }
@@ -923,6 +936,12 @@ mod lifecycle_event_tests {
             context: &SelectionContext,
         ) -> std::result::Result<Vec<SelectedIndexer>, SelectionError> {
             self.contexts.lock().unwrap().push(context.clone());
+            if let Some((status, body)) = self.rejects_with {
+                return Err(SelectionError::IisaRejected {
+                    status,
+                    body: body.to_string(),
+                });
+            }
             Ok(self.selected.iter().take(num_candidates).cloned().collect())
         }
 
@@ -1502,6 +1521,50 @@ mod lifecycle_event_tests {
                 max_grt_per_billion_entities_per_30_days: Some(2000.0),
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn retries_a_rejected_selection_after_60_seconds_and_says_it_was_rejected() {
+        // A rejection is usually fixed by a deploy, so the job must stay queued
+        // (a fatal error would drop it) and the log must not blame an outage.
+        let ctx = build_ctx(
+            MockRegistry::default(),
+            MockIisa {
+                rejects_with: Some((422, r#"{"detail":"num_candidates must be positive"}"#)),
+                ..Default::default()
+            },
+            MockQueue::default(),
+            MockChainClient::default(),
+            CapturingEventsProducer::new(),
+            indexer_urls::Snapshot::new(),
+        );
+
+        let mut result = None;
+        let logs = crate::test_support::logged(async {
+            result = Some(handle(ctx, &test_message(1)).await);
+        })
+        .await;
+
+        match result.unwrap() {
+            Err(JobError::Retryable(err, delay)) => {
+                assert_eq!(delay, std::time::Duration::from_secs(60));
+                assert!(
+                    matches!(
+                        err.downcast_ref::<SelectionError>(),
+                        Some(SelectionError::IisaRejected { status: 422, .. })
+                    ),
+                    "not a rejection: {err:?}"
+                );
+            }
+            other => panic!("expected a 60-second retry, got {other:?}"),
+        }
+        assert!(
+            logs.contains("IISA rejected the selection request"),
+            "{logs}"
+        );
+        assert!(logs.contains("num_candidates must be positive"), "{logs}");
+        assert!(logs.contains("iisa_request_rejected"), "{logs}");
+        assert!(!logs.contains("unavailable"), "{logs}");
     }
 
     // ---- Scenario 1: n_indexers_unavailable ---------------------------------
