@@ -9,7 +9,7 @@ async-signal = "0.2.10"
 async-trait.workspace = true
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 custom_debug = "0.6.1"
-dipper-core = { version = "0.1.0", path = "../../dipper-core" }
+dipper-core = { version = "0.1.0", path = "../../dipper-core", features = ["manifest"] }
 dipper-iisa = { path = "../../dipper-iisa" }
 dipper-pgmq = { path = "../../dipper-pgmq" }
 dipper-pgregistry = { path = "../../dipper-pgregistry" }
@@ -36,6 +36,7 @@ uuid.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+dipper-core = { version = "0.1.0", path = "../../dipper-core", features = ["test-util"] }
 fake = { workspace = true, features = ["url"] }
 pgtemp = "0.6.0"
 rskafka = { version = "0.6.0", features = ["transport-tls"] }

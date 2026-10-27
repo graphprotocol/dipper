@@ -105,6 +105,64 @@ pub struct Config {
     /// none are sent.
     #[serde(default)]
     pub alerts: AlertsConfig,
+    /// Refusing indexing requests whose chain is not the one their subgraph manifest
+    /// indexes. On by default, so omitting the section keeps the check.
+    #[serde(default)]
+    pub request_chain_check: RequestChainCheckConfig,
+}
+
+/// How indexing requests are checked against their subgraph manifest's chain. A request
+/// whose manifest can't be read is refused, so a check that can't run never waves it through.
+#[serde_as]
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RequestChainCheckConfig {
+    /// Whether to check at all. Turn it off only where manifests can't be read, or for a
+    /// chain neither the networks registry nor `additional_networks` names.
+    pub enabled: bool,
+
+    /// The IPFS API subgraph manifests are read from.
+    #[serde_as(as = "serde_with::DisplayFromStr")]
+    pub ipfs_url: Url,
+
+    /// How long to wait on IPFS for 1 manifest, in seconds. IPFS takes about 30 seconds
+    /// to say it has no such manifest, so a shorter wait turns that into a retry.
+    #[serde_as(as = "serde_with::DurationSeconds")]
+    pub timeout: Duration,
+}
+
+impl RequestChainCheckConfig {
+    /// Rejects a check that would fail every request.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.enabled && self.timeout.is_zero() {
+            return Err("request_chain_check.timeout must be greater than 0".to_string());
+        }
+        Ok(())
+    }
+
+    /// The IPFS endpoint named by host, for logs: an IPFS URL can carry credentials.
+    pub fn ipfs_host(&self) -> String {
+        match (self.ipfs_url.host_str(), self.ipfs_url.port()) {
+            (Some(host), Some(port)) => format!("{host}:{port}"),
+            (Some(host), None) => host.to_string(),
+            (None, _) => "unnamed endpoint".to_string(),
+        }
+    }
+}
+
+impl Default for RequestChainCheckConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ipfs_url: default_ipfs_url(),
+            timeout: Duration::from_secs(45),
+        }
+    }
+}
+
+#[expect(clippy::expect_used, reason = "a fixed URL that always parses")]
+fn default_ipfs_url() -> Url {
+    Url::parse("https://ipfs.thegraph.com").expect("a valid URL")
 }
 
 /// Alerts for the log lines an operator has to act on, picked out by their `event` tag and
@@ -144,6 +202,7 @@ impl Default for AlertsConfig {
                 "chain_listener_changes_skipped",
                 "stale_agreement_uncancellable",
                 "liveness_abandonment_paused",
+                "studio_request_chain_refused",
             ]
             .map(str::to_owned)
             .to_vec(),
@@ -2372,6 +2431,45 @@ mod tests {
             liveness.unreachable_trip_min_indexers,
             defaults.unreachable_trip_min_indexers
         );
+    }
+
+    #[test]
+    fn the_example_configmap_request_chain_check_section_parses() {
+        let check = serde_json::from_value::<RequestChainCheckConfig>(
+            example_config()["request_chain_check"].clone(),
+        )
+        .expect("the example's request_chain_check section is a valid config");
+        let defaults = RequestChainCheckConfig::default();
+
+        assert_eq!(check.enabled, defaults.enabled);
+        assert_eq!(check.ipfs_url, defaults.ipfs_url);
+        assert_eq!(check.timeout, defaults.timeout);
+    }
+
+    #[test]
+    fn a_request_chain_check_that_would_fail_every_request_is_rejected() {
+        let zero = RequestChainCheckConfig {
+            timeout: Duration::ZERO,
+            ..RequestChainCheckConfig::default()
+        };
+        let off = RequestChainCheckConfig {
+            enabled: false,
+            ..zero.clone()
+        };
+
+        assert!(zero.validate().is_err());
+        assert!(off.validate().is_ok(), "a check that is off never waits");
+        assert!(RequestChainCheckConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn the_ipfs_endpoint_is_logged_without_its_credentials() {
+        let config = RequestChainCheckConfig {
+            ipfs_url: Url::parse("https://project:secret@ipfs.example.com:5001/").unwrap(),
+            ..RequestChainCheckConfig::default()
+        };
+
+        assert_eq!(config.ipfs_host(), "ipfs.example.com:5001");
     }
 
     #[test]

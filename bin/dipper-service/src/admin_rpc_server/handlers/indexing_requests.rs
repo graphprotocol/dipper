@@ -19,6 +19,7 @@ use crate::{
         IndexingRequest as IndexingRequestRecord, IndexingRequestRegistry,
         IndexingRequestStatus as IndexingRequestRecordStatus,
     },
+    request_chain_check::RequestChainCheck,
     set_indexing_target::{ApplyError, SetIndexingTarget, apply_set_indexing_target},
     signing::eip712::Eip712Signer,
     worker::service::{JobPriority, WorkerQueue},
@@ -35,6 +36,7 @@ pub struct Ctx<R, W> {
     pub max_candidates: usize,
     pub subgraph_indexing_agreements_events_emitter:
         Arc<dyn SubgraphIndexingAgreementEventsProducer>,
+    pub request_chain_check: Arc<dyn RequestChainCheck>,
 }
 
 pub struct RpcServerImpl<R, W>(Ctx<R, W>);
@@ -114,6 +116,7 @@ where
             &self.registry,
             &self.worker,
             &self.subgraph_indexing_agreements_events_emitter,
+            self.request_chain_check.as_ref(),
             self.signer.chain_id(),
             SetIndexingTarget {
                 requested_by,
@@ -126,6 +129,11 @@ where
         )
         .await
         .map_err(|err| match err {
+            // The caller sees why, so it can resend with the manifest's chain.
+            ApplyError::WrongChain(err) => ErrorObject::owned(400, err.to_string(), None::<()>),
+            ApplyError::ChainCheckUnavailable(err) => {
+                ErrorObject::owned(503, err.to_string(), None::<()>)
+            }
             ApplyError::Registry(_) => ErrorObject::borrowed(503, "Service unavailable", None),
             ApplyError::QueueReassess { .. } => {
                 ErrorObject::borrowed(500, "Internal server error", None)
@@ -179,7 +187,8 @@ mod tests {
     use super::*;
     use crate::{
         registry::{Result as RegistryResult, SetTargetOutcome},
-        test_support::{CapturedEvent, CapturingEventsProducer},
+        request_chain_check::SkipChainCheck,
+        test_support::{CapturedEvent, CapturingEventsProducer, RefusingChainCheck},
         worker::queue::JobId,
     };
 
@@ -320,6 +329,18 @@ mod tests {
         RpcServerImpl<MockRegistry, MockWorker>,
         CapturingEventsProducer,
     ) {
+        server_with_check(allowed, outcome, Arc::new(SkipChainCheck))
+    }
+
+    /// As [`server`], with `chain_check` deciding which chains are accepted.
+    fn server_with_check(
+        allowed: Address,
+        outcome: SetTargetOutcome,
+        chain_check: Arc<dyn RequestChainCheck>,
+    ) -> (
+        RpcServerImpl<MockRegistry, MockWorker>,
+        CapturingEventsProducer,
+    ) {
         let domain = dipper_rpc::admin::eip712_domain();
         // The signer's own address is irrelevant to recovery here (the handler
         // recovers the *message* signer), so any address works.
@@ -334,6 +355,7 @@ mod tests {
             worker: MockWorker,
             max_candidates: 10,
             subgraph_indexing_agreements_events_emitter: Arc::new(events.clone()),
+            request_chain_check: chain_check,
         };
 
         (RpcServerImpl(ctx), events)
@@ -428,5 +450,76 @@ mod tests {
             "expected no emitted events, got {:?}",
             events.events()
         );
+    }
+
+    #[tokio::test]
+    async fn a_request_on_another_chain_is_refused_with_the_reason() {
+        let deployment = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
+        let (signer, req) = signed_request(deployment, DEPLOYMENT_CHAIN_ID, Some(3));
+        let (server, events) = server_with_check(
+            signer.address(),
+            SetTargetOutcome::Inserted {
+                id: IndexingRequestId::new(),
+            },
+            Arc::new(RefusingChainCheck::wrong_chain()),
+        );
+
+        let err = server
+            .set_indexing_target_candidates(req)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), 400);
+        assert!(
+            err.message().contains("indexes arbitrum-sepolia"),
+            "the caller learns the manifest's chain: {}",
+            err.message()
+        );
+        assert!(
+            events.events().is_empty(),
+            "a refused request emits nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_manifest_answers_service_unavailable() {
+        let deployment = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
+        let (signer, req) = signed_request(deployment, DEPLOYMENT_CHAIN_ID, Some(3));
+        let (server, _) = server_with_check(
+            signer.address(),
+            SetTargetOutcome::Inserted {
+                id: IndexingRequestId::new(),
+            },
+            Arc::new(RefusingChainCheck::unavailable()),
+        );
+
+        let err = server
+            .set_indexing_target_candidates(req)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), 503);
+    }
+
+    #[tokio::test]
+    async fn a_cancel_is_not_checked_against_the_manifest() {
+        //* Arrange - a request stored under the wrong chain must still be cancellable
+        let deployment = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
+        let (signer, req) = signed_request(deployment, DEPLOYMENT_CHAIN_ID, Some(0));
+        let check = Arc::new(RefusingChainCheck::wrong_chain());
+        let (server, _) = server_with_check(
+            signer.address(),
+            SetTargetOutcome::Canceled {
+                id: IndexingRequestId::new(),
+            },
+            check.clone(),
+        );
+
+        //* Act
+        let result = server.set_indexing_target_candidates(req).await;
+
+        //* Assert
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(check.calls(), 0);
     }
 }

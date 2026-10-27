@@ -13,6 +13,7 @@ use thegraph_core::{
 
 use crate::{
     registry::{IndexingRequestRegistry, SetTargetOutcome},
+    request_chain_check::{ChainCheckError, RequestChainCheck},
     worker::service::{JobPriority, WorkerQueue},
 };
 
@@ -31,10 +32,20 @@ pub struct SetIndexingTarget {
     pub priority: JobPriority,
 }
 
-/// Errors from applying a set-indexing-target request. Both variants are
+/// Errors from applying a set-indexing-target request. Every variant is
 /// already logged with full context when returned.
 #[derive(Debug, thiserror::Error)]
 pub enum ApplyError {
+    /// The request's chain is not the one its subgraph indexes, or the manifest
+    /// names no single chain; nothing was changed, and a retry won't pass.
+    #[error("indexing request refused: {0}")]
+    WrongChain(#[source] ChainCheckError),
+
+    /// The manifest could not be read to check the chain; nothing was changed,
+    /// and the same request may pass once IPFS answers.
+    #[error("could not check the indexing request's chain")]
+    ChainCheckUnavailable(#[source] ChainCheckError),
+
     /// The registry upsert failed; nothing was changed or queued.
     #[error("failed to set indexing target candidates")]
     Registry(#[source] crate::registry::Error),
@@ -50,6 +61,45 @@ pub enum ApplyError {
     },
 }
 
+/// Refuses a request for indexers whose chain is not the one its subgraph manifest
+/// indexes. A cancel is let through, so a request stored under the wrong chain can
+/// still be closed.
+async fn check_chain(
+    chain_check: &dyn RequestChainCheck,
+    request: &SetIndexingTarget,
+) -> Result<(), ApplyError> {
+    let SetIndexingTarget {
+        requested_by,
+        deployment_id,
+        deployment_chain_id,
+        num_candidates,
+        ..
+    } = *request;
+    if num_candidates == 0 {
+        return Ok(());
+    }
+    let Err(err) = chain_check.check(&deployment_id, deployment_chain_id).await else {
+        return Ok(());
+    };
+    if err.is_transient() {
+        tracing::error!(
+            %deployment_id,
+            chain_id = %deployment_chain_id,
+            error = %err,
+            "Could not check the indexing request's chain against its subgraph manifest"
+        );
+        return Err(ApplyError::ChainCheckUnavailable(err));
+    }
+    tracing::warn!(
+        %requested_by,
+        %deployment_id,
+        chain_id = %deployment_chain_id,
+        error = %err,
+        "Refused an indexing request whose chain does not match its subgraph manifest"
+    );
+    Err(ApplyError::WrongChain(err))
+}
+
 /// Upserts the indexing request, emits the request-received lifecycle event on
 /// a genuinely new request, and queues reassessment when the row changed.
 /// Returns the request id, or `None` when there was nothing to act on.
@@ -63,6 +113,7 @@ pub async fn apply_set_indexing_target<R, W>(
     registry: &R,
     worker: &W,
     events: &Arc<dyn SubgraphIndexingAgreementEventsProducer>,
+    chain_check: &dyn RequestChainCheck,
     the_graph_network: ChainId,
     request: SetIndexingTarget,
 ) -> Result<Option<IndexingRequestId>, ApplyError>
@@ -70,6 +121,7 @@ where
     R: IndexingRequestRegistry + Send + Sync,
     W: WorkerQueue + Send + Sync,
 {
+    check_chain(chain_check, &request).await?;
     let SetIndexingTarget {
         requested_by,
         deployment_id,

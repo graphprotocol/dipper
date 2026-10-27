@@ -124,5 +124,10 @@ data:
       "alerts": {
         "slack_webhook_url": "https://hooks.slack.com/services/REPLACE_ME_OR_REMOVE_FOR_NO_ALERTS",
         "throttle": 900
+      },
+      "request_chain_check": {
+        "enabled": true,
+        "ipfs_url": "https://ipfs.thegraph.com",
+        "timeout": 45
       }
     }
