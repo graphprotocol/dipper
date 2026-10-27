@@ -291,6 +291,7 @@ where
         // deploy (bad config, a rotated token, a version mismatch mid-rollout).
         Err(err @ SelectionError::IisaRejected { .. }) => {
             tracing::warn!(
+                event = "iisa_request_rejected",
                 indexing_request_id=%indexing_request_id,
                 error=%err,
                 "IISA rejected the selection request for reassessment, will retry"
@@ -1668,6 +1669,7 @@ mod lifecycle_event_tests {
             "{logs}"
         );
         assert!(logs.contains("num_candidates must be positive"), "{logs}");
+        assert!(logs.contains("iisa_request_rejected"), "{logs}");
         assert!(!logs.contains("unavailable"), "{logs}");
     }
 

@@ -167,7 +167,8 @@ fn is_retryable_status(status: reqwest::StatusCode) -> bool {
 /// the field at fault, then echoes the whole request, which can be large.
 const MAX_REJECTION_BODY_BYTES: usize = 1024;
 
-/// Cut `body` to at most [`MAX_REJECTION_BODY_BYTES`], on a character boundary.
+/// Cut `body` to [`MAX_REJECTION_BODY_BYTES`] on a character boundary, noting its full length
+/// after the cut.
 fn truncate_rejection_body(body: String) -> String {
     if body.len() <= MAX_REJECTION_BODY_BYTES {
         return body;
