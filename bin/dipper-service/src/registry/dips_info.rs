@@ -29,20 +29,11 @@ pub trait DipsInfoRegistry {
         added: Duration,
     ) -> RegistryResult<DipsInfoChecks>;
 
-    /// Get the indexers dipper itself denied for missing DIPs info.
-    async fn get_dips_info_denials(&self) -> RegistryResult<Vec<IndexerId>>;
-
-    /// Deny each of `indexer_ids` for missing DIPs info, leaving any existing denylist entry as
-    /// it is. Returns the indexers this added.
-    async fn deny_for_missing_dips_info(
+    /// Block each of `indexer_ids`, still missing its DIPs info, until `until`, which puts it on
+    /// the denylist IISA gets. Returns those not blocked before this.
+    async fn block_missing_dips_info(
         &self,
         indexer_ids: &[IndexerId],
-    ) -> RegistryResult<Vec<IndexerId>>;
-
-    /// Lift dipper's own denials for missing DIPs info of `indexer_ids`, leaving operators'
-    /// entries alone. Returns the indexers this lifted.
-    async fn lift_dips_info_denials(
-        &self,
-        indexer_ids: &[IndexerId],
+        until: time::OffsetDateTime,
     ) -> RegistryResult<Vec<IndexerId>>;
 }

@@ -888,26 +888,13 @@ impl DipsInfoRegistry for RegistryProvider {
         })
     }
 
-    async fn get_dips_info_denials(&self) -> RegistryResult<Vec<IndexerId>> {
-        self.inner.get_dips_info_denials().await.map_err(Into::into)
-    }
-
-    async fn deny_for_missing_dips_info(
+    async fn block_missing_dips_info(
         &self,
         indexer_ids: &[IndexerId],
+        until: time::OffsetDateTime,
     ) -> RegistryResult<Vec<IndexerId>> {
         self.inner
-            .deny_for_missing_dips_info(indexer_ids)
-            .await
-            .map_err(Into::into)
-    }
-
-    async fn lift_dips_info_denials(
-        &self,
-        indexer_ids: &[IndexerId],
-    ) -> RegistryResult<Vec<IndexerId>> {
-        self.inner
-            .lift_dips_info_denials(indexer_ids)
+            .block_missing_dips_info(indexer_ids, until)
             .await
             .map_err(Into::into)
     }

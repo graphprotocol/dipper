@@ -1821,60 +1821,68 @@ async fn record_dips_info_checks_with_no_indexer_missing_forgets_them_all() {
 }
 
 #[tokio::test]
-async fn dips_info_denials_add_and_lift_only_dippers_own_entries() {
+async fn a_dips_info_block_denies_an_indexer_until_it_lapses_or_the_indexer_answers() {
     //* Given
     let (db, _temp_db) = temp_registry_db().await;
-    let registry = PgRegistry::new(db.clone());
-    let operator_denied = indexer_id!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-    let missing = indexer_id!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-    sqlx::query("INSERT INTO dipper_indexer_denylist (indexer_id, reason, created_by, expires_at) VALUES ($1, $2, $3, $4)")
-        .bind(operator_denied.as_slice())
-        .bind("Poor performance")
-        .bind("ops@example.com")
-        .bind(time::OffsetDateTime::parse("3000-01-01T00:00:00Z", &time::format_description::well_known::Rfc3339).unwrap())
-        .execute(&db)
+    let registry = PgRegistry::new(db);
+    let blocked = indexer_id!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let lapsed = indexer_id!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    let answered = indexer_id!("cccccccccccccccccccccccccccccccccccccccc");
+    let now = time::OffsetDateTime::now_utc();
+    registry
+        .record_dips_info_checks(&[blocked, lapsed, answered], 48 * 3600)
         .await
-        .expect("Failed to insert the operator's entry");
+        .expect("Failed to record missing DIPs info");
 
     //* When
-    let added = registry
-        .deny_for_missing_dips_info(&[operator_denied, missing])
+    let first = registry
+        .block_missing_dips_info(&[blocked, answered], now + time::Duration::minutes(15))
         .await
-        .expect("Failed to deny");
-    let again = registry
-        .deny_for_missing_dips_info(&[missing])
+        .expect("Failed to block");
+    let renewed = registry
+        .block_missing_dips_info(&[blocked], now + time::Duration::minutes(20))
         .await
-        .expect("Failed to deny again");
-    let own = registry
-        .get_dips_info_denials()
+        .expect("Failed to renew the block");
+    registry
+        .block_missing_dips_info(&[lapsed], now - time::Duration::minutes(1))
         .await
-        .expect("Failed to get dipper's denials");
-    let denied_while_missing = registry
+        .expect("Failed to set a block already over");
+    let while_missing = registry
         .get_indexer_denylist()
         .await
         .expect("Failed to get the denylist");
-    let lifted = registry
-        .lift_dips_info_denials(&[operator_denied, missing])
+    registry
+        .record_dips_info_checks(&[blocked, lapsed], 300)
         .await
-        .expect("Failed to lift");
-    let denied_after = registry
+        .expect("Failed to record the answer");
+    let after_answer = registry
         .get_indexer_denylist()
         .await
         .expect("Failed to get the denylist");
+    let unknown = registry
+        .block_missing_dips_info(&[answered], now + time::Duration::minutes(15))
+        .await
+        .expect("Failed to block an indexer with no missing row");
 
     //* Then
-    assert_eq!(added, vec![missing], "the operator's entry stays as it was");
-    assert!(again.is_empty(), "an indexer is denied once");
-    assert_eq!(own, vec![missing]);
     assert_eq!(
-        denied_while_missing.into_iter().collect::<HashSet<_>>(),
-        HashSet::from([operator_denied, missing])
+        first.into_iter().collect::<HashSet<_>>(),
+        HashSet::from([blocked, answered])
     );
-    assert_eq!(lifted, vec![missing]);
+    assert!(renewed.is_empty(), "renewing a block isn't a new one");
     assert_eq!(
-        denied_after,
-        vec![operator_denied],
-        "only dipper's own entry is lifted"
+        while_missing.into_iter().collect::<HashSet<_>>(),
+        HashSet::from([blocked, answered]),
+        "a block already over denies nobody"
+    );
+    assert_eq!(
+        after_answer,
+        vec![blocked],
+        "answering removes the row and its block"
+    );
+    assert!(
+        unknown.is_empty(),
+        "only an indexer still missing its DIPs info is blocked"
     );
 }
 
