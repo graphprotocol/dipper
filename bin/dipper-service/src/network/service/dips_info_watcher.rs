@@ -80,7 +80,8 @@ where
                 _ = rx_stop.recv() => break,
                 _ = timer.tick() => {},
             }
-            let elapsed = cycles.start(Instant::now(), config.interval);
+            let now = Instant::now();
+            let elapsed = cycles.start(now, config.interval);
 
             let indexers = match tokio::time::timeout(
                 DB_TIMEOUT,
@@ -106,7 +107,7 @@ where
                 config.max_concurrent_requests,
             )
             .await;
-            let added = cycles.judge(indexers.len(), missing.len(), elapsed, &config);
+            let added = cycles.judge(indexers.len(), missing.len(), elapsed, now, &config);
 
             let checks = match tokio::time::timeout(
                 DB_TIMEOUT,
@@ -134,12 +135,16 @@ where
     (Handle { tx_stop }, service)
 }
 
-/// What the watcher remembers between cycles: when the last one started, and whether it was
-/// paused because too many indexers gave no readable answer at once.
+/// How often the pause alert repeats while counting stays paused.
+const PAUSE_ALERT_REPEAT: Duration = Duration::from_secs(6 * 3600);
+
+/// What the watcher remembers between cycles: when the last one started, and since when, and when
+/// last alerted on, counting has been paused because too many indexers gave no readable answer.
 #[derive(Default)]
 struct Cycles {
     last_started: Option<Instant>,
-    paused: bool,
+    paused_since: Option<Instant>,
+    pause_alerted_at: Option<Instant>,
 }
 
 impl Cycles {
@@ -155,11 +160,13 @@ impl Cycles {
 
     /// The missing time this cycle adds: none while so many of the indexers checked give no
     /// readable answer that the fault is likely dipper's, or a release that changed the endpoint.
+    /// The pause has no time limit, so its alert repeats every `PAUSE_ALERT_REPEAT` while it lasts.
     fn judge(
         &mut self,
         checked: usize,
         missing: usize,
         elapsed: Duration,
+        now: Instant,
         config: &DipsInfoWatcherConfig,
     ) -> Duration {
         let trips = unreachable_trips(
@@ -168,20 +175,34 @@ impl Cycles {
             config.unreachable_trip_fraction,
             config.unreachable_trip_min_indexers,
         );
-        if trips && !self.paused {
+        if !trips {
+            if self.paused_since.take().is_some() {
+                tracing::info!(missing, checked, "Counting missing DIPs info again");
+            }
+            return elapsed;
+        }
+        let since = *self.paused_since.get_or_insert(now);
+        if self
+            .pause_alerted_at
+            .is_none_or(|at| at < since || now.saturating_duration_since(at) >= PAUSE_ALERT_REPEAT)
+        {
+            self.pause_alerted_at = Some(now);
             tracing::warn!(
                 event = "dips_info_checks_paused",
                 missing,
                 checked,
+                paused_hours = now.saturating_duration_since(since).as_secs() / 3600,
                 "Too many indexers without readable DIPs info at once: a fault on dipper's side \
                  or an indexer-service release that changed /dips/info; not counting missing \
                  DIPs info while it lasts"
             );
-        } else if !trips && self.paused {
-            tracing::info!(missing, checked, "Counting missing DIPs info again");
         }
-        self.paused = trips;
-        if trips { Duration::ZERO } else { elapsed }
+        Duration::ZERO
+    }
+
+    /// Whether counting is paused.
+    fn paused(&self) -> bool {
+        self.paused_since.is_some()
     }
 }
 
@@ -396,24 +417,46 @@ mod tests {
         let config = DipsInfoWatcherConfig::default();
         let mut cycles = Cycles::default();
         let elapsed = Duration::from_secs(300);
+        let now = Instant::now();
 
-        assert_eq!(cycles.judge(4, 1, elapsed, &config), elapsed);
+        assert_eq!(cycles.judge(4, 1, elapsed, now, &config), elapsed);
         assert_eq!(
-            cycles.judge(4, 2, elapsed, &config),
+            cycles.judge(4, 2, elapsed, now, &config),
             Duration::ZERO,
             "half missing"
         );
-        assert!(cycles.paused);
+        assert!(cycles.paused());
         assert_eq!(
-            cycles.judge(4, 1, elapsed, &config),
+            cycles.judge(4, 1, elapsed, now, &config),
             elapsed,
             "counting resumes"
         );
-        assert!(!cycles.paused);
+        assert!(!cycles.paused());
         assert_eq!(
-            cycles.judge(2, 2, elapsed, &config),
+            cycles.judge(2, 2, elapsed, now, &config),
             elapsed,
             "too few indexers checked for the share to count"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_pause_alert_repeats_while_counting_stays_paused() {
+        let config = DipsInfoWatcherConfig::default();
+        let mut cycles = Cycles::default();
+        let elapsed = Duration::from_secs(300);
+        let start = Instant::now();
+
+        let logs = crate::test_support::logged(async {
+            for minutes in [0, 5, 10, 6 * 60 + 5] {
+                cycles.judge(4, 4, elapsed, start + Duration::from_secs(minutes * 60), &config);
+            }
+        })
+        .await;
+
+        assert_eq!(
+            logs.matches("dips_info_checks_paused").count(),
+            2,
+            "once as it pauses, again 6 hours on: {logs}"
         );
     }
 
