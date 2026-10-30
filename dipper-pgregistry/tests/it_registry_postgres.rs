@@ -1820,6 +1820,87 @@ async fn record_dips_info_checks_with_no_indexer_missing_forgets_them_all() {
     );
 }
 
+#[tokio::test]
+async fn a_dips_info_block_denies_an_indexer_until_it_lapses_or_the_indexer_answers() {
+    //* Given
+    let (db, _temp_db) = temp_registry_db().await;
+    let registry = PgRegistry::new(db);
+    let blocked = indexer_id!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let lapsed = indexer_id!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    let answered = indexer_id!("cccccccccccccccccccccccccccccccccccccccc");
+    registry
+        .record_dips_info_checks(&[blocked, lapsed, answered], 48 * 3600)
+        .await
+        .expect("Failed to record missing DIPs info");
+
+    //* When
+    let first = registry
+        .block_missing_dips_info(&[blocked, answered], 900)
+        .await
+        .expect("Failed to block");
+    let renewed = registry
+        .block_missing_dips_info(&[blocked], 1200)
+        .await
+        .expect("Failed to renew the block");
+    registry
+        .block_missing_dips_info(&[lapsed], 0)
+        .await
+        .expect("Failed to set a block already over");
+    let while_missing = registry
+        .get_indexer_denylist()
+        .await
+        .expect("Failed to get the denylist");
+    let blocks = registry
+        .get_dips_info_blocks()
+        .await
+        .expect("Failed to get the blocks");
+    registry
+        .record_dips_info_checks(&[blocked, lapsed], 300)
+        .await
+        .expect("Failed to record the answer");
+    let after_answer = registry
+        .get_indexer_denylist()
+        .await
+        .expect("Failed to get the denylist");
+    let lapsed_renewed = registry
+        .block_missing_dips_info(&[lapsed], 900)
+        .await
+        .expect("Failed to renew a lapsed block");
+    let unknown = registry
+        .block_missing_dips_info(&[answered], 900)
+        .await
+        .expect("Failed to block an indexer with no missing row");
+
+    //* Then
+    assert_eq!(
+        first.into_iter().collect::<HashSet<_>>(),
+        HashSet::from([blocked, answered])
+    );
+    assert!(renewed.is_empty(), "renewing a block isn't a new one");
+    assert_eq!(
+        while_missing.into_iter().collect::<HashSet<_>>(),
+        HashSet::from([blocked, answered]),
+        "a block already over denies nobody"
+    );
+    assert_eq!(
+        blocks.into_iter().collect::<HashSet<_>>(),
+        HashSet::from([blocked, answered])
+    );
+    assert_eq!(
+        after_answer,
+        vec![blocked],
+        "answering removes the row and its block"
+    );
+    assert!(
+        lapsed_renewed.is_empty(),
+        "renewing a lapsed block isn't a new one either"
+    );
+    assert!(
+        unknown.is_empty(),
+        "only an indexer still missing its DIPs info is blocked"
+    );
+}
+
 // =============================================================================
 // Liveness checker DB operation tests
 // =============================================================================

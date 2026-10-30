@@ -2187,15 +2187,18 @@ impl PgRegistry {
     // Indexer denylist operations
     // =========================================================================
 
-    /// Get all active (non-expired) denied indexer IDs.
-    ///
-    /// Entries with an expiration date in the past are excluded.
+    /// Get all active (non-expired) denied indexer IDs: the operator denylist's, and those the DIPs
+    /// info watcher blocks for missing their DIPs info too long.
     pub async fn get_indexer_denylist(&self) -> Result<Vec<IndexerId>, Error> {
         let rows: Vec<(PgIndexerId,)> = sqlx::query_as(
             r#"
             SELECT indexer_id
             FROM dipper_indexer_denylist
             WHERE expires_at IS NULL OR expires_at > timezone('UTC', now())
+            UNION
+            SELECT indexer_id
+            FROM dipper_indexer_dips_info_missing
+            WHERE blocked_until > timezone('UTC', now())
             "#,
         )
         .fetch_all(&self.pool)
@@ -2268,6 +2271,51 @@ impl PgRegistry {
             missing: still_missing.into_iter().map(|(id, s)| (id.0, s)).collect(),
             cleared: cleared.into_iter().map(|(id, s)| (id.0, s)).collect(),
         })
+    }
+
+    /// Get the indexers the DIPs info watcher blocks now.
+    pub async fn get_dips_info_blocks(&self) -> Result<Vec<IndexerId>, Error> {
+        let rows: Vec<(PgIndexerId,)> = sqlx::query_as(
+            r#"
+            SELECT indexer_id
+            FROM dipper_indexer_dips_info_missing
+            WHERE blocked_until > timezone('UTC', now())
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(|(id,)| id.0).collect())
+    }
+
+    /// Block each of `indexer_ids`, still missing its DIPs info, for `for_secs` from the database's
+    /// clock, returning those blocked for the 1st time since it went missing. A readable answer
+    /// removes the indexer's row, and with it the block.
+    pub async fn block_missing_dips_info(
+        &self,
+        indexer_ids: &[IndexerId],
+        for_secs: i64,
+    ) -> Result<Vec<IndexerId>, Error> {
+        let pg_ids: Vec<PgIndexerId> = indexer_ids.iter().map(|id| PgIndexerId(*id)).collect();
+        let rows: Vec<(PgIndexerId, bool)> = sqlx::query_as(
+            r#"
+            UPDATE dipper_indexer_dips_info_missing AS t
+            SET blocked_until = timezone('UTC', now()) + $2::bigint * interval '1 second'
+            FROM dipper_indexer_dips_info_missing AS was
+            WHERE t.indexer_id = was.indexer_id AND t.indexer_id = ANY($1)
+            RETURNING t.indexer_id, was.blocked_until IS NULL
+            "#,
+        )
+        .bind(&pg_ids[..])
+        .bind(for_secs)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .filter(|(_, newly)| *newly)
+            .map(|(id, _)| id.0)
+            .collect())
     }
 
     // =========================================================================

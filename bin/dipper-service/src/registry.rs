@@ -887,6 +887,22 @@ impl DipsInfoRegistry for RegistryProvider {
             cleared: to_durations(checks.cleared),
         })
     }
+
+    async fn get_dips_info_blocks(&self) -> RegistryResult<Vec<IndexerId>> {
+        self.inner.get_dips_info_blocks().await.map_err(Into::into)
+    }
+
+    async fn block_missing_dips_info(
+        &self,
+        indexer_ids: &[IndexerId],
+        duration: std::time::Duration,
+    ) -> RegistryResult<Vec<IndexerId>> {
+        let for_secs = i64::try_from(duration.as_secs()).unwrap_or(i64::MAX);
+        self.inner
+            .block_missing_dips_info(indexer_ids, for_secs)
+            .await
+            .map_err(Into::into)
+    }
 }
 
 #[async_trait]

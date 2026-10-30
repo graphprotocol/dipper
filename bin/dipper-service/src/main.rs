@@ -593,7 +593,7 @@ pub async fn main() -> anyhow::Result<()> {
     };
 
     //- The DIPs info watcher (optional, enabled by config)
-    // Alerts on agreement holders whose /dips/info stays unreadable, which IISA can't score
+    // Alerts on, then blocks, agreement holders whose /dips/info stays unreadable
     let dips_info_watcher_handle = match conf.dips_info_watcher {
         Some(ref watcher_conf) if watcher_conf.enabled => {
             let ctx = network::service::dips_info_watcher::Ctx {
