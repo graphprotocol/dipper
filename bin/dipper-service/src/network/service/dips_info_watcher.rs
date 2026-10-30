@@ -153,15 +153,15 @@ async fn run_cycle<R: DipsInfoRegistry + Sync>(
     cycles.recorded(now);
     report(&checks, added, config.alert_after());
 
-    // A block lasts 3 intervals and each cycle renews it, so it lapses on its own if the watcher
-    // stops. A readable answer lifts it at once.
+    // Each cycle renews a block, so it lapses on its own if the watcher stops. A readable answer
+    // lifts it at once.
     let to_block = indexers_to_block(&checks, cycles.paused(), &blocked, config.denylist_after());
     if to_block.is_empty() {
         return;
     }
     if let Some(mut blocked) = db(
         "block indexers missing DIPs info",
-        registry.block_missing_dips_info(&to_block, config.interval.saturating_mul(3)),
+        registry.block_missing_dips_info(&to_block, block_duration(config.interval)),
     )
     .await
         && !blocked.is_empty()
@@ -176,6 +176,12 @@ async fn run_cycle<R: DipsInfoRegistry + Sync>(
              blocks them until they answer: IISA drops them and their agreements are replaced"
         );
     }
+}
+
+/// How long a block lasts unless renewed: 3 intervals, and at least 1 hour, so a slow cycle or a
+/// couple of failed ones don't let it lapse before the next renewal.
+fn block_duration(interval: Duration) -> Duration {
+    interval.saturating_mul(3).max(Duration::from_secs(3600))
 }
 
 /// The indexers to block after a recorded cycle: each missing its DIPs info for `limit` or
@@ -693,8 +699,11 @@ mod tests {
         /// The indexers blocked before the cycle.
         blocks: Vec<IndexerId>,
         recorded: Arc<std::sync::Mutex<Vec<Vec<IndexerId>>>>,
-        blocked: Arc<std::sync::Mutex<Vec<Vec<IndexerId>>>>,
+        blocked: Blocks,
     }
+
+    /// Each block call a stub registry got: the indexers and how long.
+    type Blocks = Arc<std::sync::Mutex<Vec<(Vec<IndexerId>, Duration)>>>;
 
     #[async_trait::async_trait]
     impl DipsInfoRegistry for StubRegistry {
@@ -720,9 +729,12 @@ mod tests {
         async fn block_missing_dips_info(
             &self,
             indexer_ids: &[IndexerId],
-            _duration: Duration,
+            duration: Duration,
         ) -> crate::registry::Result<Vec<IndexerId>> {
-            self.blocked.lock().unwrap().push(indexer_ids.to_vec());
+            self.blocked
+                .lock()
+                .unwrap()
+                .push((indexer_ids.to_vec(), duration));
             Ok(indexer_ids.to_vec())
         }
     }
@@ -863,7 +875,11 @@ mod tests {
         .await;
 
         //* Then
-        assert_eq!(*blocked.lock().unwrap(), vec![vec![unregistered]]);
+        assert_eq!(
+            *blocked.lock().unwrap(),
+            vec![(vec![unregistered], HOUR)],
+            "blocked for 1 hour, as 3 intervals of 5 minutes are less"
+        );
         assert!(logs.contains("dips_info_missing_denylisted"), "{logs}");
         assert!(logs.contains(&unregistered.to_string()), "{logs}");
     }
@@ -902,6 +918,16 @@ mod tests {
 
         //* Then
         assert_eq!(*recorded.lock().unwrap(), vec![vec![gone]], "still asked");
-        assert_eq!(*blocked.lock().unwrap(), vec![vec![gone]], "block renewed");
+        assert_eq!(
+            *blocked.lock().unwrap(),
+            vec![(vec![gone], HOUR)],
+            "block renewed"
+        );
+    }
+
+    #[test]
+    fn a_block_lasts_3_intervals_and_at_least_an_hour() {
+        assert_eq!(block_duration(Duration::from_secs(300)), HOUR);
+        assert_eq!(block_duration(2 * HOUR), 6 * HOUR);
     }
 }
