@@ -699,6 +699,9 @@ impl DipsInfoWatcherConfig {
         if self.interval.is_zero() {
             return Err("interval must be above 0".to_string());
         }
+        if self.request_timeout.is_zero() {
+            return Err("request_timeout must be above 0".to_string());
+        }
         if self.alert_after_hours == 0 {
             return Err("alert_after_hours must be above 0".to_string());
         }
@@ -2039,6 +2042,10 @@ mod tests {
         for bad in [
             DipsInfoWatcherConfig {
                 interval: Duration::ZERO,
+                ..enabled.clone()
+            },
+            DipsInfoWatcherConfig {
+                request_timeout: Duration::ZERO,
                 ..enabled.clone()
             },
             DipsInfoWatcherConfig {
