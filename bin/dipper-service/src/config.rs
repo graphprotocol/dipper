@@ -654,8 +654,8 @@ pub struct DipsInfoWatcherConfig {
     #[serde(default = "default_dips_info_watcher_alert_after_hours")]
     pub alert_after_hours: u32,
 
-    /// Hours an indexer may go without a readable answer before dipper denies it, so IISA drops
-    /// it and its agreements are replaced; must be above `alert_after_hours` (default: 48).
+    /// Hours an indexer may go without a readable answer before dipper blocks it, so IISA drops it
+    /// and its agreements are replaced; must be above `alert_after_hours` (default: 48).
     #[serde(default = "default_dips_info_watcher_denylist_after_hours")]
     pub denylist_after_hours: u32,
 
@@ -721,7 +721,7 @@ impl DipsInfoWatcherConfig {
         if self.denylist_after_hours <= self.alert_after_hours {
             return Err(format!(
                 "denylist_after_hours ({}) must be above alert_after_hours ({}), so an alert comes \
-                 before the denial",
+                 before the block",
                 self.denylist_after_hours, self.alert_after_hours
             ));
         }
@@ -742,7 +742,7 @@ impl DipsInfoWatcherConfig {
         Duration::from_secs(u64::from(self.alert_after_hours) * 3600)
     }
 
-    /// How long an indexer may go without a readable answer before dipper denies it.
+    /// How long an indexer may go without a readable answer before dipper blocks it.
     pub fn denylist_after(&self) -> Duration {
         Duration::from_secs(u64::from(self.denylist_after_hours) * 3600)
     }
