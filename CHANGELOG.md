@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.5](https://github.com/graphprotocol/dipper/compare/v0.2.4...v0.2.5) (2026-10-30)
+
+
+### CI/CD
+
+* trust the Postgres repo with a signed-by key, not apt-key ([#769](https://github.com/graphprotocol/dipper/issues/769)) ([24a8b50](https://github.com/graphprotocol/dipper/commit/24a8b50909864222bacbf10dad803b7464fe2a34))
+
 ## [0.2.4](https://github.com/graphprotocol/dipper/compare/v0.2.3...v0.2.4) (2026-10-27)
 
 
