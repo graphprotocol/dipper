@@ -81,7 +81,7 @@ where
                 _ = timer.tick() => {},
             }
             let now = Instant::now();
-            let elapsed = cycles.start(now, config.interval);
+            let elapsed = cycles.elapsed(now, config.interval);
 
             let indexers = match tokio::time::timeout(
                 DB_TIMEOUT,
@@ -125,6 +125,7 @@ where
                     continue;
                 }
             };
+            cycles.recorded(now);
             report(&checks, added, config.alert_after());
         }
 
@@ -138,11 +139,11 @@ where
 /// How often the pause alert repeats while counting stays paused.
 const PAUSE_ALERT_REPEAT: Duration = Duration::from_secs(6 * 3600);
 
-/// What the watcher remembers between cycles: when the last one started, and since when, and when
-/// last alerted on, counting has been paused because too many indexers gave no readable answer.
+/// What the watcher remembers between cycles: when the last recorded one started, and, while too
+/// many indexers giving no readable answer pause counting, since when and when last alerted on.
 #[derive(Default)]
 struct Cycles {
-    last_started: Option<Instant>,
+    last_recorded: Option<Instant>,
     paused_since: Option<Instant>,
     pause_alerted_at: Option<Instant>,
     /// Cycles in a row, while paused, with too few indexers missing to pause it.
@@ -150,14 +151,18 @@ struct Cycles {
 }
 
 impl Cycles {
-    /// Note a cycle starting, returning the time since the last one, at most 2 intervals so a
-    /// stall doesn't count as missing time. The first cycle after startup counts nothing.
-    fn start(&mut self, now: Instant, interval: Duration) -> Duration {
-        let elapsed = self
-            .last_started
-            .map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
-        self.last_started = Some(now);
-        elapsed.min(interval.saturating_mul(2))
+    /// The time since the last recorded cycle, at most 2 intervals so a stall doesn't count as
+    /// missing time. The first cycle after startup counts nothing.
+    fn elapsed(&self, now: Instant, interval: Duration) -> Duration {
+        self.last_recorded
+            .map_or(Duration::ZERO, |at| now.saturating_duration_since(at))
+            .min(interval.saturating_mul(2))
+    }
+
+    /// Note that the cycle started at `now` was recorded, so a cycle that fails before then
+    /// leaves its time to the next one.
+    fn recorded(&mut self, now: Instant) {
+        self.last_recorded = Some(now);
     }
 
     /// The missing time this cycle adds: none while so many of the indexers checked give no
@@ -414,18 +419,28 @@ mod tests {
     }
 
     #[test]
-    fn a_cycle_counts_the_time_since_the_last_up_to_2_intervals() {
+    fn a_cycle_counts_the_time_since_the_last_recorded_up_to_2_intervals() {
         let interval = Duration::from_secs(300);
         let start = Instant::now();
         let mut cycles = Cycles::default();
 
-        assert_eq!(cycles.start(start, interval), Duration::ZERO, "first cycle");
         assert_eq!(
-            cycles.start(start + Duration::from_secs(310), interval),
-            Duration::from_secs(310)
+            cycles.elapsed(start, interval),
+            Duration::ZERO,
+            "first cycle"
         );
+        cycles.recorded(start);
+        let failed = start + Duration::from_secs(300);
+        assert_eq!(cycles.elapsed(failed, interval), Duration::from_secs(300));
+        let next = start + Duration::from_secs(590);
         assert_eq!(
-            cycles.start(start + Duration::from_secs(5000), interval),
+            cycles.elapsed(next, interval),
+            Duration::from_secs(590),
+            "a cycle that failed to record leaves its time to the next"
+        );
+        cycles.recorded(next);
+        assert_eq!(
+            cycles.elapsed(next + Duration::from_secs(5000), interval),
             Duration::from_secs(600),
             "a stall counts as 2 intervals at most"
         );
