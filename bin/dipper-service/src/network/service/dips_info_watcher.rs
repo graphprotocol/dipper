@@ -2,7 +2,7 @@
 //! readable answer from its `/dips/info` endpoint, and alerts once that passes a limit. IISA keeps
 //! such an indexer in its group but can't score it, so nothing else would ever replace it.
 
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
 
 use thegraph_core::IndexerId;
 use tokio::{
@@ -232,6 +232,7 @@ impl Cycles {
     }
 
     /// Whether counting is paused.
+    #[cfg(test)]
     fn paused(&self) -> bool {
         self.paused_since.is_some()
     }
@@ -273,42 +274,65 @@ fn crossed(total: Duration, added: Duration, limit: Duration) -> bool {
     !added.is_zero() && total >= limit && total.saturating_sub(added) < limit
 }
 
-/// Ask each of `indexers` for its DIPs info, at most `max_concurrent` at a time, returning those
-/// that gave no readable answer.
+/// Ask each of `indexers` for its DIPs info, at its current URL in the network registry, at most
+/// `max_concurrent` at a time, returning those that gave no readable answer.
 async fn missing_dips_info(
     network: &NetworkProviderService,
     http_client: &reqwest::Client,
     indexers: &[IndexerId],
     max_concurrent: usize,
 ) -> Vec<IndexerId> {
-    let permits = Arc::new(Semaphore::new(max_concurrent.max(1)));
-    let mut asks = JoinSet::new();
-    for indexer_id in indexers {
-        let indexer_id = *indexer_id;
+    let asks = indexers.iter().map(|indexer_id| {
         let url = network
-            .get_indexer_by_id(&indexer_id)
+            .get_indexer_by_id(indexer_id)
             .map(|indexer| indexer.url);
         let http_client = http_client.clone();
-        let permits = permits.clone();
-        asks.spawn(async move {
-            let _permit = permits.acquire_owned().await;
-            let answer = match url {
+        let ask = async move {
+            match url {
                 Some(url) => ask_dips_info(&http_client, &url).await,
                 None => Err("not in the network registry".to_string()),
-            };
-            (indexer_id, answer)
+            }
+        };
+        (*indexer_id, ask)
+    });
+    missing_answers(asks, max_concurrent).await
+}
+
+/// Run each indexer's `ask`, at most `max_concurrent` at a time, returning the indexers whose ask
+/// failed. One that crashed counts as failed, so its indexer keeps its count rather than being
+/// forgotten as if it had answered.
+async fn missing_answers<A>(
+    asks: impl IntoIterator<Item = (IndexerId, A)>,
+    max_concurrent: usize,
+) -> Vec<IndexerId>
+where
+    A: Future<Output = Result<(), String>> + Send + 'static,
+{
+    let permits = Arc::new(Semaphore::new(max_concurrent.max(1)));
+    let mut tasks = JoinSet::new();
+    let mut asked_by_task = HashMap::new();
+    for (indexer_id, ask) in asks {
+        let permits = permits.clone();
+        let task = tasks.spawn(async move {
+            let _permit = permits.acquire_owned().await;
+            (indexer_id, ask.await)
         });
+        asked_by_task.insert(task.id(), indexer_id);
     }
 
     let mut missing = Vec::new();
-    while let Some(asked) = asks.join_next().await {
+    while let Some(asked) = tasks.join_next().await {
         match asked {
             Ok((_, Ok(()))) => {}
             Ok((indexer_id, Err(why))) => {
                 tracing::debug!(indexer_id = %indexer_id, why, "no readable DIPs info");
                 missing.push(indexer_id);
             }
-            Err(err) => tracing::error!(error = %err, "DIPs info check task failed"),
+            Err(err) => {
+                let indexer_id = asked_by_task.get(&err.id()).copied();
+                tracing::error!(error = %err, indexer_id = ?indexer_id, "DIPs info check failed");
+                missing.extend(indexer_id);
+            }
         }
     }
     missing
@@ -581,6 +605,22 @@ mod tests {
         let mut expected = vec![gone, invalid, unregistered];
         expected.sort();
         assert_eq!(missing, expected);
+    }
+
+    #[tokio::test]
+    async fn a_check_that_crashes_counts_its_indexer_as_missing() {
+        let answers = indexer_id!("1111111111111111111111111111111111111111");
+        let crashes = indexer_id!("2222222222222222222222222222222222222222");
+        let asks = [answers, crashes].map(|indexer_id| {
+            (indexer_id, async move {
+                assert_ne!(indexer_id, crashes, "the check crashes");
+                Ok(())
+            })
+        });
+
+        let missing = missing_answers(asks, 2).await;
+
+        assert_eq!(missing, vec![crashes]);
     }
 
     /// A registry holding a fixed set of agreement holders, recording each cycle it is given.
