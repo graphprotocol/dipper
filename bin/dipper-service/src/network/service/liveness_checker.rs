@@ -393,7 +393,7 @@ impl UnreachablePolicy {
 
 /// Cycles in a row that must see too few indexers unreachable to trip the breaker before it
 /// clears, so a share hovering around the trip fraction doesn't trip and clear it over and over.
-const UNREACHABLE_CLEAR_CYCLES: u32 = 3;
+pub(super) const UNREACHABLE_CLEAR_CYCLES: u32 = 3;
 
 /// How often the alert repeats while the breaker stays tripped.
 const UNREACHABLE_ALERT_REPEAT: time::Duration = time::Duration::hours(6);

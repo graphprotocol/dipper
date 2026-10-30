@@ -11,7 +11,7 @@ use tokio::{
     time::{Instant, MissedTickBehavior},
 };
 
-use super::liveness_checker::unreachable_trips;
+use super::liveness_checker::{UNREACHABLE_CLEAR_CYCLES, unreachable_trips};
 use crate::{
     config::DipsInfoWatcherConfig,
     network::provider::NetworkProviderService,
@@ -145,6 +145,8 @@ struct Cycles {
     last_started: Option<Instant>,
     paused_since: Option<Instant>,
     pause_alerted_at: Option<Instant>,
+    /// Cycles in a row, while paused, with too few indexers missing to pause it.
+    quiet_cycles: u32,
 }
 
 impl Cycles {
@@ -175,13 +177,24 @@ impl Cycles {
             config.unreachable_trip_fraction,
             config.unreachable_trip_min_indexers,
         );
-        if !trips {
-            if self.paused_since.take().is_some() {
+        // Clearing takes several calm cycles in a row, so a share hovering around the trip
+        // fraction doesn't pause and resume counting every cycle.
+        if trips {
+            self.quiet_cycles = 0;
+        } else if self.paused_since.is_some() {
+            self.quiet_cycles += 1;
+            if self.quiet_cycles >= UNREACHABLE_CLEAR_CYCLES {
+                self.paused_since = None;
+                self.quiet_cycles = 0;
                 tracing::info!(missing, checked, "Counting missing DIPs info again");
             }
-            return elapsed;
         }
-        let since = *self.paused_since.get_or_insert(now);
+        if trips {
+            self.paused_since.get_or_insert(now);
+        }
+        let Some(since) = self.paused_since else {
+            return elapsed;
+        };
         if self
             .pause_alerted_at
             .is_none_or(|at| at < since || now.saturating_duration_since(at) >= PAUSE_ALERT_REPEAT)
@@ -426,10 +439,22 @@ mod tests {
             "half missing"
         );
         assert!(cycles.paused());
+        for _ in 0..2 {
+            assert_eq!(
+                cycles.judge(4, 1, elapsed, now, &config),
+                Duration::ZERO,
+                "still paused until 3 calm cycles in a row"
+            );
+        }
+        assert_eq!(cycles.judge(4, 2, elapsed, now, &config), Duration::ZERO);
+        for _ in 0..2 {
+            cycles.judge(4, 1, elapsed, now, &config);
+        }
+        assert!(cycles.paused(), "a missing share back up starts the calm cycles again");
         assert_eq!(
             cycles.judge(4, 1, elapsed, now, &config),
             elapsed,
-            "counting resumes"
+            "counting resumes on the 3rd calm cycle"
         );
         assert!(!cycles.paused());
         assert_eq!(
