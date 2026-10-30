@@ -65,8 +65,6 @@ where
             "DIPs info watcher started"
         );
 
-        const DB_TIMEOUT: Duration = Duration::from_secs(30);
-
         let mut timer = tokio::time::interval(config.interval);
         timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let http_client = reqwest::Client::builder()
@@ -80,53 +78,12 @@ where
                 _ = rx_stop.recv() => break,
                 _ = timer.tick() => {},
             }
-            let now = Instant::now();
-            let elapsed = cycles.elapsed(now, config.interval);
-
-            let indexers = match tokio::time::timeout(
-                DB_TIMEOUT,
-                registry.get_indexers_with_accepted_agreements(),
-            )
-            .await
-            {
-                Ok(Ok(indexers)) => indexers,
-                Ok(Err(err)) => {
-                    tracing::error!(error = %err, "failed to query indexers with accepted agreements");
-                    continue;
-                }
-                Err(_) => {
-                    tracing::error!("timeout querying indexers with accepted agreements");
-                    continue;
-                }
-            };
-
-            let missing = missing_dips_info(
-                &network,
-                &http_client,
-                &indexers,
-                config.max_concurrent_requests,
-            )
-            .await;
-            let added = cycles.judge(indexers.len(), missing.len(), elapsed, now, &config);
-
-            let checks = match tokio::time::timeout(
-                DB_TIMEOUT,
-                registry.record_dips_info_checks(&missing, added),
-            )
-            .await
-            {
-                Ok(Ok(checks)) => checks,
-                Ok(Err(err)) => {
-                    tracing::error!(error = %err, "failed to record DIPs info checks");
-                    continue;
-                }
-                Err(_) => {
-                    tracing::error!("timeout recording DIPs info checks");
-                    continue;
-                }
-            };
-            cycles.recorded(now);
-            report(&checks, added, config.alert_after());
+            // A stop ends a cycle midway, dropping its requests before anything is recorded, so
+            // shutdown doesn't wait on slow indexers.
+            tokio::select! {
+                _ = rx_stop.recv() => break,
+                () = run_cycle(&registry, &network, &http_client, &mut cycles, &config) => {},
+            }
         }
 
         tracing::debug!("DIPs info watcher stopped");
@@ -134,6 +91,62 @@ where
     };
 
     (Handle { tx_stop }, service)
+}
+
+/// Run 1 cycle: ask every agreement holder for its DIPs info, record how long each without it has
+/// gone, and alert on any that reached the limit. A failed registry call ends the cycle early.
+async fn run_cycle<R: DipsInfoRegistry + Sync>(
+    registry: &R,
+    network: &NetworkProviderService,
+    http_client: &reqwest::Client,
+    cycles: &mut Cycles,
+    config: &DipsInfoWatcherConfig,
+) {
+    let now = Instant::now();
+    let elapsed = cycles.elapsed(now, config.interval);
+    let Some(indexers) = db(
+        "query indexers with accepted agreements",
+        registry.get_indexers_with_accepted_agreements(),
+    )
+    .await
+    else {
+        return;
+    };
+    let missing = missing_dips_info(
+        network,
+        http_client,
+        &indexers,
+        config.max_concurrent_requests,
+    )
+    .await;
+    let added = cycles.judge(indexers.len(), missing.len(), elapsed, now, config);
+    let Some(checks) = db(
+        "record DIPs info checks",
+        registry.record_dips_info_checks(&missing, added),
+    )
+    .await
+    else {
+        return;
+    };
+    cycles.recorded(now);
+    report(&checks, added, config.alert_after());
+}
+
+/// Run 1 registry call with a timeout, logging and returning nothing when it fails, so the cycle
+/// can end early; the next one tries again.
+async fn db<T>(what: &str, call: impl Future<Output = crate::registry::Result<T>>) -> Option<T> {
+    const DB_TIMEOUT: Duration = Duration::from_secs(30);
+    match tokio::time::timeout(DB_TIMEOUT, call).await {
+        Ok(Ok(value)) => Some(value),
+        Ok(Err(err)) => {
+            tracing::error!(error = %err, "failed to {what}");
+            None
+        }
+        Err(_) => {
+            tracing::error!("timeout trying to {what}");
+            None
+        }
+    }
 }
 
 /// How often the pause alert repeats while counting stays paused.
@@ -568,6 +581,78 @@ mod tests {
         let mut expected = vec![gone, invalid, unregistered];
         expected.sort();
         assert_eq!(missing, expected);
+    }
+
+    /// A registry holding a fixed set of agreement holders, recording each cycle it is given.
+    struct StubRegistry {
+        holders: Vec<IndexerId>,
+        recorded: Arc<std::sync::Mutex<Vec<Vec<IndexerId>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl DipsInfoRegistry for StubRegistry {
+        async fn get_indexers_with_accepted_agreements(
+            &self,
+        ) -> crate::registry::Result<Vec<IndexerId>> {
+            Ok(self.holders.clone())
+        }
+
+        async fn record_dips_info_checks(
+            &self,
+            missing: &[IndexerId],
+            _added: Duration,
+        ) -> crate::registry::Result<DipsInfoChecks> {
+            self.recorded.lock().unwrap().push(missing.to_vec());
+            Ok(DipsInfoChecks::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_ends_a_cycle_waiting_on_a_slow_indexer() {
+        //* Given
+        let slow = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/dips/info"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
+            .mount(&slow)
+            .await;
+        let indexer = indexer_id!("1111111111111111111111111111111111111111");
+        let snapshot: indexer_urls::Snapshot =
+            BTreeMap::from([(indexer, format!("{}/", slow.uri()).parse().unwrap())]);
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let registry = StubRegistry {
+            holders: vec![indexer],
+            recorded: recorded.clone(),
+        };
+        let (handle, service) = new(Ctx {
+            registry,
+            network: NetworkProviderService::new(indexer_urls::Handle::for_test(snapshot)),
+            config: DipsInfoWatcherConfig {
+                enabled: true,
+                request_timeout: Duration::from_secs(60),
+                ..DipsInfoWatcherConfig::default()
+            },
+        });
+        let task = tokio::spawn(service);
+        while slow
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        //* When
+        let stopped = tokio::time::timeout(Duration::from_secs(5), handle.stop()).await;
+
+        //* Then
+        assert!(stopped.is_ok(), "stop waited on the slow indexer");
+        assert!(task.await.unwrap().is_ok());
+        assert!(
+            recorded.lock().unwrap().is_empty(),
+            "the interrupted cycle recorded nothing"
+        );
     }
 
     #[tokio::test]
