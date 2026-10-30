@@ -344,7 +344,7 @@ async fn probe_indexer(
 
 /// Whether so many of a cycle's indexers are unreachable at once that the fault is likely
 /// dipper's own: at least `trip_fraction` of them, out of at least `min_indexers` checked.
-fn unreachable_trips(
+pub(super) fn unreachable_trips(
     checked: usize,
     unreachable: usize,
     trip_fraction: f64,
