@@ -159,10 +159,9 @@ async fn run_cycle<R: DipsInfoRegistry + Sync>(
     if to_block.is_empty() {
         return;
     }
-    let until = time::OffsetDateTime::now_utc() + config.interval.saturating_mul(3);
     if let Some(mut blocked) = db(
         "block indexers missing DIPs info",
-        registry.block_missing_dips_info(&to_block, until),
+        registry.block_missing_dips_info(&to_block, config.interval.saturating_mul(3)),
     )
     .await
         && !blocked.is_empty()
@@ -721,7 +720,7 @@ mod tests {
         async fn block_missing_dips_info(
             &self,
             indexer_ids: &[IndexerId],
-            _until: time::OffsetDateTime,
+            _duration: Duration,
         ) -> crate::registry::Result<Vec<IndexerId>> {
             self.blocked.lock().unwrap().push(indexer_ids.to_vec());
             Ok(indexer_ids.to_vec())

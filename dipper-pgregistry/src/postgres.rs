@@ -2288,19 +2288,19 @@ impl PgRegistry {
         Ok(rows.into_iter().map(|(id,)| id.0).collect())
     }
 
-    /// Block each of `indexer_ids`, still missing its DIPs info, until `until`. Returns those not
-    /// blocked before this. Only an indexer with a missing row can be blocked, so a readable
-    /// answer, which removes its row, lifts its block.
+    /// Block each of `indexer_ids`, still missing its DIPs info, for `for_secs` from the database's
+    /// clock. Returns those not blocked before this. Only an indexer with a missing row can be
+    /// blocked, so a readable answer, which removes its row, lifts its block.
     pub async fn block_missing_dips_info(
         &self,
         indexer_ids: &[IndexerId],
-        until: time::OffsetDateTime,
+        for_secs: i64,
     ) -> Result<Vec<IndexerId>, Error> {
         let pg_ids: Vec<PgIndexerId> = indexer_ids.iter().map(|id| PgIndexerId(*id)).collect();
         let rows: Vec<(PgIndexerId, bool)> = sqlx::query_as(
             r#"
             UPDATE dipper_indexer_dips_info_missing AS t
-            SET blocked_until = $2
+            SET blocked_until = timezone('UTC', now()) + $2::bigint * interval '1 second'
             FROM dipper_indexer_dips_info_missing AS was
             WHERE t.indexer_id = was.indexer_id AND t.indexer_id = ANY($1)
             RETURNING t.indexer_id,
@@ -2308,7 +2308,7 @@ impl PgRegistry {
             "#,
         )
         .bind(&pg_ids[..])
-        .bind(until)
+        .bind(for_secs)
         .fetch_all(&self.pool)
         .await?;
 

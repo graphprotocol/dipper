@@ -895,10 +895,11 @@ impl DipsInfoRegistry for RegistryProvider {
     async fn block_missing_dips_info(
         &self,
         indexer_ids: &[IndexerId],
-        until: time::OffsetDateTime,
+        duration: std::time::Duration,
     ) -> RegistryResult<Vec<IndexerId>> {
+        let for_secs = i64::try_from(duration.as_secs()).unwrap_or(i64::MAX);
         self.inner
-            .block_missing_dips_info(indexer_ids, until)
+            .block_missing_dips_info(indexer_ids, for_secs)
             .await
             .map_err(Into::into)
     }

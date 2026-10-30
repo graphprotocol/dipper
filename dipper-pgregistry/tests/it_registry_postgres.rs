@@ -1828,7 +1828,6 @@ async fn a_dips_info_block_denies_an_indexer_until_it_lapses_or_the_indexer_answ
     let blocked = indexer_id!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     let lapsed = indexer_id!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
     let answered = indexer_id!("cccccccccccccccccccccccccccccccccccccccc");
-    let now = time::OffsetDateTime::now_utc();
     registry
         .record_dips_info_checks(&[blocked, lapsed, answered], 48 * 3600)
         .await
@@ -1836,21 +1835,25 @@ async fn a_dips_info_block_denies_an_indexer_until_it_lapses_or_the_indexer_answ
 
     //* When
     let first = registry
-        .block_missing_dips_info(&[blocked, answered], now + time::Duration::minutes(15))
+        .block_missing_dips_info(&[blocked, answered], 900)
         .await
         .expect("Failed to block");
     let renewed = registry
-        .block_missing_dips_info(&[blocked], now + time::Duration::minutes(20))
+        .block_missing_dips_info(&[blocked], 1200)
         .await
         .expect("Failed to renew the block");
     registry
-        .block_missing_dips_info(&[lapsed], now - time::Duration::minutes(1))
+        .block_missing_dips_info(&[lapsed], 0)
         .await
         .expect("Failed to set a block already over");
     let while_missing = registry
         .get_indexer_denylist()
         .await
         .expect("Failed to get the denylist");
+    let blocks = registry
+        .get_dips_info_blocks()
+        .await
+        .expect("Failed to get the blocks");
     registry
         .record_dips_info_checks(&[blocked, lapsed], 300)
         .await
@@ -1860,7 +1863,7 @@ async fn a_dips_info_block_denies_an_indexer_until_it_lapses_or_the_indexer_answ
         .await
         .expect("Failed to get the denylist");
     let unknown = registry
-        .block_missing_dips_info(&[answered], now + time::Duration::minutes(15))
+        .block_missing_dips_info(&[answered], 900)
         .await
         .expect("Failed to block an indexer with no missing row");
 
@@ -1874,6 +1877,10 @@ async fn a_dips_info_block_denies_an_indexer_until_it_lapses_or_the_indexer_answ
         while_missing.into_iter().collect::<HashSet<_>>(),
         HashSet::from([blocked, answered]),
         "a block already over denies nobody"
+    );
+    assert_eq!(
+        blocks.into_iter().collect::<HashSet<_>>(),
+        HashSet::from([blocked, answered])
     );
     assert_eq!(
         after_answer,
