@@ -1862,6 +1862,10 @@ async fn a_dips_info_block_denies_an_indexer_until_it_lapses_or_the_indexer_answ
         .get_indexer_denylist()
         .await
         .expect("Failed to get the denylist");
+    let lapsed_renewed = registry
+        .block_missing_dips_info(&[lapsed], 900)
+        .await
+        .expect("Failed to renew a lapsed block");
     let unknown = registry
         .block_missing_dips_info(&[answered], 900)
         .await
@@ -1886,6 +1890,10 @@ async fn a_dips_info_block_denies_an_indexer_until_it_lapses_or_the_indexer_answ
         after_answer,
         vec![blocked],
         "answering removes the row and its block"
+    );
+    assert!(
+        lapsed_renewed.is_empty(),
+        "renewing a lapsed block isn't a new one either"
     );
     assert!(
         unknown.is_empty(),

@@ -2289,8 +2289,8 @@ impl PgRegistry {
     }
 
     /// Block each of `indexer_ids`, still missing its DIPs info, for `for_secs` from the database's
-    /// clock. Returns those not blocked before this. Only an indexer with a missing row can be
-    /// blocked, so a readable answer, which removes its row, lifts its block.
+    /// clock, returning those blocked for the 1st time since it went missing. A readable answer
+    /// removes the indexer's row, and with it the block.
     pub async fn block_missing_dips_info(
         &self,
         indexer_ids: &[IndexerId],
@@ -2303,8 +2303,7 @@ impl PgRegistry {
             SET blocked_until = timezone('UTC', now()) + $2::bigint * interval '1 second'
             FROM dipper_indexer_dips_info_missing AS was
             WHERE t.indexer_id = was.indexer_id AND t.indexer_id = ANY($1)
-            RETURNING t.indexer_id,
-                (was.blocked_until IS NULL OR was.blocked_until <= timezone('UTC', now()))
+            RETURNING t.indexer_id, was.blocked_until IS NULL
             "#,
         )
         .bind(&pg_ids[..])
