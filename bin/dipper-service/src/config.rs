@@ -662,9 +662,9 @@ pub struct DipsInfoWatcherConfig {
     #[serde(default = "default_dips_info_watcher_max_concurrent_requests")]
     pub max_concurrent_requests: usize,
 
-    /// Share of the indexers checked in a cycle that, when none of them answers readably, makes
-    /// the cycle count toward nobody's missing time, since so many points to a fault on dipper's
-    /// side or a release that changed the endpoint (default: 0.5).
+    /// Share of the indexers checked in a cycle that, giving no readable answer at once, pauses
+    /// counting missing time, since so many points to a fault on dipper's side or a release that
+    /// changed the endpoint (default: 0.5).
     #[serde(default = "default_liveness_checker_unreachable_trip_fraction")]
     pub unreachable_trip_fraction: f64,
 
