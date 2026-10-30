@@ -634,8 +634,8 @@ impl Default for LivenessCheckerConfig {
     }
 }
 
-/// Configuration for the DIPs info watcher, which alerts when an indexer holding an accepted
-/// agreement goes too long without a readable answer from its `/dips/info` endpoint.
+/// Configuration for the DIPs info watcher, which alerts on, then blocks, an indexer holding an
+/// accepted agreement that goes too long without a readable answer from its `/dips/info`.
 #[serde_as]
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
