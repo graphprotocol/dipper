@@ -103,6 +103,14 @@ pub struct RecordedEnd {
     pub canceled_tx: Option<String>,
 }
 
+/// What recording a cycle of DIPs info checks left, in seconds without a readable answer: each
+/// indexer still missing its DIPs info, and each one forgotten, with the time it had built up.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DipsInfoChecks {
+    pub missing: HashMap<IndexerId, i64>,
+    pub cleared: HashMap<IndexerId, i64>,
+}
+
 /// An announced end that a write replaced or cleared, so its `terminated` event goes out again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EndCorrection {
@@ -2194,6 +2202,72 @@ impl PgRegistry {
         .await?;
 
         Ok(rows.into_iter().map(|(id,)| id.0).collect())
+    }
+
+    // =========================================================================
+    // DIPs info watcher operations
+    // =========================================================================
+
+    /// Get every indexer holding at least 1 `AcceptedOnChain` agreement, each once.
+    pub async fn get_indexers_with_accepted_agreements(&self) -> Result<Vec<IndexerId>, Error> {
+        let rows: Vec<(PgIndexerId,)> = sqlx::query_as(
+            r#"
+            SELECT DISTINCT indexer_id
+            FROM dipper_reg_indexing_agreements
+            WHERE status = $1
+            "#,
+        )
+        .bind(IndexingAgreementStatus::AcceptedOnChain)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(|(id,)| id.0).collect())
+    }
+
+    /// Record 1 cycle of DIPs info checks: add `added_secs` to the time each of `missing` has
+    /// gone without a readable answer, and forget every other indexer, so a readable answer, or
+    /// no longer being checked, starts its count again from 0.
+    pub async fn record_dips_info_checks(
+        &self,
+        missing: &[IndexerId],
+        added_secs: i64,
+    ) -> Result<DipsInfoChecks, Error> {
+        let pg_missing: Vec<PgIndexerId> = missing.iter().map(|id| PgIndexerId(*id)).collect();
+        let mut tx = self.pool.begin().await?;
+
+        let cleared: Vec<(PgIndexerId, i64)> = sqlx::query_as(
+            r#"
+            DELETE FROM dipper_indexer_dips_info_missing
+            WHERE NOT (indexer_id = ANY($1))
+            RETURNING indexer_id, missing_secs
+            "#,
+        )
+        .bind(&pg_missing[..])
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let still_missing: Vec<(PgIndexerId, i64)> = sqlx::query_as(
+            r#"
+            INSERT INTO dipper_indexer_dips_info_missing (indexer_id, missing_secs)
+            SELECT indexer_id, $2 FROM unnest($1::bytea[]) AS t(indexer_id)
+            ON CONFLICT (indexer_id) DO UPDATE SET
+                missing_secs = dipper_indexer_dips_info_missing.missing_secs
+                    + EXCLUDED.missing_secs,
+                updated_at = timezone('UTC', now())
+            RETURNING indexer_id, missing_secs
+            "#,
+        )
+        .bind(&pg_missing[..])
+        .bind(added_secs)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        Ok(DipsInfoChecks {
+            missing: still_missing.into_iter().map(|(id, s)| (id.0, s)).collect(),
+            cleared: cleared.into_iter().map(|(id, s)| (id.0, s)).collect(),
+        })
     }
 
     // =========================================================================
