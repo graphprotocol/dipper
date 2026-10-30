@@ -70,6 +70,9 @@ pub struct Config {
     /// The liveness checker service configuration (detects silent agreement abandonment)
     #[serde(default)]
     pub liveness_checker: Option<LivenessCheckerConfig>,
+    /// The DIPs info watcher configuration (alerts on agreement holders missing DIPs info)
+    #[serde(default)]
+    pub dips_info_watcher: Option<DipsInfoWatcherConfig>,
     /// The escrow reconciler service configuration (runs only when this section is present)
     #[serde(default)]
     pub escrow_reconciler: Option<EscrowReconcilerConfig>,
@@ -141,6 +144,8 @@ impl Default for AlertsConfig {
                 "stale_agreement_uncancellable",
                 "liveness_abandonment_paused",
                 "iisa_request_rejected",
+                "dips_info_missing",
+                "dips_info_checks_paused",
             ]
             .map(str::to_owned)
             .to_vec(),
@@ -622,6 +627,113 @@ impl Default for LivenessCheckerConfig {
             max_tolerance_days: default_liveness_checker_max_tolerance_days(),
             request_timeout: default_liveness_checker_request_timeout(),
             batch_size: default_liveness_checker_batch_size(),
+            unreachable_trip_fraction: default_liveness_checker_unreachable_trip_fraction(),
+            unreachable_trip_min_indexers: default_liveness_checker_unreachable_trip_min_indexers(),
+        }
+    }
+}
+
+/// Configuration for the DIPs info watcher, which alerts when an indexer holding an accepted
+/// agreement goes too long without a readable answer from its `/dips/info` endpoint.
+#[serde_as]
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DipsInfoWatcherConfig {
+    /// Whether the DIPs info watcher is enabled (default: false).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Interval between checks in seconds (default: 300s / 5 min).
+    #[serde_as(as = "serde_with::DurationSeconds<u64>")]
+    #[serde(default = "default_dips_info_watcher_interval")]
+    pub interval: Duration,
+
+    /// Hours an indexer may go without a readable answer before the `dips_info_missing`
+    /// alert (default: 24).
+    #[serde(default = "default_dips_info_watcher_alert_after_hours")]
+    pub alert_after_hours: u32,
+
+    /// Timeout per `/dips/info` request in seconds (default: 10s).
+    #[serde_as(as = "serde_with::DurationSeconds<u64>")]
+    #[serde(default = "default_dips_info_watcher_request_timeout")]
+    pub request_timeout: Duration,
+
+    /// Most indexers asked at once (default: 16).
+    #[serde(default = "default_dips_info_watcher_max_concurrent_requests")]
+    pub max_concurrent_requests: usize,
+
+    /// Share of the indexers checked in a cycle that, giving no readable answer at once, pauses
+    /// counting missing time, since so many points to a fault on dipper's side or a release that
+    /// changed the endpoint (default: 0.5).
+    #[serde(default = "default_liveness_checker_unreachable_trip_fraction")]
+    pub unreachable_trip_fraction: f64,
+
+    /// Fewest indexers checked in a cycle for that share to count (default: 3).
+    #[serde(default = "default_liveness_checker_unreachable_trip_min_indexers")]
+    pub unreachable_trip_min_indexers: usize,
+}
+
+fn default_dips_info_watcher_interval() -> Duration {
+    Duration::from_secs(300)
+}
+
+fn default_dips_info_watcher_alert_after_hours() -> u32 {
+    24
+}
+
+fn default_dips_info_watcher_request_timeout() -> Duration {
+    Duration::from_secs(10)
+}
+
+fn default_dips_info_watcher_max_concurrent_requests() -> usize {
+    16
+}
+
+impl DipsInfoWatcherConfig {
+    /// Reject settings the watcher can't run with. A disabled watcher uses none of them, so only
+    /// an enabled one is checked.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.interval.is_zero() || self.interval > Duration::from_secs(24 * 3600) {
+            return Err(format!(
+                "interval ({}s) must be above 0 and at most 1 day",
+                self.interval.as_secs()
+            ));
+        }
+        if self.request_timeout.is_zero() {
+            return Err("request_timeout must be above 0".to_string());
+        }
+        if self.alert_after_hours == 0 {
+            return Err("alert_after_hours must be above 0".to_string());
+        }
+        if self.max_concurrent_requests == 0 {
+            return Err("max_concurrent_requests must be above 0".to_string());
+        }
+        let fraction = self.unreachable_trip_fraction;
+        if fraction.is_nan() || fraction <= 0.0 || fraction > 1.0 {
+            return Err(format!(
+                "unreachable_trip_fraction ({fraction}) must be above 0 and at most 1"
+            ));
+        }
+        Ok(())
+    }
+
+    /// How long an indexer may go without a readable answer before it is alerted on.
+    pub fn alert_after(&self) -> Duration {
+        Duration::from_secs(u64::from(self.alert_after_hours) * 3600)
+    }
+}
+
+impl Default for DipsInfoWatcherConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval: default_dips_info_watcher_interval(),
+            alert_after_hours: default_dips_info_watcher_alert_after_hours(),
+            request_timeout: default_dips_info_watcher_request_timeout(),
+            max_concurrent_requests: default_dips_info_watcher_max_concurrent_requests(),
             unreachable_trip_fraction: default_liveness_checker_unreachable_trip_fraction(),
             unreachable_trip_min_indexers: default_liveness_checker_unreachable_trip_min_indexers(),
         }
@@ -1911,6 +2023,65 @@ mod tests {
     }
 
     #[test]
+    fn dips_info_watcher_defaults_alert_after_a_day() {
+        let conf: DipsInfoWatcherConfig =
+            serde_json::from_str(r#"{"enabled": true}"#).expect("deserialization");
+
+        assert!(conf.validate().is_ok());
+        assert_eq!(conf.alert_after(), Duration::from_secs(24 * 3600));
+        assert_eq!(conf.interval, Duration::from_secs(300));
+        assert!(
+            !DipsInfoWatcherConfig::default().enabled,
+            "off until configured"
+        );
+    }
+
+    #[test]
+    fn dips_info_watcher_validate_rejects_settings_it_cannot_run_with() {
+        let enabled = DipsInfoWatcherConfig {
+            enabled: true,
+            ..DipsInfoWatcherConfig::default()
+        };
+        for bad in [
+            DipsInfoWatcherConfig {
+                interval: Duration::ZERO,
+                ..enabled.clone()
+            },
+            DipsInfoWatcherConfig {
+                interval: Duration::from_secs(24 * 3600 + 1),
+                ..enabled.clone()
+            },
+            DipsInfoWatcherConfig {
+                request_timeout: Duration::ZERO,
+                ..enabled.clone()
+            },
+            DipsInfoWatcherConfig {
+                alert_after_hours: 0,
+                ..enabled.clone()
+            },
+            DipsInfoWatcherConfig {
+                max_concurrent_requests: 0,
+                ..enabled.clone()
+            },
+            DipsInfoWatcherConfig {
+                unreachable_trip_fraction: f64::NAN,
+                ..enabled.clone()
+            },
+        ] {
+            assert!(bad.validate().is_err(), "{bad:?}");
+        }
+        let disabled = DipsInfoWatcherConfig {
+            enabled: false,
+            alert_after_hours: 0,
+            ..enabled
+        };
+        assert!(
+            disabled.validate().is_ok(),
+            "a disabled watcher uses none of it"
+        );
+    }
+
+    #[test]
     fn validate_rejects_a_duration_too_short_for_its_deadline() {
         // With a bounded duration the agreement must outlive the acceptance
         // deadline by min_seconds_per_collection + 600, so a collection fits
@@ -2480,6 +2651,7 @@ mod tests {
         assert_rejects::<ExpirationConfig>("expiration");
         assert_rejects::<EscrowReconcilerConfig>("escrow_reconciler");
         assert_rejects::<LivenessCheckerConfig>("liveness_checker");
+        assert_rejects::<DipsInfoWatcherConfig>("dips_info_watcher");
         assert_rejects::<IndexerClientConfig>("indexer_client");
         assert_rejects::<EventStreamingConfig>("event_streaming_config");
     }
