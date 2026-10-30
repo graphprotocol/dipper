@@ -696,8 +696,11 @@ impl DipsInfoWatcherConfig {
         if !self.enabled {
             return Ok(());
         }
-        if self.interval.is_zero() {
-            return Err("interval must be above 0".to_string());
+        if self.interval.is_zero() || self.interval > Duration::from_secs(24 * 3600) {
+            return Err(format!(
+                "interval ({}s) must be above 0 and at most 1 day",
+                self.interval.as_secs()
+            ));
         }
         if self.request_timeout.is_zero() {
             return Err("request_timeout must be above 0".to_string());
@@ -2042,6 +2045,10 @@ mod tests {
         for bad in [
             DipsInfoWatcherConfig {
                 interval: Duration::ZERO,
+                ..enabled.clone()
+            },
+            DipsInfoWatcherConfig {
+                interval: Duration::from_secs(24 * 3600 + 1),
                 ..enabled.clone()
             },
             DipsInfoWatcherConfig {

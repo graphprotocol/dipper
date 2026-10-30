@@ -865,6 +865,7 @@ impl DipsInfoRegistry for RegistryProvider {
         missing: &[IndexerId],
         added: std::time::Duration,
     ) -> RegistryResult<DipsInfoChecks> {
+        // The watcher adds at most 2 intervals, and its config keeps an interval to 1 day.
         let added_secs = i64::try_from(added.as_secs()).unwrap_or(i64::MAX);
         let checks = self
             .inner
