@@ -54,7 +54,8 @@ jobs:
       - run: cargo-machete
 
   test-rust:
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest moved to 26.04, which no longer ships apt-key for the Postgres repo.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
 
