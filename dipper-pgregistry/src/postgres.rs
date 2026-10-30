@@ -103,6 +103,11 @@ pub struct RecordedEnd {
     pub canceled_tx: Option<String>,
 }
 
+/// The `created_by` and `reason` of the denylist entries dipper adds itself for missing DIPs info,
+/// which let it lift its own entries without touching an operator's.
+const DIPS_INFO_DENIAL_CREATED_BY: &str = "dipper";
+const DIPS_INFO_DENIAL_REASON: &str = "dips_info_missing";
+
 /// What recording a cycle of DIPs info checks left, in seconds without a readable answer: each
 /// indexer still missing its DIPs info, and each one forgotten, with the time it had built up.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2268,6 +2273,72 @@ impl PgRegistry {
             missing: still_missing.into_iter().map(|(id, s)| (id.0, s)).collect(),
             cleared: cleared.into_iter().map(|(id, s)| (id.0, s)).collect(),
         })
+    }
+
+    /// Get the indexers dipper itself denied for missing DIPs info. An operator's entry for the
+    /// same indexer, or one that overwrote dipper's, is not among them.
+    pub async fn get_dips_info_denials(&self) -> Result<Vec<IndexerId>, Error> {
+        let rows: Vec<(PgIndexerId,)> = sqlx::query_as(
+            r#"
+            SELECT indexer_id
+            FROM dipper_indexer_denylist
+            WHERE created_by = $1 AND reason = $2
+            "#,
+        )
+        .bind(DIPS_INFO_DENIAL_CREATED_BY)
+        .bind(DIPS_INFO_DENIAL_REASON)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(|(id,)| id.0).collect())
+    }
+
+    /// Deny each of `indexer_ids` for missing DIPs info, leaving any existing entry as it is.
+    /// Returns the indexers this added.
+    pub async fn deny_for_missing_dips_info(
+        &self,
+        indexer_ids: &[IndexerId],
+    ) -> Result<Vec<IndexerId>, Error> {
+        let pg_ids: Vec<PgIndexerId> = indexer_ids.iter().map(|id| PgIndexerId(*id)).collect();
+        let rows: Vec<(PgIndexerId,)> = sqlx::query_as(
+            r#"
+            INSERT INTO dipper_indexer_denylist (indexer_id, reason, created_by, expires_at)
+            SELECT indexer_id, $2, $3, '3000-01-01'::timestamptz
+            FROM unnest($1::bytea[]) AS t(indexer_id)
+            ON CONFLICT (indexer_id) DO NOTHING
+            RETURNING indexer_id
+            "#,
+        )
+        .bind(&pg_ids[..])
+        .bind(DIPS_INFO_DENIAL_REASON)
+        .bind(DIPS_INFO_DENIAL_CREATED_BY)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(|(id,)| id.0).collect())
+    }
+
+    /// Remove dipper's own denials for missing DIPs info of `indexer_ids`, leaving operators'
+    /// entries alone. Returns the indexers this lifted.
+    pub async fn lift_dips_info_denials(
+        &self,
+        indexer_ids: &[IndexerId],
+    ) -> Result<Vec<IndexerId>, Error> {
+        let pg_ids: Vec<PgIndexerId> = indexer_ids.iter().map(|id| PgIndexerId(*id)).collect();
+        let rows: Vec<(PgIndexerId,)> = sqlx::query_as(
+            r#"
+            DELETE FROM dipper_indexer_denylist
+            WHERE indexer_id = ANY($1) AND created_by = $2 AND reason = $3
+            RETURNING indexer_id
+            "#,
+        )
+        .bind(&pg_ids[..])
+        .bind(DIPS_INFO_DENIAL_CREATED_BY)
+        .bind(DIPS_INFO_DENIAL_REASON)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(|(id,)| id.0).collect())
     }
 
     // =========================================================================

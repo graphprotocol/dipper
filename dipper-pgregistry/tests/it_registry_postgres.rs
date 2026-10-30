@@ -1820,6 +1820,64 @@ async fn record_dips_info_checks_with_no_indexer_missing_forgets_them_all() {
     );
 }
 
+#[tokio::test]
+async fn dips_info_denials_add_and_lift_only_dippers_own_entries() {
+    //* Given
+    let (db, _temp_db) = temp_registry_db().await;
+    let registry = PgRegistry::new(db.clone());
+    let operator_denied = indexer_id!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let missing = indexer_id!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    sqlx::query("INSERT INTO dipper_indexer_denylist (indexer_id, reason, created_by, expires_at) VALUES ($1, $2, $3, $4)")
+        .bind(operator_denied.as_slice())
+        .bind("Poor performance")
+        .bind("ops@example.com")
+        .bind(time::OffsetDateTime::parse("3000-01-01T00:00:00Z", &time::format_description::well_known::Rfc3339).unwrap())
+        .execute(&db)
+        .await
+        .expect("Failed to insert the operator's entry");
+
+    //* When
+    let added = registry
+        .deny_for_missing_dips_info(&[operator_denied, missing])
+        .await
+        .expect("Failed to deny");
+    let again = registry
+        .deny_for_missing_dips_info(&[missing])
+        .await
+        .expect("Failed to deny again");
+    let own = registry
+        .get_dips_info_denials()
+        .await
+        .expect("Failed to get dipper's denials");
+    let denied_while_missing = registry
+        .get_indexer_denylist()
+        .await
+        .expect("Failed to get the denylist");
+    let lifted = registry
+        .lift_dips_info_denials(&[operator_denied, missing])
+        .await
+        .expect("Failed to lift");
+    let denied_after = registry
+        .get_indexer_denylist()
+        .await
+        .expect("Failed to get the denylist");
+
+    //* Then
+    assert_eq!(added, vec![missing], "the operator's entry stays as it was");
+    assert!(again.is_empty(), "an indexer is denied once");
+    assert_eq!(own, vec![missing]);
+    assert_eq!(
+        denied_while_missing.into_iter().collect::<HashSet<_>>(),
+        HashSet::from([operator_denied, missing])
+    );
+    assert_eq!(lifted, vec![missing]);
+    assert_eq!(
+        denied_after,
+        vec![operator_denied],
+        "only dipper's own entry is lifted"
+    );
+}
+
 // =============================================================================
 // Liveness checker DB operation tests
 // =============================================================================
