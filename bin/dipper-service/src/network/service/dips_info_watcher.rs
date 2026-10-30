@@ -219,19 +219,25 @@ impl Cycles {
     }
 }
 
-/// Log what a recorded cycle means: an alert for each indexer whose missing time passed
-/// `alert_after` in it, and a note for each one that had been alerted on and has answered again.
+/// Log what a recorded cycle means: 1 alert naming every indexer whose missing time passed
+/// `alert_after` in it, since Slack posts 1 message per event in each throttle window and only
+/// counts the rest, and a note for each one that had been alerted on and has answered again.
 fn report(checks: &DipsInfoChecks, added: Duration, alert_after: Duration) {
-    for (indexer_id, missing) in &checks.missing {
-        if crossed(*missing, added, alert_after) {
-            tracing::warn!(
-                event = "dips_info_missing",
-                indexer_id = %indexer_id,
-                missing_hours = missing.as_secs() / 3600,
-                "Indexer holding an accepted agreement has given no readable /dips/info answer \
-                 for over missing_hours; IISA keeps it in its groups but can't score it"
-            );
-        }
+    let mut reached: Vec<String> = checks
+        .missing
+        .iter()
+        .filter(|(_, missing)| crossed(**missing, added, alert_after))
+        .map(|(indexer_id, _)| indexer_id.to_string())
+        .collect();
+    if !reached.is_empty() {
+        reached.sort();
+        tracing::warn!(
+            event = "dips_info_missing",
+            indexer_ids = reached.join(", "),
+            alert_after_hours = alert_after.as_secs() / 3600,
+            "Indexers holding an accepted agreement have given no readable /dips/info answer for \
+             alert_after_hours; IISA keeps them in their groups but can't score them"
+        );
     }
     for (indexer_id, missing) in &checks.cleared {
         if *missing >= alert_after {
@@ -450,7 +456,10 @@ mod tests {
         for _ in 0..2 {
             cycles.judge(4, 1, elapsed, now, &config);
         }
-        assert!(cycles.paused(), "a missing share back up starts the calm cycles again");
+        assert!(
+            cycles.paused(),
+            "a missing share back up starts the calm cycles again"
+        );
         assert_eq!(
             cycles.judge(4, 1, elapsed, now, &config),
             elapsed,
@@ -473,7 +482,13 @@ mod tests {
 
         let logs = crate::test_support::logged(async {
             for minutes in [0, 5, 10, 6 * 60 + 5] {
-                cycles.judge(4, 4, elapsed, start + Duration::from_secs(minutes * 60), &config);
+                cycles.judge(
+                    4,
+                    4,
+                    elapsed,
+                    start + Duration::from_secs(minutes * 60),
+                    &config,
+                );
             }
         })
         .await;
@@ -541,11 +556,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn report_alerts_once_an_indexer_reaches_the_limit() {
+    async fn report_alerts_once_naming_every_indexer_that_reached_the_limit() {
         let reached = indexer_id!("1111111111111111111111111111111111111111");
+        let also_reached = indexer_id!("3333333333333333333333333333333333333333");
         let short = indexer_id!("2222222222222222222222222222222222222222");
         let checks = DipsInfoChecks {
-            missing: HashMap::from([(reached, 24 * HOUR), (short, 23 * HOUR)]),
+            missing: HashMap::from([
+                (reached, 24 * HOUR),
+                (also_reached, 24 * HOUR),
+                (short, 23 * HOUR),
+            ]),
             cleared: HashMap::new(),
         };
 
@@ -553,6 +573,7 @@ mod tests {
 
         assert_eq!(logs.matches("dips_info_missing").count(), 1, "{logs}");
         assert!(logs.contains(&reached.to_string()), "{logs}");
+        assert!(logs.contains(&also_reached.to_string()), "{logs}");
         assert!(!logs.contains(&short.to_string()), "{logs}");
     }
 }
