@@ -2273,6 +2273,21 @@ impl PgRegistry {
         })
     }
 
+    /// Get the indexers the DIPs info watcher blocks now.
+    pub async fn get_dips_info_blocks(&self) -> Result<Vec<IndexerId>, Error> {
+        let rows: Vec<(PgIndexerId,)> = sqlx::query_as(
+            r#"
+            SELECT indexer_id
+            FROM dipper_indexer_dips_info_missing
+            WHERE blocked_until > timezone('UTC', now())
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(|(id,)| id.0).collect())
+    }
+
     /// Block each of `indexer_ids`, still missing its DIPs info, until `until`. Returns those not
     /// blocked before this. Only an indexer with a missing row can be blocked, so a readable
     /// answer, which removes its row, lifts its block.

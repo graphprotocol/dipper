@@ -888,6 +888,10 @@ impl DipsInfoRegistry for RegistryProvider {
         })
     }
 
+    async fn get_dips_info_blocks(&self) -> RegistryResult<Vec<IndexerId>> {
+        self.inner.get_dips_info_blocks().await.map_err(Into::into)
+    }
+
     async fn block_missing_dips_info(
         &self,
         indexer_ids: &[IndexerId],

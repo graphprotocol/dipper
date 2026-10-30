@@ -29,6 +29,9 @@ pub trait DipsInfoRegistry {
         added: Duration,
     ) -> RegistryResult<DipsInfoChecks>;
 
+    /// Get the indexers blocked now for missing their DIPs info too long.
+    async fn get_dips_info_blocks(&self) -> RegistryResult<Vec<IndexerId>>;
+
     /// Block each of `indexer_ids`, still missing its DIPs info, until `until`, which puts it on
     /// the denylist IISA gets. Returns those not blocked before this.
     async fn block_missing_dips_info(
