@@ -154,8 +154,8 @@ async fn run_cycle<R: DipsInfoRegistry + Sync>(
     report(&checks, added, config.alert_after());
 
     // A block lasts 3 intervals and each cycle renews it, so it lapses on its own if the watcher
-    // stops or counting pauses. A readable answer, or holding no agreement, lifts it at once.
-    let to_block = indexers_to_block(&checks, cycles.paused(), config.denylist_after());
+    // stops. A readable answer lifts it at once.
+    let to_block = indexers_to_block(&checks, cycles.paused(), &blocked, config.denylist_after());
     if to_block.is_empty() {
         return;
     }
@@ -180,19 +180,20 @@ async fn run_cycle<R: DipsInfoRegistry + Sync>(
 }
 
 /// The indexers to block after a recorded cycle: each missing its DIPs info for `limit` or
-/// longer, unless counting is paused.
-fn indexers_to_block(checks: &DipsInfoChecks, paused: bool, limit: Duration) -> Vec<IndexerId> {
-    if paused {
-        return Vec::new();
-    }
-    let mut to_block: Vec<IndexerId> = checks
+/// longer. While counting is paused only those already blocked are, so a fault on dipper's side
+/// neither blocks anyone new nor frees an indexer already found broken.
+fn indexers_to_block(
+    checks: &DipsInfoChecks,
+    paused: bool,
+    blocked: &[IndexerId],
+    limit: Duration,
+) -> Vec<IndexerId> {
+    checks
         .missing
         .iter()
-        .filter(|(_, missing)| **missing >= limit)
+        .filter(|(id, missing)| **missing >= limit && (!paused || blocked.contains(id)))
         .map(|(id, _)| *id)
-        .collect();
-    to_block.sort();
-    to_block
+        .collect()
 }
 
 /// Run 1 registry call with a timeout, logging and returning nothing when it fails, so the cycle
@@ -801,25 +802,31 @@ mod tests {
     }
 
     #[test]
-    fn indexers_to_block_are_those_missing_dips_info_for_the_limit_unless_paused() {
+    fn indexers_to_block_are_those_missing_dips_info_for_the_limit() {
         let at_limit = indexer_id!("1111111111111111111111111111111111111111");
         let short = indexer_id!("2222222222222222222222222222222222222222");
-        let past_limit = indexer_id!("3333333333333333333333333333333333333333");
+        let already_blocked = indexer_id!("3333333333333333333333333333333333333333");
         let checks = DipsInfoChecks {
             missing: HashMap::from([
                 (at_limit, 48 * HOUR),
                 (short, 47 * HOUR),
-                (past_limit, 60 * HOUR),
+                (already_blocked, 60 * HOUR),
             ]),
             cleared: HashMap::new(),
         };
+        let blocked = [already_blocked];
+        let to_block = |paused| {
+            indexers_to_block(&checks, paused, &blocked, 48 * HOUR)
+                .into_iter()
+                .collect::<HashSet<_>>()
+        };
 
+        assert_eq!(to_block(false), HashSet::from([at_limit, already_blocked]));
         assert_eq!(
-            indexers_to_block(&checks, false, 48 * HOUR),
-            vec![at_limit, past_limit],
-            "each cycle renews the block of one still past the limit"
+            to_block(true),
+            HashSet::from([already_blocked]),
+            "while paused, blocks are renewed but none added"
         );
-        assert!(indexers_to_block(&checks, true, 48 * HOUR).is_empty());
     }
 
     #[tokio::test]
