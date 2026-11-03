@@ -146,6 +146,7 @@ impl Default for AlertsConfig {
                 "iisa_request_rejected",
                 "dips_info_missing",
                 "dips_info_checks_paused",
+                "dips_info_missing_denylisted",
             ]
             .map(str::to_owned)
             .to_vec(),
@@ -633,8 +634,8 @@ impl Default for LivenessCheckerConfig {
     }
 }
 
-/// Configuration for the DIPs info watcher, which alerts when an indexer holding an accepted
-/// agreement goes too long without a readable answer from its `/dips/info` endpoint.
+/// Configuration for the DIPs info watcher, which alerts on, then blocks, an indexer holding an
+/// accepted agreement that goes too long without a readable answer from its `/dips/info`.
 #[serde_as]
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -652,6 +653,11 @@ pub struct DipsInfoWatcherConfig {
     /// alert (default: 24).
     #[serde(default = "default_dips_info_watcher_alert_after_hours")]
     pub alert_after_hours: u32,
+
+    /// Hours an indexer may go without a readable answer before dipper blocks it, so IISA drops it
+    /// and its agreements are replaced; must be above `alert_after_hours` (default: 48).
+    #[serde(default = "default_dips_info_watcher_denylist_after_hours")]
+    pub denylist_after_hours: u32,
 
     /// Timeout per `/dips/info` request in seconds (default: 10s).
     #[serde_as(as = "serde_with::DurationSeconds<u64>")]
@@ -681,6 +687,10 @@ fn default_dips_info_watcher_alert_after_hours() -> u32 {
     24
 }
 
+fn default_dips_info_watcher_denylist_after_hours() -> u32 {
+    48
+}
+
 fn default_dips_info_watcher_request_timeout() -> Duration {
     Duration::from_secs(10)
 }
@@ -708,6 +718,13 @@ impl DipsInfoWatcherConfig {
         if self.alert_after_hours == 0 {
             return Err("alert_after_hours must be above 0".to_string());
         }
+        if self.denylist_after_hours <= self.alert_after_hours {
+            return Err(format!(
+                "denylist_after_hours ({}) must be above alert_after_hours ({}), so an alert comes \
+                 before the block",
+                self.denylist_after_hours, self.alert_after_hours
+            ));
+        }
         if self.max_concurrent_requests == 0 {
             return Err("max_concurrent_requests must be above 0".to_string());
         }
@@ -724,6 +741,11 @@ impl DipsInfoWatcherConfig {
     pub fn alert_after(&self) -> Duration {
         Duration::from_secs(u64::from(self.alert_after_hours) * 3600)
     }
+
+    /// How long an indexer may go without a readable answer before dipper blocks it.
+    pub fn denylist_after(&self) -> Duration {
+        Duration::from_secs(u64::from(self.denylist_after_hours) * 3600)
+    }
 }
 
 impl Default for DipsInfoWatcherConfig {
@@ -732,6 +754,7 @@ impl Default for DipsInfoWatcherConfig {
             enabled: false,
             interval: default_dips_info_watcher_interval(),
             alert_after_hours: default_dips_info_watcher_alert_after_hours(),
+            denylist_after_hours: default_dips_info_watcher_denylist_after_hours(),
             request_timeout: default_dips_info_watcher_request_timeout(),
             max_concurrent_requests: default_dips_info_watcher_max_concurrent_requests(),
             unreachable_trip_fraction: default_liveness_checker_unreachable_trip_fraction(),
@@ -2029,6 +2052,7 @@ mod tests {
 
         assert!(conf.validate().is_ok());
         assert_eq!(conf.alert_after(), Duration::from_secs(24 * 3600));
+        assert_eq!(conf.denylist_after(), Duration::from_secs(48 * 3600));
         assert_eq!(conf.interval, Duration::from_secs(300));
         assert!(
             !DipsInfoWatcherConfig::default().enabled,
@@ -2057,6 +2081,11 @@ mod tests {
             },
             DipsInfoWatcherConfig {
                 alert_after_hours: 0,
+                ..enabled.clone()
+            },
+            DipsInfoWatcherConfig {
+                alert_after_hours: 48,
+                denylist_after_hours: 48,
                 ..enabled.clone()
             },
             DipsInfoWatcherConfig {

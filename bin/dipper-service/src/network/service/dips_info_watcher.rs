@@ -1,8 +1,13 @@
 //! DIPs info watcher: counts how long each indexer holding an accepted agreement goes without a
-//! readable answer from its `/dips/info` endpoint, and alerts once that passes a limit. IISA keeps
-//! such an indexer in its group but can't score it, so nothing else would ever replace it.
+//! readable answer from its `/dips/info` endpoint, alerts past 1 limit and blocks it past a 2nd, so
+//! IISA, which keeps but can't score such an indexer, drops it until it answers readably again.
 
-use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+    sync::Arc,
+    time::Duration,
+};
 
 use thegraph_core::IndexerId;
 use tokio::{
@@ -62,6 +67,7 @@ where
         tracing::info!(
             interval_secs = config.interval.as_secs(),
             alert_after_hours = config.alert_after_hours,
+            denylist_after_hours = config.denylist_after_hours,
             "DIPs info watcher started"
         );
 
@@ -93,8 +99,9 @@ where
     (Handle { tx_stop }, service)
 }
 
-/// Run 1 cycle: ask every agreement holder for its DIPs info, record how long each without it has
-/// gone, and alert on any that reached the limit. A failed registry call ends the cycle early.
+/// Run 1 cycle: ask every agreement holder, and every indexer still blocked, for its DIPs info,
+/// record how long each without it has gone, alert on those past the 1st limit and block those
+/// past the 2nd. A failed registry call ends the cycle early.
 async fn run_cycle<R: DipsInfoRegistry + Sync>(
     registry: &R,
     network: &NetworkProviderService,
@@ -104,7 +111,7 @@ async fn run_cycle<R: DipsInfoRegistry + Sync>(
 ) {
     let now = Instant::now();
     let elapsed = cycles.elapsed(now, config.interval);
-    let Some(indexers) = db(
+    let Some(holders) = db(
         "query indexers with accepted agreements",
         registry.get_indexers_with_accepted_agreements(),
     )
@@ -112,14 +119,29 @@ async fn run_cycle<R: DipsInfoRegistry + Sync>(
     else {
         return;
     };
+    let Some(blocked) = db("query DIPs info blocks", registry.get_dips_info_blocks()).await else {
+        return;
+    };
+    let holders: HashSet<IndexerId> = holders.into_iter().collect();
+
+    // A blocked indexer is asked even once its agreements are gone, so its block lasts until it
+    // answers, but only agreement holders count toward the share that pauses counting.
+    let checked: Vec<IndexerId> = holders
+        .iter()
+        .chain(&blocked)
+        .copied()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
     let missing = missing_dips_info(
         network,
         http_client,
-        &indexers,
+        &checked,
         config.max_concurrent_requests,
     )
     .await;
-    let added = cycles.judge(indexers.len(), missing.len(), elapsed, now, config);
+    let missing_holders = missing.iter().filter(|id| holders.contains(id)).count();
+    let added = cycles.judge(holders.len(), missing_holders, elapsed, now, config);
     let Some(checks) = db(
         "record DIPs info checks",
         registry.record_dips_info_checks(&missing, added),
@@ -130,6 +152,53 @@ async fn run_cycle<R: DipsInfoRegistry + Sync>(
     };
     cycles.recorded(now);
     report(&checks, added, config.alert_after());
+
+    // Each cycle renews a block, so it lapses on its own if the watcher stops. A readable answer
+    // lifts it at once.
+    let to_block = indexers_to_block(&checks, cycles.paused(), &blocked, config.denylist_after());
+    if to_block.is_empty() {
+        return;
+    }
+    if let Some(mut blocked) = db(
+        "block indexers missing DIPs info",
+        registry.block_missing_dips_info(&to_block, block_duration(config.interval)),
+    )
+    .await
+        && !blocked.is_empty()
+    {
+        blocked.sort();
+        let indexer_ids: Vec<String> = blocked.iter().map(ToString::to_string).collect();
+        tracing::warn!(
+            event = "dips_info_missing_denylisted",
+            indexer_ids = indexer_ids.join(", "),
+            denylist_after_hours = config.denylist_after_hours,
+            "Indexers gave no readable /dips/info answer for denylist_after_hours, so dipper \
+             blocks them until they answer: IISA drops them and their agreements are replaced"
+        );
+    }
+}
+
+/// How long a block lasts unless renewed: 3 intervals, and at least 1 hour, so a slow cycle or a
+/// couple of failed ones don't let it lapse before the next renewal.
+fn block_duration(interval: Duration) -> Duration {
+    interval.saturating_mul(3).max(Duration::from_secs(3600))
+}
+
+/// The indexers to block after a recorded cycle: each missing its DIPs info for `limit` or
+/// longer. While counting is paused only those already blocked are, so a fault on dipper's side
+/// neither blocks anyone new nor frees an indexer already found broken.
+fn indexers_to_block(
+    checks: &DipsInfoChecks,
+    paused: bool,
+    blocked: &[IndexerId],
+    limit: Duration,
+) -> Vec<IndexerId> {
+    checks
+        .missing
+        .iter()
+        .filter(|(id, missing)| **missing >= limit && (!paused || blocked.contains(id)))
+        .map(|(id, _)| *id)
+        .collect()
 }
 
 /// Run 1 registry call with a timeout, logging and returning nothing when it fails, so the cycle
@@ -232,7 +301,6 @@ impl Cycles {
     }
 
     /// Whether counting is paused.
-    #[cfg(test)]
     fn paused(&self) -> bool {
         self.paused_since.is_some()
     }
@@ -626,8 +694,16 @@ mod tests {
     /// A registry holding a fixed set of agreement holders, recording each cycle it is given.
     struct StubRegistry {
         holders: Vec<IndexerId>,
+        /// What recording a cycle returns.
+        checks: DipsInfoChecks,
+        /// The indexers blocked before the cycle.
+        blocks: Vec<IndexerId>,
         recorded: Arc<std::sync::Mutex<Vec<Vec<IndexerId>>>>,
+        blocked: Blocks,
     }
+
+    /// Each block call a stub registry got: the indexers and how long.
+    type Blocks = Arc<std::sync::Mutex<Vec<(Vec<IndexerId>, Duration)>>>;
 
     #[async_trait::async_trait]
     impl DipsInfoRegistry for StubRegistry {
@@ -643,7 +719,23 @@ mod tests {
             _added: Duration,
         ) -> crate::registry::Result<DipsInfoChecks> {
             self.recorded.lock().unwrap().push(missing.to_vec());
-            Ok(DipsInfoChecks::default())
+            Ok(self.checks.clone())
+        }
+
+        async fn get_dips_info_blocks(&self) -> crate::registry::Result<Vec<IndexerId>> {
+            Ok(self.blocks.clone())
+        }
+
+        async fn block_missing_dips_info(
+            &self,
+            indexer_ids: &[IndexerId],
+            duration: Duration,
+        ) -> crate::registry::Result<Vec<IndexerId>> {
+            self.blocked
+                .lock()
+                .unwrap()
+                .push((indexer_ids.to_vec(), duration));
+            Ok(indexer_ids.to_vec())
         }
     }
 
@@ -662,7 +754,10 @@ mod tests {
         let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
         let registry = StubRegistry {
             holders: vec![indexer],
+            checks: DipsInfoChecks::default(),
+            blocks: Vec::new(),
             recorded: recorded.clone(),
+            blocked: Arc::default(),
         };
         let (handle, service) = new(Ctx {
             registry,
@@ -715,5 +810,124 @@ mod tests {
         assert!(logs.contains(&reached.to_string()), "{logs}");
         assert!(logs.contains(&also_reached.to_string()), "{logs}");
         assert!(!logs.contains(&short.to_string()), "{logs}");
+    }
+
+    #[test]
+    fn indexers_to_block_are_those_missing_dips_info_for_the_limit() {
+        let at_limit = indexer_id!("1111111111111111111111111111111111111111");
+        let short = indexer_id!("2222222222222222222222222222222222222222");
+        let already_blocked = indexer_id!("3333333333333333333333333333333333333333");
+        let checks = DipsInfoChecks {
+            missing: HashMap::from([
+                (at_limit, 48 * HOUR),
+                (short, 47 * HOUR),
+                (already_blocked, 60 * HOUR),
+            ]),
+            cleared: HashMap::new(),
+        };
+        let blocked = [already_blocked];
+        let to_block = |paused| {
+            indexers_to_block(&checks, paused, &blocked, 48 * HOUR)
+                .into_iter()
+                .collect::<HashSet<_>>()
+        };
+
+        assert_eq!(to_block(false), HashSet::from([at_limit, already_blocked]));
+        assert_eq!(
+            to_block(true),
+            HashSet::from([already_blocked]),
+            "while paused, blocks are renewed but none added"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cycle_blocks_a_holder_missing_dips_info_past_the_limit() {
+        //* Given
+        let unregistered = indexer_id!("1111111111111111111111111111111111111111");
+        let blocked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let registry = StubRegistry {
+            holders: vec![unregistered],
+            checks: DipsInfoChecks {
+                missing: HashMap::from([(unregistered, 48 * HOUR)]),
+                cleared: HashMap::new(),
+            },
+            blocks: Vec::new(),
+            recorded: Arc::default(),
+            blocked: blocked.clone(),
+        };
+        let network = NetworkProviderService::new(indexer_urls::Handle::for_test(BTreeMap::new()));
+        let config = DipsInfoWatcherConfig {
+            enabled: true,
+            ..DipsInfoWatcherConfig::default()
+        };
+
+        //* When
+        let logs = crate::test_support::logged(async {
+            run_cycle(
+                &registry,
+                &network,
+                &reqwest::Client::new(),
+                &mut Cycles::default(),
+                &config,
+            )
+            .await;
+        })
+        .await;
+
+        //* Then
+        assert_eq!(
+            *blocked.lock().unwrap(),
+            vec![(vec![unregistered], HOUR)],
+            "blocked for 1 hour, as 3 intervals of 5 minutes are less"
+        );
+        assert!(logs.contains("dips_info_missing_denylisted"), "{logs}");
+        assert!(logs.contains(&unregistered.to_string()), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn a_blocked_indexer_holding_no_agreement_is_asked_until_it_answers() {
+        //* Given
+        let gone = indexer_id!("2222222222222222222222222222222222222222");
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let blocked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let registry = StubRegistry {
+            holders: Vec::new(),
+            checks: DipsInfoChecks {
+                missing: HashMap::from([(gone, 60 * HOUR)]),
+                cleared: HashMap::new(),
+            },
+            blocks: vec![gone],
+            recorded: recorded.clone(),
+            blocked: blocked.clone(),
+        };
+        let network = NetworkProviderService::new(indexer_urls::Handle::for_test(BTreeMap::new()));
+        let config = DipsInfoWatcherConfig {
+            enabled: true,
+            ..DipsInfoWatcherConfig::default()
+        };
+
+        //* When
+        run_cycle(
+            &registry,
+            &network,
+            &reqwest::Client::new(),
+            &mut Cycles::default(),
+            &config,
+        )
+        .await;
+
+        //* Then
+        assert_eq!(*recorded.lock().unwrap(), vec![vec![gone]], "still asked");
+        assert_eq!(
+            *blocked.lock().unwrap(),
+            vec![(vec![gone], HOUR)],
+            "block renewed"
+        );
+    }
+
+    #[test]
+    fn a_block_lasts_3_intervals_and_at_least_an_hour() {
+        assert_eq!(block_duration(Duration::from_secs(300)), HOUR);
+        assert_eq!(block_duration(2 * HOUR), 6 * HOUR);
     }
 }
