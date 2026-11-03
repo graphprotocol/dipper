@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.5](https://github.com/graphprotocol/dipper/compare/v0.2.4...v0.2.5) (2026-11-03)
+
+
+### Added
+
+* alert when an agreement holder's DIPs info stays down ([#767](https://github.com/graphprotocol/dipper/issues/767)) ([0ad4808](https://github.com/graphprotocol/dipper/commit/0ad4808fb05e4ca8641795db188ee88b7b79e6d5))
+* deny an indexer whose DIPs info stays down for 48 hours ([#768](https://github.com/graphprotocol/dipper/issues/768)) ([4aed6b7](https://github.com/graphprotocol/dipper/commit/4aed6b707515f5ce76fc55666537ee9ed374e3ba))
+
+
+### CI/CD
+
+* trust the Postgres repo with a signed-by key, not apt-key ([#769](https://github.com/graphprotocol/dipper/issues/769)) ([24a8b50](https://github.com/graphprotocol/dipper/commit/24a8b50909864222bacbf10dad803b7464fe2a34))
+
 ## [0.2.4](https://github.com/graphprotocol/dipper/compare/v0.2.3...v0.2.4) (2026-10-27)
 
 
