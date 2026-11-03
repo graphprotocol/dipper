@@ -1,6 +1,6 @@
 #![cfg(feature = "fake")]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use dipper_core::ids::{IndexingAgreementId, IndexingRequestId};
 use dipper_pgregistry::{
@@ -1707,6 +1707,117 @@ async fn get_open_indexing_requests_for_reassessment_zero_batch_returns_all() {
 
     //* Then
     assert_eq!(requests.len(), 3, "Expected all 3 eligible requests");
+}
+
+// =============================================================================
+// DIPs info watcher DB operation tests
+// =============================================================================
+
+#[tokio::test]
+async fn get_indexers_with_accepted_agreements_lists_each_holder_once() {
+    //* Given
+    let (db, _temp_db) = temp_registry_db().await;
+    run_fixture(
+        &db,
+        include_str!("fixtures/0003_multi_indexer_agreements.sql"),
+    )
+    .await
+    .expect("Failed to run fixture");
+    // Indexer 0x1111 holds 2 accepted agreements and indexer 0x2222 holds 1; indexer 0x3333's
+    // only agreement expired.
+    run_fixture(
+        &db,
+        r#"
+        UPDATE dipper_reg_indexing_agreements SET status = 6
+        WHERE id IN ('\xaa000000000000000000000000000001'::bytea,
+                     '\xbb000000000000000000000000000001'::bytea);
+        "#,
+    )
+    .await
+    .expect("Failed to set up accepted agreements");
+    let registry = PgRegistry::new(db);
+
+    //* When
+    let indexers: HashSet<IndexerId> = registry
+        .get_indexers_with_accepted_agreements()
+        .await
+        .expect("Failed to get indexers with accepted agreements")
+        .into_iter()
+        .collect();
+
+    //* Then
+    assert_eq!(
+        indexers,
+        HashSet::from([
+            indexer_id!("1111111111111111111111111111111111111111"),
+            indexer_id!("2222222222222222222222222222222222222222"),
+        ])
+    );
+}
+
+#[tokio::test]
+async fn record_dips_info_checks_adds_up_missing_time_until_an_indexer_answers() {
+    //* Given
+    let (db, _temp_db) = temp_registry_db().await;
+    let registry = PgRegistry::new(db);
+    let indexer_a = indexer_id!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let indexer_b = indexer_id!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+    //* When
+    registry
+        .record_dips_info_checks(&[indexer_a, indexer_b], 300)
+        .await
+        .expect("Failed to record first cycle");
+    let second = registry
+        .record_dips_info_checks(&[indexer_a, indexer_b], 600)
+        .await
+        .expect("Failed to record second cycle");
+    let third = registry
+        .record_dips_info_checks(&[indexer_a], 300)
+        .await
+        .expect("Failed to record third cycle");
+
+    //* Then
+    assert_eq!(second.missing.get(&indexer_a), Some(&900));
+    assert_eq!(second.missing.get(&indexer_b), Some(&900));
+    assert!(second.cleared.is_empty());
+    assert_eq!(third.missing, HashMap::from([(indexer_a, 1200)]));
+    assert_eq!(
+        third.cleared,
+        HashMap::from([(indexer_b, 900)]),
+        "indexer B answered, so its count is forgotten"
+    );
+}
+
+#[tokio::test]
+async fn record_dips_info_checks_with_no_indexer_missing_forgets_them_all() {
+    //* Given
+    let (db, _temp_db) = temp_registry_db().await;
+    let registry = PgRegistry::new(db);
+    let indexer_a = indexer_id!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    registry
+        .record_dips_info_checks(&[indexer_a], 300)
+        .await
+        .expect("Failed to record first cycle");
+
+    //* When
+    let checks = registry
+        .record_dips_info_checks(&[], 300)
+        .await
+        .expect("Failed to record second cycle");
+    let after = registry
+        .record_dips_info_checks(&[indexer_a], 0)
+        .await
+        .expect("Failed to record third cycle");
+
+    //* Then
+    assert!(checks.missing.is_empty());
+    assert_eq!(checks.cleared, HashMap::from([(indexer_a, 300)]));
+    assert_eq!(
+        after.missing,
+        HashMap::from([(indexer_a, 0)]),
+        "a forgotten indexer starts again from 0"
+    );
 }
 
 // =============================================================================

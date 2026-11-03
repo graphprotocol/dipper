@@ -1,6 +1,7 @@
 mod agreement;
 #[cfg(test)]
 mod agreement_stub;
+mod dips_info;
 mod indexer_denylist;
 mod indexing_request;
 mod pending_cancellation;
@@ -28,6 +29,7 @@ pub use self::{
         Status as IndexingAgreementStatus, Terms as IndexingAgreementTerms,
         TermsMetadata as IndexingAgreementTermsMetadata,
     },
+    dips_info::{DipsInfoChecks, DipsInfoRegistry},
     indexer_denylist::IndexerDenylistRegistry,
     indexing_request::{
         IndexingRequest, IndexingRequestRegistry, SetTargetOutcome, Status as IndexingRequestStatus,
@@ -846,6 +848,44 @@ impl AgreementRegistry for RegistryProvider {
 impl IndexerDenylistRegistry for RegistryProvider {
     async fn get_indexer_denylist(&self) -> RegistryResult<Vec<IndexerId>> {
         self.inner.get_indexer_denylist().await.map_err(Into::into)
+    }
+}
+
+#[async_trait]
+impl DipsInfoRegistry for RegistryProvider {
+    async fn get_indexers_with_accepted_agreements(&self) -> RegistryResult<Vec<IndexerId>> {
+        self.inner
+            .get_indexers_with_accepted_agreements()
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn record_dips_info_checks(
+        &self,
+        missing: &[IndexerId],
+        added: std::time::Duration,
+    ) -> RegistryResult<DipsInfoChecks> {
+        // The watcher adds at most 2 intervals, and its config keeps an interval to 1 day.
+        let added_secs = i64::try_from(added.as_secs()).unwrap_or(i64::MAX);
+        let checks = self
+            .inner
+            .record_dips_info_checks(missing, added_secs)
+            .await?;
+        let to_durations = |times: std::collections::HashMap<IndexerId, i64>| {
+            times
+                .into_iter()
+                .map(|(id, secs)| {
+                    (
+                        id,
+                        std::time::Duration::from_secs(secs.max(0).unsigned_abs()),
+                    )
+                })
+                .collect()
+        };
+        Ok(DipsInfoChecks {
+            missing: to_durations(checks.missing),
+            cleared: to_durations(checks.cleared),
+        })
     }
 }
 

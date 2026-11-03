@@ -111,6 +111,11 @@ pub async fn main() -> anyhow::Result<()> {
     {
         anyhow::bail!("invalid liveness checker config: {err}");
     }
+    if let Some(watcher_conf) = &conf.dips_info_watcher
+        && let Err(err) = watcher_conf.validate()
+    {
+        anyhow::bail!("invalid DIPs info watcher config: {err}");
+    }
 
     // TODO: Decouple the config file format from the internal representation
     let (agreement_conf, pricing_table) = conf.dips.into();
@@ -587,6 +592,20 @@ pub async fn main() -> anyhow::Result<()> {
         _ => None,
     };
 
+    //- The DIPs info watcher (optional, enabled by config)
+    // Alerts on agreement holders whose /dips/info stays unreadable, which IISA can't score
+    let dips_info_watcher_handle = match conf.dips_info_watcher {
+        Some(ref watcher_conf) if watcher_conf.enabled => {
+            let ctx = network::service::dips_info_watcher::Ctx {
+                registry: registry.clone(),
+                network: network_provider.clone(),
+                config: watcher_conf.clone(),
+            };
+            Some(network::service::dips_info_watcher::new(ctx))
+        }
+        _ => None,
+    };
+
     //- The escrow reconciler service (AgreementManager mode only)
     // Reclaims orphaned manager-owned escrow the indexer has no reason to touch.
     let escrow_reconciler_handle = if network::service::escrow_reconciler::should_run(
@@ -698,6 +717,15 @@ pub async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Spawn the DIPs info watcher if enabled
+    let dips_info_watcher_stop_handle = if let Some((handle, service)) = dips_info_watcher_handle {
+        let task_handle = task_tree.spawn(service);
+        tracing::debug!(task_id=%task_handle.id(), "DIPs info watcher started");
+        Some(handle)
+    } else {
+        None
+    };
+
     // Spawn the chain listener service if enabled
     let chain_listener_stop_handle = if let Some((handle, service)) = chain_listener_handle {
         let task_handle = task_tree.spawn(service);
@@ -783,6 +811,10 @@ pub async fn main() -> anyhow::Result<()> {
         // Stop liveness checker service before worker (it depends on worker queue)
         if let Some(handle) = liveness_checker_stop_handle {
             all_stopped &= stop_service("Liveness checker", handle.stop()).await;
+        }
+
+        if let Some(handle) = dips_info_watcher_stop_handle {
+            all_stopped &= stop_service("DIPs info watcher", handle.stop()).await;
         }
 
         // Stop chain listener service before worker (it depends on worker queue)

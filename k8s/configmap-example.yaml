@@ -103,6 +103,15 @@ data:
         "unreachable_trip_fraction": 0.5,
         "unreachable_trip_min_indexers": 3
       },
+      "dips_info_watcher": {
+        "enabled": true,
+        "interval": 300,
+        "alert_after_hours": 24,
+        "request_timeout": 10,
+        "max_concurrent_requests": 16,
+        "unreachable_trip_fraction": 0.5,
+        "unreachable_trip_min_indexers": 3
+      },
       "chain_client": {
         "enabled": true,
         "providers": [
