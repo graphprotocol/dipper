@@ -734,14 +734,13 @@ where
                 );
                 Some(cached_ts)
             }
-            (Some(new_ts), Some(cached_ts)) => Some(apply_chain_ts_drift_cap(
+            (Some(new_ts), cached_ts) => Some(apply_chain_ts_drift_cap(
                 new_ts,
-                cached_ts,
+                cached_ts.unwrap_or(0),
                 dipper_core::time::now_secs(),
                 chain_ts_drift_tolerance_secs,
                 bypass_chain_clock_defenses,
             )),
-            (Some(new_ts), None) => Some(new_ts),
             (None, _) => *last_persisted_timestamp,
         };
 
@@ -4783,6 +4782,55 @@ mod tests {
             result,
             now + 50,
             "the persisted value must not go backwards"
+        );
+    }
+
+    /// The first timestamp ever saved is held to the wall clock too, so a subgraph
+    /// that answers a fresh database with a future time can't expire agreements early.
+    #[tokio::test]
+    async fn test_chain_ts_first_save_capped_against_wall_clock() {
+        let registry = MockRegistry::new();
+        let chain_client = MockChainClient::default();
+        let event_source = super::super::chain_events::mock::MockEventSource::new();
+        let now = dipper_core::time::now_secs();
+
+        event_source.set_latest_block(100);
+        event_source.set_latest_block_timestamp(Some(now + 55));
+
+        let mut cursor = Cursor::genesis();
+        let mut last_persisted_timestamp: Option<u64> = None;
+        let mut last_subgraph_head: u64 = 0;
+        let mut stall_count: u32 = 0;
+        let mut consecutive_failures: u32 = 0;
+        let (_tx_stop, mut rx_stop) = mpsc::channel::<()>(1);
+        let mut live_checks = LiveChecks::new(MockWorkerQueue::default());
+
+        drain_once(
+            &mut cursor,
+            &mut None,
+            &mut last_persisted_timestamp,
+            &mut last_subgraph_head,
+            &mut stall_count,
+            &mut consecutive_failures,
+            1337,
+            0,
+            10,
+            false,
+            &registry,
+            &chain_client,
+            &mut live_checks,
+            &event_source,
+            &mut rx_stop,
+            test_agreement_conf().as_ref(),
+        )
+        .await
+        .expect("poll must succeed");
+
+        let persisted = last_persisted_timestamp.expect("must be set");
+        let latest_allowed = dipper_core::time::now_secs() + 10;
+        assert!(
+            persisted <= latest_allowed,
+            "persisted {persisted} is past the wall clock bound {latest_allowed}"
         );
     }
 
