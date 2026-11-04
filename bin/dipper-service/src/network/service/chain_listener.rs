@@ -61,7 +61,7 @@ use crate::{
     worker::service::{ChainAccept, JobPriority, WorkerQueue},
 };
 
-/// Idle interval used when no `Created` agreements are awaiting acceptance.
+/// Idle interval used when no agreement is `Created` or `AcceptedOnChain`.
 const SLOW_POLL_INTERVAL: Duration = Duration::from_secs(300);
 /// How often the heartbeat info-line fires while idle. ~5 min at the fast
 /// rate, every poll at the slow rate.
@@ -277,8 +277,8 @@ where
                 }
             };
 
-        // Adaptive polling: fast (config.poll_interval) when Created
-        // agreements exist, slow (`SLOW_POLL_INTERVAL`) when idle.
+        // Adaptive polling: fast (config.poll_interval) while any agreement is
+        // Created or AcceptedOnChain, slow (`SLOW_POLL_INTERVAL`) when none is.
         let fast_interval = config.poll_interval;
         let slow_interval = SLOW_POLL_INTERVAL;
         let mut timer = tokio::time::interval(fast_interval);
@@ -330,7 +330,7 @@ where
                 },
             }
 
-            // Adaptive interval: check if there are Created agreements awaiting acceptance
+            // Adaptive interval: check if any agreement is Created or AcceptedOnChain
             let has_pending = registry.exists_active_agreements().await.unwrap_or(false);
 
             let want_fast = has_pending;
