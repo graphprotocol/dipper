@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.7](https://github.com/graphprotocol/dipper/compare/v0.2.6...v0.2.7) (2026-11-04)
+
+
+### Fixed
+
+* let the expiry clock catch up at once after a restart ([#778](https://github.com/graphprotocol/dipper/issues/778)) ([68ab0aa](https://github.com/graphprotocol/dipper/commit/68ab0aa87b039ccb5bd700c7e4e3a0db6551278b))
+
 ## [0.2.6](https://github.com/graphprotocol/dipper/compare/v0.2.5...v0.2.6) (2026-11-04)
 
 
