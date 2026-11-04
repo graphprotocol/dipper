@@ -301,14 +301,6 @@ where
         // poll interval up to the idle interval, so a hung broker cannot stall the
         // poll loop on every iteration.
         let mut broker_cooldown = BrokerCooldown::new(fast_interval, slow_interval);
-        // Wall-clock instant of the last successful chain-timestamp
-        // persist. Used to bound how fast the persisted timestamp can
-        // advance: a hostile response that stays just under the skew
-        // tolerance every poll would otherwise drift the timestamp
-        // forward by tens of seconds per tick, expiring agreements
-        // prematurely. Persisted in memory only; on restart it resets
-        // and the first poll's bound is strict.
-        let mut last_chain_ts_persist_wall: std::time::Instant = std::time::Instant::now();
         let mut live_checks = LiveChecks::new(worker_queue);
 
         loop {
@@ -367,7 +359,6 @@ where
                 &mut cursor,
                 &mut cursor_hold,
                 &mut last_persisted_timestamp,
-                &mut last_chain_ts_persist_wall,
                 &mut last_subgraph_head,
                 &mut stall_count,
                 &mut consecutive_failures,
@@ -499,7 +490,6 @@ async fn drain_once<R, E, T, W>(
     cursor: &mut Cursor,
     cursor_hold: &mut Option<CursorHold>,
     last_persisted_timestamp: &mut Option<u64>,
-    last_chain_ts_persist_wall: &mut std::time::Instant,
     last_subgraph_head: &mut u64,
     stall_count: &mut u32,
     consecutive_failures: &mut u32,
@@ -733,17 +723,8 @@ where
         pages_per_tick += 1;
 
         // Persisted timestamp never decreases so a rolled-back subgraph
-        // can't drag expiration's clock backwards. Forward advances are
-        // bounded by wall-clock elapsed so a hostile response that stays
-        // just under the per-poll skew tolerance can't ratchet the
-        // persisted timestamp forward faster than real time. When
-        // `bypass_chain_clock_defenses` is true the cap is skipped so
-        // `evm_increaseTime`-style chain jumps in local-network testing
-        // don't get clamped.
+        // can't drag expiration's clock backwards.
         let now_instant = std::time::Instant::now();
-        let wall_elapsed_secs = now_instant
-            .duration_since(*last_chain_ts_persist_wall)
-            .as_secs();
         let ratchet_timestamp = match (new_timestamp, *last_persisted_timestamp) {
             (Some(new_ts), Some(cached_ts)) if new_ts < cached_ts => {
                 tracing::warn!(
@@ -756,7 +737,7 @@ where
             (Some(new_ts), Some(cached_ts)) => Some(apply_chain_ts_drift_cap(
                 new_ts,
                 cached_ts,
-                wall_elapsed_secs,
+                dipper_core::time::now_secs(),
                 chain_ts_drift_tolerance_secs,
                 bypass_chain_clock_defenses,
             )),
@@ -815,7 +796,6 @@ where
             {
                 Ok(()) => {
                     *last_persisted_timestamp = ratchet_timestamp;
-                    *last_chain_ts_persist_wall = now_instant;
                 }
                 Err(err) => {
                     tracing::error!(error = %err, "Failed to update chain listener state");
@@ -884,35 +864,29 @@ struct PreparedReconciliation {
     indexer: Address,
 }
 
-/// Cap the per-poll ratchet on the persisted chain timestamp. The cap
-/// bounds the new timestamp to `cached_ts + wall_elapsed_secs +
-/// chain_ts_drift_tolerance_secs` so a subgraph that ratchets faster
-/// than real time can't drive expiration's clock past wall-clock.
-/// When `bypass` is true the cap is skipped entirely and the new
-/// timestamp is accepted as-is. Pulled out of `drain_once` so the
-/// decision is unit-testable without a chain or subgraph harness.
+/// Keep expiration's clock from running ahead of real time: a subgraph claiming a later
+/// time is held to `now_secs + chain_ts_drift_tolerance_secs`. Bounding against the wall clock
+/// rather than the last persisted value lets a clock left behind by downtime catch up at once.
 fn apply_chain_ts_drift_cap(
     new_ts: u64,
     cached_ts: u64,
-    wall_elapsed_secs: u64,
+    now_secs: u64,
     chain_ts_drift_tolerance_secs: u64,
     bypass: bool,
 ) -> u64 {
     if bypass {
         return new_ts;
     }
-    let max_chain_advance = wall_elapsed_secs.saturating_add(chain_ts_drift_tolerance_secs);
-    let max_allowed = cached_ts.saturating_add(max_chain_advance);
+    let max_allowed = now_secs.saturating_add(chain_ts_drift_tolerance_secs);
     if new_ts > max_allowed {
         tracing::warn!(
             event = "chain_ts_drift_capped",
             new_timestamp_secs = new_ts,
             persisted_timestamp_secs = cached_ts,
             max_allowed_secs = max_allowed,
-            wall_elapsed_secs,
-            "Chain timestamp advance exceeds wall-clock elapsed; capping"
+            "Chain timestamp is ahead of the wall clock; capping"
         );
-        max_allowed
+        max_allowed.max(cached_ts)
     } else {
         new_ts
     }
@@ -4303,7 +4277,6 @@ mod tests {
 
         let mut cursor = Cursor::genesis();
         let mut last_persisted_timestamp: Option<u64> = None;
-        let mut last_chain_ts_persist_wall = std::time::Instant::now();
         let mut last_subgraph_head: u64 = 0;
         let mut stall_count: u32 = 0;
         let mut consecutive_failures: u32 = 0;
@@ -4314,7 +4287,6 @@ mod tests {
             &mut cursor,
             &mut None,
             &mut last_persisted_timestamp,
-            &mut last_chain_ts_persist_wall,
             &mut last_subgraph_head,
             &mut stall_count,
             &mut consecutive_failures,
@@ -4381,7 +4353,6 @@ mod tests {
             since,
         });
         let mut last_persisted_timestamp: Option<u64> = None;
-        let mut last_chain_ts_persist_wall = std::time::Instant::now();
         let mut last_subgraph_head: u64 = 0;
         let mut stall_count: u32 = 0;
         let mut consecutive_failures: u32 = 0;
@@ -4394,7 +4365,6 @@ mod tests {
                 &mut cursor,
                 &mut cursor_hold,
                 &mut last_persisted_timestamp,
-                &mut last_chain_ts_persist_wall,
                 &mut last_subgraph_head,
                 &mut stall_count,
                 &mut consecutive_failures,
@@ -4471,7 +4441,6 @@ mod tests {
         event_source.set_latest_block_timestamp(Some(1_700_000_000));
         let mut cursor = Cursor::genesis();
         let mut last_persisted_timestamp: Option<u64> = None;
-        let mut last_chain_ts_persist_wall = std::time::Instant::now();
         let mut last_subgraph_head: u64 = 0;
         let mut stall_count: u32 = 0;
         let mut consecutive_failures: u32 = 0;
@@ -4492,7 +4461,6 @@ mod tests {
                     &mut cursor,
                     &mut None,
                     &mut last_persisted_timestamp,
-                    &mut last_chain_ts_persist_wall,
                     &mut last_subgraph_head,
                     &mut stall_count,
                     &mut consecutive_failures,
@@ -4560,7 +4528,6 @@ mod tests {
         let mut cursor = Cursor::genesis();
         let mut cursor_hold = None;
         let mut last_persisted_timestamp: Option<u64> = None;
-        let mut last_chain_ts_persist_wall = std::time::Instant::now();
         let mut last_subgraph_head: u64 = 0;
         let mut stall_count: u32 = 0;
         let mut consecutive_failures: u32 = 0;
@@ -4585,7 +4552,6 @@ mod tests {
                 &mut cursor,
                 &mut cursor_hold,
                 &mut last_persisted_timestamp,
-                &mut last_chain_ts_persist_wall,
                 &mut last_subgraph_head,
                 &mut stall_count,
                 &mut consecutive_failures,
@@ -4725,27 +4691,21 @@ mod tests {
         );
     }
 
-    /// Drives a hostile timestamp drift through `drain_once` and asserts
-    /// the persisted chain timestamp is capped near
-    /// `CHAIN_TS_DRIFT_TOLERANCE_SECS` instead of accepting the huge
-    /// jump. Without the cap, a subgraph response that stays just under
-    /// the per-poll skew tolerance would advance the persisted timestamp
-    /// far faster than wall clock.
+    /// A subgraph claiming a time far ahead of the wall clock must not move
+    /// expiration's clock past `now + tolerance`, or agreements expire early.
     #[tokio::test]
     async fn test_chain_ts_drift_capped_against_wall_clock() {
         let registry = MockRegistry::new();
         let chain_client = MockChainClient::default();
         let event_source = super::super::chain_events::mock::MockEventSource::new();
-        let baseline_ts = 1_700_000_000u64;
-        let attempted_jump_secs = 100_000u64;
+        let now = dipper_core::time::now_secs();
+        let attempted = now + 100_000;
 
-        // First poll establishes the persisted timestamp baseline.
         event_source.set_latest_block(100);
-        event_source.set_latest_block_timestamp(Some(baseline_ts));
+        event_source.set_latest_block_timestamp(Some(attempted));
 
         let mut cursor = Cursor::genesis();
-        let mut last_persisted_timestamp: Option<u64> = None;
-        let mut last_chain_ts_persist_wall = std::time::Instant::now();
+        let mut last_persisted_timestamp = Some(now);
         let mut last_subgraph_head: u64 = 0;
         let mut stall_count: u32 = 0;
         let mut consecutive_failures: u32 = 0;
@@ -4756,7 +4716,6 @@ mod tests {
             &mut cursor,
             &mut None,
             &mut last_persisted_timestamp,
-            &mut last_chain_ts_persist_wall,
             &mut last_subgraph_head,
             &mut stall_count,
             &mut consecutive_failures,
@@ -4772,115 +4731,77 @@ mod tests {
             test_agreement_conf().as_ref(),
         )
         .await
-        .expect("first poll must succeed");
-
-        assert_eq!(last_persisted_timestamp, Some(baseline_ts));
-
-        // Hostile second poll: wall clock has barely moved, but subgraph
-        // claims chain time advanced by ~28 hours.
-        event_source.set_latest_block(101);
-        event_source.set_latest_block_timestamp(Some(baseline_ts + attempted_jump_secs));
-
-        drain_once(
-            &mut cursor,
-            &mut None,
-            &mut last_persisted_timestamp,
-            &mut last_chain_ts_persist_wall,
-            &mut last_subgraph_head,
-            &mut stall_count,
-            &mut consecutive_failures,
-            1337,
-            0,
-            10,
-            false,
-            &registry,
-            &chain_client,
-            &mut live_checks,
-            &event_source,
-            &mut rx_stop,
-            test_agreement_conf().as_ref(),
-        )
-        .await
-        .expect("second poll must succeed");
+        .expect("poll must succeed");
 
         let persisted = last_persisted_timestamp.expect("must be set");
-        let attempted = baseline_ts + attempted_jump_secs;
+        let latest_allowed = dipper_core::time::now_secs() + 10;
         assert!(
-            persisted < attempted,
-            "drift must be capped; persisted={persisted}, attempted={attempted}"
-        );
-        // wall_elapsed in this synchronous test is sub-second, so the cap
-        // is dominated by the static tolerance. Allow generous slack for
-        // slow CI machines but still assert "nowhere near the attempted
-        // jump".
-        assert!(
-            persisted <= baseline_ts + 1_000,
-            "persisted ({persisted}) should be within seconds of baseline ({baseline_ts}), \
-             not near the attempted jump ({attempted})"
+            (now..=latest_allowed).contains(&persisted),
+            "persisted {persisted} must be held to the wall clock, not the attempted {attempted}"
         );
     }
 
-    /// `apply_chain_ts_drift_cap` clamps a hostile jump when bypass is off.
     #[test]
     fn test_apply_chain_ts_drift_cap_bypass_off_clamps_jump() {
-        // baseline 1.7e9, cached at baseline, wall barely moved, tolerance 10s.
-        // Attempting a 100_000s jump should clamp to baseline + (wall + tol).
-        let baseline_ts = 1_700_000_000u64;
-        let attempted = baseline_ts + 100_000;
-        let capped = apply_chain_ts_drift_cap(attempted, baseline_ts, 0, 10, false);
+        let now = 1_700_000_000u64;
+        let capped = apply_chain_ts_drift_cap(now + 100_000, now - 300, now, 10, false);
         assert_eq!(
             capped,
-            baseline_ts + 10,
-            "must clamp to cached_ts + tolerance"
+            now + 10,
+            "must clamp to the wall clock plus tolerance"
         );
     }
 
-    /// `apply_chain_ts_drift_cap` accepts the new timestamp unchanged when
-    /// bypass is on, regardless of how far past the wall-bound cap it would
-    /// otherwise be clamped.
+    /// With bypass on, a jump far past the wall clock is accepted as-is.
     #[test]
     fn test_apply_chain_ts_drift_cap_bypass_on_skips_cap() {
-        let baseline_ts = 1_700_000_000u64;
-        let attempted = baseline_ts + 100_000;
-        let unclamped = apply_chain_ts_drift_cap(attempted, baseline_ts, 0, 10, true);
-        assert_eq!(unclamped, attempted, "bypass must accept the jump as-is");
+        let now = 1_700_000_000u64;
+        let unclamped = apply_chain_ts_drift_cap(now + 100_000, now, now, 10, true);
+        assert_eq!(
+            unclamped,
+            now + 100_000,
+            "bypass must accept the jump as-is"
+        );
     }
 
-    /// Within-bound advances are accepted unchanged even with bypass off.
+    /// A time within tolerance of the wall clock is accepted however far behind
+    /// the persisted value was, so a clock left behind catches up in 1 poll.
     #[test]
     fn test_apply_chain_ts_drift_cap_within_bound_passes_through() {
-        let baseline_ts = 1_700_000_000u64;
-        // wall_elapsed 5s + tolerance 10s = 15s allowed; advance 7s.
-        let advance = baseline_ts + 7;
-        let result = apply_chain_ts_drift_cap(advance, baseline_ts, 5, 10, false);
-        assert_eq!(result, advance, "advances inside the bound are not clamped");
+        let now = 1_700_000_000u64;
+        let result = apply_chain_ts_drift_cap(now + 7, now - 3_600, now, 10, false);
+        assert_eq!(result, now + 7, "advances inside the bound are not clamped");
     }
 
-    /// Simulates a restart after a long downtime: the persisted timestamp
-    /// is loaded from the DB at its pre-downtime value, the in-memory
-    /// wall-clock tracker is set to "downtime ago", and the subgraph
-    /// reports a chain timestamp that has legitimately advanced by the
-    /// downtime amount. A single poll must catch up fully because the
-    /// chain advance is within the wall-elapsed + tolerance bound.
+    /// A persisted value already past the cap (the host clock stepped back) is
+    /// kept, because expiration's clock must never run backwards.
+    #[test]
+    fn test_apply_chain_ts_drift_cap_never_moves_the_clock_back() {
+        let now = 1_700_000_000u64;
+        let result = apply_chain_ts_drift_cap(now + 100, now + 50, now, 10, false);
+        assert_eq!(
+            result,
+            now + 50,
+            "the persisted value must not go backwards"
+        );
+    }
+
+    /// After a restart the persisted chain timestamp is as old as the downtime,
+    /// while the subgraph is already at current chain time. The first poll must
+    /// bring it up to date, or agreements expire late until it catches up.
     #[tokio::test]
-    async fn test_chain_ts_restart_catches_up_within_wall_elapsed() {
+    async fn test_chain_ts_catches_up_in_one_poll_after_a_restart() {
         let registry = MockRegistry::new();
         let chain_client = MockChainClient::default();
         let event_source = super::super::chain_events::mock::MockEventSource::new();
-        let baseline_ts = 1_700_000_000u64;
-        let downtime_secs = 3_600u64; // 1 hour
+        let now = dipper_core::time::now_secs();
+        let downtime_secs = 3_600u64;
 
         event_source.set_latest_block(100);
-        event_source.set_latest_block_timestamp(Some(baseline_ts + downtime_secs));
+        event_source.set_latest_block_timestamp(Some(now));
 
-        // Restart state: persisted timestamp loaded from the DB at the
-        // pre-downtime value; in-memory wall tracker reflects the time
-        // the previous instance last persisted.
         let mut cursor = Cursor::genesis();
-        let mut last_persisted_timestamp: Option<u64> = Some(baseline_ts);
-        let mut last_chain_ts_persist_wall = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_secs(downtime_secs))
-            .expect("now - 1h must be representable");
+        let mut last_persisted_timestamp = Some(now - downtime_secs);
         let mut last_subgraph_head: u64 = 0;
         let mut stall_count: u32 = 0;
         let mut consecutive_failures: u32 = 0;
@@ -4891,7 +4812,6 @@ mod tests {
             &mut cursor,
             &mut None,
             &mut last_persisted_timestamp,
-            &mut last_chain_ts_persist_wall,
             &mut last_subgraph_head,
             &mut stall_count,
             &mut consecutive_failures,
@@ -4909,13 +4829,7 @@ mod tests {
         .await
         .expect("post-restart poll must succeed");
 
-        let persisted = last_persisted_timestamp.expect("must be set");
-        assert_eq!(
-            persisted,
-            baseline_ts + downtime_secs,
-            "after {downtime_secs}s downtime, a single poll must catch up \
-             fully because the chain advance is within wall_elapsed + tolerance"
-        );
+        assert_eq!(last_persisted_timestamp, Some(now));
     }
 
     /// Verify that notify_one() wakes the chain_listener from its idle

@@ -850,11 +850,9 @@ pub struct ChainListenerConfig {
     #[serde(default = "default_chain_listener_wall_clock_skew_tolerance_secs")]
     pub wall_clock_skew_tolerance_secs: u64,
 
-    /// How much faster than wall-clock the persisted chain timestamp
-    /// may advance per poll before the listener caps the advance.
-    /// Chain time legitimately moves at ~1s per wall second; the
-    /// tolerance covers poll-cadence jitter and subgraph-side rounding.
-    /// Widen for environments with choppy poll cadence.
+    /// How far ahead of the host's wall clock the persisted chain timestamp,
+    /// which drives agreement expiry, may be set. Widen if the host clock is
+    /// known to lag the chain.
     #[serde(default = "default_chain_listener_chain_ts_drift_tolerance_secs")]
     pub chain_ts_drift_tolerance_secs: u64,
 
@@ -865,7 +863,7 @@ pub struct ChainListenerConfig {
     ///
     /// When true:
     ///   * the subgraph timestamp skew check is skipped
-    ///   * the per-poll chain timestamp drift cap is skipped
+    ///   * the chain timestamp drift cap is skipped
     ///   * agreement deadlines are computed from chain time instead
     ///     of wall time, so freshly created agreements do not appear
     ///     born-expired against an advanced chain
