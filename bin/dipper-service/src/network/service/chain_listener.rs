@@ -863,9 +863,9 @@ struct PreparedReconciliation {
     indexer: Address,
 }
 
-/// Keep expiration's clock from running ahead of real time: a subgraph claiming a later
-/// time is held to `now_secs + chain_ts_drift_tolerance_secs`. Bounding against the wall clock
-/// rather than the last persisted value lets a clock left behind by downtime catch up at once.
+/// Hold expiration's clock to `now_secs + chain_ts_drift_tolerance_secs`, unless `bypass` is set
+/// for a local network that jumps chain time ahead. Bounding by the wall clock rather than the
+/// last persisted value lets a clock left behind by downtime catch up in 1 poll.
 fn apply_chain_ts_drift_cap(
     new_ts: u64,
     cached_ts: u64,
@@ -4740,6 +4740,7 @@ mod tests {
         );
     }
 
+    /// A jump far past the wall clock is clamped to the wall clock plus tolerance.
     #[test]
     fn test_apply_chain_ts_drift_cap_bypass_off_clamps_jump() {
         let now = 1_700_000_000u64;

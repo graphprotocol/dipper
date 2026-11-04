@@ -843,16 +843,15 @@ pub struct ChainListenerConfig {
     #[serde(default = "default_chain_listener_reorg_buffer_blocks")]
     pub reorg_buffer_blocks: u32,
 
-    /// How far ahead of the host's wall clock the subgraph's reported
-    /// chain timestamp may sit before the response is rejected as
-    /// corrupt. Default 60s covers typical NTP drift; widen if the
-    /// host clock is known to lag.
+    /// How far ahead of the host's wall clock the subgraph's chain timestamp may sit before
+    /// the response is rejected as corrupt (default 60s, for typical NTP drift). If the host
+    /// clock lags, widen this along with `chain_ts_drift_tolerance_secs`.
     #[serde(default = "default_chain_listener_wall_clock_skew_tolerance_secs")]
     pub wall_clock_skew_tolerance_secs: u64,
 
     /// How far ahead of the host's wall clock the persisted chain timestamp,
-    /// which drives agreement expiry, may be set. Widen if the host clock is
-    /// known to lag the chain.
+    /// which drives agreement expiry, may be set. If the host clock lags the
+    /// chain, widen this along with `wall_clock_skew_tolerance_secs`.
     #[serde(default = "default_chain_listener_chain_ts_drift_tolerance_secs")]
     pub chain_ts_drift_tolerance_secs: u64,
 
