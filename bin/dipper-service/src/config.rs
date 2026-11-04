@@ -137,6 +137,7 @@ pub struct Config {
 #[serde(default, deny_unknown_fields)]
 pub struct AlertsConfig {
     /// The Slack incoming-webhook URL to post alerts to. Without one, none are sent.
+    #[serde_as(as = "Option<serde_with::DisplayFromStr>")]
     pub slack_webhook_url: Option<Hidden<Url>>,
     /// The `event` tags of the log lines to alert on. Leave it out to alert on the defaults,
     /// which grow as alerts are added; a list given here replaces them.
@@ -936,6 +937,7 @@ pub struct ChainClientConfig {
     /// At least one provider is required when enabled. Providers are tried in order,
     /// rotating to the next on persistent failures.
     #[debug(with = debug_endpoints)]
+    #[serde_as(as = "Vec<serde_with::DisplayFromStr>")]
     pub providers: Vec<Url>,
 
     /// Request timeout per RPC call in seconds (default: 10s). Every call here is a small one,
@@ -2674,6 +2676,26 @@ mod tests {
         }
         assert!(dumped.contains("gateway.example.com"), "{dumped}");
         assert!(dumped.contains("rpc.example.com"), "{dumped}");
+    }
+
+    #[test]
+    fn a_malformed_secret_url_is_refused_without_repeating_it() {
+        let chain_client = serde_json::from_value::<ChainClientConfig>(serde_json::json!({
+            "enabled": true,
+            "providers": ["rpc.example.com/v2/rpc-key"],
+        }))
+        .expect_err("a provider without a scheme is refused");
+        let alerts = serde_json::from_value::<AlertsConfig>(serde_json::json!({
+            "slack_webhook_url": "hooks.slack.com/services/T/B/webhook-secret",
+        }))
+        .expect_err("a webhook without a scheme is refused");
+
+        let refused = format!("{chain_client} {alerts}");
+
+        assert!(refused.contains("relative URL without a base"), "{refused}");
+        for secret in ["rpc-key", "webhook-secret"] {
+            assert!(!refused.contains(secret), "{secret} in {refused}");
+        }
     }
 
     #[test]
