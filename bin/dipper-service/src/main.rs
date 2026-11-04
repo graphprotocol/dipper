@@ -403,6 +403,7 @@ pub async fn main() -> anyhow::Result<()> {
             network::service::entity_count_cache::Ctx {
                 cache: entity_count_cache.clone(),
                 endpoint: cl_conf.subgraph_endpoint.clone(),
+                api_key: cl_conf.subgraph_api_key.clone(),
                 // Entity counts change slowly (once per collection epoch).
                 // Refresh hourly to balance freshness and query cost.
                 interval: std::time::Duration::from_secs(3600),
