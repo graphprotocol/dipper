@@ -67,8 +67,24 @@ const SLOW_POLL_INTERVAL: Duration = Duration::from_secs(300);
 /// rate, every poll at the slow rate.
 const HEARTBEAT_POLLS: u64 = 60;
 /// After this many back-to-back fetch failures the listener escalates the
-/// log line from `warn` to `error`.
+/// log line from `warn` to `error`, alerting once until a fetch succeeds.
 const MAX_CONSECUTIVE_FAILURES: u32 = 10;
+
+/// How to log a fetch failure, given how many have come back to back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FetchFailureLog {
+    Warn,
+    Alert,
+    Error,
+}
+
+fn fetch_failure_log(consecutive_failures: u32) -> FetchFailureLog {
+    match consecutive_failures.cmp(&MAX_CONSECUTIVE_FAILURES) {
+        std::cmp::Ordering::Less => FetchFailureLog::Warn,
+        std::cmp::Ordering::Equal => FetchFailureLog::Alert,
+        std::cmp::Ordering::Greater => FetchFailureLog::Error,
+    }
+}
 /// Base for the exponential failure-backoff sleep applied between ticks
 /// while `consecutive_failures > 0`.
 const FAILURE_BACKOFF_BASE: Duration = Duration::from_secs(5);
@@ -547,20 +563,27 @@ where
             }
             Err(err) => {
                 *consecutive_failures = consecutive_failures.saturating_add(1);
-                if *consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                    tracing::error!(
+                match fetch_failure_log(*consecutive_failures) {
+                    FetchFailureLog::Alert => tracing::error!(
+                        event = "chain_listener_fetch_failing",
+                        error = %err,
+                        consecutive_failures = *consecutive_failures,
+                        pages_drained = pages_per_tick,
+                        "Chain listener keeps failing to fetch agreement changes from the \
+                         subgraph; on-chain accepts and cancels go unrecorded until it recovers"
+                    ),
+                    FetchFailureLog::Error => tracing::error!(
                         error = %err,
                         consecutive_failures = *consecutive_failures,
                         pages_drained = pages_per_tick,
                         "Too many consecutive failures fetching changed agreements"
-                    );
-                } else {
-                    tracing::warn!(
+                    ),
+                    FetchFailureLog::Warn => tracing::warn!(
                         error = %err,
                         consecutive_failures = *consecutive_failures,
                         pages_drained = pages_per_tick,
                         "Failed to fetch changed agreements from subgraph"
-                    );
+                    ),
                 }
                 return Err(());
             }
@@ -1966,6 +1989,17 @@ mod tests {
             canceled_at: TEST_CANCELED_AT,
             canceled_tx: TEST_CANCELED_TX.to_string(),
         }
+    }
+
+    #[test]
+    fn fetch_failures_alert_once_per_run_of_failures() {
+        let mut expected = vec![FetchFailureLog::Warn; 9];
+        expected.push(FetchFailureLog::Alert);
+        expected.extend([FetchFailureLog::Error; 5]);
+
+        let logged: Vec<_> = (1..=15).map(fetch_failure_log).collect();
+
+        assert_eq!(logged, expected);
     }
 
     #[test]
