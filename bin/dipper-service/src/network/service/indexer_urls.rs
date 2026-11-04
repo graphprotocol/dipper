@@ -105,10 +105,15 @@ pub async fn fetch_snapshot(
             builder = builder.bearer_auth(key);
         }
 
-        let response: PageResponse = builder
+        let response = builder
             .send()
             .await
-            .map_err(|err| anyhow::anyhow!("failed to query indexers page: {err}"))?
+            .map_err(|err| anyhow::anyhow!("failed to query indexers page: {err}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            anyhow::bail!("indexers page request failed: HTTP {status}");
+        }
+        let response: PageResponse = response
             .json()
             .await
             .map_err(|err| anyhow::anyhow!("failed to decode indexers page: {err}"))?;

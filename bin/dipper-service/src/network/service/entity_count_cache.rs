@@ -127,10 +127,6 @@ async fn refresh_cache(cache: &EntityCountCache, endpoint: &Url) {
 
 /// Fetch all IndexerDeploymentLatest entities from the subgraph with
 /// cursor-based pagination.
-#[expect(
-    clippy::cognitive_complexity,
-    reason = "predates this lint; fix when next touched"
-)]
 async fn fetch_all_entity_counts(endpoint: &Url) -> HashMap<EntityCountKey, u64> {
     let mut result = HashMap::new();
     let mut last_id = String::new();
@@ -140,25 +136,10 @@ async fn fetch_all_entity_counts(endpoint: &Url) -> HashMap<EntityCountKey, u64>
         .unwrap_or_default();
 
     loop {
-        let body = serde_json::json!({
-            "query": PAGINATED_QUERY,
-            "variables": {
-                "lastId": last_id,
-            },
-        });
-
-        let response = match client.post(endpoint.as_str()).json(&body).send().await {
-            Ok(resp) => resp,
+        let json = match fetch_page(&client, endpoint, &last_id).await {
+            Ok(json) => json,
             Err(err) => {
                 tracing::warn!(error = %err, "failed to fetch entity counts page");
-                return result;
-            }
-        };
-
-        let json: PageResponse = match response.json().await {
-            Ok(j) => j,
-            Err(err) => {
-                tracing::warn!(error = %err, "failed to parse entity counts page");
                 return result;
             }
         };
@@ -187,6 +168,36 @@ async fn fetch_all_entity_counts(endpoint: &Url) -> HashMap<EntityCountKey, u64>
     }
 
     result
+}
+
+/// Fetch the page of entity counts after `last_id`, failing on a refused request (such as a
+/// rate limit) before trying to read its body.
+async fn fetch_page(
+    client: &reqwest::Client,
+    endpoint: &Url,
+    last_id: &str,
+) -> anyhow::Result<PageResponse> {
+    let body = serde_json::json!({
+        "query": PAGINATED_QUERY,
+        "variables": {
+            "lastId": last_id,
+        },
+    });
+
+    let response = client
+        .post(endpoint.as_str())
+        .json(&body)
+        .send()
+        .await
+        .map_err(|err| anyhow::anyhow!("failed to query entity counts page: {err}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        anyhow::bail!("entity counts page request failed: HTTP {status}");
+    }
+    response
+        .json()
+        .await
+        .map_err(|err| anyhow::anyhow!("failed to decode entity counts page: {err}"))
 }
 
 /// Parse a single entity entry into a cache key-value pair.
@@ -289,6 +300,23 @@ mod tests {
             entities: "not-a-number".to_string(),
         };
         assert!(parse_entity_entry(&entry).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_page_names_the_http_status_of_a_refused_request() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(429).set_body_string("Too many requests"))
+            .mount(&server)
+            .await;
+        let endpoint: Url = server.uri().parse().unwrap();
+
+        let err = fetch_page(&reqwest::Client::new(), &endpoint, "")
+            .await
+            .expect_err("a 429 must fail the fetch")
+            .to_string();
+
+        assert!(err.contains("429"), "unexpected error: {err}");
     }
 
     #[tokio::test]
