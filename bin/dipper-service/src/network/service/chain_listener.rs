@@ -4460,6 +4460,68 @@ mod tests {
         assert!(!again.contains("chain_listener_cursor_held"), "{again}");
     }
 
+    /// A run of failed fetches alerts once, at the 10th; a fetch that works ends the run, so the
+    /// next run alerts once more.
+    #[tokio::test]
+    async fn test_drain_alerts_once_per_run_of_failed_fetches() {
+        let registry = MockRegistry::new();
+        let chain_client = MockChainClient::default();
+        let event_source = super::super::chain_events::mock::MockEventSource::new();
+        event_source.set_latest_block(100);
+        event_source.set_latest_block_timestamp(Some(1_700_000_000));
+        let mut cursor = Cursor::genesis();
+        let mut last_persisted_timestamp: Option<u64> = None;
+        let mut last_chain_ts_persist_wall = std::time::Instant::now();
+        let mut last_subgraph_head: u64 = 0;
+        let mut stall_count: u32 = 0;
+        let mut consecutive_failures: u32 = 0;
+        let (_tx_stop, mut rx_stop) = mpsc::channel::<()>(1);
+        let mut live_checks = LiveChecks::new(MockWorkerQueue::default());
+        let fetch_fails = [vec![true; 15], vec![false], vec![true; 10]].concat();
+
+        let logged = crate::test_support::logged(async {
+            for fails in fetch_fails {
+                if fails {
+                    event_source.set_error(
+                        super::super::chain_events::ChainEventError::RateLimited(
+                            "HTTP error: 429 Too Many Requests".into(),
+                        ),
+                    );
+                }
+                let drained = drain_once(
+                    &mut cursor,
+                    &mut None,
+                    &mut last_persisted_timestamp,
+                    &mut last_chain_ts_persist_wall,
+                    &mut last_subgraph_head,
+                    &mut stall_count,
+                    &mut consecutive_failures,
+                    1337,
+                    0,
+                    10,
+                    false,
+                    &registry,
+                    &chain_client,
+                    &mut live_checks,
+                    &event_source,
+                    &mut rx_stop,
+                    test_agreement_conf().as_ref(),
+                )
+                .await;
+                assert_eq!(drained.is_err(), fails);
+            }
+        })
+        .await;
+
+        assert_eq!(
+            logged
+                .matches(r#"event="chain_listener_fetch_failing""#)
+                .count(),
+            2,
+            "{logged}"
+        );
+    }
+
     /// A page that keeps failing is passed over once the cursor has been held long enough, so
     /// it can't hold up every later change.
     #[tokio::test]
