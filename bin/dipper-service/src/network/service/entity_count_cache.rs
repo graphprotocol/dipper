@@ -47,6 +47,8 @@ pub struct Ctx {
     pub cache: EntityCountCache,
     /// Subgraph endpoint URL.
     pub endpoint: Url,
+    /// Bearer token for the endpoint (needed for gateway-served subgraphs).
+    pub api_key: Option<String>,
     /// Refresh interval.
     pub interval: Duration,
 }
@@ -60,24 +62,25 @@ pub fn new(ctx: Ctx) -> (Handle, impl Future<Output = anyhow::Result<()>>) {
     let (tx_stop, rx_stop) = mpsc::channel(1);
     let handle = Handle { tx_stop };
 
-    let fut = run(ctx.cache, ctx.endpoint, ctx.interval, rx_stop);
+    let fut = run(ctx.cache, ctx.endpoint, ctx.api_key, ctx.interval, rx_stop);
     (handle, fut)
 }
 
 async fn run(
     cache: EntityCountCache,
     endpoint: Url,
+    api_key: Option<String>,
     interval: Duration,
     mut rx_stop: mpsc::Receiver<()>,
 ) -> anyhow::Result<()> {
     tracing::info!(
         interval_secs = interval.as_secs(),
-        endpoint = %endpoint,
+        endpoint = %crate::config::endpoint_name(&endpoint),
         "entity count cache service starting"
     );
 
     // Fetch immediately on startup
-    refresh_cache(&cache, &endpoint).await;
+    refresh_cache(&cache, &endpoint, api_key.as_deref()).await;
 
     let mut timer = tokio::time::interval(interval);
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -91,7 +94,7 @@ async fn run(
                 return Ok(());
             }
             _ = timer.tick() => {
-                refresh_cache(&cache, &endpoint).await;
+                refresh_cache(&cache, &endpoint, api_key.as_deref()).await;
             }
         }
     }
@@ -101,10 +104,10 @@ async fn run(
     clippy::cognitive_complexity,
     reason = "predates this lint; fix when next touched"
 )]
-async fn refresh_cache(cache: &EntityCountCache, endpoint: &Url) {
+async fn refresh_cache(cache: &EntityCountCache, endpoint: &Url, api_key: Option<&str>) {
     tracing::debug!("refreshing entity count cache");
 
-    let counts = fetch_all_entity_counts(endpoint).await;
+    let counts = fetch_all_entity_counts(endpoint, api_key).await;
 
     if counts.is_empty() {
         let stale_count = cache.read().await.len();
@@ -127,7 +130,10 @@ async fn refresh_cache(cache: &EntityCountCache, endpoint: &Url) {
 
 /// Fetch all IndexerDeploymentLatest entities from the subgraph with
 /// cursor-based pagination.
-async fn fetch_all_entity_counts(endpoint: &Url) -> HashMap<EntityCountKey, u64> {
+async fn fetch_all_entity_counts(
+    endpoint: &Url,
+    api_key: Option<&str>,
+) -> HashMap<EntityCountKey, u64> {
     let mut result = HashMap::new();
     let mut last_id = String::new();
     let client = reqwest::Client::builder()
@@ -136,7 +142,7 @@ async fn fetch_all_entity_counts(endpoint: &Url) -> HashMap<EntityCountKey, u64>
         .unwrap_or_default();
 
     loop {
-        let json = match fetch_page(&client, endpoint, &last_id).await {
+        let json = match fetch_page(&client, endpoint, api_key, &last_id).await {
             Ok(json) => json,
             Err(err) => {
                 tracing::warn!(error = %err, "failed to fetch entity counts page");
@@ -175,6 +181,7 @@ async fn fetch_all_entity_counts(endpoint: &Url) -> HashMap<EntityCountKey, u64>
 async fn fetch_page(
     client: &reqwest::Client,
     endpoint: &Url,
+    api_key: Option<&str>,
     last_id: &str,
 ) -> anyhow::Result<PageResponse> {
     let body = serde_json::json!({
@@ -184,20 +191,20 @@ async fn fetch_page(
         },
     });
 
-    let response = client
-        .post(endpoint.as_str())
-        .json(&body)
-        .send()
-        .await
-        .map_err(|err| anyhow::anyhow!("failed to query entity counts page: {err}"))?;
+    let mut builder = client.post(endpoint.as_str()).json(&body);
+    if let Some(key) = api_key {
+        builder = builder.bearer_auth(key);
+    }
+    let response = builder.send().await.map_err(|err| {
+        anyhow::anyhow!("failed to query entity counts page: {}", err.without_url())
+    })?;
     let status = response.status();
     if !status.is_success() {
         anyhow::bail!("entity counts page request failed: HTTP {status}");
     }
-    response
-        .json()
-        .await
-        .map_err(|err| anyhow::anyhow!("failed to decode entity counts page: {err}"))
+    response.json().await.map_err(|err| {
+        anyhow::anyhow!("failed to decode entity counts page: {}", err.without_url())
+    })
 }
 
 /// Parse a single entity entry into a cache key-value pair.
@@ -311,12 +318,49 @@ mod tests {
             .await;
         let endpoint: Url = server.uri().parse().unwrap();
 
-        let err = fetch_page(&reqwest::Client::new(), &endpoint, "")
+        let err = fetch_page(&reqwest::Client::new(), &endpoint, None, "")
             .await
             .expect_err("a 429 must fail the fetch")
             .to_string();
 
         assert!(err.contains("429"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_page_leaves_the_url_out_of_a_connection_error() {
+        let endpoint = crate::test_support::refused_url_with_key("secret-key");
+
+        let err = fetch_page(&reqwest::Client::new(), &endpoint, None, "")
+            .await
+            .expect_err("a refused connection must fail the fetch")
+            .to_string();
+
+        assert!(!err.contains("secret-key"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_page_sends_the_api_key_as_a_bearer_token() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer test-key",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data": { "indexerDeploymentLatests": [] }
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let endpoint: Url = server.uri().parse().unwrap();
+
+        let page = fetch_page(&reqwest::Client::new(), &endpoint, Some("test-key"), "")
+            .await
+            .expect("a request carrying the key is answered");
+
+        assert!(page.data.is_some());
     }
 
     #[tokio::test]
@@ -327,6 +371,7 @@ mod tests {
         let (handle, fut) = new(Ctx {
             cache: cache.clone(),
             endpoint,
+            api_key: None,
             interval: Duration::from_secs(3600),
         });
 

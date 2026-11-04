@@ -20,6 +20,30 @@ use url::Url;
 /// The maximum number of candidates to select.
 pub const DEFAULT_MAX_CANDIDATES: usize = 3;
 
+/// How an endpoint is named in logs and errors. Hosted RPC and gateway endpoints can carry their
+/// API key in the path or the query, so naming one by host says which it was without the key.
+pub fn endpoint_name(url: &Url) -> String {
+    match (url.host_str(), url.port()) {
+        (Some(host), Some(port)) => format!("{host}:{port}"),
+        (Some(host), None) => host.to_string(),
+        (None, _) => "unnamed endpoint".to_string(),
+    }
+}
+
+fn debug_endpoint(url: &Url, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.write_str(&endpoint_name(url))
+}
+
+#[expect(
+    clippy::ptr_arg,
+    reason = "custom_debug passes the field itself, a &Vec"
+)]
+fn debug_endpoints(urls: &Vec<Url>, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_list()
+        .entries(urls.iter().map(endpoint_name))
+        .finish()
+}
+
 /// Load the configuration from a JSON file.
 pub fn load_from_file(path: &Path) -> Result<Config, Error> {
     let config_content = std::fs::read_to_string(path)?;
@@ -113,6 +137,7 @@ pub struct Config {
 #[serde(default, deny_unknown_fields)]
 pub struct AlertsConfig {
     /// The Slack incoming-webhook URL to post alerts to. Without one, none are sent.
+    #[serde_as(as = "Option<serde_with::DisplayFromStr>")]
     pub slack_webhook_url: Option<Hidden<Url>>,
     /// The `event` tags of the log lines to alert on. Leave it out to alert on the defaults,
     /// which grow as alerts are added; a list given here replaces them.
@@ -770,7 +795,7 @@ impl Default for DipsInfoWatcherConfig {
 /// and `IndexingAgreementCanceled` events via a subgraph. When a `Rejected` agreement
 /// is accepted on-chain, it triggers automatic cancellation via `cancelIndexingAgreementByPayer`.
 #[serde_as]
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(custom_debug::CustomDebug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChainListenerConfig {
     /// Whether the chain listener service is enabled (default: false)
@@ -783,12 +808,13 @@ pub struct ChainListenerConfig {
     ///
     /// This should point to a subgraph that indexes the SubgraphService contract's
     /// IndexingAgreementAccepted and IndexingAgreementCanceled events.
+    #[debug(with = debug_endpoint)]
     #[serde_as(as = "serde_with::DisplayFromStr")]
     pub subgraph_endpoint: Url,
 
     /// API key for subgraph authentication (optional for local/test subgraphs).
     #[serde(default)]
-    pub subgraph_api_key: Option<String>,
+    pub subgraph_api_key: Option<Hidden<String>>,
 
     /// Chain ID for state tracking (default: 42161 for Arbitrum One)
     #[serde(default = "default_chain_id")]
@@ -897,7 +923,7 @@ fn default_max_gas_price_gwei() -> u64 {
 /// `cancelIndexingAgreementByPayer` on the SubgraphService contract.
 /// It supports multiple RPC providers with automatic failover and retry.
 #[serde_as]
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(custom_debug::CustomDebug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChainClientConfig {
     /// Whether the chain client is enabled (default: false). Required in practice: dipper
@@ -910,6 +936,8 @@ pub struct ChainClientConfig {
     ///
     /// At least one provider is required when enabled. Providers are tried in order,
     /// rotating to the next on persistent failures.
+    #[debug(with = debug_endpoints)]
+    #[serde_as(as = "Vec<serde_with::DisplayFromStr>")]
     pub providers: Vec<Url>,
 
     /// Request timeout per RPC call in seconds (default: 10s). Every call here is a small one,
@@ -1393,7 +1421,7 @@ pub struct IndexerUrlsConfig {
     /// The indexing-payments subgraph query endpoint used to look up
     /// registered indexer URLs. Same form as `chain_listener.subgraph_endpoint`:
     /// a full query URL, gateway-served or self-hosted.
-    #[debug(with = std::fmt::Display::fmt)]
+    #[debug(with = debug_endpoint)]
     #[serde_as(as = "serde_with::DisplayFromStr")]
     pub subgraph_endpoint: Url,
 
@@ -2619,6 +2647,55 @@ mod tests {
             "a deployment copied from the example keeps every event later added to the defaults"
         );
         assert_eq!(alerts.events, AlertsConfig::default().events);
+    }
+
+    #[test]
+    fn the_config_dump_names_endpoints_by_host_and_hides_the_subgraph_key() {
+        let gateway = "https://gateway.example.com/api/url-key/subgraphs/id/x";
+        let listener = serde_json::from_value::<ChainListenerConfig>(serde_json::json!({
+            "enabled": true,
+            "subgraph_endpoint": gateway,
+            "subgraph_api_key": "header-key",
+        }))
+        .expect("chain listener config");
+        let indexer_urls = serde_json::from_value::<IndexerUrlsConfig>(serde_json::json!({
+            "subgraph_endpoint": gateway,
+            "update_interval": 60,
+        }))
+        .expect("indexer URLs config");
+        let chain_client = serde_json::from_value::<ChainClientConfig>(serde_json::json!({
+            "enabled": true,
+            "providers": ["https://rpc.example.com/v2/rpc-key"],
+        }))
+        .expect("chain client config");
+
+        let dumped = format!("{listener:?} {indexer_urls:?} {chain_client:?}");
+
+        for secret in ["url-key", "header-key", "rpc-key"] {
+            assert!(!dumped.contains(secret), "{secret} in {dumped}");
+        }
+        assert!(dumped.contains("gateway.example.com"), "{dumped}");
+        assert!(dumped.contains("rpc.example.com"), "{dumped}");
+    }
+
+    #[test]
+    fn a_malformed_secret_url_is_refused_without_repeating_it() {
+        let chain_client = serde_json::from_value::<ChainClientConfig>(serde_json::json!({
+            "enabled": true,
+            "providers": ["rpc.example.com/v2/rpc-key"],
+        }))
+        .expect_err("a provider without a scheme is refused");
+        let alerts = serde_json::from_value::<AlertsConfig>(serde_json::json!({
+            "slack_webhook_url": "hooks.slack.com/services/T/B/webhook-secret",
+        }))
+        .expect_err("a webhook without a scheme is refused");
+
+        let refused = format!("{chain_client} {alerts}");
+
+        assert!(refused.contains("relative URL without a base"), "{refused}");
+        for secret in ["rpc-key", "webhook-secret"] {
+            assert!(!refused.contains(secret), "{secret} in {refused}");
+        }
     }
 
     #[test]

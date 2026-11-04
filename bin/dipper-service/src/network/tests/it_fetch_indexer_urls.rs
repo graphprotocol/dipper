@@ -151,6 +151,19 @@ async fn fetch_names_the_http_status_of_a_refused_request() {
     assert!(err.contains("429"), "unexpected error: {err}");
 }
 
+#[tokio::test]
+async fn fetch_leaves_the_url_out_of_a_connection_error() {
+    //* Given
+    let endpoint = crate::test_support::refused_url_with_key("secret-key");
+
+    //* When
+    let result = fetch_snapshot(&reqwest::Client::new(), &endpoint, None).await;
+
+    //* Then
+    let err = result.expect_err("fetch should fail").to_string();
+    assert!(!err.contains("secret-key"), "unexpected error: {err}");
+}
+
 /// Spawn the refresh service against `server` with a 50 ms interval and a
 /// single-entry init snapshot; returns the handle and the init entry.
 fn spawn_service(server: &MockServer) -> (Handle, IndexerId, Url) {
