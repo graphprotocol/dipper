@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.2.6](https://github.com/graphprotocol/dipper/compare/v0.2.5...v0.2.6) (2026-11-04)
+
+
+### Added
+
+* alert once when subgraph fetches keep failing ([#774](https://github.com/graphprotocol/dipper/issues/774)) ([3d85587](https://github.com/graphprotocol/dipper/commit/3d85587d1e9b61f7b30af041e2ae94b53cb01da6))
+
+
+### Fixed
+
+* keep subgraph and RPC API keys out of dipper's logs ([#777](https://github.com/graphprotocol/dipper/issues/777)) ([d9e6565](https://github.com/graphprotocol/dipper/commit/d9e6565f9d9f5de1f514754cae7a6d7a5dedfa6f))
+* **listener:** log subgraph rate limits as such, without quick retries ([#772](https://github.com/graphprotocol/dipper/issues/772)) ([f2e928e](https://github.com/graphprotocol/dipper/commit/f2e928e776bacc0d4589f2e48f6165b0e9d2be52))
+* **network:** report the HTTP status when a subgraph poller is refused ([#773](https://github.com/graphprotocol/dipper/issues/773)) ([c532b84](https://github.com/graphprotocol/dipper/commit/c532b8462d54161df16882f13e2c00c6554d89b1))
+
 ## [0.2.5](https://github.com/graphprotocol/dipper/compare/v0.2.4...v0.2.5) (2026-11-03)
 
 
