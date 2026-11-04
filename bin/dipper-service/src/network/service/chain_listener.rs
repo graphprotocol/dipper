@@ -61,14 +61,30 @@ use crate::{
     worker::service::{ChainAccept, JobPriority, WorkerQueue},
 };
 
-/// Idle interval used when no `Created` agreements are awaiting acceptance.
+/// Idle interval used when no agreement is `Created` or `AcceptedOnChain`.
 const SLOW_POLL_INTERVAL: Duration = Duration::from_secs(300);
 /// How often the heartbeat info-line fires while idle. ~5 min at the fast
 /// rate, every poll at the slow rate.
 const HEARTBEAT_POLLS: u64 = 60;
 /// After this many back-to-back fetch failures the listener escalates the
-/// log line from `warn` to `error`.
+/// log line from `warn` to `error`, alerting once until a fetch succeeds.
 const MAX_CONSECUTIVE_FAILURES: u32 = 10;
+
+/// How to log a fetch failure, given how many have come back to back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FetchFailureLog {
+    Warn,
+    Alert,
+    Error,
+}
+
+fn fetch_failure_log(consecutive_failures: u32) -> FetchFailureLog {
+    match consecutive_failures.cmp(&MAX_CONSECUTIVE_FAILURES) {
+        std::cmp::Ordering::Less => FetchFailureLog::Warn,
+        std::cmp::Ordering::Equal => FetchFailureLog::Alert,
+        std::cmp::Ordering::Greater => FetchFailureLog::Error,
+    }
+}
 /// Base for the exponential failure-backoff sleep applied between ticks
 /// while `consecutive_failures > 0`.
 const FAILURE_BACKOFF_BASE: Duration = Duration::from_secs(5);
@@ -261,8 +277,8 @@ where
                 }
             };
 
-        // Adaptive polling: fast (config.poll_interval) when Created
-        // agreements exist, slow (`SLOW_POLL_INTERVAL`) when idle.
+        // Adaptive polling: fast (config.poll_interval) while any agreement is
+        // Created or AcceptedOnChain, slow (`SLOW_POLL_INTERVAL`) when none is.
         let fast_interval = config.poll_interval;
         let slow_interval = SLOW_POLL_INTERVAL;
         let mut timer = tokio::time::interval(fast_interval);
@@ -314,7 +330,7 @@ where
                 },
             }
 
-            // Adaptive interval: check if there are Created agreements awaiting acceptance
+            // Adaptive interval: check if any agreement is Created or AcceptedOnChain
             let has_pending = registry.exists_active_agreements().await.unwrap_or(false);
 
             let want_fast = has_pending;
@@ -547,20 +563,27 @@ where
             }
             Err(err) => {
                 *consecutive_failures = consecutive_failures.saturating_add(1);
-                if *consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                    tracing::error!(
+                match fetch_failure_log(*consecutive_failures) {
+                    FetchFailureLog::Alert => tracing::error!(
+                        event = "chain_listener_fetch_failing",
+                        error = %err,
+                        consecutive_failures = *consecutive_failures,
+                        pages_drained = pages_per_tick,
+                        "Chain listener keeps failing to fetch agreement changes from the \
+                         subgraph; on-chain accepts and cancels go unrecorded until it recovers"
+                    ),
+                    FetchFailureLog::Error => tracing::error!(
                         error = %err,
                         consecutive_failures = *consecutive_failures,
                         pages_drained = pages_per_tick,
                         "Too many consecutive failures fetching changed agreements"
-                    );
-                } else {
-                    tracing::warn!(
+                    ),
+                    FetchFailureLog::Warn => tracing::warn!(
                         error = %err,
                         consecutive_failures = *consecutive_failures,
                         pages_drained = pages_per_tick,
                         "Failed to fetch changed agreements from subgraph"
-                    );
+                    ),
                 }
                 return Err(());
             }
@@ -1966,6 +1989,17 @@ mod tests {
             canceled_at: TEST_CANCELED_AT,
             canceled_tx: TEST_CANCELED_TX.to_string(),
         }
+    }
+
+    #[test]
+    fn fetch_failures_alert_once_per_run_of_failures() {
+        let mut expected = vec![FetchFailureLog::Warn; 9];
+        expected.push(FetchFailureLog::Alert);
+        expected.extend([FetchFailureLog::Error; 5]);
+
+        let logged: Vec<_> = (1..=15).map(fetch_failure_log).collect();
+
+        assert_eq!(logged, expected);
     }
 
     #[test]
@@ -4424,6 +4458,68 @@ mod tests {
             .expect("the hold going on is logged");
         assert!(went_on.contains("WARN"), "{went_on}");
         assert!(!again.contains("chain_listener_cursor_held"), "{again}");
+    }
+
+    /// A run of failed fetches alerts once, at the 10th; a fetch that works ends the run, so the
+    /// next run alerts once more.
+    #[tokio::test]
+    async fn test_drain_alerts_once_per_run_of_failed_fetches() {
+        let registry = MockRegistry::new();
+        let chain_client = MockChainClient::default();
+        let event_source = super::super::chain_events::mock::MockEventSource::new();
+        event_source.set_latest_block(100);
+        event_source.set_latest_block_timestamp(Some(1_700_000_000));
+        let mut cursor = Cursor::genesis();
+        let mut last_persisted_timestamp: Option<u64> = None;
+        let mut last_chain_ts_persist_wall = std::time::Instant::now();
+        let mut last_subgraph_head: u64 = 0;
+        let mut stall_count: u32 = 0;
+        let mut consecutive_failures: u32 = 0;
+        let (_tx_stop, mut rx_stop) = mpsc::channel::<()>(1);
+        let mut live_checks = LiveChecks::new(MockWorkerQueue::default());
+        let fetch_fails = [vec![true; 15], vec![false], vec![true; 10]].concat();
+
+        let logged = crate::test_support::logged(async {
+            for fails in fetch_fails {
+                if fails {
+                    event_source.set_error(
+                        super::super::chain_events::ChainEventError::RateLimited(
+                            "HTTP error: 429 Too Many Requests".into(),
+                        ),
+                    );
+                }
+                let drained = drain_once(
+                    &mut cursor,
+                    &mut None,
+                    &mut last_persisted_timestamp,
+                    &mut last_chain_ts_persist_wall,
+                    &mut last_subgraph_head,
+                    &mut stall_count,
+                    &mut consecutive_failures,
+                    1337,
+                    0,
+                    10,
+                    false,
+                    &registry,
+                    &chain_client,
+                    &mut live_checks,
+                    &event_source,
+                    &mut rx_stop,
+                    test_agreement_conf().as_ref(),
+                )
+                .await;
+                assert_eq!(drained.is_err(), fails);
+            }
+        })
+        .await;
+
+        assert_eq!(
+            logged
+                .matches(r#"event="chain_listener_fetch_failing""#)
+                .count(),
+            2,
+            "{logged}"
+        );
     }
 
     /// A page that keeps failing is passed over once the cursor has been held long enough, so

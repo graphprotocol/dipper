@@ -880,6 +880,11 @@ pub mod mock {
         pub fn set_page_size(&self, page_size: Option<usize>) {
             *self.page_size.lock().unwrap() = page_size;
         }
+
+        /// Fail the next query with `error`.
+        pub fn set_error(&self, error: ChainEventError) {
+            *self.error.lock().unwrap() = Some(error);
+        }
     }
 
     impl Default for MockEventSource {
