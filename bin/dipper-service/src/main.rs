@@ -403,7 +403,7 @@ pub async fn main() -> anyhow::Result<()> {
             network::service::entity_count_cache::Ctx {
                 cache: entity_count_cache.clone(),
                 endpoint: cl_conf.subgraph_endpoint.clone(),
-                api_key: cl_conf.subgraph_api_key.clone(),
+                api_key: cl_conf.subgraph_api_key.clone().map(|key| key.into_inner()),
                 // Entity counts change slowly (once per collection epoch).
                 // Refresh hourly to balance freshness and query cost.
                 interval: std::time::Duration::from_secs(3600),
@@ -539,7 +539,10 @@ pub async fn main() -> anyhow::Result<()> {
             // Create the subgraph event source
             let event_source_config = network::service::chain_events::SubgraphEventSourceConfig {
                 endpoint: chain_listener_conf.subgraph_endpoint.clone(),
-                api_key: chain_listener_conf.subgraph_api_key.clone(),
+                api_key: chain_listener_conf
+                    .subgraph_api_key
+                    .clone()
+                    .map(|key| key.into_inner()),
                 payer_address: listener_payer_address,
                 request_timeout: chain_listener_conf.request_timeout,
                 max_retries: chain_listener_conf.max_retries,

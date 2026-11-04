@@ -17,7 +17,7 @@ use thegraph_core::alloy::{
 };
 use url::Url;
 
-use crate::chain_client::ChainClientError;
+use crate::{chain_client::ChainClientError, config::endpoint_name};
 
 /// Pull a `ChainClientError` back out of a `TransportError` if a closure
 /// boxed it in via `TransportErrorKind::custom` (see `build_and_send_call`).
@@ -28,16 +28,6 @@ fn extract_chain_client_error(err: TransportError) -> Option<ChainClientError> {
             boxed.downcast::<ChainClientError>().ok().map(|b| *b)
         }
         _ => None,
-    }
-}
-
-/// How an endpoint is named in logs and errors. Hosted RPC endpoints carry their API key in
-/// the path or the query, so naming one by host says which endpoint it was without the key.
-fn endpoint_name(url: &Url) -> String {
-    match (url.host_str(), url.port()) {
-        (Some(host), Some(port)) => format!("{host}:{port}"),
-        (Some(host), None) => host.to_string(),
-        (None, _) => "unnamed endpoint".to_string(),
     }
 }
 

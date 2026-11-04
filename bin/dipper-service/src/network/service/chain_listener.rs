@@ -238,7 +238,7 @@ where
     let service = async move {
         tracing::info!(
             poll_interval_secs = config.poll_interval.as_secs(),
-            endpoint = %config.subgraph_endpoint,
+            endpoint = %crate::config::endpoint_name(&config.subgraph_endpoint),
             "chain listener service started"
         );
 

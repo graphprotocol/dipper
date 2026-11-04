@@ -75,7 +75,7 @@ async fn run(
 ) -> anyhow::Result<()> {
     tracing::info!(
         interval_secs = interval.as_secs(),
-        endpoint = %endpoint,
+        endpoint = %crate::config::endpoint_name(&endpoint),
         "entity count cache service starting"
     );
 
