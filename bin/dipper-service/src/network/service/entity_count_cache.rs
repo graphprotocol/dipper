@@ -195,18 +195,16 @@ async fn fetch_page(
     if let Some(key) = api_key {
         builder = builder.bearer_auth(key);
     }
-    let response = builder
-        .send()
-        .await
-        .map_err(|err| anyhow::anyhow!("failed to query entity counts page: {err}"))?;
+    let response = builder.send().await.map_err(|err| {
+        anyhow::anyhow!("failed to query entity counts page: {}", err.without_url())
+    })?;
     let status = response.status();
     if !status.is_success() {
         anyhow::bail!("entity counts page request failed: HTTP {status}");
     }
-    response
-        .json()
-        .await
-        .map_err(|err| anyhow::anyhow!("failed to decode entity counts page: {err}"))
+    response.json().await.map_err(|err| {
+        anyhow::anyhow!("failed to decode entity counts page: {}", err.without_url())
+    })
 }
 
 /// Parse a single entity entry into a cache key-value pair.
@@ -326,6 +324,18 @@ mod tests {
             .to_string();
 
         assert!(err.contains("429"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_page_leaves_the_url_out_of_a_connection_error() {
+        let endpoint = crate::test_support::refused_url_with_key("secret-key");
+
+        let err = fetch_page(&reqwest::Client::new(), &endpoint, None, "")
+            .await
+            .expect_err("a refused connection must fail the fetch")
+            .to_string();
+
+        assert!(!err.contains("secret-key"), "unexpected error: {err}");
     }
 
     #[tokio::test]

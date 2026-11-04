@@ -185,6 +185,17 @@ pub async fn logged(run: impl std::future::Future<Output = ()>) -> String {
     String::from_utf8(lines.lock().unwrap().clone()).unwrap()
 }
 
+/// A local URL that refuses connections, carrying `key` in its path the way a gateway URL can
+/// carry its API key.
+pub fn refused_url_with_key(key: &str) -> url::Url {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    format!("http://127.0.0.1:{port}/api/{key}/subgraphs/id/test")
+        .parse()
+        .unwrap()
+}
+
 /// Installs, once per test binary, a global subscriber that answers "ask each
 /// time" for every log line and then declines them all. `tracing` caches that
 /// answer per log line for the whole process the first time any thread reaches

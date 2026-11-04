@@ -360,7 +360,9 @@ impl SubgraphEventSource {
             request = request.bearer_auth(api_key);
         }
 
+        // The HTTP client names the URL in a failed request, and a gateway URL can carry the key.
         let response = request.send().await.map_err(|e| {
+            let e = e.without_url();
             if e.is_timeout() || e.is_connect() {
                 ChainEventError::Transient(format!("Network error: {}", e))
             } else {
@@ -400,10 +402,9 @@ impl SubgraphEventSource {
             message: String,
         }
 
-        let graphql_response: GraphQLResponse<T> = response
-            .json()
-            .await
-            .map_err(|e| ChainEventError::Permanent(format!("Failed to parse response: {}", e)))?;
+        let graphql_response: GraphQLResponse<T> = response.json().await.map_err(|e| {
+            ChainEventError::Permanent(format!("Failed to parse response: {}", e.without_url()))
+        })?;
 
         if let Some(errors) = graphql_response.errors {
             let messages: Vec<_> = errors.iter().map(|e| e.message.as_str()).collect();
@@ -1135,16 +1136,20 @@ mod tests {
         assert!(!ChainEventError::RateLimited("test".into()).is_transient());
     }
 
-    fn event_source_for(server: &wiremock::MockServer) -> SubgraphEventSource {
+    fn event_source_at(endpoint: Url, max_retries: u32) -> SubgraphEventSource {
         SubgraphEventSource::new(SubgraphEventSourceConfig {
-            endpoint: server.uri().parse().unwrap(),
+            endpoint,
             api_key: None,
             payer_address: Address::ZERO,
             request_timeout: Duration::from_secs(5),
-            max_retries: 3,
+            max_retries,
             wall_clock_skew_tolerance_secs: 60,
             bypass_chain_clock_defenses: false,
         })
+    }
+
+    fn event_source_for(server: &wiremock::MockServer) -> SubgraphEventSource {
+        event_source_at(server.uri().parse().unwrap(), 3)
     }
 
     /// Mounts `response` for every query, failing the test on drop unless exactly 1 arrived.
@@ -1180,6 +1185,17 @@ mod tests {
             matches!(err, ChainEventError::RateLimited(_)),
             "got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_connection_error_leaves_the_url_out() {
+        let source = event_source_at(crate::test_support::refused_url_with_key("secret-key"), 0);
+
+        let err = query_meta(&source)
+            .await
+            .expect_err("a refused connection must fail the query");
+
+        assert!(!err.to_string().contains("secret-key"), "{err}");
     }
 
     #[tokio::test]
