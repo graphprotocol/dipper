@@ -61,8 +61,8 @@ pub trait IndexingRequestRegistry {
         batch_size: i64,
     ) -> RegistryResult<Vec<IndexingRequest>>;
 
-    /// Open requests still short of indexers on a deployment where an agreement ended within
-    /// the last `since_seconds`, whose freed indexer could now fill them.
+    /// Open requests still short of indexers on a deployment where dipper finished cancelling an
+    /// agreement within the last `since_seconds`, whose freed indexer could now fill them.
     async fn get_short_requests_on_deployments_with_ended_agreements(
         &self,
         since_seconds: i64,

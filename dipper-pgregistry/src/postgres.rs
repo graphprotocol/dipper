@@ -1738,9 +1738,9 @@ impl PgRegistry {
         .map_err(Into::into)
     }
 
-    /// Open requests still short of indexers on a deployment where an agreement ended within
-    /// the last `since_seconds`. An ended agreement frees its indexer to be picked again, so
-    /// these requests are worth reassessing.
+    /// Open requests still short of indexers on a deployment where dipper finished cancelling an
+    /// agreement within the last `since_seconds`. That frees its indexer to be picked again; one
+    /// the indexer ended itself stays declined, so it doesn't count.
     pub async fn get_short_requests_on_deployments_with_ended_agreements(
         &self,
         since_seconds: i64,
@@ -1764,17 +1764,15 @@ impl PgRegistry {
                 SELECT 1
                 FROM dipper_reg_indexing_agreements a
                 WHERE a.deployment_id = r.deployment_id
-                  AND a.status IN ($2, $3, $4)
-                  AND a.updated_at >= timezone('UTC', now()) - ($5 * interval '1 second')
+                  AND a.status = $2
+                  AND a.updated_at >= timezone('UTC', now()) - ($3 * interval '1 second')
               )
             ORDER BY r.updated_at ASC
-            LIMIT $6
+            LIMIT $4
             "#,
         )
         .bind(IndexingRequestStatus::Open)
         .bind(IndexingAgreementStatus::CanceledByRequester)
-        .bind(IndexingAgreementStatus::CanceledByIndexer)
-        .bind(IndexingAgreementStatus::AbandonedByIndexer)
         .bind(since_seconds)
         .bind(batch_size)
         .fetch_all(&self.pool)
