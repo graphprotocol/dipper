@@ -71,6 +71,28 @@ async fn set_indexing_target_candidates_inserts_when_no_open_row_exists() {
 }
 
 #[tokio::test]
+async fn set_indexing_target_candidates_refuses_a_negative_count() {
+    //* Given
+    let requested_by = FakeAlloy.fake();
+    let deployment_id = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
+    let deployment_chain_id = Faker.fake::<ChainId>();
+
+    let (db, _temp_db) = temp_registry_db().await;
+    let registry = PgRegistry::new(db);
+
+    //* When
+    let result = registry
+        .set_indexing_target_candidates(requested_by, deployment_id, deployment_chain_id, -1)
+        .await;
+
+    //* Then
+    assert!(
+        result.is_err(),
+        "a negative count must not be stored: {result:?}"
+    );
+}
+
+#[tokio::test]
 async fn set_indexing_target_candidates_updates_when_count_changes() {
     //* Given
     let requested_by = FakeAlloy.fake();
