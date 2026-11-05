@@ -208,7 +208,7 @@ where
     }
 
     // Gather load balancing context for IISA, including chain/ceiling info
-    let (mut context, unresponsive) = gather_selection_context(
+    let (mut context, unresponsive, still_cancelling) = gather_selection_context(
         &ctx.registry,
         deployment_id,
         ctx.agreement_conf.declined_indexer_lookback_days(),
@@ -415,13 +415,22 @@ where
             );
     }
 
+    let waiting_on_cancels = in_shortfall && !still_cancelling.is_empty();
+    if waiting_on_cancels {
+        tracing::debug!(
+            indexing_request_id = %indexing_request_id,
+            still_cancelling = still_cancelling.len(),
+            "request is short while indexers finish cancelling earlier agreements; checking again"
+        );
+    }
+
     if to_cancel.is_empty() && to_add.is_empty() {
         tracing::debug!(
             indexing_request_id=%indexing_request_id,
             deployment_id=%deployment_id,
             "reassessment: no changes needed"
         );
-        return Ok(());
+        return finish(waiting_on_cancels);
     }
 
     // Pre-compute old agreements to cancel so we can pair replacements
@@ -761,7 +770,22 @@ where
         return Err(JobError::Deferred(pacing_defer_delay(indexing_request_id)));
     }
 
-    Ok(())
+    finish(waiting_on_cancels)
+}
+
+/// How long a request short of indexers waits before checking whether the cancels holding
+/// some of them back have closed.
+const CANCEL_WAIT_DELAY: Duration = Duration::from_secs(60);
+
+/// End a reassessment, or check again later when the request is short while some indexers
+/// finish cancelling an earlier agreement on this deployment: nothing else re-checks the
+/// request once those cancels close.
+fn finish(waiting_on_cancels: bool) -> JobResult<()> {
+    if waiting_on_cancels {
+        Err(JobError::Deferred(CANCEL_WAIT_DELAY))
+    } else {
+        Ok(())
+    }
 }
 
 /// An indexer dipper can offer an agreement to, and the prices it would offer.
@@ -1188,6 +1212,8 @@ mod lifecycle_event_tests {
         unresponsive: Vec<IndexerId>,
         /// The stored request the job reads its target from.
         request: Option<IndexingRequest>,
+        /// Agreements on the deployment that belong to earlier requests.
+        earlier_requests_agreements: Vec<IndexingAgreement>,
     }
 
     #[async_trait]
@@ -1242,7 +1268,9 @@ mod lifecycle_event_tests {
             &self,
             _deployment_id: &DeploymentId,
         ) -> RegistryResult<Vec<IndexingAgreement>> {
-            Ok(self.active_agreements.clone())
+            let mut agreements = self.active_agreements.clone();
+            agreements.extend(self.earlier_requests_agreements.iter().cloned());
+            Ok(agreements)
         }
         // gather_selection_context: no pending agreements.
         async fn get_pending_agreement_indexers_by_deployment(
@@ -1575,6 +1603,49 @@ mod lifecycle_event_tests {
         run(ctx, 1).await.expect("handler ok");
 
         assert_eq!(queue.proposals.lock().unwrap().len(), 1);
+    }
+
+    /// A context for a request whose indexer is still cancelling an agreement from an earlier
+    /// request on the deployment, so IISA has nobody else to pick.
+    fn ctx_with_earlier_agreement(
+        status: IndexingAgreementStatus,
+    ) -> Ctx<MockRegistry, MockQueue, MockIisa, MockChainClient> {
+        build_ctx(
+            MockRegistry {
+                earlier_requests_agreements: vec![agreement(indexer_id(0x91), status)],
+                ..MockRegistry::default()
+            },
+            MockIisa::default(),
+            MockQueue::default(),
+            MockChainClient::default(),
+            CapturingEventsProducer::new(),
+            indexer_urls::Snapshot::new(),
+        )
+    }
+
+    /// A request left short because an indexer is still cancelling an earlier agreement on the
+    /// deployment checks again later, since nothing else re-checks it once that cancel closes.
+    #[tokio::test]
+    async fn checks_again_while_an_indexer_is_still_cancelling() {
+        let ctx = ctx_with_earlier_agreement(IndexingAgreementStatus::Cancelling);
+
+        let result = run(ctx, 2).await;
+
+        assert!(
+            matches!(result, Err(JobError::Deferred(delay)) if delay == super::CANCEL_WAIT_DELAY),
+            "{result:?}"
+        );
+    }
+
+    /// Once the earlier agreement has closed, a request that is still short finishes instead of
+    /// checking again forever.
+    #[tokio::test]
+    async fn finishes_short_when_nothing_is_cancelling() {
+        let ctx = ctx_with_earlier_agreement(IndexingAgreementStatus::CanceledByRequester);
+
+        let result = run(ctx, 2).await;
+
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[tokio::test]
@@ -2175,6 +2246,7 @@ mod lifecycle_event_tests {
             held: Vec::new(),
             unresponsive: Vec::new(),
             request: None,
+            earlier_requests_agreements: Vec::new(),
         };
         let ctx = build_ctx(
             registry,
@@ -2217,6 +2289,7 @@ mod lifecycle_event_tests {
             held: Vec::new(),
             unresponsive: Vec::new(),
             request: None,
+            earlier_requests_agreements: Vec::new(),
         };
         let ctx = build_ctx(
             registry,
@@ -2365,6 +2438,7 @@ mod lifecycle_event_tests {
             held: Vec::new(),
             unresponsive: Vec::new(),
             request: None,
+            earlier_requests_agreements: Vec::new(),
         };
         let ctx = build_ctx(
             registry,
@@ -2426,6 +2500,7 @@ mod lifecycle_event_tests {
             held: Vec::new(),
             unresponsive: Vec::new(),
             request: None,
+            earlier_requests_agreements: Vec::new(),
         };
         let ctx = build_ctx(
             registry,
@@ -2495,6 +2570,7 @@ mod lifecycle_event_tests {
             held: Vec::new(),
             unresponsive: Vec::new(),
             request: None,
+            earlier_requests_agreements: Vec::new(),
         };
         let ctx = build_ctx(
             registry,
@@ -2634,6 +2710,7 @@ mod lifecycle_event_tests {
             held: Vec::new(),
             unresponsive: Vec::new(),
             request: None,
+            earlier_requests_agreements: Vec::new(),
         };
         let ctx = build_ctx(
             registry,
