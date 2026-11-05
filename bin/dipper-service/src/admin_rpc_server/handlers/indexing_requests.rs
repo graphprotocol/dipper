@@ -538,7 +538,10 @@ mod tests {
 
             let err = result.expect_err("a count above the maximum must be refused");
             assert_eq!(err.code(), 400, "count {count}: {err:?}");
-            assert!(err.message().contains("100"), "count {count}: {err:?}");
+            assert_eq!(
+                err.message(),
+                format!("num_candidates must be at most {MAX_NUM_CANDIDATES}, got {count}")
+            );
             assert!(
                 events.events().is_empty(),
                 "count {count} must not be recorded"
