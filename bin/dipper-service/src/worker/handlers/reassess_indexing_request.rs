@@ -29,7 +29,7 @@ use crate::{
     registry::{
         AgreementRegistry, IndexerDenylistRegistry, IndexingAgreementStatus,
         IndexingAgreementTerms, IndexingAgreementTermsMetadata, IndexingRequestRegistry,
-        NewAgreementParams, PendingCancellationRegistry,
+        IndexingRequestStatus, NewAgreementParams, PendingCancellationRegistry,
     },
     signing::eip712::Eip712Signer,
     worker::{
@@ -93,7 +93,8 @@ pub struct Message {
     pub deployment_id: DeploymentId,
     /// The chain ID of the subgraph deployment
     pub deployment_chain_id: ChainId,
-    /// The desired group size (how many indexers should be assigned)
+    /// The request's target when this job was queued. The job reads the current target instead;
+    /// this stays so a worker running an older release can still read and run the job.
     pub num_candidates: usize,
 }
 
@@ -111,7 +112,7 @@ pub async fn handle<R, W, I, T>(
         indexing_request_id,
         deployment_id,
         deployment_chain_id,
-        num_candidates,
+        num_candidates: _,
     }: &Message,
 ) -> JobResult<()>
 where
@@ -131,6 +132,25 @@ where
     let _reassess_guard = match ctx.reassess_lock.try_lock() {
         Ok(guard) => guard,
         Err(_) => return Err(JobError::Deferred(Duration::from_secs(1))),
+    };
+
+    // Use the request's target as it stands now, not when this job was queued: a burst of target
+    // changes queues a job each, and only the latest should take effect. Cancelled means zero.
+    let num_candidates = match ctx
+        .registry
+        .get_indexing_request_by_id(indexing_request_id)
+        .await
+        .map_err(|err| JobError::Fatal(err.into()))?
+    {
+        Some(request) if request.status == IndexingRequestStatus::Open => request.num_candidates,
+        Some(_) => 0,
+        None => {
+            tracing::warn!(
+                indexing_request_id = %indexing_request_id,
+                "Reassessing an indexing request that doesn't exist; nothing to do"
+            );
+            return Ok(());
+        }
     };
 
     // Get current active agreements for this indexing request. Fetched once here
@@ -273,7 +293,7 @@ where
     // stall new requests until IISA recovers — see README "IISA dependency".
     let target_selected: Vec<SelectedIndexer> = match ctx
         .iisa
-        .select_indexers(*deployment_id, *num_candidates, &context)
+        .select_indexers(*deployment_id, num_candidates, &context)
         .await
     {
         Ok(indexers) => indexers,
@@ -370,7 +390,7 @@ where
     // a re-run after a later failure sees the latch already set and does not
     // re-emit.
     let offerable_picks = target_selected.len() - unofferable as usize;
-    let in_shortfall = offerable_picks < *num_candidates;
+    let in_shortfall = offerable_picks < num_candidates;
     let shortfall_changed = ctx
         .registry
         .set_indexing_request_shortfall_active(indexing_request_id, in_shortfall)
@@ -389,7 +409,7 @@ where
                 *deployment_id,
                 ctx.signer.chain_id(),
                 proto::SubgraphIndexingAgreementNIndexersUnavailable {
-                    agreements_requested: *num_candidates as i32,
+                    agreements_requested: num_candidates as i32,
                     candidates_returned: offerable_picks as i32,
                 },
             );
@@ -922,7 +942,7 @@ mod lifecycle_event_tests {
     use time::OffsetDateTime;
     use url::Url;
 
-    use super::{Ctx, JobError, Message, handle};
+    use super::{Ctx, JobError, JobResult, Message, handle};
     use crate::{
         chain_client::{AgreementOnChain, ChainClient, ChainClientError},
         config::{IndexingAgreementChainPrices, IndexingAgreementConfig},
@@ -936,8 +956,9 @@ mod lifecycle_event_tests {
         registry::{
             AgreementFeeRate, Indexer, IndexerDenylistRegistry, IndexingAgreement,
             IndexingAgreementStatus, IndexingAgreementTerms, IndexingAgreementTermsMetadata,
-            IndexingRequest, IndexingRequestRegistry, NewAgreementParams, PendingCancellation,
-            PendingCancellationRegistry, Result as RegistryResult, SetTargetOutcome,
+            IndexingRequest, IndexingRequestRegistry, IndexingRequestStatus, NewAgreementParams,
+            PendingCancellation, PendingCancellationRegistry, Result as RegistryResult,
+            SetTargetOutcome,
         },
         signing::eip712::Eip712Signer,
         test_support::{CapturedEvent, CapturingEventsProducer},
@@ -1165,6 +1186,8 @@ mod lifecycle_event_tests {
         held: Vec<IndexerId>,
         /// Indexers reported as recently unresponsive, which wakes the breaker.
         unresponsive: Vec<IndexerId>,
+        /// The stored request the job reads its target from.
+        request: Option<IndexingRequest>,
     }
 
     #[async_trait]
@@ -1183,9 +1206,9 @@ mod lifecycle_event_tests {
         }
         async fn get_indexing_request_by_id(
             &self,
-            _id: &IndexingRequestId,
+            id: &IndexingRequestId,
         ) -> RegistryResult<Option<IndexingRequest>> {
-            unimplemented!()
+            Ok(self.request.clone().filter(|request| request.id == *id))
         }
         async fn get_indexing_requests_by_deployment_id(
             &self,
@@ -1464,13 +1487,105 @@ mod lifecycle_event_tests {
         }
     }
 
-    fn test_message(num_candidates: usize) -> Message {
+    /// The job queued for `request`, carrying the count it had then, as callers queue it.
+    fn test_message(request: &IndexingRequest) -> Message {
         Message {
-            indexing_request_id: IndexingRequestId::new(),
+            indexing_request_id: request.id,
+            deployment_id: deployment(),
+            deployment_chain_id: TEST_DEPLOYMENT_CHAIN_ID,
+            num_candidates: request.num_candidates,
+        }
+    }
+
+    /// A stored request wanting `num_candidates` indexers, or a cancelled one for 0, since
+    /// cancelling is how a request's target reaches zero.
+    fn stored_request(num_candidates: usize) -> IndexingRequest {
+        IndexingRequest {
+            id: IndexingRequestId::new(),
+            created_at: OffsetDateTime::now_utc(),
+            updated_at: OffsetDateTime::now_utc(),
+            status: if num_candidates == 0 {
+                IndexingRequestStatus::Canceled
+            } else {
+                IndexingRequestStatus::Open
+            },
+            requested_by: Address::ZERO,
             deployment_id: deployment(),
             deployment_chain_id: TEST_DEPLOYMENT_CHAIN_ID,
             num_candidates,
         }
+    }
+
+    /// Run the handler for a request whose stored target is `num_candidates`.
+    async fn run(
+        mut ctx: Ctx<MockRegistry, MockQueue, MockIisa, MockChainClient>,
+        num_candidates: usize,
+    ) -> JobResult<()> {
+        let request = stored_request(num_candidates);
+        let message = test_message(&request);
+        ctx.registry.request = Some(request);
+        handle(ctx, &message).await
+    }
+
+    /// A context whose IISA picks `picked`, with `picked` reachable, plus the queue it offers on.
+    fn ctx_picking(
+        picked: IndexerId,
+    ) -> (
+        Ctx<MockRegistry, MockQueue, MockIisa, MockChainClient>,
+        MockQueue,
+    ) {
+        let mut snapshot = indexer_urls::Snapshot::new();
+        snapshot.insert(picked, url_of(picked));
+        let queue = MockQueue::default();
+        let ctx = build_ctx(
+            MockRegistry::default(),
+            MockIisa {
+                selected: vec![selected(picked)],
+                ..Default::default()
+            },
+            queue.clone(),
+            MockChainClient::default(),
+            CapturingEventsProducer::new(),
+            snapshot,
+        );
+        (ctx, queue)
+    }
+
+    /// A job queued while its request wanted indexers but run after the request was cancelled
+    /// makes no offers, so a burst of target changes settles on the last one.
+    #[tokio::test]
+    async fn a_job_for_a_request_since_cancelled_makes_no_offers() {
+        let (mut ctx, queue) = ctx_picking(indexer_id(0x81));
+        let mut request = stored_request(2);
+        let queued_while_open = test_message(&request);
+        request.status = IndexingRequestStatus::Canceled;
+        ctx.registry.request = Some(request);
+
+        handle(ctx, &queued_while_open).await.expect("handler ok");
+
+        assert!(queue.proposals.lock().unwrap().is_empty());
+    }
+
+    /// The same job for a request that is still open makes its offer, which shows the test above
+    /// passes because the request was cancelled, not because nothing could be offered.
+    #[tokio::test]
+    async fn a_job_for_an_open_request_makes_its_offers() {
+        let (ctx, queue) = ctx_picking(indexer_id(0x81));
+
+        run(ctx, 1).await.expect("handler ok");
+
+        assert_eq!(queue.proposals.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_job_for_a_missing_request_does_nothing() {
+        let (ctx, queue) = ctx_picking(indexer_id(0x81));
+
+        handle(ctx, &test_message(&stored_request(1)))
+            .await
+            .expect("handler ok");
+
+        assert!(queue.proposals.lock().unwrap().is_empty());
     }
 
     /// Build an active agreement for `indexer` in the given status.
@@ -1538,7 +1653,7 @@ mod lifecycle_event_tests {
             indexer_urls::Snapshot::new(),
         );
 
-        handle(ctx, &test_message(1)).await.expect("handler ok");
+        run(ctx, 1).await.expect("handler ok");
 
         let contexts = contexts.lock().unwrap();
         assert_eq!(contexts.len(), 1, "IISA asked once: {contexts:?}");
@@ -1569,7 +1684,7 @@ mod lifecycle_event_tests {
             ..test_agreement_conf()
         });
 
-        handle(ctx, &test_message(1)).await.expect("handler ok");
+        run(ctx, 1).await.expect("handler ok");
 
         let contexts = contexts.lock().unwrap();
         assert_eq!(contexts.len(), 1, "IISA asked once: {contexts:?}");
@@ -1594,7 +1709,7 @@ mod lifecycle_event_tests {
             indexer_urls::Snapshot::new(),
         );
 
-        handle(ctx, &test_message(1)).await.expect("handler ok");
+        run(ctx, 1).await.expect("handler ok");
 
         assert_eq!(
             *dips_ceilings.lock().unwrap(),
@@ -1629,7 +1744,7 @@ mod lifecycle_event_tests {
             indexer_urls::Snapshot::new(),
         );
 
-        handle(ctx, &test_message(1)).await.expect("handler ok");
+        run(ctx, 1).await.expect("handler ok");
 
         let contexts = contexts.lock().unwrap();
         assert_eq!(contexts.len(), 1, "IISA asked once: {contexts:?}");
@@ -1661,7 +1776,7 @@ mod lifecycle_event_tests {
             indexer_urls::Snapshot::new(),
         );
 
-        handle(ctx, &test_message(1)).await.expect("handler ok");
+        run(ctx, 1).await.expect("handler ok");
 
         let contexts = contexts.lock().unwrap();
         assert_eq!(contexts.len(), 1, "IISA asked once: {contexts:?}");
@@ -1688,7 +1803,7 @@ mod lifecycle_event_tests {
 
         let mut result = None;
         let logs = crate::test_support::logged(async {
-            result = Some(handle(ctx, &test_message(1)).await);
+            result = Some(run(ctx, 1).await);
         })
         .await;
 
@@ -1738,7 +1853,8 @@ mod lifecycle_event_tests {
         for indexer in &selected {
             snapshot.insert(indexer.id, url_of(indexer.id));
         }
-        let message = test_message(selected.len());
+        let request = stored_request(selected.len());
+        let message = test_message(&request);
         let queue = MockQueue::default();
         let mut ctx = build_ctx(
             MockRegistry::default(),
@@ -1751,6 +1867,7 @@ mod lifecycle_event_tests {
             CapturingEventsProducer::new(),
             snapshot,
         );
+        ctx.registry.request = Some(request);
         if let Some(prices) = fallback {
             ctx.chain_price = Arc::new(BTreeMap::from([(TEST_DEPLOYMENT_CHAIN_ID, prices)]));
         }
@@ -1891,7 +2008,7 @@ mod lifecycle_event_tests {
                 snapshot,
             );
 
-            handle(ctx, &test_message(2)).await.expect("handler ok");
+            run(ctx, 2).await.expect("handler ok");
 
             assert!(queue.proposals.lock().unwrap().is_empty(), "{case}");
             assert!(chain.cancelled.lock().unwrap().is_empty(), "{case}");
@@ -1923,7 +2040,7 @@ mod lifecycle_event_tests {
             snapshot,
         );
 
-        handle(ctx, &test_message(2)).await.expect("handler ok");
+        run(ctx, 2).await.expect("handler ok");
 
         let captured = events.events();
         let unavailable: Vec<_> = captured
@@ -1964,7 +2081,7 @@ mod lifecycle_event_tests {
             snapshot,
         );
 
-        handle(ctx, &test_message(3)).await.expect("handler ok");
+        run(ctx, 3).await.expect("handler ok");
 
         let captured = events.events();
         let unavailable: Vec<_> = captured
@@ -2021,7 +2138,7 @@ mod lifecycle_event_tests {
         ctx.chain_listener_chain_id = Some(1337);
 
         // Request 3, IISA returns 1: enters shortfall. The clock read then fails.
-        let result = handle(ctx, &test_message(3)).await;
+        let result = run(ctx, 3).await;
 
         assert!(
             result.is_err(),
@@ -2057,6 +2174,7 @@ mod lifecycle_event_tests {
             marked_cancelling: Arc::default(),
             held: Vec::new(),
             unresponsive: Vec::new(),
+            request: None,
         };
         let ctx = build_ctx(
             registry,
@@ -2072,7 +2190,7 @@ mod lifecycle_event_tests {
 
         // Request 3, IISA returns 1: still short, synced (empty diff). The latch is
         // already set, so no re-emit.
-        handle(ctx, &test_message(3)).await.expect("handler ok");
+        run(ctx, 3).await.expect("handler ok");
 
         assert!(
             events.events().is_empty(),
@@ -2098,6 +2216,7 @@ mod lifecycle_event_tests {
             marked_cancelling: Arc::default(),
             held: Vec::new(),
             unresponsive: Vec::new(),
+            request: None,
         };
         let ctx = build_ctx(
             registry,
@@ -2111,7 +2230,7 @@ mod lifecycle_event_tests {
             indexer_urls::Snapshot::new(),
         );
 
-        handle(ctx, &test_message(1)).await.expect("handler ok");
+        run(ctx, 1).await.expect("handler ok");
 
         assert!(
             events.events().is_empty(),
@@ -2139,7 +2258,7 @@ mod lifecycle_event_tests {
             indexer_urls::Snapshot::new(),
         );
 
-        handle(ctx, &test_message(3)).await.expect("handler ok");
+        run(ctx, 3).await.expect("handler ok");
 
         let captured = events.events();
         let unavailable: Vec<_> = captured
@@ -2185,7 +2304,7 @@ mod lifecycle_event_tests {
             snapshot,
         );
 
-        handle(ctx, &test_message(3)).await.expect("handler ok");
+        run(ctx, 3).await.expect("handler ok");
 
         let proposed: std::collections::HashSet<Url> =
             queue.proposals.lock().unwrap().iter().cloned().collect();
@@ -2220,7 +2339,7 @@ mod lifecycle_event_tests {
             indexer_urls::Snapshot::new(),
         );
 
-        handle(ctx, &test_message(1)).await.expect("handler ok");
+        run(ctx, 1).await.expect("handler ok");
 
         assert!(chain_client.cancelled.lock().unwrap().is_empty());
         assert!(marked_cancelling.lock().unwrap().is_empty());
@@ -2245,6 +2364,7 @@ mod lifecycle_event_tests {
             marked_cancelling: Arc::default(),
             held: Vec::new(),
             unresponsive: Vec::new(),
+            request: None,
         };
         let ctx = build_ctx(
             registry,
@@ -2258,7 +2378,7 @@ mod lifecycle_event_tests {
             indexer_urls::Snapshot::new(),
         );
 
-        handle(ctx, &test_message(3)).await.expect("handler ok");
+        run(ctx, 3).await.expect("handler ok");
 
         let unavailable = events
             .events()
@@ -2305,6 +2425,7 @@ mod lifecycle_event_tests {
             marked_cancelling: Arc::default(),
             held: Vec::new(),
             unresponsive: Vec::new(),
+            request: None,
         };
         let ctx = build_ctx(
             registry,
@@ -2319,7 +2440,7 @@ mod lifecycle_event_tests {
         );
 
         // Request size 1 == returned 1, so no shortfall event.
-        handle(ctx, &test_message(1)).await.expect("handler ok");
+        run(ctx, 1).await.expect("handler ok");
 
         let captured = events.events();
         let proposed: Vec<_> = captured
@@ -2373,6 +2494,7 @@ mod lifecycle_event_tests {
             marked_cancelling: Arc::default(),
             held: Vec::new(),
             unresponsive: Vec::new(),
+            request: None,
         };
         let ctx = build_ctx(
             registry,
@@ -2386,7 +2508,7 @@ mod lifecycle_event_tests {
             snapshot,
         );
 
-        handle(ctx, &test_message(1)).await.expect("handler ok");
+        run(ctx, 1).await.expect("handler ok");
 
         let captured = events.events();
         assert_eq!(
@@ -2433,7 +2555,7 @@ mod lifecycle_event_tests {
         let chain = ctx.chain_client.clone();
         let cancelled = ctx.registry.marked_cancelled.clone();
 
-        let result = handle(ctx, &test_message(0)).await;
+        let result = run(ctx, 0).await;
 
         assert!(result.is_ok(), "got {result:?}");
         assert_eq!(
@@ -2453,7 +2575,7 @@ mod lifecycle_event_tests {
         let chain = ctx.chain_client.clone();
         let marked = ctx.registry.marked_cancelling.clone();
 
-        let result = handle(ctx, &test_message(0)).await;
+        let result = run(ctx, 0).await;
 
         assert!(result.is_ok(), "got {result:?}");
         assert!(chain.cancelled.lock().unwrap().is_empty());
@@ -2466,7 +2588,7 @@ mod lifecycle_event_tests {
         let chain = ctx.chain_client.clone();
         let cancelled = ctx.registry.marked_cancelled.clone();
 
-        let result = handle(ctx, &test_message(0)).await;
+        let result = run(ctx, 0).await;
 
         assert!(result.is_ok(), "got {result:?}");
         assert_eq!(*chain.marked_at_cancel.lock().unwrap(), vec![true]);
@@ -2486,7 +2608,7 @@ mod lifecycle_event_tests {
             let cancelling = ctx.registry.marked_cancelling.clone();
             let cancelled = ctx.registry.marked_cancelled.clone();
 
-            let result = handle(ctx, &test_message(0)).await;
+            let result = run(ctx, 0).await;
 
             assert!(result.is_ok(), "got {result:?}");
             assert_eq!(*cancelling.lock().unwrap(), vec![leaving.id]);
@@ -2511,6 +2633,7 @@ mod lifecycle_event_tests {
             marked_cancelling: Arc::default(),
             held: Vec::new(),
             unresponsive: Vec::new(),
+            request: None,
         };
         let ctx = build_ctx(
             registry,
@@ -2524,7 +2647,7 @@ mod lifecycle_event_tests {
             indexer_urls::Snapshot::new(),
         );
 
-        handle(ctx, &test_message(0)).await.expect("handler ok");
+        run(ctx, 0).await.expect("handler ok");
 
         assert_eq!(*chain_client.cancelled.lock().unwrap(), vec![leaving_id]);
     }
