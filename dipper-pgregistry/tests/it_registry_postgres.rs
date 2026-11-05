@@ -542,8 +542,20 @@ async fn get_indexing_agreements_by_indexing_request_id() {
     );
 }
 
-/// A short open request is found once an agreement on its deployment has just ended, and not
-/// before, nor when that agreement ended long ago.
+/// Apply `sql` to the fixture, then count the short requests the cancel sweep would reassess.
+async fn short_requests_after(db: &Pool<Postgres>, registry: &PgRegistry, sql: &str) -> usize {
+    run_fixture(db, sql)
+        .await
+        .expect("Failed to apply the change");
+    registry
+        .get_short_requests_on_deployments_with_ended_agreements(600, 10)
+        .await
+        .expect("Failed to query")
+        .len()
+}
+
+/// Only an open, short request is found, and only once dipper has just finished cancelling an
+/// agreement on its deployment.
 #[tokio::test]
 async fn finds_short_requests_on_deployments_with_recently_ended_agreements() {
     //* Given
@@ -552,38 +564,45 @@ async fn finds_short_requests_on_deployments_with_recently_ended_agreements() {
         .await
         .expect("Failed to run fixture");
     let registry = PgRegistry::new(db.clone());
-    let deployment = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
-    let find = || registry.get_short_requests_on_deployments_with_ended_agreements(600, 10);
-    run_fixture(
-        &db,
-        "UPDATE dipper_reg_indexing_requests SET shortfall_active = true;",
-    )
-    .await
-    .expect("Failed to mark the request short");
-    let before = find().await.expect("Failed to query");
+    let ended_long_ago = "UPDATE dipper_reg_indexing_requests SET shortfall_active = true; \
+         UPDATE dipper_reg_indexing_agreements \
+         SET status = 3, updated_at = timezone('UTC', now()) - interval '1 hour';";
 
     //* When
-    run_fixture(
+    let long_ago = short_requests_after(&db, &registry, ended_long_ago).await;
+    let just_ended = short_requests_after(
         &db,
-        "UPDATE dipper_reg_indexing_agreements SET status = 3, updated_at = timezone('UTC', now());",
+        &registry,
+        "UPDATE dipper_reg_indexing_agreements SET updated_at = timezone('UTC', now());",
     )
-    .await
-    .expect("Failed to end the agreements");
-    let after = find().await.expect("Failed to query");
-    run_fixture(
+    .await;
+    let not_short = short_requests_after(
         &db,
-        "UPDATE dipper_reg_indexing_agreements \
-         SET updated_at = timezone('UTC', now()) - interval '1 hour';",
+        &registry,
+        "UPDATE dipper_reg_indexing_requests SET shortfall_active = false;",
     )
-    .await
-    .expect("Failed to age the agreements");
-    let long_after = find().await.expect("Failed to query");
+    .await;
+    let ended_by_indexer = short_requests_after(
+        &db,
+        &registry,
+        "UPDATE dipper_reg_indexing_requests SET shortfall_active = true; \
+         UPDATE dipper_reg_indexing_agreements SET status = 4;",
+    )
+    .await;
+    let request_cancelled = short_requests_after(
+        &db,
+        &registry,
+        "UPDATE dipper_reg_indexing_agreements SET status = 3; \
+         UPDATE dipper_reg_indexing_requests SET status = 1;",
+    )
+    .await;
 
     //* Then
-    assert!(before.is_empty(), "{before:?}");
-    assert_eq!(after.len(), 1, "{after:?}");
-    assert_eq!(after[0].deployment_id, deployment);
-    assert!(long_after.is_empty(), "{long_after:?}");
+    assert_eq!(long_ago, 0, "a cancel that ended long ago");
+    assert_eq!(just_ended, 1, "a cancel that just ended");
+    assert_eq!(not_short, 0, "a request that isn't short");
+    assert_eq!(ended_by_indexer, 0, "an agreement the indexer ended");
+    assert_eq!(request_cancelled, 0, "a cancelled request");
 }
 
 #[tokio::test]
