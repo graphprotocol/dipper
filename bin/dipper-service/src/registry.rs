@@ -143,11 +143,6 @@ impl RegistryProvider {
 
 #[async_trait]
 impl IndexingRequestRegistry for RegistryProvider {
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap,
-        reason = "predates this lint; fix when next touched"
-    )]
     async fn set_indexing_target_candidates(
         &self,
         requested_by: Address,
@@ -155,12 +150,15 @@ impl IndexingRequestRegistry for RegistryProvider {
         deployment_chain_id: ChainId,
         num_candidates: usize,
     ) -> RegistryResult<crate::registry::indexing_request::SetTargetOutcome> {
+        // The admin API refuses counts above MAX_NUM_CANDIDATES first; saturating rather than
+        // wrapping means a count that slipped past it could never be stored as 0 or negative.
+        let num_candidates = i32::try_from(num_candidates).unwrap_or(i32::MAX);
         self.inner
             .set_indexing_target_candidates(
                 requested_by,
                 deployment_id,
                 deployment_chain_id,
-                num_candidates as i32,
+                num_candidates,
             )
             .await
             .map_err(Into::into)

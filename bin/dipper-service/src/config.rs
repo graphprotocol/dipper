@@ -20,6 +20,10 @@ use url::Url;
 /// The maximum number of candidates to select.
 pub const DEFAULT_MAX_CANDIDATES: usize = 3;
 
+/// The most indexers one indexing request may ask for. Each is paid separately, so this keeps a
+/// mistyped count from becoming an agreement with every indexer IISA can find.
+pub const MAX_NUM_CANDIDATES: usize = 100;
+
 /// How an endpoint is named in logs and errors. Hosted RPC and gateway endpoints can carry their
 /// API key in the path or the query, so naming one by host says which it was without the key.
 pub fn endpoint_name(url: &Url) -> String {
