@@ -150,9 +150,10 @@ impl IndexingRequestRegistry for RegistryProvider {
         deployment_chain_id: ChainId,
         num_candidates: usize,
     ) -> RegistryResult<crate::registry::indexing_request::SetTargetOutcome> {
-        // The admin API refuses counts above MAX_NUM_CANDIDATES first; saturating rather than
-        // wrapping means a count that slipped past it could never be stored as 0 or negative.
-        let num_candidates = i32::try_from(num_candidates).unwrap_or(i32::MAX);
+        let num_candidates = i32::try_from(num_candidates).map_err(|_| Error::TooLarge {
+            field: "num_candidates",
+            value: num_candidates,
+        })?;
         self.inner
             .set_indexing_target_candidates(
                 requested_by,
@@ -994,8 +995,38 @@ mod tests {
     use dipper_core::ids::IndexingAgreementId;
     use dipper_pgregistry::{EndCorrection, RecordedEnd};
 
-    use super::warn_if_end_corrected;
+    use super::{IndexingRequestRegistry, RegistryProvider, warn_if_end_corrected};
     use crate::test_support::logged;
+
+    /// A count the 32-bit column can't hold is refused before any query, never wrapped or
+    /// saturated, so no live database is needed.
+    #[tokio::test]
+    async fn refuses_a_count_too_large_to_store() {
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/unused")
+            .expect("a lazy pool never connects");
+        let registry = RegistryProvider::new(db);
+
+        let result = registry
+            .set_indexing_target_candidates(
+                thegraph_core::alloy::primitives::Address::ZERO,
+                thegraph_core::deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv"),
+                1,
+                2_147_483_648,
+            )
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(crate::registry::Error::TooLarge {
+                    value: 2_147_483_648,
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+    }
 
     #[tokio::test]
     async fn warns_with_both_ends_when_an_announced_end_changes() {
