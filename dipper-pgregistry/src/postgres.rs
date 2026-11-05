@@ -1738,6 +1738,48 @@ impl PgRegistry {
         .map_err(Into::into)
     }
 
+    /// Open requests still short of indexers on a deployment where dipper finished cancelling an
+    /// agreement within the last `since_seconds`. That frees its indexer to be picked again; one
+    /// the indexer ended itself stays declined, so it doesn't count.
+    pub async fn get_short_requests_on_deployments_with_ended_agreements(
+        &self,
+        since_seconds: i64,
+        batch_size: i64,
+    ) -> Result<Vec<IndexingRequest>, Error> {
+        sqlx::query_as(
+            r#"
+            SELECT
+                r.id,
+                r.created_at,
+                r.updated_at,
+                r.status,
+                r.requested_by,
+                r.deployment_id,
+                r.deployment_chain_id,
+                r.num_candidates
+            FROM dipper_reg_indexing_requests r
+            WHERE r.status = $1
+              AND r.shortfall_active
+              AND EXISTS (
+                SELECT 1
+                FROM dipper_reg_indexing_agreements a
+                WHERE a.deployment_id = r.deployment_id
+                  AND a.status = $2
+                  AND a.updated_at >= timezone('UTC', now()) - ($3 * interval '1 second')
+              )
+            ORDER BY r.updated_at ASC
+            LIMIT $4
+            "#,
+        )
+        .bind(IndexingRequestStatus::Open)
+        .bind(IndexingAgreementStatus::CanceledByRequester)
+        .bind(since_seconds)
+        .bind(batch_size)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Atomically set the coverage-shortfall latch on a request, returning whether
     /// the value changed. The `shortfall_active <> $2` guard makes the UPDATE a
     /// no-op (returning no row) when the value is unchanged, so the caller learns

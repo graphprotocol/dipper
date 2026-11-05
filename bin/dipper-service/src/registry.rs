@@ -218,6 +218,21 @@ impl IndexingRequestRegistry for RegistryProvider {
             .collect())
     }
 
+    async fn get_short_requests_on_deployments_with_ended_agreements(
+        &self,
+        since_seconds: i64,
+        batch_size: i64,
+    ) -> RegistryResult<Vec<IndexingRequest>> {
+        Ok(self
+            .inner
+            .get_short_requests_on_deployments_with_ended_agreements(since_seconds, batch_size)
+            .await?
+            .into_iter()
+            .map(IndexingRequest::try_from)
+            .filter_map(filter_map_with_logging)
+            .collect())
+    }
+
     async fn set_indexing_request_shortfall_active(
         &self,
         id: &IndexingRequestId,

@@ -542,6 +542,69 @@ async fn get_indexing_agreements_by_indexing_request_id() {
     );
 }
 
+/// Apply `sql` to the fixture, then count the short requests the cancel sweep would reassess.
+async fn short_requests_after(db: &Pool<Postgres>, registry: &PgRegistry, sql: &str) -> usize {
+    run_fixture(db, sql)
+        .await
+        .expect("Failed to apply the change");
+    registry
+        .get_short_requests_on_deployments_with_ended_agreements(600, 10)
+        .await
+        .expect("Failed to query")
+        .len()
+}
+
+/// Only an open, short request is found, and only once dipper has just finished cancelling an
+/// agreement on its deployment.
+#[tokio::test]
+async fn finds_short_requests_on_deployments_with_recently_ended_agreements() {
+    //* Given
+    let (db, _temp_db) = temp_registry_db().await;
+    run_fixture(&db, include_str!("fixtures/0002_indexing_agreements.sql"))
+        .await
+        .expect("Failed to run fixture");
+    let registry = PgRegistry::new(db.clone());
+    let ended_long_ago = "UPDATE dipper_reg_indexing_requests SET shortfall_active = true; \
+         UPDATE dipper_reg_indexing_agreements \
+         SET status = 3, updated_at = timezone('UTC', now()) - interval '1 hour';";
+
+    //* When
+    let long_ago = short_requests_after(&db, &registry, ended_long_ago).await;
+    let just_ended = short_requests_after(
+        &db,
+        &registry,
+        "UPDATE dipper_reg_indexing_agreements SET updated_at = timezone('UTC', now());",
+    )
+    .await;
+    let not_short = short_requests_after(
+        &db,
+        &registry,
+        "UPDATE dipper_reg_indexing_requests SET shortfall_active = false;",
+    )
+    .await;
+    let ended_by_indexer = short_requests_after(
+        &db,
+        &registry,
+        "UPDATE dipper_reg_indexing_requests SET shortfall_active = true; \
+         UPDATE dipper_reg_indexing_agreements SET status = 4;",
+    )
+    .await;
+    let request_cancelled = short_requests_after(
+        &db,
+        &registry,
+        "UPDATE dipper_reg_indexing_agreements SET status = 3; \
+         UPDATE dipper_reg_indexing_requests SET status = 1;",
+    )
+    .await;
+
+    //* Then
+    assert_eq!(long_ago, 0, "a cancel that ended long ago");
+    assert_eq!(just_ended, 1, "a cancel that just ended");
+    assert_eq!(not_short, 0, "a request that isn't short");
+    assert_eq!(ended_by_indexer, 0, "an agreement the indexer ended");
+    assert_eq!(request_cancelled, 0, "a cancelled request");
+}
+
 #[tokio::test]
 async fn get_pending_agreement_indexers_by_deployment_aggregation() {
     //* Given
