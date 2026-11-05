@@ -29,6 +29,7 @@ pub trait WorkerQueue {
         indexing_request_id: IndexingRequestId,
         deployment_id: DeploymentId,
         deployment_chain_id: ChainId,
+        num_candidates: usize,
         priority: JobPriority,
     ) -> anyhow::Result<JobId>;
 
@@ -107,6 +108,7 @@ where
         indexing_request_id: IndexingRequestId,
         deployment_id: DeploymentId,
         deployment_chain_id: ChainId,
+        num_candidates: usize,
         priority: JobPriority,
     ) -> anyhow::Result<JobId> {
         self.queue
@@ -115,6 +117,7 @@ where
                     indexing_request_id,
                     deployment_id,
                     deployment_chain_id,
+                    num_candidates,
                 }),
                 priority,
             )

@@ -6,6 +6,7 @@ use thegraph_core::{DeploymentId, alloy::primitives::ChainId};
 use url::Url;
 
 use crate::{
+    config::DEFAULT_MAX_CANDIDATES,
     indexer_rpc_client::IndexerClient,
     registry::{
         AgreementRegistry, IndexingAgreementStatus, IndexingRequestRegistry,
@@ -342,12 +343,21 @@ where
         indexing_request_id=%indexing_request_id,
         "Reassessing indexing request after failure"
     );
+    let indexing_request = ctx
+        .registry
+        .get_indexing_request_by_id(indexing_request_id)
+        .await
+        .map_err(|err| JobError::Fatal(err.into()))?;
+    let num_candidates = indexing_request
+        .map(|r| r.num_candidates)
+        .unwrap_or(DEFAULT_MAX_CANDIDATES);
     if let Err(err) = ctx
         .queue
         .reassess_indexing_request(
             *indexing_request_id,
             *deployment_id,
             *deployment_chain_id,
+            num_candidates,
             // Background: reassessment retry after a proposal failure.
             JobPriority::Background,
         )
@@ -675,7 +685,7 @@ mod tests {
 
     #[derive(Default)]
     struct MockQueueState {
-        reassess_calls: Vec<(IndexingRequestId, DeploymentId, ChainId)>,
+        reassess_calls: Vec<(IndexingRequestId, DeploymentId, ChainId, usize)>,
     }
 
     struct MockQueue {
@@ -707,13 +717,15 @@ mod tests {
             request_id: IndexingRequestId,
             deployment_id: DeploymentId,
             chain_id: ChainId,
+            num_candidates: usize,
             _priority: JobPriority,
         ) -> anyhow::Result<JobId> {
-            self.state
-                .lock()
-                .unwrap()
-                .reassess_calls
-                .push((request_id, deployment_id, chain_id));
+            self.state.lock().unwrap().reassess_calls.push((
+                request_id,
+                deployment_id,
+                chain_id,
+                num_candidates,
+            ));
             Ok(JobId::default())
         }
 

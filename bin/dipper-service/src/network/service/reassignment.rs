@@ -187,6 +187,7 @@ where
                         request.id,
                         request.deployment_id,
                         request.deployment_chain_id,
+                        request.num_candidates,
                         // Background: the periodic sweep yields to interactive work.
                         JobPriority::Background,
                     ),

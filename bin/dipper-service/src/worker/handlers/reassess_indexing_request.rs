@@ -93,6 +93,9 @@ pub struct Message {
     pub deployment_id: DeploymentId,
     /// The chain ID of the subgraph deployment
     pub deployment_chain_id: ChainId,
+    /// The request's target when this job was queued. The job reads the current target instead;
+    /// this stays so a worker running an older release can still read and run the job.
+    pub num_candidates: usize,
 }
 
 #[expect(
@@ -109,6 +112,7 @@ pub async fn handle<R, W, I, T>(
         indexing_request_id,
         deployment_id,
         deployment_chain_id,
+        num_candidates: _,
     }: &Message,
 ) -> JobResult<()>
 where
@@ -1058,6 +1062,7 @@ mod lifecycle_event_tests {
             _indexing_request_id: IndexingRequestId,
             _deployment_id: DeploymentId,
             _deployment_chain_id: ChainId,
+            _num_candidates: usize,
             _priority: crate::worker::queue::JobPriority,
         ) -> anyhow::Result<crate::worker::queue::JobId> {
             unimplemented!("not exercised by reassess handler")
@@ -1201,9 +1206,9 @@ mod lifecycle_event_tests {
         }
         async fn get_indexing_request_by_id(
             &self,
-            _id: &IndexingRequestId,
+            id: &IndexingRequestId,
         ) -> RegistryResult<Option<IndexingRequest>> {
-            Ok(self.request.clone())
+            Ok(self.request.clone().filter(|request| request.id == *id))
         }
         async fn get_indexing_requests_by_deployment_id(
             &self,
@@ -1482,11 +1487,13 @@ mod lifecycle_event_tests {
         }
     }
 
-    fn test_message() -> Message {
+    /// The job queued for `request`, carrying the count it had then, as callers queue it.
+    fn test_message(request: &IndexingRequest) -> Message {
         Message {
-            indexing_request_id: IndexingRequestId::new(),
+            indexing_request_id: request.id,
             deployment_id: deployment(),
             deployment_chain_id: TEST_DEPLOYMENT_CHAIN_ID,
+            num_candidates: request.num_candidates,
         }
     }
 
@@ -1514,8 +1521,10 @@ mod lifecycle_event_tests {
         mut ctx: Ctx<MockRegistry, MockQueue, MockIisa, MockChainClient>,
         num_candidates: usize,
     ) -> JobResult<()> {
-        ctx.registry.request = Some(stored_request(num_candidates));
-        handle(ctx, &test_message()).await
+        let request = stored_request(num_candidates);
+        let message = test_message(&request);
+        ctx.registry.request = Some(request);
+        handle(ctx, &message).await
     }
 
     /// A context whose IISA picks `picked`, with `picked` reachable, plus the queue it offers on.
@@ -1546,9 +1555,13 @@ mod lifecycle_event_tests {
     /// makes no offers, so a burst of target changes settles on the last one.
     #[tokio::test]
     async fn a_job_for_a_request_since_cancelled_makes_no_offers() {
-        let (ctx, queue) = ctx_picking(indexer_id(0x81));
+        let (mut ctx, queue) = ctx_picking(indexer_id(0x81));
+        let mut request = stored_request(2);
+        let queued_while_open = test_message(&request);
+        request.status = IndexingRequestStatus::Canceled;
+        ctx.registry.request = Some(request);
 
-        run(ctx, 0).await.expect("handler ok");
+        handle(ctx, &queued_while_open).await.expect("handler ok");
 
         assert!(queue.proposals.lock().unwrap().is_empty());
     }
@@ -1568,7 +1581,9 @@ mod lifecycle_event_tests {
     async fn a_job_for_a_missing_request_does_nothing() {
         let (ctx, queue) = ctx_picking(indexer_id(0x81));
 
-        handle(ctx, &test_message()).await.expect("handler ok");
+        handle(ctx, &test_message(&stored_request(1)))
+            .await
+            .expect("handler ok");
 
         assert!(queue.proposals.lock().unwrap().is_empty());
     }
@@ -1838,8 +1853,8 @@ mod lifecycle_event_tests {
         for indexer in &selected {
             snapshot.insert(indexer.id, url_of(indexer.id));
         }
-        let message = test_message();
-        let target = selected.len();
+        let request = stored_request(selected.len());
+        let message = test_message(&request);
         let queue = MockQueue::default();
         let mut ctx = build_ctx(
             MockRegistry::default(),
@@ -1852,7 +1867,7 @@ mod lifecycle_event_tests {
             CapturingEventsProducer::new(),
             snapshot,
         );
-        ctx.registry.request = Some(stored_request(target));
+        ctx.registry.request = Some(request);
         if let Some(prices) = fallback {
             ctx.chain_price = Arc::new(BTreeMap::from([(TEST_DEPLOYMENT_CHAIN_ID, prices)]));
         }

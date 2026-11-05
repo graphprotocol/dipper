@@ -2812,6 +2812,7 @@ mod tests {
             _indexing_request_id: IndexingRequestId,
             _deployment_id: DeploymentId,
             _deployment_chain_id: ChainId,
+            _num_candidates: usize,
             _priority: JobPriority,
         ) -> anyhow::Result<dipper_pgmq::JobId> {
             unimplemented!()
