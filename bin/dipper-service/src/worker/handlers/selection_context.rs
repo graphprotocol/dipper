@@ -28,9 +28,6 @@ const WEI_PER_GRT: f64 = 1e18;
 /// - Which indexers are on the denylist and should be excluded entirely
 /// - Optimistic DIPs fees from accepted agreement vouchers, enriched with
 ///   entity counts from the shared cache when available
-///
-/// Also returns the recently unresponsive indexers, and the indexers skipped because
-/// their agreement on this deployment is still being cancelled.
 #[allow(clippy::too_many_arguments)]
 pub async fn gather_selection_context<R>(
     registry: &R,
@@ -42,7 +39,7 @@ pub async fn gather_selection_context<R>(
     unresponsive_indexer_lookback_days: i32,
     deployment_chain_id: ChainId,
     entity_count_cache: &EntityCountCache,
-) -> JobResult<(SelectionContext, Vec<IndexerId>, Vec<IndexerId>)>
+) -> JobResult<(SelectionContext, Vec<IndexerId>)>
 where
     R: AgreementRegistry + IndexerDenylistRegistry,
 {
@@ -73,8 +70,7 @@ where
         )
         .await
         .map_err(|err| JobError::Fatal(err.into()))?;
-    let still_cancelling =
-        exclude_cancelling_indexers(&mut declined_indexers, *deployment_id, &agreements);
+    exclude_cancelling_indexers(&mut declined_indexers, *deployment_id, &agreements);
 
     // Get denied indexers that should be excluded from selection
     let indexer_denylist = registry
@@ -108,7 +104,6 @@ where
             ..Default::default()
         },
         unresponsive_indexers,
-        still_cancelling,
     ))
 }
 
@@ -184,27 +179,26 @@ fn wei_per_second_to_grt_per_28d(wei_per_second: f64) -> f64 {
 
 /// Add to the deployment's declined list the indexers whose agreement dipper is still
 /// cancelling. That agreement may still be live and paid on-chain, so its indexer must not
-/// be picked again, but it no longer counts towards the group IISA sizes. Returns them.
+/// be picked again, but it no longer counts towards the group IISA sizes.
 fn exclude_cancelling_indexers(
     declined: &mut HashMap<DeploymentId, Vec<IndexerId>>,
     deployment_id: DeploymentId,
     agreements: &[IndexingAgreement],
-) -> Vec<IndexerId> {
+) {
     let cancelling = agreements
         .iter()
         .filter(|a| a.status == IndexingAgreementStatus::Cancelling)
         .map(|a| a.indexer.id)
         .collect::<Vec<_>>();
     if cancelling.is_empty() {
-        return cancelling;
+        return;
     }
     let excluded = declined.entry(deployment_id).or_default();
-    for indexer in &cancelling {
-        if !excluded.contains(indexer) {
-            excluded.push(*indexer);
+    for indexer in cancelling {
+        if !excluded.contains(&indexer) {
+            excluded.push(indexer);
         }
     }
-    cancelling
 }
 
 /// Check if an agreement status represents an active agreement.
@@ -237,11 +231,9 @@ mod tests {
         accepted.indexer.id = indexer('c');
         let mut declined = HashMap::from([(deployment, vec![indexer('a')])]);
 
-        let still_cancelling =
-            exclude_cancelling_indexers(&mut declined, deployment, &[cancelling, accepted]);
+        exclude_cancelling_indexers(&mut declined, deployment, &[cancelling, accepted]);
 
         assert_eq!(declined[&deployment], vec![indexer('a'), indexer('b')]);
-        assert_eq!(still_cancelling, vec![indexer('b')]);
     }
 
     #[test]
