@@ -542,6 +542,50 @@ async fn get_indexing_agreements_by_indexing_request_id() {
     );
 }
 
+/// A short open request is found once an agreement on its deployment has just ended, and not
+/// before, nor when that agreement ended long ago.
+#[tokio::test]
+async fn finds_short_requests_on_deployments_with_recently_ended_agreements() {
+    //* Given
+    let (db, _temp_db) = temp_registry_db().await;
+    run_fixture(&db, include_str!("fixtures/0002_indexing_agreements.sql"))
+        .await
+        .expect("Failed to run fixture");
+    let registry = PgRegistry::new(db.clone());
+    let deployment = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
+    let find = || registry.get_short_requests_on_deployments_with_ended_agreements(600, 10);
+    run_fixture(
+        &db,
+        "UPDATE dipper_reg_indexing_requests SET shortfall_active = true;",
+    )
+    .await
+    .expect("Failed to mark the request short");
+    let before = find().await.expect("Failed to query");
+
+    //* When
+    run_fixture(
+        &db,
+        "UPDATE dipper_reg_indexing_agreements SET status = 3, updated_at = timezone('UTC', now());",
+    )
+    .await
+    .expect("Failed to end the agreements");
+    let after = find().await.expect("Failed to query");
+    run_fixture(
+        &db,
+        "UPDATE dipper_reg_indexing_agreements \
+         SET updated_at = timezone('UTC', now()) - interval '1 hour';",
+    )
+    .await
+    .expect("Failed to age the agreements");
+    let long_after = find().await.expect("Failed to query");
+
+    //* Then
+    assert!(before.is_empty(), "{before:?}");
+    assert_eq!(after.len(), 1, "{after:?}");
+    assert_eq!(after[0].deployment_id, deployment);
+    assert!(long_after.is_empty(), "{long_after:?}");
+}
+
 #[tokio::test]
 async fn get_pending_agreement_indexers_by_deployment_aggregation() {
     //* Given

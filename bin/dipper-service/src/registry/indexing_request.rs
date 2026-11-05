@@ -61,6 +61,14 @@ pub trait IndexingRequestRegistry {
         batch_size: i64,
     ) -> RegistryResult<Vec<IndexingRequest>>;
 
+    /// Open requests still short of indexers on a deployment where an agreement ended within
+    /// the last `since_seconds`, whose freed indexer could now fill them.
+    async fn get_short_requests_on_deployments_with_ended_agreements(
+        &self,
+        since_seconds: i64,
+        batch_size: i64,
+    ) -> RegistryResult<Vec<IndexingRequest>>;
+
     /// Atomically set the request's coverage-shortfall latch, returning whether
     /// the value actually changed (a single guarded UPDATE, so the transition is
     /// race-free).

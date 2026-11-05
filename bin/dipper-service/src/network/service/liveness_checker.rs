@@ -1467,6 +1467,13 @@ mod tests {
         ) -> RegistryResult<Vec<IndexingRequest>> {
             unimplemented!()
         }
+        async fn get_short_requests_on_deployments_with_ended_agreements(
+            &self,
+            _since_seconds: i64,
+            _batch_size: i64,
+        ) -> crate::registry::Result<Vec<crate::registry::IndexingRequest>> {
+            unimplemented!()
+        }
     }
 
     #[async_trait]
