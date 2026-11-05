@@ -15,6 +15,7 @@ use thegraph_core::{DeploymentId, alloy::primitives::Address};
 
 use super::error_handling::{handle_list_result, handle_optional_result};
 use crate::{
+    config::MAX_NUM_CANDIDATES,
     registry::{
         IndexingRequest as IndexingRequestRecord, IndexingRequestRegistry,
         IndexingRequestStatus as IndexingRequestRecordStatus, SetTargetOutcome,
@@ -87,8 +88,6 @@ where
     }
 
     #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap,
         clippy::too_many_lines,
         reason = "predates this lint; fix when next touched"
     )]
@@ -114,6 +113,18 @@ where
         } = req.into_message();
 
         let num_candidates = num_candidates.unwrap_or(self.max_candidates);
+        let agreements_requested = match i32::try_from(num_candidates) {
+            Ok(count) if num_candidates <= MAX_NUM_CANDIDATES => count,
+            _ => {
+                return Err(ErrorObject::owned(
+                    400,
+                    format!(
+                        "num_candidates must be at most {MAX_NUM_CANDIDATES}, got {num_candidates}"
+                    ),
+                    None::<()>,
+                ));
+            }
+        };
 
         let outcome = match self
             .registry
@@ -150,7 +161,7 @@ where
                         deployment_id,
                         self.signer.chain_id(),
                         proto::SubgraphIndexingAgreementRequestReceived {
-                            agreements_requested: num_candidates as i32,
+                            agreements_requested,
                         },
                     );
 
@@ -507,6 +518,53 @@ mod tests {
             id: IndexingRequestId::new(),
         })
         .await;
+    }
+
+    /// A count above the maximum is refused before anything is stored, including counts that a
+    /// 32-bit column would otherwise wrap to a small or negative number.
+    #[tokio::test]
+    async fn refuses_a_count_above_the_maximum() {
+        let deployment = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
+        for count in [MAX_NUM_CANDIDATES + 1, 2_147_483_648, 4_294_967_298] {
+            let (signer, req) = signed_request(deployment, DEPLOYMENT_CHAIN_ID, Some(count));
+            let (server, events) = server(
+                signer.address(),
+                SetTargetOutcome::Inserted {
+                    id: IndexingRequestId::new(),
+                },
+            );
+
+            let result = server.set_indexing_target_candidates(req).await;
+
+            let err = result.expect_err("a count above the maximum must be refused");
+            assert_eq!(err.code(), 400, "count {count}: {err:?}");
+            assert_eq!(
+                err.message(),
+                format!("num_candidates must be at most {MAX_NUM_CANDIDATES}, got {count}")
+            );
+            assert!(
+                events.events().is_empty(),
+                "count {count} must not be recorded"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn accepts_the_maximum_count() {
+        let deployment = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
+        let (signer, req) =
+            signed_request(deployment, DEPLOYMENT_CHAIN_ID, Some(MAX_NUM_CANDIDATES));
+        let (server, events) = server(
+            signer.address(),
+            SetTargetOutcome::Inserted {
+                id: IndexingRequestId::new(),
+            },
+        );
+
+        let result = server.set_indexing_target_candidates(req).await;
+
+        assert!(result.is_ok(), "handler returned an error: {result:?}");
+        assert_eq!(events.events().len(), 1);
     }
 
     /// Drive the handler with `outcome` and assert no lifecycle event is
