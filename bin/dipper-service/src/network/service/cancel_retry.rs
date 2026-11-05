@@ -34,7 +34,15 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(300);
 
 /// How far back a sweep looks for agreements that ended: 2 sweeps, so one that ended just
 /// after the last sweep read the database is still seen.
-const FREED_WINDOW_SECS: i64 = 600;
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "twice a 300s interval is far below i64::MAX"
+)]
+const FREED_WINDOW_SECS: i64 = 2 * SWEEP_INTERVAL.as_secs() as i64;
+
+/// Short requests a sweep queues at most. Queueing is cheap and the window is only 2 sweeps
+/// long, so this is large enough that a burst of ended cancels doesn't leave any out.
+const FREED_BATCH_SIZE: i64 = 500;
 
 /// Time a sweep may take before leaving the rest to the next one, as each cancel can wait up
 /// to 15 s to be mined.
@@ -160,13 +168,21 @@ where
     R: IndexingRequestRegistry + Sync,
     W: WorkerQueue + Sync,
 {
-    let requests = match registry
-        .get_short_requests_on_deployments_with_ended_agreements(FREED_WINDOW_SECS, BATCH_SIZE)
-        .await
-    {
+    let listed = tokio::time::timeout(
+        DB_TIMEOUT,
+        registry.get_short_requests_on_deployments_with_ended_agreements(
+            FREED_WINDOW_SECS,
+            FREED_BATCH_SIZE,
+        ),
+    )
+    .await;
+    let listed = listed
+        .map_err(anyhow::Error::from)
+        .and_then(|requests| requests.map_err(anyhow::Error::from));
+    let requests = match listed {
         Ok(requests) => requests,
         Err(err) => {
-            tracing::warn!(error = %err, "Failed to list short requests that ended agreements may fill");
+            tracing::warn!(error = %err, "Failed to list short requests that ended cancels may fill");
             return;
         }
     };
