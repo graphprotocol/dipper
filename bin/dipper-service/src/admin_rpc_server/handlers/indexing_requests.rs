@@ -113,15 +113,18 @@ where
         } = req.into_message();
 
         let num_candidates = num_candidates.unwrap_or(self.max_candidates);
-        if num_candidates > MAX_NUM_CANDIDATES {
-            return Err(ErrorObject::owned(
-                400,
-                format!(
-                    "num_candidates must be at most {MAX_NUM_CANDIDATES}, got {num_candidates}"
-                ),
-                None::<()>,
-            ));
-        }
+        let agreements_requested = match i32::try_from(num_candidates) {
+            Ok(count) if num_candidates <= MAX_NUM_CANDIDATES => count,
+            _ => {
+                return Err(ErrorObject::owned(
+                    400,
+                    format!(
+                        "num_candidates must be at most {MAX_NUM_CANDIDATES}, got {num_candidates}"
+                    ),
+                    None::<()>,
+                ));
+            }
+        };
 
         let outcome = match self
             .registry
@@ -158,7 +161,7 @@ where
                         deployment_id,
                         self.signer.chain_id(),
                         proto::SubgraphIndexingAgreementRequestReceived {
-                            agreements_requested: i32::try_from(num_candidates).unwrap_or(i32::MAX),
+                            agreements_requested,
                         },
                     );
 
