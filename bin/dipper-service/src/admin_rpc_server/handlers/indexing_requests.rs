@@ -140,7 +140,7 @@ where
 
         // Translate the outcome into the appropriate follow-up worker job and the
         // wire-level return value.
-        let (id_opt, reassess_count): (Option<IndexingRequestId>, Option<usize>) = match outcome {
+        let (id_opt, reassess): (Option<IndexingRequestId>, bool) = match outcome {
             SetTargetOutcome::Inserted { id } => {
                 tracing::info!(
                     indexing_request_id = %id,
@@ -165,7 +165,7 @@ where
                         },
                     );
 
-                (Some(id), Some(num_candidates))
+                (Some(id), true)
             }
             SetTargetOutcome::Updated {
                 id,
@@ -179,14 +179,14 @@ where
                     num_candidates = new_num_candidates,
                     "Updated num_candidates on open indexing request"
                 );
-                (Some(id), Some(new_num_candidates))
+                (Some(id), true)
             }
             SetTargetOutcome::NoOp { id } => {
                 tracing::debug!(
                     indexing_request_id = %id,
                     "Set target candidates is a no-op (count unchanged)"
                 );
-                (Some(id), None)
+                (Some(id), false)
             }
             SetTargetOutcome::Canceled { id } => {
                 tracing::info!(
@@ -196,7 +196,7 @@ where
                     %chain_id,
                     "Canceled indexing request (target candidates set to zero)"
                 );
-                (Some(id), Some(0))
+                (Some(id), true)
             }
             SetTargetOutcome::NoOpAlreadyEmpty => {
                 tracing::warn!(
@@ -206,23 +206,20 @@ where
                     "set_indexing_target_candidates with num_candidates=0 against a key with no open request \
                      - nothing to cancel"
                 );
-                (None, None)
+                (None, false)
             }
         };
 
-        // Queue reassessment if the row changed. Reassessment computes the
-        // diff between the IISA target group of size `num_candidates` and the
-        // current active agreements, then grows or shrinks accordingly. With
-        // num_candidates=0 it shrinks to zero, firing the on-chain cancel for
-        // every active agreement on the key.
-        if let (Some(id), Some(count)) = (id_opt, reassess_count)
+        // Queue reassessment if the row changed. It reads the request's target when it runs and
+        // grows or shrinks the agreements to match; a cancelled request shrinks to zero, firing
+        // the on-chain cancel for every active agreement on the key.
+        if let (Some(id), true) = (id_opt, reassess)
             && let Err(err) = self
                 .worker
                 .reassess_indexing_request(
                     id,
                     deployment_id,
                     chain_id,
-                    count,
                     // Interactive: a caller is waiting on this set-target result.
                     JobPriority::Interactive,
                 )
@@ -369,7 +366,6 @@ mod tests {
             _indexing_request_id: IndexingRequestId,
             _deployment_id: DeploymentId,
             _deployment_chain_id: ChainId,
-            _num_candidates: usize,
             _priority: crate::worker::queue::JobPriority,
         ) -> anyhow::Result<JobId> {
             Ok(JobId::default())

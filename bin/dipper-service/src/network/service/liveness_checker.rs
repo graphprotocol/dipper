@@ -964,8 +964,8 @@ where
     R: IndexingRequestRegistry + Sync,
     W: WorkerQueue + Sync,
 {
-    let request = match abandoned_request(agreement, registry, db_timeout).await {
-        Ok(Some(request)) => request,
+    match abandoned_request(agreement, registry, db_timeout).await {
+        Ok(Some(_)) => {}
         Ok(None) => return true,
         Err(()) => return false,
     };
@@ -975,7 +975,6 @@ where
             agreement.indexing_request_id,
             agreement.terms.metadata.subgraph_deployment_id,
             agreement.terms.metadata.chain_id,
-            request.num_candidates,
             // Background: abandonment remediation yields to interactive work.
             JobPriority::Background,
         ),
@@ -1521,7 +1520,6 @@ mod tests {
             req_id: IndexingRequestId,
             _dep: DeploymentId,
             _chain: ChainId,
-            _n: usize,
             _priority: JobPriority,
         ) -> anyhow::Result<JobId> {
             self.calls.reassessments.lock().unwrap().push(req_id);

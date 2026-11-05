@@ -238,8 +238,8 @@ where
                 )
                 .await;
 
-                let request = match request_result {
-                    Ok(Ok(Some(r))) => r,
+                match request_result {
+                    Ok(Ok(Some(_))) => {}
                     Ok(Ok(None)) => {
                         tracing::warn!(
                             agreement_id = %agreement.id,
@@ -272,7 +272,6 @@ where
                         agreement.indexing_request_id,
                         agreement.terms.metadata.subgraph_deployment_id,
                         agreement.terms.metadata.chain_id,
-                        request.num_candidates,
                         // Background: expiration remediation yields to interactive work.
                         JobPriority::Background,
                     ),
@@ -536,7 +535,6 @@ mod tests {
             _indexing_request_id: IndexingRequestId,
             _deployment_id: DeploymentId,
             _deployment_chain_id: ChainId,
-            _num_candidates: usize,
             _priority: JobPriority,
         ) -> anyhow::Result<JobId> {
             Ok(JobId::default())

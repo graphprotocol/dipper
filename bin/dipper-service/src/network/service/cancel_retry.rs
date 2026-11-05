@@ -775,7 +775,6 @@ mod tests {
             indexing_request_id: IndexingRequestId,
             _deployment_id: thegraph_core::DeploymentId,
             _deployment_chain_id: u64,
-            _num_candidates: usize,
             _priority: JobPriority,
         ) -> anyhow::Result<dipper_pgmq::JobId> {
             self.0.lock().unwrap().push(indexing_request_id);
