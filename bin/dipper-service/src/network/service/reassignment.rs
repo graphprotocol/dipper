@@ -589,9 +589,15 @@ mod tests {
         async fn get_open_indexing_requests_for_reassessment(
             &self,
             _min_age_seconds: i64,
-            _batch_size: i64,
+            batch_size: i64,
         ) -> crate::registry::Result<Vec<IndexingRequest>> {
-            Ok(self.open.clone())
+            let limit = usize::try_from(batch_size).ok().filter(|n| *n > 0);
+            Ok(self
+                .open
+                .iter()
+                .take(limit.unwrap_or(usize::MAX))
+                .cloned()
+                .collect())
         }
         async fn get_short_requests_on_deployments_with_ended_agreements(
             &self,
@@ -1004,6 +1010,27 @@ mod tests {
         let (_tx, mut rx) = mpsc::channel(1);
 
         run_due_passes(&ctx, true, true, &mut rx).await;
+
+        assert_eq!(*queue.0.lock().unwrap(), vec![other.id]);
+    }
+
+    /// Requests already waiting for a reassessment don't use up the full pass's batch.
+    #[tokio::test]
+    async fn requests_already_waiting_dont_use_up_the_full_pass_batch() {
+        let (waiting, other) = (request(3), request(3));
+        let registry = MockRegistry {
+            open: vec![waiting.clone(), other.clone()],
+            ..MockRegistry::default()
+        };
+        let config = ReassignmentConfig {
+            batch_size: 1,
+            ..ReassignmentConfig::default()
+        };
+        let (mut ctx, queue) = ctx(registry, Some(Vec::new()), config);
+        ctx.worker_queue.1 = HashSet::from([waiting.id]);
+        let (_tx, mut rx) = mpsc::channel(1);
+
+        run_due_passes(&ctx, true, false, &mut rx).await;
 
         assert_eq!(*queue.0.lock().unwrap(), vec![other.id]);
     }
