@@ -827,8 +827,8 @@ impl PgRegistry {
                 (rejection_reason IN ($8, $9, $10, $11, $12, $13, $14, $15, $16)
                  AND updated_at >= timezone('UTC', now()) - make_interval(mins => $7))
                 OR
-                -- Capacity and availability are the indexer's own service failing, so once enough
-                -- of them on 1 deployment fit in a lookback, the latest skips it for a lookback;
+                -- Indexer-side: its service failing, or at its cap on new agreements. Once enough
+                -- on 1 deployment fit in a lookback, the latest skips it there for a lookback;
                 -- dipper-side faults stay short, as they repeat at every indexer until fixed
                 (status = $3 AND rejection_reason IN ($13, $14)
                  AND updated_at >= timezone('UTC', now()) - make_interval(days => $17)
