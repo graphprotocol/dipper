@@ -6,7 +6,7 @@ use dipper_core::ids::{IndexingAgreementId, IndexingRequestId};
 use dipper_pgregistry::{
     CancelKind, EndCorrection, Error, IndexingAgreementStatus, IndexingAgreementTerms,
     IndexingRequestStatus, NewAgreementParams, PgRegistry, ReconciliationAudit, ReconciliationItem,
-    RecordedEnd,
+    RecordedEnd, rejection_reason,
 };
 use fake::{Fake, Faker};
 use pgtemp::PgTempDB;
@@ -915,6 +915,179 @@ async fn get_declined_indexers_by_deployment_excludes_old_rejections() {
     assert!(
         result.is_empty(),
         "Rejections older than lookback period should not be returned"
+    );
+}
+
+const DEPLOYMENT_1A: &str = "QmAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA1a";
+const DEPLOYMENT_2B: &str = "QmBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB2b";
+const DEPLOYMENT_3C: &str = "QmCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC3c";
+
+/// Ages every fixture agreement out of every lookback window, then marks indexer A's fixture
+/// agreements `Rejected`, one per `(reason, deployment, minutes ago)`, and returns the result.
+#[expect(
+    clippy::expect_used,
+    reason = "a failed setup step should fail the test"
+)]
+async fn declined_after_indexer_a_rejects(
+    rejections: &[(&str, &str, i32)],
+) -> HashMap<DeploymentId, Vec<IndexerId>> {
+    let (db, _temp_db) = temp_registry_db().await;
+    run_fixture(
+        &db,
+        include_str!("fixtures/0003_multi_indexer_agreements.sql"),
+    )
+    .await
+    .expect("Failed to run fixture");
+    sqlx::query(
+        r#"
+        UPDATE dipper_reg_indexing_agreements
+        SET updated_at = timezone('UTC', now()) - interval '31 days'
+        "#,
+    )
+    .execute(&db)
+    .await
+    .expect("Failed to age the fixture agreements");
+
+    for (last_byte, (reason, deployment, minutes_ago)) in (1u8..=3).zip(rejections) {
+        sqlx::query(
+            r#"
+            UPDATE dipper_reg_indexing_agreements
+            SET status = 7, rejection_reason = $2, deployment_id = $3,
+                updated_at = timezone('UTC', now()) - make_interval(mins => $4)
+            WHERE id = $1
+            "#,
+        )
+        .bind(IndexingAgreementId::from_bytes([
+            0xaa, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, last_byte,
+        ]))
+        .bind(reason)
+        .bind(deployment)
+        .bind(minutes_ago)
+        .execute(&db)
+        .await
+        .expect("Failed to reject agreement");
+    }
+
+    PgRegistry::new(db)
+        .get_declined_indexers_by_deployment(30, 1, 5, 1)
+        .await
+        .expect("Failed to get declined indexers")
+}
+
+/// An indexer whose own service keeps failing would otherwise be offered the deployment again
+/// every 5 minutes, failing each time.
+#[tokio::test]
+async fn get_declined_indexers_by_deployment_keeps_an_indexer_failing_3_times_in_a_day() {
+    let result = declined_after_indexer_a_rejects(&[
+        (rejection_reason::INDEXER_UNAVAILABLE, DEPLOYMENT_1A, 10),
+        (rejection_reason::INDEXER_UNAVAILABLE, DEPLOYMENT_1A, 120),
+        (
+            rejection_reason::INDEXER_UNAVAILABLE,
+            DEPLOYMENT_1A,
+            20 * 60,
+        ),
+    ])
+    .await;
+
+    let deployment_1a: DeploymentId = DEPLOYMENT_1A.parse().unwrap();
+    let indexer_a = indexer_id!("1111111111111111111111111111111111111111");
+    assert!(
+        result
+            .get(&deployment_1a)
+            .is_some_and(|ids| ids.contains(&indexer_a)),
+        "3 failures in a day should keep the indexer declined, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn get_declined_indexers_by_deployment_counts_capacity_and_unavailable_together() {
+    let result = declined_after_indexer_a_rejects(&[
+        (rejection_reason::CAPACITY_EXCEEDED, DEPLOYMENT_1A, 10),
+        (rejection_reason::INDEXER_UNAVAILABLE, DEPLOYMENT_1A, 120),
+        (rejection_reason::CAPACITY_EXCEEDED, DEPLOYMENT_1A, 20 * 60),
+    ])
+    .await;
+
+    let deployment_1a: DeploymentId = DEPLOYMENT_1A.parse().unwrap();
+    let indexer_a = indexer_id!("1111111111111111111111111111111111111111");
+    assert!(
+        result
+            .get(&deployment_1a)
+            .is_some_and(|ids| ids.contains(&indexer_a)),
+        "both indexer-side reasons should count towards the 3, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn get_declined_indexers_by_deployment_lets_2_failures_go_after_5_minutes() {
+    let result = declined_after_indexer_a_rejects(&[
+        (rejection_reason::INDEXER_UNAVAILABLE, DEPLOYMENT_1A, 10),
+        (rejection_reason::INDEXER_UNAVAILABLE, DEPLOYMENT_1A, 120),
+    ])
+    .await;
+
+    assert!(
+        result.is_empty(),
+        "2 failures should keep the 5 minute window, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn get_declined_indexers_by_deployment_ignores_failures_older_than_a_day() {
+    let result = declined_after_indexer_a_rejects(&[
+        (rejection_reason::INDEXER_UNAVAILABLE, DEPLOYMENT_1A, 10),
+        (
+            rejection_reason::INDEXER_UNAVAILABLE,
+            DEPLOYMENT_1A,
+            20 * 60,
+        ),
+        (
+            rejection_reason::INDEXER_UNAVAILABLE,
+            DEPLOYMENT_1A,
+            25 * 60,
+        ),
+    ])
+    .await;
+
+    assert!(
+        result.is_empty(),
+        "only 2 of the failures fall within the last day, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn get_declined_indexers_by_deployment_counts_failures_per_deployment() {
+    let result = declined_after_indexer_a_rejects(&[
+        (rejection_reason::INDEXER_UNAVAILABLE, DEPLOYMENT_1A, 10),
+        (rejection_reason::INDEXER_UNAVAILABLE, DEPLOYMENT_2B, 120),
+        (
+            rejection_reason::INDEXER_UNAVAILABLE,
+            DEPLOYMENT_3C,
+            20 * 60,
+        ),
+    ])
+    .await;
+
+    assert!(
+        result.is_empty(),
+        "1 failure on each of 3 deployments should not add up, got {result:?}"
+    );
+}
+
+/// A dipper-side fault repeats at every indexer until dipper is fixed, so repeating it must not
+/// bench anyone for a day.
+#[tokio::test]
+async fn get_declined_indexers_by_deployment_keeps_dipper_side_failures_short() {
+    let result = declined_after_indexer_a_rejects(&[
+        (rejection_reason::INVALID_SIGNATURE, DEPLOYMENT_1A, 10),
+        (rejection_reason::INVALID_SIGNATURE, DEPLOYMENT_1A, 120),
+        (rejection_reason::INVALID_SIGNATURE, DEPLOYMENT_1A, 20 * 60),
+    ])
+    .await;
+
+    assert!(
+        result.is_empty(),
+        "a repeated dipper-side reason should keep the 5 minute window, got {result:?}"
     );
 }
 
