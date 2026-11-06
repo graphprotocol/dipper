@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.2.8](https://github.com/graphprotocol/dipper/compare/v0.2.7...v0.2.8) (2026-11-06)
+
+
+### Added
+
+* **reassignment:** retry subgraphs below target every hour ([#786](https://github.com/graphprotocol/dipper/issues/786)) ([cd02dd9](https://github.com/graphprotocol/dipper/commit/cd02dd93073454abfc316b06e65af4b40aae430c))
+
+
+### Fixed
+
+* reassess requests from their latest indexer count ([#782](https://github.com/graphprotocol/dipper/issues/782)) ([732bb65](https://github.com/graphprotocol/dipper/commit/732bb655dd5e2b14a0b61ccf21a6c343c7b1831f))
+* **reassignment:** reassess every open request daily ([#788](https://github.com/graphprotocol/dipper/issues/788)) ([f9af831](https://github.com/graphprotocol/dipper/commit/f9af831d25d1681451f83788de842710bc679549))
+* **reassignment:** skip requests with a reassessment queued ([#787](https://github.com/graphprotocol/dipper/issues/787)) ([ba12c70](https://github.com/graphprotocol/dipper/commit/ba12c7021927217ab8955213668469df89d1ac1f))
+* refuse indexer counts above 100 instead of wrapping them ([#780](https://github.com/graphprotocol/dipper/issues/780)) ([99b8507](https://github.com/graphprotocol/dipper/commit/99b8507bc627cf53133074df12148d67e9fa5db6))
+* retry short requests once their indexers finish cancelling ([#783](https://github.com/graphprotocol/dipper/issues/783)) ([666e33b](https://github.com/graphprotocol/dipper/commit/666e33b65e73f3851854f02369b0cd7693adeb9f))
+
 ## [0.2.7](https://github.com/graphprotocol/dipper/compare/v0.2.6...v0.2.7) (2026-11-04)
 
 
