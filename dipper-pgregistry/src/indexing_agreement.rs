@@ -55,9 +55,9 @@ pub mod rejection_reason {
     /// Lookback: 1 day (the indexer may add the payer to its trusted set).
     pub const SENDER_NOT_TRUSTED: &str = "SENDER_NOT_TRUSTED";
 
-    /// The indexer is at its DIPs capacity and may have room later.
-    /// Lookback: 5 minutes (transient, retry once load drops), or the uncertain
-    /// 1 day while it and INDEXER_UNAVAILABLE keep recurring on a deployment.
+    /// The indexer is at its cap on new agreements and may have room later. Lookback:
+    /// 5 minutes, or 1 day from the latest once 3 of this and INDEXER_UNAVAILABLE
+    /// combined fall within a day on 1 deployment.
     pub const CAPACITY_EXCEEDED: &str = "CAPACITY_EXCEEDED";
 
     /// The subgraph manifest exceeds the indexer's size cap.
@@ -73,9 +73,9 @@ pub mod rejection_reason {
     /// lookback: the protocol contract funds escrow, so this should not recur.
     pub const INSUFFICIENT_ESCROW: &str = "INSUFFICIENT_ESCROW";
 
-    /// A transient internal error on the indexer; the proposal may be resent.
-    /// Lookback: 5 minutes (transient, not the indexer's lasting state), or the
-    /// uncertain 1 day while it and CAPACITY_EXCEEDED keep recurring on a deployment.
+    /// A transient internal error on the indexer; the proposal may be resent. Lookback:
+    /// 5 minutes, or 1 day from the latest once 3 of this and CAPACITY_EXCEEDED
+    /// combined fall within a day on 1 deployment.
     pub const INDEXER_UNAVAILABLE: &str = "INDEXER_UNAVAILABLE";
 
     /// The rejection reason was not specified, recognised, or mapped to a more

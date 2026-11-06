@@ -1097,9 +1097,9 @@ pub struct DipsAgreementConfig {
     #[serde(default = "default_price_rejection_lookback_days")]
     pub price_rejection_lookback_days: i32,
 
-    /// Minutes to look back for transient rejections: reasons that clear on
-    /// their own (capacity, availability) or dipper-side faults (invalid
-    /// signature, replay). Default 5 minutes; the alias accepts the older key.
+    /// Minutes to look back for transient rejections: capacity and availability until they
+    /// repeat enough to earn the uncertain window, and dipper-side faults (invalid signature,
+    /// replay). Default 5 minutes; the alias accepts the older key.
     #[serde(
         default = "default_transient_rejection_lookback_minutes",
         alias = "signer_rejection_lookback_minutes"
@@ -1107,8 +1107,8 @@ pub struct DipsAgreementConfig {
     pub transient_rejection_lookback_minutes: i32,
 
     /// Days to look back for rejections that may clear within a day: SENDER_NOT_TRUSTED, an
-    /// unspecified/unknown/missing reason, or capacity and availability rejections that keep
-    /// recurring on 1 deployment. Default: 1 day.
+    /// unspecified/unknown/missing reason, or the latest of 3 capacity or availability rejections
+    /// on 1 deployment within that many days. Default: 1 day.
     #[serde(default = "default_uncertain_rejection_lookback_days")]
     pub uncertain_rejection_lookback_days: i32,
 

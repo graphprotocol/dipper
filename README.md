@@ -92,6 +92,7 @@ When an offer fails, dipper temporarily stops offering that indexer new work. Ho
 | Your price was too high for the deployment | 1 day |
 | You never replied to the offer | 1 day, on every deployment on that chain |
 | A transient failure, including offers that never reached the chain | 5 minutes |
+| Your service failed, or you were at your cap on new agreements, 3 times on a deployment within a day | 1 day from the latest, on that deployment |
 | The operator denylist | Until removed, and agreements you hold are cancelled |
 | Your `/dips/info` gave no readable answer for 48 hours while you held an agreement | Until it answers readably again, and agreements you hold are cancelled |
 

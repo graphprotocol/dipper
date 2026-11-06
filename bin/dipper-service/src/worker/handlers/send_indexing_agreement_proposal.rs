@@ -1159,7 +1159,7 @@ mod tests {
         let result = handle(ctx, &message).await;
 
         assert!(result.is_ok());
-        // CapacityExceeded is transient and maps to its own 5-minute constant.
+        // CapacityExceeded maps to its own constant, so repeats on a deployment can be counted.
         let state = registry_state.lock().unwrap();
         assert_eq!(state.marked_rejected.len(), 1);
         assert_eq!(state.marked_rejected[0].0, agreement_id);
