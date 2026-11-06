@@ -209,9 +209,9 @@ pub(crate) fn is_active_agreement(status: &IndexingAgreementStatus) -> bool {
     )
 }
 
-/// The indexers in IISA's DIPs `pool` a reassessment could offer `deployment_id` to now, in pool
-/// order: not holding or still cancelling an agreement there, declined there, denylisted,
-/// unresponsive on the chain, or holding an abandoned slot, as the reassessment would rule out.
+/// The indexers in IISA's DIPs `pool` that dipper's records leave free for a new offer on
+/// `deployment_id`, in pool order: none holding or cancelling an agreement there, declined there,
+/// denylisted, unresponsive or holding a slot. IISA's own scoring may still pass one over.
 pub(crate) fn offerable_indexers(
     pool: &[IndexerId],
     deployment_id: DeploymentId,

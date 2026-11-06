@@ -1,6 +1,6 @@
 //! Periodic reassignment of open indexing requests. A daily full pass queues a reassessment of
 //! every open request; a more frequent top-up pass queues only requests left short of indexers
-//! that a free indexer could fill now, instead of leaving them for the next day.
+//! with an indexer free to take them by dipper's own records, instead of waiting a day.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, hash_map::Entry},
@@ -31,9 +31,8 @@ use crate::{
 const DB_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 const QUEUE_PUSH_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Calculate the duration until the next occurrence of the target UTC hour.
-fn duration_until_utc_hour(target_hour: u8) -> Duration {
-    let now = OffsetDateTime::now_utc();
+/// Calculate the duration from `now` until the next occurrence of the target UTC hour.
+fn duration_until_utc_hour(now: OffsetDateTime, target_hour: u8) -> Duration {
     let current_hour = now.hour();
     let current_minute = now.minute();
     let current_second = now.second();
@@ -51,6 +50,14 @@ fn duration_until_utc_hour(target_hour: u8) -> Duration {
     let total_seconds = (hours_until as u64) * 3600 - seconds_into_current_hour;
 
     Duration::from_secs(total_seconds)
+}
+
+/// The duration from `now` until the next whole multiple of `every` since the Unix epoch, so the
+/// top-up keeps to the clock across restarts and an hourly one falls due with the daily pass.
+fn until_next_multiple(now: OffsetDateTime, every: Duration) -> Duration {
+    let every = every.as_secs().max(1);
+    let since_epoch = u64::try_from(now.unix_timestamp()).unwrap_or(0);
+    Duration::from_secs((every - since_epoch % every) % every)
 }
 
 /// The first run after `now` of a schedule that last ran at `last` and repeats every `every`.
@@ -118,11 +125,16 @@ where
 
     let service = async move {
         let config = &ctx.config;
-        let started = Instant::now();
-        let initial_delay = duration_until_utc_hour(config.run_at_utc_hour);
+        if config.interval.is_zero() {
+            anyhow::bail!(
+                "reassignment.interval must be at least 1 second; set enabled to false to turn it off"
+            );
+        }
+        let (started, clock) = (Instant::now(), OffsetDateTime::now_utc());
+        let initial_delay = duration_until_utc_hour(clock, config.run_at_utc_hour);
         let mut next_full = started + initial_delay;
         let top_up_every = (!config.top_up_interval.is_zero()).then_some(config.top_up_interval);
-        let mut next_top_up = top_up_every.map(|every| started + every);
+        let mut next_top_up = top_up_every.map(|every| started + until_next_multiple(clock, every));
 
         tracing::info!(
             run_at_utc_hour = config.run_at_utc_hour,
@@ -253,9 +265,9 @@ where
     }
 }
 
-/// The open requests left short of indexers, other than those in `skip`, that a reassessment
-/// could add an indexer to now: below their target counting held slots, with at least 1 indexer
-/// in IISA's DIPs pool for their chain that nothing rules out.
+/// The open requests left short of indexers, other than those in `skip`, below their target
+/// counting held slots and with an indexer in their chain's DIPs pool that dipper's records don't
+/// rule out. IISA may still pass that indexer over; the request is then checked again next pass.
 async fn short_requests_with_a_free_indexer<R, W, I>(
     ctx: &Ctx<R, W, I>,
     skip: &HashSet<IndexingRequestId>,
@@ -264,13 +276,13 @@ where
     R: IndexingRequestRegistry + AgreementRegistry + IndexerDenylistRegistry + Sync,
     I: CandidateSelection + Sync,
 {
-    let short: Vec<IndexingRequest> = db(ctx
-        .registry
-        .get_short_open_indexing_requests(ctx.config.batch_size))
-    .await?
-    .into_iter()
-    .filter(|request| !skip.contains(&request.id))
-    .collect();
+    // Every short request is looked at, and the batch caps how many are queued, so ones nobody
+    // can fill don't keep out ones a free indexer could.
+    let short: Vec<IndexingRequest> = db(ctx.registry.get_short_open_indexing_requests(0))
+        .await?
+        .into_iter()
+        .filter(|request| !skip.contains(&request.id))
+        .collect();
     if short.is_empty() {
         return Ok(short);
     }
@@ -333,6 +345,9 @@ where
             "short request has a free indexer"
         );
         fillable.push(request);
+        if usize::try_from(ctx.config.batch_size).is_ok_and(|batch| fillable.len() == batch) {
+            break;
+        }
     }
     Ok(fillable)
 }
@@ -587,9 +602,15 @@ mod tests {
         }
         async fn get_short_open_indexing_requests(
             &self,
-            _batch_size: i64,
+            batch_size: i64,
         ) -> crate::registry::Result<Vec<IndexingRequest>> {
-            Ok(self.short.clone())
+            let limit = usize::try_from(batch_size).ok().filter(|n| *n > 0);
+            Ok(self
+                .short
+                .iter()
+                .take(limit.unwrap_or(usize::MAX))
+                .cloned()
+                .collect())
         }
     }
 
@@ -775,9 +796,39 @@ mod tests {
     #[test]
     fn test_duration_until_utc_hour() {
         // This is a basic sanity check - the actual delay depends on current time
-        let delay = duration_until_utc_hour(2);
+        let delay = duration_until_utc_hour(OffsetDateTime::now_utc(), 2);
         // Should always be less than 24 hours
         assert!(delay.as_secs() < 86400);
+    }
+
+    /// An hourly top-up keeps to the hour, so after a restart it waits at most an hour and it
+    /// falls due with the daily pass, which then queues first.
+    #[test]
+    fn an_hourly_top_up_falls_due_on_the_hour_with_the_daily_pass() {
+        let hour = Duration::from_secs(3600);
+        let at = |h, m, s| {
+            time::Date::from_calendar_date(2026, time::Month::November, 6)
+                .unwrap()
+                .with_hms(h, m, s)
+                .unwrap()
+                .assume_utc()
+        };
+        let before_ten = at(9, 59, 30);
+        assert_eq!(
+            until_next_multiple(before_ten, hour),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            duration_until_utc_hour(before_ten, 10),
+            Duration::from_secs(30)
+        );
+        let on_the_hour = at(10, 0, 0);
+        assert_eq!(until_next_multiple(on_the_hour, hour), Duration::ZERO);
+        let after = at(10, 20, 0);
+        assert_eq!(
+            until_next_multiple(after, hour),
+            Duration::from_secs(40 * 60)
+        );
     }
 
     #[test]
@@ -817,6 +868,22 @@ mod tests {
         assert!(queued.is_empty(), "{queued:?}");
     }
 
+    /// Another request's agreement on the same subgraph keeps its indexer from a new offer but
+    /// takes none of this request's slots.
+    #[tokio::test]
+    async fn another_requests_agreement_on_the_subgraph_takes_none_of_its_slots() {
+        let (short, other) = (request(1), request(1));
+        let registry = MockRegistry {
+            agreements: vec![holding(&other, indexer('a'))],
+            short: vec![short.clone()],
+            ..MockRegistry::default()
+        };
+
+        let queued = top_up(registry, Some(vec![indexer('a'), indexer('b')])).await;
+
+        assert_eq!(queued, vec![short.id]);
+    }
+
     #[tokio::test]
     async fn leaves_a_request_alone_when_its_only_free_indexers_are_ruled_out() {
         let short = request(3);
@@ -849,6 +916,29 @@ mod tests {
         let queued = top_up(registry, Some(pool)).await;
 
         assert!(queued.is_empty(), "{queued:?}");
+    }
+
+    /// The batch limits how many requests are queued, not how many are looked at, so requests a
+    /// free indexer can't fill don't crowd out those it can.
+    #[tokio::test]
+    async fn the_batch_counts_only_requests_a_free_indexer_could_fill() {
+        let (full, fillable) = (request(2), request(3));
+        let registry = MockRegistry {
+            agreements: vec![holding(&full, indexer('a')), holding(&full, indexer('b'))],
+            short: vec![full, fillable.clone()],
+            ..MockRegistry::default()
+        };
+        let config = ReassignmentConfig {
+            batch_size: 1,
+            ..ReassignmentConfig::default()
+        };
+        let pool = "abc".chars().map(indexer).collect();
+        let (ctx, queue) = ctx(registry, Some(pool), config);
+        let (_tx, mut rx) = mpsc::channel(1);
+
+        run_due_passes(&ctx, false, true, &mut rx).await;
+
+        assert_eq!(*queue.0.lock().unwrap(), vec![fillable.id]);
     }
 
     #[tokio::test]
@@ -918,11 +1008,28 @@ mod tests {
         assert_eq!(*queue.0.lock().unwrap(), vec![other.id]);
     }
 
-    /// The top-up runs on its own interval without waiting for the daily hour, and not at all when
-    /// its interval is 0. The full pass finds nothing to queue, wherever the clock puts its hour.
+    /// A daily interval of 0 is refused at start-up rather than running the full pass every second.
+    #[tokio::test(start_paused = true)]
+    async fn refuses_a_full_pass_interval_of_0() {
+        let config = ReassignmentConfig {
+            interval: Duration::ZERO,
+            ..ReassignmentConfig::default()
+        };
+        let (ctx, _queue) = ctx(MockRegistry::default(), Some(Vec::new()), config);
+        let (_handle, service) = new(ctx);
+
+        let ended = tokio::time::timeout(Duration::from_secs(48 * 3600), service).await;
+
+        let err = ended.expect("the service should stop at once").unwrap_err();
+        assert!(err.to_string().contains("interval"), "{err}");
+    }
+
+    /// The top-up runs every interval on the clock without waiting for the daily hour, and not at all
+    /// when its interval is 0. In 150s a 60s top-up runs 2 or 3 times, depending on where the
+    /// clock's minute falls. The full pass finds nothing to queue, wherever the clock puts its hour.
     #[tokio::test(start_paused = true)]
     async fn tops_up_every_interval_and_never_when_turned_off() {
-        for (every, expected) in [(Duration::from_secs(60), 2), (Duration::ZERO, 0)] {
+        for (every, expected) in [(Duration::from_secs(60), 2..=3), (Duration::ZERO, 0..=0)] {
             let short = request(3);
             let registry = MockRegistry {
                 short: vec![short],
@@ -940,7 +1047,8 @@ mod tests {
             handle.stop().await;
             task.await.unwrap().unwrap();
 
-            assert_eq!(queue.0.lock().unwrap().len(), expected, "every {every:?}");
+            let runs = queue.0.lock().unwrap().len();
+            assert!(expected.contains(&runs), "every {every:?}: {runs} runs");
         }
     }
 }
