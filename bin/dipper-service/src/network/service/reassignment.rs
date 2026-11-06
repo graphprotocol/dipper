@@ -1,6 +1,6 @@
 //! Periodic reassignment of open indexing requests. A daily full pass queues a reassessment of
 //! every open request; a more frequent top-up pass queues only requests left short of indexers
-//! that a free indexer could fill now, instead of leaving them for the next day.
+//! with an indexer free to take them by dipper's own records, instead of waiting a day.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, hash_map::Entry},
@@ -241,9 +241,9 @@ where
     }
 }
 
-/// The open requests left short of indexers, other than those in `skip`, that a reassessment
-/// could add an indexer to now: below their target counting held slots, with at least 1 indexer
-/// in IISA's DIPs pool for their chain that nothing rules out.
+/// The open requests left short of indexers, other than those in `skip`, below their target
+/// counting held slots and with an indexer in their chain's DIPs pool that dipper's records don't
+/// rule out. IISA may still pass that indexer over; the request is then checked again next pass.
 async fn short_requests_with_a_free_indexer<R, W, I>(
     ctx: &Ctx<R, W, I>,
     skip: &HashSet<IndexingRequestId>,
