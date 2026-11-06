@@ -689,11 +689,12 @@ mod tests {
     }
 
     /// Records the requests it is asked to reassess, and reports the 2nd field's requests as
-    /// already having a reassessment queued.
+    /// already having a reassessment queued. With the 3rd field set, every push fails.
     #[derive(Default, Clone)]
     struct MockQueue(
         Arc<Mutex<Vec<IndexingRequestId>>>,
         HashSet<IndexingRequestId>,
+        bool,
     );
 
     #[async_trait]
@@ -718,6 +719,9 @@ mod tests {
             _priority: JobPriority,
         ) -> anyhow::Result<JobId> {
             self.0.lock().unwrap().push(indexing_request_id);
+            if self.2 {
+                anyhow::bail!("the queue's database is down");
+            }
             Ok(JobId::default())
         }
         async fn queued_reassessments(&self) -> anyhow::Result<HashSet<IndexingRequestId>> {
@@ -1034,6 +1038,23 @@ mod tests {
 
         let all: Vec<IndexingRequestId> = open.iter().map(|r| r.id).collect();
         assert_eq!(*queue.0.lock().unwrap(), all);
+    }
+
+    /// A queue that keeps failing ends the pass after a few tries instead of waiting out a push
+    /// timeout for every remaining request.
+    #[tokio::test]
+    async fn a_pass_gives_up_once_the_queue_keeps_failing() {
+        let registry = MockRegistry {
+            open: (0..10).map(|_| request(3)).collect(),
+            ..MockRegistry::default()
+        };
+        let (mut ctx, queue) = ctx(registry, Some(Vec::new()), ReassignmentConfig::default());
+        ctx.worker_queue.2 = true;
+        let (_tx, mut rx) = mpsc::channel(1);
+
+        run_due_passes(&ctx, true, false, &mut rx).await;
+
+        assert_eq!(queue.0.lock().unwrap().len(), 3);
     }
 
     /// A daily interval of 0 is refused at start-up rather than running the full pass every second.
