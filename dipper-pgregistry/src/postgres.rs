@@ -827,18 +827,19 @@ impl PgRegistry {
                 (rejection_reason IN ($8, $9, $10, $11, $12, $13, $14, $15, $16)
                  AND updated_at >= timezone('UTC', now()) - make_interval(mins => $7))
                 OR
-                -- Capacity and availability are the indexer's own service failing, so repeats of
-                -- them on 1 deployment get the uncertain lookback; dipper-side faults stay short,
-                -- since they repeat at every indexer until dipper is fixed
+                -- Capacity and availability are the indexer's own service failing, so once enough
+                -- of them on 1 deployment fit in a lookback, the latest skips it for a lookback;
+                -- dipper-side faults stay short, as they repeat at every indexer until fixed
                 (status = $3 AND rejection_reason IN ($13, $14)
                  AND updated_at >= timezone('UTC', now()) - make_interval(days => $17)
                  AND (SELECT COUNT(*)
-                      FROM dipper_reg_indexing_agreements recent
-                      WHERE recent.indexer_id = a.indexer_id
-                        AND recent.deployment_id = a.deployment_id
-                        AND recent.status = $3
-                        AND recent.rejection_reason IN ($13, $14)
-                        AND recent.updated_at >= timezone('UTC', now()) - make_interval(days => $17)
+                      FROM dipper_reg_indexing_agreements burst
+                      WHERE burst.indexer_id = a.indexer_id
+                        AND burst.deployment_id = a.deployment_id
+                        AND burst.status = $3
+                        AND burst.rejection_reason IN ($13, $14)
+                        AND burst.updated_at <= a.updated_at
+                        AND burst.updated_at >= a.updated_at - make_interval(days => $17)
                      ) >= $21)
                 OR
                 -- Uncertain reasons (sender not trusted, unspecified/unknown):
