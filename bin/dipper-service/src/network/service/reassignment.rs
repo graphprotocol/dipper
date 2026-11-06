@@ -252,13 +252,13 @@ where
     R: IndexingRequestRegistry + AgreementRegistry + IndexerDenylistRegistry + Sync,
     I: CandidateSelection + Sync,
 {
-    let short: Vec<IndexingRequest> = db(ctx
-        .registry
-        .get_short_open_indexing_requests(ctx.config.batch_size))
-    .await?
-    .into_iter()
-    .filter(|request| !skip.contains(&request.id))
-    .collect();
+    // Every short request is looked at, and the batch caps how many are queued, so ones nobody
+    // can fill don't keep out ones a free indexer could.
+    let short: Vec<IndexingRequest> = db(ctx.registry.get_short_open_indexing_requests(0))
+        .await?
+        .into_iter()
+        .filter(|request| !skip.contains(&request.id))
+        .collect();
     if short.is_empty() {
         return Ok(short);
     }
@@ -321,6 +321,9 @@ where
             "short request has a free indexer"
         );
         fillable.push(request);
+        if usize::try_from(ctx.config.batch_size).is_ok_and(|batch| fillable.len() == batch) {
+            break;
+        }
     }
     Ok(fillable)
 }
