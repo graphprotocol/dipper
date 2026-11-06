@@ -450,8 +450,8 @@ async fn queue_reassessment<W: WorkerQueue + Sync>(
             request.deployment_id,
             request.deployment_chain_id,
             request.num_candidates,
-            // Background: the periodic sweep yields to interactive work.
-            JobPriority::Background,
+            // Sweep: behind every other job, including the offers these reassessments create.
+            JobPriority::Sweep,
         ),
     )
     .await
