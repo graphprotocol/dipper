@@ -30,6 +30,8 @@ use crate::{
 /// The longest 1 database read or 1 queue push may take, so neither can stall the service.
 const DB_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 const QUEUE_PUSH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Failed queue pushes in a row after which a pass gives up; the next pass tries again.
+const MAX_FAILED_PUSHES_IN_A_ROW: usize = 3;
 
 /// Calculate the duration from `now` until the next occurrence of the target UTC hour.
 fn duration_until_utc_hour(now: OffsetDateTime, target_hour: u8) -> Duration {
@@ -217,7 +219,7 @@ async fn already_queued<W: WorkerQueue + Sync>(worker_queue: &W) -> HashSet<Inde
 }
 
 /// Queue a reassessment of every open request older than the minimum age, other than those in
-/// `skip`.
+/// `skip`, however many there are.
 async fn full_pass<R, W, I>(
     ctx: &Ctx<R, W, I>,
     skip: &HashSet<IndexingRequestId>,
@@ -228,8 +230,6 @@ where
     W: WorkerQueue + Sync,
 {
     let min_age_seconds = i64::try_from(ctx.config.min_request_age.as_secs()).unwrap_or(i64::MAX);
-    // All are listed, then the batch is taken from those not already waiting, so waiting ones
-    // don't use it up.
     let listed = db(ctx
         .registry
         .get_open_indexing_requests_for_reassessment(min_age_seconds, 0))
@@ -237,11 +237,6 @@ where
     match listed {
         Ok(mut requests) => {
             requests.retain(|request| !skip.contains(&request.id));
-            if let Ok(batch) = usize::try_from(ctx.config.batch_size)
-                && batch > 0
-            {
-                requests.truncate(batch);
-            }
             queue_reassessments(&ctx.worker_queue, &requests, rx_stop, "full").await
         }
         Err(err) => {
@@ -420,6 +415,7 @@ async fn queue_reassessments<W: WorkerQueue + Sync>(
     pass: &'static str,
 ) -> Pass {
     let mut queued = HashSet::new();
+    let mut failed_in_a_row = 0;
     for request in requests {
         // Check for shutdown between queue pushes to stay responsive
         if rx_stop.try_recv().is_ok() {
@@ -428,6 +424,13 @@ async fn queue_reassessments<W: WorkerQueue + Sync>(
         }
         if queue_reassessment(worker_queue, request, pass).await {
             queued.insert(request.id);
+            failed_in_a_row = 0;
+        } else {
+            failed_in_a_row += 1;
+            if failed_in_a_row == MAX_FAILED_PUSHES_IN_A_ROW {
+                tracing::warn!(pass, "the queue keeps failing; ending this pass early");
+                break;
+            }
         }
     }
     log_cycle(pass, requests.len(), queued.len());
@@ -447,8 +450,8 @@ async fn queue_reassessment<W: WorkerQueue + Sync>(
             request.deployment_id,
             request.deployment_chain_id,
             request.num_candidates,
-            // Background: the periodic sweep yields to interactive work.
-            JobPriority::Background,
+            // Sweep: behind every other job, including the offers these reassessments create.
+            JobPriority::Sweep,
         ),
     )
     .await
@@ -696,11 +699,14 @@ mod tests {
     }
 
     /// Records the requests it is asked to reassess, and reports the 2nd field's requests as
-    /// already having a reassessment queued.
+    /// already having a reassessment queued. With the 3rd field set, every push fails. The 4th
+    /// records each push's priority.
     #[derive(Default, Clone)]
     struct MockQueue(
         Arc<Mutex<Vec<IndexingRequestId>>>,
         HashSet<IndexingRequestId>,
+        bool,
+        Arc<Mutex<Vec<JobPriority>>>,
     );
 
     #[async_trait]
@@ -722,9 +728,13 @@ mod tests {
             _deployment_id: DeploymentId,
             _deployment_chain_id: ChainId,
             _num_candidates: usize,
-            _priority: JobPriority,
+            priority: JobPriority,
         ) -> anyhow::Result<JobId> {
             self.0.lock().unwrap().push(indexing_request_id);
+            self.3.lock().unwrap().push(priority);
+            if self.2 {
+                anyhow::bail!("the queue's database is down");
+            }
             Ok(JobId::default())
         }
         async fn queued_reassessments(&self) -> anyhow::Result<HashSet<IndexingRequestId>> {
@@ -1021,25 +1031,68 @@ mod tests {
         assert_eq!(*queue.0.lock().unwrap(), vec![other.id]);
     }
 
-    /// Requests already waiting for a reassessment don't use up the full pass's batch.
+    /// The daily pass queues every eligible request, however many there are, so none is left out
+    /// day after day because others come first in the list.
     #[tokio::test]
-    async fn requests_already_waiting_dont_use_up_the_full_pass_batch() {
-        let (waiting, other) = (request(3), request(3));
+    async fn the_daily_pass_queues_every_eligible_request() {
+        let open: Vec<IndexingRequest> = (0..3).map(|_| request(3)).collect();
         let registry = MockRegistry {
-            open: vec![waiting.clone(), other.clone()],
+            open: open.clone(),
             ..MockRegistry::default()
         };
         let config = ReassignmentConfig {
             batch_size: 1,
             ..ReassignmentConfig::default()
         };
-        let (mut ctx, queue) = ctx(registry, Some(Vec::new()), config);
-        ctx.worker_queue.1 = HashSet::from([waiting.id]);
+        let (ctx, queue) = ctx(registry, Some(Vec::new()), config);
         let (_tx, mut rx) = mpsc::channel(1);
 
         run_due_passes(&ctx, true, false, &mut rx).await;
 
-        assert_eq!(*queue.0.lock().unwrap(), vec![other.id]);
+        let all: Vec<IndexingRequestId> = open.iter().map(|r| r.id).collect();
+        assert_eq!(*queue.0.lock().unwrap(), all);
+    }
+
+    /// Both passes queue behind every other job, so the offers their reassessments create aren't
+    /// held up by the rest of a long pass.
+    #[tokio::test]
+    async fn both_passes_queue_behind_every_other_job() {
+        let short = request(3);
+        let registry = MockRegistry {
+            open: vec![request(3)],
+            short: vec![short],
+            ..MockRegistry::default()
+        };
+        let (ctx, queue) = ctx(
+            registry,
+            Some(vec![indexer('a')]),
+            ReassignmentConfig::default(),
+        );
+        let (_tx, mut rx) = mpsc::channel(1);
+
+        run_due_passes(&ctx, true, true, &mut rx).await;
+
+        assert_eq!(
+            *queue.3.lock().unwrap(),
+            [JobPriority::Sweep, JobPriority::Sweep]
+        );
+    }
+
+    /// A queue that keeps failing ends the pass after a few tries instead of waiting out a push
+    /// timeout for every remaining request.
+    #[tokio::test]
+    async fn a_pass_gives_up_once_the_queue_keeps_failing() {
+        let registry = MockRegistry {
+            open: (0..10).map(|_| request(3)).collect(),
+            ..MockRegistry::default()
+        };
+        let (mut ctx, queue) = ctx(registry, Some(Vec::new()), ReassignmentConfig::default());
+        ctx.worker_queue.2 = true;
+        let (_tx, mut rx) = mpsc::channel(1);
+
+        run_due_passes(&ctx, true, false, &mut rx).await;
+
+        assert_eq!(queue.0.lock().unwrap().len(), 3);
     }
 
     /// A daily interval of 0 is refused at start-up rather than running the full pass every second.

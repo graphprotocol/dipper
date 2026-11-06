@@ -372,7 +372,7 @@ pub struct ReassignmentConfig {
     )]
     pub run_at_utc_hour: u8,
 
-    /// Maximum number of requests to process per cycle (default: 100, 0 = unlimited)
+    /// Most requests 1 top-up queues (default: 100, 0 = unlimited); the daily pass queues them all
     #[serde(default = "default_reassignment_batch_size")]
     pub batch_size: i64,
 

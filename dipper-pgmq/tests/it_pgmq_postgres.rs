@@ -793,6 +793,39 @@ async fn deferred_job_does_not_count_an_attempt() {
     assert_eq!(job.failed_attempts(), 0);
 }
 
+/// A Background job, such as an offer a sweep's reassessment created, pops before Sweep jobs
+/// queued earlier, so a long sweep can't hold it up.
+#[tokio::test]
+async fn background_pops_before_earlier_sweep_jobs() {
+    //* Given
+    let (db, _temp_db) = temp_pgmq_db().await;
+    let queue = PgQueue::new(db);
+    for _ in 0..2 {
+        queue
+            .push(JobBuilder::new(Faker.fake::<TestMsg>()).priority(JobPriority::Sweep))
+            .await
+            .expect("Failed to push sweep job");
+    }
+    let background_id = queue
+        .push(JobBuilder::new(Faker.fake::<TestMsg>()).priority(JobPriority::Background))
+        .await
+        .expect("Failed to push background job");
+
+    //* When
+    let first = queue
+        .pop::<TestMsg>()
+        .await
+        .expect("Failed to pop")
+        .expect("expected a job");
+
+    //* Then
+    assert_eq!(
+        first.id(),
+        &background_id,
+        "background must pop before earlier sweep jobs"
+    );
+}
+
 #[tokio::test]
 async fn interactive_pops_before_earlier_background() {
     // pop() orders by priority DESC first: an Interactive job pushed after two

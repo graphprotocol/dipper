@@ -1701,12 +1701,9 @@ impl PgRegistry {
 
     /// Get open indexing requests eligible for reassessment.
     ///
-    /// Returns requests that are in the `OPEN` status and were created at least
-    /// `min_age_seconds` ago. Results are ordered by `updated_at` ascending to
-    /// prioritize requests that haven't been reassessed recently.
-    ///
-    /// If `batch_size` is greater than 0, limits the number of results.
-    /// If `batch_size` is 0 or negative, returns all matching requests.
+    /// Returns `OPEN` requests created at least `min_age_seconds` ago, least recently changed
+    /// first (a target or status change; reassessing doesn't count). If `batch_size` is greater
+    /// than 0, limits the number of results; otherwise returns them all.
     pub async fn get_open_indexing_requests_for_reassessment(
         &self,
         min_age_seconds: i64,
