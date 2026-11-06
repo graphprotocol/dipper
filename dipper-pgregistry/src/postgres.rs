@@ -791,10 +791,9 @@ impl PgRegistry {
             .collect())
     }
 
-    /// Get declined `CanceledByIndexer`/`Expired`/`Rejected` indexers, and those whose agreement
-    /// dipper ended `AbandonedByIndexer`, grouped by deployment (deployment id -> indexer ids).
-    /// Each rejection reason gets its own exclusion window, as does an expiry that never had an
-    /// offer transaction.
+    /// Indexers to skip on each deployment for cancelling, rejecting, letting an offer expire or
+    /// abandoning an agreement there, each for the window its reason earns. Repeated capacity
+    /// and availability rejections earn the uncertain window (see `REPEATED_INDEXER_FAILURES`).
     pub async fn get_declined_indexers_by_deployment(
         &self,
         default_lookback_days: i32,
@@ -808,13 +807,15 @@ impl PgRegistry {
             SUBGRAPH_MANIFEST_UNAVAILABLE, UNEXPECTED_SERVICE_PROVIDER, UNSPECIFIED,
             UNSUPPORTED_METADATA_VERSION,
         };
+        // Not config: a parameter would change the registry trait and every mock of it.
+        const REPEATED_INDEXER_FAILURES: i64 = 3;
 
         let rows: Vec<(PgDeploymentId, Vec<PgIndexerId>)> = sqlx::query_as(
             r#"
             SELECT
                 deployment_id,
                 array_agg(DISTINCT indexer_id) as indexer_ids
-            FROM dipper_reg_indexing_agreements
+            FROM dipper_reg_indexing_agreements a
             WHERE status IN ($1, $2, $3, $20)
               AND (
                 -- PRICE_TOO_LOW: shorter lookback (until next IISA refresh)
@@ -825,6 +826,20 @@ impl PgRegistry {
                 -- clear once dipper is fixed: very short lookback
                 (rejection_reason IN ($8, $9, $10, $11, $12, $13, $14, $15, $16)
                  AND updated_at >= timezone('UTC', now()) - make_interval(mins => $7))
+                OR
+                -- Capacity and availability are the indexer's own service failing, so repeats of
+                -- them on 1 deployment get the uncertain lookback; dipper-side faults stay short,
+                -- since they repeat at every indexer until dipper is fixed
+                (status = $3 AND rejection_reason IN ($13, $14)
+                 AND updated_at >= timezone('UTC', now()) - make_interval(days => $17)
+                 AND (SELECT COUNT(*)
+                      FROM dipper_reg_indexing_agreements recent
+                      WHERE recent.indexer_id = a.indexer_id
+                        AND recent.deployment_id = a.deployment_id
+                        AND recent.status = $3
+                        AND recent.rejection_reason IN ($13, $14)
+                        AND recent.updated_at >= timezone('UTC', now()) - make_interval(days => $17)
+                     ) >= $21)
                 OR
                 -- Uncertain reasons (sender not trusted, unspecified/unknown):
                 -- may clear within about a day, so a 1-day lookback
@@ -871,6 +886,7 @@ impl PgRegistry {
         .bind(SENDER_NOT_TRUSTED) // $18
         .bind(UNSPECIFIED) // $19
         .bind(IndexingAgreementStatus::AbandonedByIndexer) // $20
+        .bind(REPEATED_INDEXER_FAILURES) // $21
         .fetch_all(&self.pool)
         .await?;
 

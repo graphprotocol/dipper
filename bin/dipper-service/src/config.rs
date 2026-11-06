@@ -1106,9 +1106,9 @@ pub struct DipsAgreementConfig {
     )]
     pub transient_rejection_lookback_minutes: i32,
 
-    /// Days to look back for uncertain rejections that may clear within a day but
-    /// aren't a quick transient blip: the indexer not yet trusting the payer
-    /// (SENDER_NOT_TRUSTED), or an unspecified/unknown/missing reason. Default: 1 day.
+    /// Days to look back for rejections that may clear within a day: SENDER_NOT_TRUSTED, an
+    /// unspecified/unknown/missing reason, or capacity and availability rejections that keep
+    /// recurring on 1 deployment. Default: 1 day.
     #[serde(default = "default_uncertain_rejection_lookback_days")]
     pub uncertain_rejection_lookback_days: i32,
 
@@ -1492,7 +1492,8 @@ pub struct IndexingAgreementConfig {
     pub price_rejection_lookback_days: i32,
     /// Number of minutes to look back for transient rejections.
     pub transient_rejection_lookback_minutes: i32,
-    /// Number of days to look back for uncertain rejections (sender-not-trusted, unspecified).
+    /// Number of days to look back for uncertain rejections (sender-not-trusted, unspecified,
+    /// recurring capacity or availability).
     pub uncertain_rejection_lookback_days: i32,
     /// Number of days to skip an unresponsive indexer across all deployments.
     pub unresponsive_indexer_lookback_days: i32,

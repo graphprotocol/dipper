@@ -56,7 +56,8 @@ pub mod rejection_reason {
     pub const SENDER_NOT_TRUSTED: &str = "SENDER_NOT_TRUSTED";
 
     /// The indexer is at its DIPs capacity and may have room later.
-    /// Lookback: 5 minutes (transient, retry once load drops).
+    /// Lookback: 5 minutes (transient, retry once load drops), or the uncertain
+    /// 1 day while it and INDEXER_UNAVAILABLE keep recurring on a deployment.
     pub const CAPACITY_EXCEEDED: &str = "CAPACITY_EXCEEDED";
 
     /// The subgraph manifest exceeds the indexer's size cap.
@@ -73,7 +74,8 @@ pub mod rejection_reason {
     pub const INSUFFICIENT_ESCROW: &str = "INSUFFICIENT_ESCROW";
 
     /// A transient internal error on the indexer; the proposal may be resent.
-    /// Lookback: 5 minutes (transient, not the indexer's lasting state).
+    /// Lookback: 5 minutes (transient, not the indexer's lasting state), or the
+    /// uncertain 1 day while it and CAPACITY_EXCEEDED keep recurring on a deployment.
     pub const INDEXER_UNAVAILABLE: &str = "INDEXER_UNAVAILABLE";
 
     /// The rejection reason was not specified, recognised, or mapped to a more
