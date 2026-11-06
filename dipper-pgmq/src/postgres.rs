@@ -267,12 +267,15 @@ pub struct PgJob<T> {
 }
 
 /// The scheduling priority of a job; `pop()` serves higher priority first.
-/// Policy: Interactive = a human or Studio waits on first assessment;
-/// everything else is remediation or hygiene and yields.
+/// Policy: Interactive = a human or Studio waits on first assessment; Sweep = periodic passes
+/// over every request, which yield even to the offers their own jobs create; everything else is
+/// remediation or hygiene and runs Background.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Default)]
 #[repr(i16)]
 pub enum JobPriority {
-    /// Reassignment sweeps, expiration, liveness remediation, follow-up jobs.
+    /// The reassignment service's daily and hourly passes.
+    Sweep = -1,
+    /// Expiration, liveness remediation, follow-up jobs.
     /// Downstream proposal/offer jobs also run Background by design for now.
     #[default]
     Background = 0,
@@ -283,7 +286,8 @@ pub enum JobPriority {
 impl From<i16> for JobPriority {
     fn from(value: i16) -> Self {
         match value {
-            i16::MIN..=0 => Self::Background,
+            i16::MIN..=-1 => Self::Sweep,
+            0 => Self::Background,
             1..=i16::MAX => Self::Interactive,
         }
     }
@@ -362,5 +366,26 @@ impl sqlx::Decode<'_, Postgres> for PgJobStatus {
     ) -> Result<Self, sqlx::error::BoxDynError> {
         let value: i32 = sqlx::Decode::<Postgres>::decode(value)?;
         Ok(value.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::JobPriority;
+
+    /// A stored priority reads back as the level it was written at, and anything below
+    /// Background, as an older release could never have written, reads as Sweep.
+    #[test]
+    fn stored_priorities_read_back_in_order() {
+        for priority in [
+            JobPriority::Sweep,
+            JobPriority::Background,
+            JobPriority::Interactive,
+        ] {
+            assert_eq!(JobPriority::from(priority as i16), priority);
+        }
+        assert_eq!(JobPriority::from(i16::MIN), JobPriority::Sweep);
+        assert!(JobPriority::Sweep < JobPriority::Background);
+        assert!(JobPriority::Background < JobPriority::Interactive);
     }
 }
