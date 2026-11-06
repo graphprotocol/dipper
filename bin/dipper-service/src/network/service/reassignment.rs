@@ -31,9 +31,8 @@ use crate::{
 const DB_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 const QUEUE_PUSH_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Calculate the duration until the next occurrence of the target UTC hour.
-fn duration_until_utc_hour(target_hour: u8) -> Duration {
-    let now = OffsetDateTime::now_utc();
+/// Calculate the duration from `now` until the next occurrence of the target UTC hour.
+fn duration_until_utc_hour(now: OffsetDateTime, target_hour: u8) -> Duration {
     let current_hour = now.hour();
     let current_minute = now.minute();
     let current_second = now.second();
@@ -51,6 +50,14 @@ fn duration_until_utc_hour(target_hour: u8) -> Duration {
     let total_seconds = (hours_until as u64) * 3600 - seconds_into_current_hour;
 
     Duration::from_secs(total_seconds)
+}
+
+/// The duration from `now` until the next whole multiple of `every` since the Unix epoch, so the
+/// top-up keeps to the clock across restarts and an hourly one falls due with the daily pass.
+fn until_next_multiple(now: OffsetDateTime, every: Duration) -> Duration {
+    let every = every.as_secs().max(1);
+    let since_epoch = u64::try_from(now.unix_timestamp()).unwrap_or(0);
+    Duration::from_secs((every - since_epoch % every) % every)
 }
 
 /// The first run after `now` of a schedule that last ran at `last` and repeats every `every`.
@@ -118,11 +125,11 @@ where
 
     let service = async move {
         let config = &ctx.config;
-        let started = Instant::now();
-        let initial_delay = duration_until_utc_hour(config.run_at_utc_hour);
+        let (started, clock) = (Instant::now(), OffsetDateTime::now_utc());
+        let initial_delay = duration_until_utc_hour(clock, config.run_at_utc_hour);
         let mut next_full = started + initial_delay;
         let top_up_every = (!config.top_up_interval.is_zero()).then_some(config.top_up_interval);
-        let mut next_top_up = top_up_every.map(|every| started + every);
+        let mut next_top_up = top_up_every.map(|every| started + until_next_multiple(clock, every));
 
         tracing::info!(
             run_at_utc_hour = config.run_at_utc_hour,
@@ -744,9 +751,39 @@ mod tests {
     #[test]
     fn test_duration_until_utc_hour() {
         // This is a basic sanity check - the actual delay depends on current time
-        let delay = duration_until_utc_hour(2);
+        let delay = duration_until_utc_hour(OffsetDateTime::now_utc(), 2);
         // Should always be less than 24 hours
         assert!(delay.as_secs() < 86400);
+    }
+
+    /// An hourly top-up keeps to the hour, so after a restart it waits at most an hour and it
+    /// falls due with the daily pass, which then queues first.
+    #[test]
+    fn an_hourly_top_up_falls_due_on_the_hour_with_the_daily_pass() {
+        let hour = Duration::from_secs(3600);
+        let at = |h, m, s| {
+            time::Date::from_calendar_date(2026, time::Month::November, 6)
+                .unwrap()
+                .with_hms(h, m, s)
+                .unwrap()
+                .assume_utc()
+        };
+        let before_ten = at(9, 59, 30);
+        assert_eq!(
+            until_next_multiple(before_ten, hour),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            duration_until_utc_hour(before_ten, 10),
+            Duration::from_secs(30)
+        );
+        let on_the_hour = at(10, 0, 0);
+        assert_eq!(until_next_multiple(on_the_hour, hour), Duration::ZERO);
+        let after = at(10, 20, 0);
+        assert_eq!(
+            until_next_multiple(after, hour),
+            Duration::from_secs(40 * 60)
+        );
     }
 
     #[test]
@@ -866,11 +903,12 @@ mod tests {
         assert_eq!(*queue.0.lock().unwrap(), vec![short.id]);
     }
 
-    /// The top-up runs on its own interval without waiting for the daily hour, and not at all when
-    /// its interval is 0. The full pass finds nothing to queue, wherever the clock puts its hour.
+    /// The top-up runs every interval on the clock without waiting for the daily hour, and not at all
+    /// when its interval is 0. In 150s a 60s top-up runs 2 or 3 times, depending on where the
+    /// clock's minute falls. The full pass finds nothing to queue, wherever the clock puts its hour.
     #[tokio::test(start_paused = true)]
     async fn tops_up_every_interval_and_never_when_turned_off() {
-        for (every, expected) in [(Duration::from_secs(60), 2), (Duration::ZERO, 0)] {
+        for (every, expected) in [(Duration::from_secs(60), 2..=3), (Duration::ZERO, 0..=0)] {
             let short = request(3);
             let registry = MockRegistry {
                 short: vec![short],
@@ -888,7 +926,8 @@ mod tests {
             handle.stop().await;
             task.await.unwrap().unwrap();
 
-            assert_eq!(queue.0.lock().unwrap().len(), expected, "every {every:?}");
+            let runs = queue.0.lock().unwrap().len();
+            assert!(expected.contains(&runs), "every {every:?}: {runs} runs");
         }
     }
 }
