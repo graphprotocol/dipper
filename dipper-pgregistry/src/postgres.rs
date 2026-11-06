@@ -1780,6 +1780,38 @@ impl PgRegistry {
         .map_err(Into::into)
     }
 
+    /// Open requests whose last reassessment left them short of indexers, whatever their age,
+    /// least recently changed first. If `batch_size` is greater than 0, limits the number of
+    /// results; otherwise returns them all.
+    pub async fn get_short_open_indexing_requests(
+        &self,
+        batch_size: i64,
+    ) -> Result<Vec<IndexingRequest>, Error> {
+        sqlx::query_as(
+            r#"
+            SELECT
+                id,
+                created_at,
+                updated_at,
+                status,
+                requested_by,
+                deployment_id,
+                deployment_chain_id,
+                num_candidates
+            FROM dipper_reg_indexing_requests
+            WHERE status = $1
+              AND shortfall_active
+            ORDER BY updated_at ASC
+            LIMIT CASE WHEN $2 > 0 THEN $2 ELSE NULL END
+            "#,
+        )
+        .bind(IndexingRequestStatus::Open)
+        .bind(batch_size)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Atomically set the coverage-shortfall latch on a request, returning whether
     /// the value changed. The `shortfall_active <> $2` guard makes the UPDATE a
     /// no-op (returning no row) when the value is unchanged, so the caller learns

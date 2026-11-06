@@ -69,6 +69,16 @@ pub trait IndexingRequestRegistry {
         batch_size: i64,
     ) -> RegistryResult<Vec<IndexingRequest>>;
 
+    /// Open requests whose last reassessment left them short of indexers, whatever their age,
+    /// least recently changed first, at most `batch_size` (all when it is 0 or less).
+    /// Default: none, so mocks need not override.
+    async fn get_short_open_indexing_requests(
+        &self,
+        _batch_size: i64,
+    ) -> RegistryResult<Vec<IndexingRequest>> {
+        Ok(Vec::new())
+    }
+
     /// Atomically set the request's coverage-shortfall latch, returning whether
     /// the value actually changed (a single guarded UPDATE, so the transition is
     /// race-free).
