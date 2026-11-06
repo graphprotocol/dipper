@@ -699,12 +699,14 @@ mod tests {
     }
 
     /// Records the requests it is asked to reassess, and reports the 2nd field's requests as
-    /// already having a reassessment queued. With the 3rd field set, every push fails.
+    /// already having a reassessment queued. With the 3rd field set, every push fails. The 4th
+    /// records each push's priority.
     #[derive(Default, Clone)]
     struct MockQueue(
         Arc<Mutex<Vec<IndexingRequestId>>>,
         HashSet<IndexingRequestId>,
         bool,
+        Arc<Mutex<Vec<JobPriority>>>,
     );
 
     #[async_trait]
@@ -726,9 +728,10 @@ mod tests {
             _deployment_id: DeploymentId,
             _deployment_chain_id: ChainId,
             _num_candidates: usize,
-            _priority: JobPriority,
+            priority: JobPriority,
         ) -> anyhow::Result<JobId> {
             self.0.lock().unwrap().push(indexing_request_id);
+            self.3.lock().unwrap().push(priority);
             if self.2 {
                 anyhow::bail!("the queue's database is down");
             }
@@ -1048,6 +1051,31 @@ mod tests {
 
         let all: Vec<IndexingRequestId> = open.iter().map(|r| r.id).collect();
         assert_eq!(*queue.0.lock().unwrap(), all);
+    }
+
+    /// Both passes queue behind every other job, so the offers their reassessments create aren't
+    /// held up by the rest of a long pass.
+    #[tokio::test]
+    async fn both_passes_queue_behind_every_other_job() {
+        let short = request(3);
+        let registry = MockRegistry {
+            open: vec![request(3)],
+            short: vec![short],
+            ..MockRegistry::default()
+        };
+        let (ctx, queue) = ctx(
+            registry,
+            Some(vec![indexer('a')]),
+            ReassignmentConfig::default(),
+        );
+        let (_tx, mut rx) = mpsc::channel(1);
+
+        run_due_passes(&ctx, true, true, &mut rx).await;
+
+        assert_eq!(
+            *queue.3.lock().unwrap(),
+            [JobPriority::Sweep, JobPriority::Sweep]
+        );
     }
 
     /// A queue that keeps failing ends the pass after a few tries instead of waiting out a push
