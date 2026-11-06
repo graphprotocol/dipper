@@ -30,6 +30,8 @@ use crate::{
 /// The longest 1 database read or 1 queue push may take, so neither can stall the service.
 const DB_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 const QUEUE_PUSH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Failed queue pushes in a row after which a pass gives up; the next pass tries again.
+const MAX_FAILED_PUSHES_IN_A_ROW: usize = 3;
 
 /// Calculate the duration from `now` until the next occurrence of the target UTC hour.
 fn duration_until_utc_hour(now: OffsetDateTime, target_hour: u8) -> Duration {
@@ -413,6 +415,7 @@ async fn queue_reassessments<W: WorkerQueue + Sync>(
     pass: &'static str,
 ) -> Pass {
     let mut queued = HashSet::new();
+    let mut failed_in_a_row = 0;
     for request in requests {
         // Check for shutdown between queue pushes to stay responsive
         if rx_stop.try_recv().is_ok() {
@@ -421,6 +424,13 @@ async fn queue_reassessments<W: WorkerQueue + Sync>(
         }
         if queue_reassessment(worker_queue, request, pass).await {
             queued.insert(request.id);
+            failed_in_a_row = 0;
+        } else {
+            failed_in_a_row += 1;
+            if failed_in_a_row == MAX_FAILED_PUSHES_IN_A_ROW {
+                tracing::warn!(pass, "the queue keeps failing; ending this pass early");
+                break;
+            }
         }
     }
     log_cycle(pass, requests.len(), queued.len());
