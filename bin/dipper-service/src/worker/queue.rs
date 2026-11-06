@@ -31,6 +31,9 @@ where
     /// Pulls a job from the queue
     async fn pop(&self) -> anyhow::Result<Option<JobGuard<'_, M>>>;
 
+    /// Every message whose job isn't done yet: queued, waiting to retry, or running.
+    async fn unfinished(&self) -> anyhow::Result<Vec<M>>;
+
     /// Subscribes to the `pgmq_jobs_available` channel
     async fn subscribe(&self) -> anyhow::Result<Self::Listener>;
 }
@@ -78,6 +81,22 @@ where
 
     async fn pop(&self) -> anyhow::Result<Option<JobGuard<'_, M>>> {
         self.inner.pop().await
+    }
+
+    /// A stored message this release can't read, such as 1 from a newer release, is left out
+    /// with a warning rather than failing the whole list.
+    async fn unfinished(&self) -> anyhow::Result<Vec<M>> {
+        let descriptors = self.inner.unfinished_descriptors().await?;
+        Ok(descriptors
+            .iter()
+            .filter_map(|descriptor| match serde_json::from_str(descriptor) {
+                Ok(msg) => Some(msg),
+                Err(err) => {
+                    tracing::warn!(error = %err, "skipping a queued job this release can't read");
+                    None
+                }
+            })
+            .collect())
     }
 
     async fn subscribe(&self) -> anyhow::Result<QueueImplListener> {

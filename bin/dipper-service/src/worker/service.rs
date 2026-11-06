@@ -803,6 +803,10 @@ mod tests {
             Ok(None)
         }
 
+        async fn unfinished(&self) -> anyhow::Result<Vec<Message>> {
+            Ok(Vec::new())
+        }
+
         async fn subscribe(&self) -> anyhow::Result<Self::Listener> {
             let attempt = self.subscribe_attempts.fetch_add(1, Ordering::SeqCst);
             if attempt < self.failures_before_success {
