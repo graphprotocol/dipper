@@ -903,6 +903,22 @@ mod tests {
         assert_eq!(*queue.0.lock().unwrap(), vec![short.id]);
     }
 
+    /// A daily interval of 0 is refused at start-up rather than running the full pass every second.
+    #[tokio::test(start_paused = true)]
+    async fn refuses_a_full_pass_interval_of_0() {
+        let config = ReassignmentConfig {
+            interval: Duration::ZERO,
+            ..ReassignmentConfig::default()
+        };
+        let (ctx, _queue) = ctx(MockRegistry::default(), Some(Vec::new()), config);
+        let (_handle, service) = new(ctx);
+
+        let ended = tokio::time::timeout(Duration::from_secs(48 * 3600), service).await;
+
+        let err = ended.expect("the service should stop at once").unwrap_err();
+        assert!(err.to_string().contains("interval"), "{err}");
+    }
+
     /// The top-up runs every interval on the clock without waiting for the daily hour, and not at all
     /// when its interval is 0. In 150s a 60s top-up runs 2 or 3 times, depending on where the
     /// clock's minute falls. The full pass finds nothing to queue, wherever the clock puts its hour.
