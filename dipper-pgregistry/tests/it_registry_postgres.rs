@@ -1033,7 +1033,7 @@ async fn get_declined_indexers_by_deployment_lets_2_failures_go_after_5_minutes(
 }
 
 #[tokio::test]
-async fn get_declined_indexers_by_deployment_ignores_failures_older_than_a_day() {
+async fn get_declined_indexers_by_deployment_ignores_failures_spread_over_more_than_a_day() {
     let result = declined_after_indexer_a_rejects(&[
         (rejection_reason::INDEXER_UNAVAILABLE, DEPLOYMENT_1A, 10),
         (
@@ -1051,7 +1051,67 @@ async fn get_declined_indexers_by_deployment_ignores_failures_older_than_a_day()
 
     assert!(
         result.is_empty(),
-        "only 2 of the failures fall within the last day, got {result:?}"
+        "no single day holds all 3 failures, got {result:?}"
+    );
+}
+
+/// The skip lasts a day from the latest of the 3 failures, even once the earlier 2 are more than
+/// a day old.
+#[tokio::test]
+async fn get_declined_indexers_by_deployment_skips_for_a_day_after_the_latest_failure() {
+    let result = declined_after_indexer_a_rejects(&[
+        (
+            rejection_reason::INDEXER_UNAVAILABLE,
+            DEPLOYMENT_1A,
+            30 * 60,
+        ),
+        (
+            rejection_reason::INDEXER_UNAVAILABLE,
+            DEPLOYMENT_1A,
+            29 * 60,
+        ),
+        (
+            rejection_reason::INDEXER_UNAVAILABLE,
+            DEPLOYMENT_1A,
+            10 * 60,
+        ),
+    ])
+    .await;
+
+    let deployment_1a: DeploymentId = DEPLOYMENT_1A.parse().unwrap();
+    let indexer_a = indexer_id!("1111111111111111111111111111111111111111");
+    assert!(
+        result
+            .get(&deployment_1a)
+            .is_some_and(|ids| ids.contains(&indexer_a)),
+        "3 failures within 20 hours, the latest 10 hours ago, should still skip, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn get_declined_indexers_by_deployment_lets_a_burst_go_a_day_after_its_latest_failure() {
+    let result = declined_after_indexer_a_rejects(&[
+        (
+            rejection_reason::INDEXER_UNAVAILABLE,
+            DEPLOYMENT_1A,
+            50 * 60,
+        ),
+        (
+            rejection_reason::INDEXER_UNAVAILABLE,
+            DEPLOYMENT_1A,
+            49 * 60,
+        ),
+        (
+            rejection_reason::INDEXER_UNAVAILABLE,
+            DEPLOYMENT_1A,
+            26 * 60,
+        ),
+    ])
+    .await;
+
+    assert!(
+        result.is_empty(),
+        "the latest failure is over a day old, got {result:?}"
     );
 }
 
