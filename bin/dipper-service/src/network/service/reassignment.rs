@@ -828,6 +828,22 @@ mod tests {
         assert!(queued.is_empty(), "{queued:?}");
     }
 
+    /// Another request's agreement on the same subgraph keeps its indexer from a new offer but
+    /// takes none of this request's slots.
+    #[tokio::test]
+    async fn another_requests_agreement_on_the_subgraph_takes_none_of_its_slots() {
+        let (short, other) = (request(1), request(1));
+        let registry = MockRegistry {
+            agreements: vec![holding(&other, indexer('a'))],
+            short: vec![short.clone()],
+            ..MockRegistry::default()
+        };
+
+        let queued = top_up(registry, Some(vec![indexer('a'), indexer('b')])).await;
+
+        assert_eq!(queued, vec![short.id]);
+    }
+
     #[tokio::test]
     async fn leaves_a_request_alone_when_its_only_free_indexers_are_ruled_out() {
         let short = request(3);
