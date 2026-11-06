@@ -8,4 +8,5 @@ mod service_queue;
 mod unresponsive_breaker;
 
 pub use context::Ctx;
+pub(crate) use handlers::{is_active_agreement, offerable_indexers, resolve_chain_name};
 pub use unresponsive_breaker::{DipsAcceptingCache, UnresponsiveBreaker};

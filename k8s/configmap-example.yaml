@@ -79,7 +79,8 @@ data:
         "interval": 86400,
         "run_at_utc_hour": 10,
         "batch_size": 100,
-        "min_request_age": 86400
+        "min_request_age": 86400,
+        "top_up_interval": 3600
       },
       "expiration": {
         "enabled": true,

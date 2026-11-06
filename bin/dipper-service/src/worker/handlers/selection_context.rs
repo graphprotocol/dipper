@@ -1,6 +1,6 @@
 //! Shared utilities for gathering IISA selection context.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use dipper_iisa::SelectionContext;
 use thegraph_core::{DeploymentId, IndexerId, alloy::primitives::ChainId};
@@ -202,11 +202,38 @@ fn exclude_cancelling_indexers(
 }
 
 /// Check if an agreement status represents an active agreement.
-fn is_active_agreement(status: &IndexingAgreementStatus) -> bool {
+pub(crate) fn is_active_agreement(status: &IndexingAgreementStatus) -> bool {
     matches!(
         status,
         IndexingAgreementStatus::Created | IndexingAgreementStatus::AcceptedOnChain
     )
+}
+
+/// The indexers in IISA's DIPs `pool` a reassessment could offer `deployment_id` to now, in pool
+/// order: not holding or still cancelling an agreement there, declined there, denylisted,
+/// unresponsive on the chain, or holding an abandoned slot, as the reassessment would rule out.
+pub(crate) fn offerable_indexers(
+    pool: &[IndexerId],
+    deployment_id: DeploymentId,
+    agreements: &[IndexingAgreement],
+    declined: &HashMap<DeploymentId, Vec<IndexerId>>,
+    denylist: &[IndexerId],
+    unresponsive: &[IndexerId],
+    held: &[IndexerId],
+) -> Vec<IndexerId> {
+    let mut excluded: HashSet<IndexerId> = agreements
+        .iter()
+        .filter(|a| {
+            is_active_agreement(&a.status) || a.status == IndexingAgreementStatus::Cancelling
+        })
+        .map(|a| a.indexer.id)
+        .collect();
+    excluded.extend(declined.get(&deployment_id).into_iter().flatten());
+    excluded.extend(denylist.iter().chain(unresponsive).chain(held));
+    pool.iter()
+        .copied()
+        .filter(|id| !excluded.contains(id))
+        .collect()
 }
 
 #[cfg(test)]
@@ -218,6 +245,69 @@ mod tests {
         format!("0x{}", hex_digit.to_string().repeat(40))
             .parse()
             .unwrap()
+    }
+
+    fn on(indexer_id: IndexerId, status: IndexingAgreementStatus) -> IndexingAgreement {
+        let mut a = agreement(status, None);
+        a.indexer.id = indexer_id;
+        a
+    }
+
+    #[test]
+    fn offerable_indexers_leave_out_every_indexer_a_reassessment_would_rule_out() {
+        let deployment: DeploymentId = "QmTXzATwNfgGVukV1fX2T6xw9f6LAYRVWpsdXyRWzUR2H9"
+            .parse()
+            .unwrap();
+        let other: DeploymentId = "QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv"
+            .parse()
+            .unwrap();
+        let pool: Vec<IndexerId> = "abcdef123".chars().map(indexer).collect();
+        let agreements = [
+            on(indexer('a'), IndexingAgreementStatus::AcceptedOnChain),
+            on(indexer('b'), IndexingAgreementStatus::Created),
+            on(indexer('c'), IndexingAgreementStatus::Cancelling),
+            // Ended agreements don't keep their indexer from a new offer.
+            on(indexer('3'), IndexingAgreementStatus::CanceledByRequester),
+        ];
+        let declined = HashMap::from([
+            (deployment, vec![indexer('d')]),
+            (other, vec![indexer('2')]),
+        ]);
+
+        let offerable = offerable_indexers(
+            &pool,
+            deployment,
+            &agreements,
+            &declined,
+            &[indexer('e')],
+            &[indexer('f')],
+            &[indexer('1')],
+        );
+
+        assert_eq!(offerable, vec![indexer('2'), indexer('3')]);
+    }
+
+    #[test]
+    fn no_indexer_is_offerable_when_every_pool_member_already_holds_the_deployment() {
+        let deployment: DeploymentId = "QmTXzATwNfgGVukV1fX2T6xw9f6LAYRVWpsdXyRWzUR2H9"
+            .parse()
+            .unwrap();
+        let agreements = [
+            on(indexer('a'), IndexingAgreementStatus::AcceptedOnChain),
+            on(indexer('b'), IndexingAgreementStatus::AcceptedOnChain),
+        ];
+
+        let offerable = offerable_indexers(
+            &[indexer('a'), indexer('b')],
+            deployment,
+            &agreements,
+            &HashMap::new(),
+            &[],
+            &[],
+            &[],
+        );
+
+        assert!(offerable.is_empty(), "{offerable:?}");
     }
 
     #[test]
