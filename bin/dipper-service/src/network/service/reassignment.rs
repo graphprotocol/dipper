@@ -228,13 +228,20 @@ where
     W: WorkerQueue + Sync,
 {
     let min_age_seconds = i64::try_from(ctx.config.min_request_age.as_secs()).unwrap_or(i64::MAX);
+    // All are listed, then the batch is taken from those not already waiting, so waiting ones
+    // don't use it up.
     let listed = db(ctx
         .registry
-        .get_open_indexing_requests_for_reassessment(min_age_seconds, ctx.config.batch_size))
+        .get_open_indexing_requests_for_reassessment(min_age_seconds, 0))
     .await;
     match listed {
         Ok(mut requests) => {
             requests.retain(|request| !skip.contains(&request.id));
+            if let Ok(batch) = usize::try_from(ctx.config.batch_size)
+                && batch > 0
+            {
+                requests.truncate(batch);
+            }
             queue_reassessments(&ctx.worker_queue, &requests, rx_stop, "full").await
         }
         Err(err) => {
