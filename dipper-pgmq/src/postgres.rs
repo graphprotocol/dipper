@@ -133,6 +133,21 @@ where
     Ok(res)
 }
 
+/// The serialized descriptor of every job not yet done: queued, waiting to retry, or running. A job
+/// that failed for good isn't listed.
+pub async fn unfinished_descriptors<'q, E>(executor: E) -> anyhow::Result<Vec<String>>
+where
+    E: sqlx::Executor<'q, Database = Postgres>,
+{
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT descriptor::text FROM pgmq_queue WHERE status IN ($1, $2)")
+            .bind(PgJobStatus::Queued)
+            .bind(PgJobStatus::Running)
+            .fetch_all(executor)
+            .await?;
+    Ok(rows.into_iter().map(|(descriptor,)| descriptor).collect())
+}
+
 /// Clear the queue
 pub async fn clear<'q, E>(executor: E) -> anyhow::Result<()>
 where

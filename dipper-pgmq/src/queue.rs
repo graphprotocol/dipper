@@ -108,6 +108,11 @@ impl PgQueue {
         PgQueueListener::new(&self.pool).await
     }
 
+    /// The serialized descriptor of every job not yet done: queued, waiting to retry, or running.
+    pub async fn unfinished_descriptors(&self) -> anyhow::Result<Vec<String>> {
+        postgres::unfinished_descriptors(&self.pool).await
+    }
+
     /// Clears the queue
     pub async fn clear(&self) -> anyhow::Result<()> {
         postgres::clear(&self.pool).await

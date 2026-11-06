@@ -174,8 +174,9 @@ where
     (Handle { tx_stop }, service)
 }
 
-/// Run the passes that are due, full first. Both run in this 1 task, so they never overlap, and
-/// the top-up skips any request the full pass has just queued.
+/// Run the passes that are due, full first. Both run in this 1 task, so they never overlap.
+/// Neither queues a request that already has a reassessment queued or running, and the top-up
+/// skips what the full pass has just queued.
 async fn run_due_passes<R, W, I>(
     ctx: &Ctx<R, W, I>,
     full_due: bool,
@@ -187,32 +188,62 @@ where
     W: WorkerQueue + Sync,
     I: CandidateSelection + Sync,
 {
-    let mut queued = HashSet::new();
+    if !full_due && !top_up_due {
+        return Pass::Done(HashSet::new());
+    }
+    let mut skip = already_queued(&ctx.worker_queue).await;
     if full_due {
-        match full_pass(ctx, rx_stop).await {
-            Pass::Done(ids) => queued = ids,
+        match full_pass(ctx, &skip, rx_stop).await {
+            Pass::Done(ids) => skip.extend(ids),
             Pass::Stopped => return Pass::Stopped,
         }
     }
-    if top_up_due && let Pass::Stopped = top_up_pass(ctx, &queued, rx_stop).await {
+    if top_up_due && let Pass::Stopped = top_up_pass(ctx, &skip, rx_stop).await {
         return Pass::Stopped;
     }
-    Pass::Done(queued)
+    Pass::Done(skip)
 }
 
-/// Queue a reassessment of every open request older than the minimum age.
-async fn full_pass<R, W, I>(ctx: &Ctx<R, W, I>, rx_stop: &mut mpsc::Receiver<()>) -> Pass
+/// The requests a reassessment is already queued or running for. When the queue can't be read
+/// the passes go ahead without that check; a duplicate job only repeats a reassessment.
+async fn already_queued<W: WorkerQueue + Sync>(worker_queue: &W) -> HashSet<IndexingRequestId> {
+    match db(worker_queue.queued_reassessments()).await {
+        Ok(ids) => ids,
+        Err(err) => {
+            tracing::warn!(error = %err, "can't list queued reassessments; queueing without that check");
+            HashSet::new()
+        }
+    }
+}
+
+/// Queue a reassessment of every open request older than the minimum age, other than those in
+/// `skip`.
+async fn full_pass<R, W, I>(
+    ctx: &Ctx<R, W, I>,
+    skip: &HashSet<IndexingRequestId>,
+    rx_stop: &mut mpsc::Receiver<()>,
+) -> Pass
 where
     R: IndexingRequestRegistry + Sync,
     W: WorkerQueue + Sync,
 {
     let min_age_seconds = i64::try_from(ctx.config.min_request_age.as_secs()).unwrap_or(i64::MAX);
+    // All are listed, then the batch is taken from those not already waiting, so waiting ones
+    // don't use it up.
     let listed = db(ctx
         .registry
-        .get_open_indexing_requests_for_reassessment(min_age_seconds, ctx.config.batch_size))
+        .get_open_indexing_requests_for_reassessment(min_age_seconds, 0))
     .await;
     match listed {
-        Ok(requests) => queue_reassessments(&ctx.worker_queue, &requests, rx_stop, "full").await,
+        Ok(mut requests) => {
+            requests.retain(|request| !skip.contains(&request.id));
+            if let Ok(batch) = usize::try_from(ctx.config.batch_size)
+                && batch > 0
+            {
+                requests.truncate(batch);
+            }
+            queue_reassessments(&ctx.worker_queue, &requests, rx_stop, "full").await
+        }
         Err(err) => {
             tracing::error!(error = %err, "failed to query indexing requests for reassessment");
             Pass::Done(HashSet::new())
@@ -565,9 +596,15 @@ mod tests {
         async fn get_open_indexing_requests_for_reassessment(
             &self,
             _min_age_seconds: i64,
-            _batch_size: i64,
+            batch_size: i64,
         ) -> crate::registry::Result<Vec<IndexingRequest>> {
-            Ok(self.open.clone())
+            let limit = usize::try_from(batch_size).ok().filter(|n| *n > 0);
+            Ok(self
+                .open
+                .iter()
+                .take(limit.unwrap_or(usize::MAX))
+                .cloned()
+                .collect())
         }
         async fn get_short_requests_on_deployments_with_ended_agreements(
             &self,
@@ -658,9 +695,13 @@ mod tests {
         }
     }
 
-    /// Records the requests it is asked to reassess.
+    /// Records the requests it is asked to reassess, and reports the 2nd field's requests as
+    /// already having a reassessment queued.
     #[derive(Default, Clone)]
-    struct MockQueue(Arc<Mutex<Vec<IndexingRequestId>>>);
+    struct MockQueue(
+        Arc<Mutex<Vec<IndexingRequestId>>>,
+        HashSet<IndexingRequestId>,
+    );
 
     #[async_trait]
     impl WorkerQueue for MockQueue {
@@ -685,6 +726,9 @@ mod tests {
         ) -> anyhow::Result<JobId> {
             self.0.lock().unwrap().push(indexing_request_id);
             Ok(JobId::default())
+        }
+        async fn queued_reassessments(&self) -> anyhow::Result<HashSet<IndexingRequestId>> {
+            Ok(self.1.clone())
         }
         async fn cancel_rejected_agreement_on_chain(
             &self,
@@ -954,6 +998,48 @@ mod tests {
         run_due_passes(&ctx, true, true, &mut rx).await;
 
         assert_eq!(*queue.0.lock().unwrap(), vec![short.id]);
+    }
+
+    #[tokio::test]
+    async fn neither_pass_queues_a_request_already_waiting_for_a_reassessment() {
+        let (waiting, other) = (request(3), request(3));
+        let registry = MockRegistry {
+            open: vec![waiting.clone()],
+            short: vec![waiting.clone(), other.clone()],
+            ..MockRegistry::default()
+        };
+        let (mut ctx, queue) = ctx(
+            registry,
+            Some(vec![indexer('a')]),
+            ReassignmentConfig::default(),
+        );
+        ctx.worker_queue.1 = HashSet::from([waiting.id]);
+        let (_tx, mut rx) = mpsc::channel(1);
+
+        run_due_passes(&ctx, true, true, &mut rx).await;
+
+        assert_eq!(*queue.0.lock().unwrap(), vec![other.id]);
+    }
+
+    /// Requests already waiting for a reassessment don't use up the full pass's batch.
+    #[tokio::test]
+    async fn requests_already_waiting_dont_use_up_the_full_pass_batch() {
+        let (waiting, other) = (request(3), request(3));
+        let registry = MockRegistry {
+            open: vec![waiting.clone(), other.clone()],
+            ..MockRegistry::default()
+        };
+        let config = ReassignmentConfig {
+            batch_size: 1,
+            ..ReassignmentConfig::default()
+        };
+        let (mut ctx, queue) = ctx(registry, Some(Vec::new()), config);
+        ctx.worker_queue.1 = HashSet::from([waiting.id]);
+        let (_tx, mut rx) = mpsc::channel(1);
+
+        run_due_passes(&ctx, true, false, &mut rx).await;
+
+        assert_eq!(*queue.0.lock().unwrap(), vec![other.id]);
     }
 
     /// A daily interval of 0 is refused at start-up rather than running the full pass every second.
