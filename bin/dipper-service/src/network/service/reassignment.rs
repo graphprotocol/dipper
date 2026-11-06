@@ -1021,6 +1021,28 @@ mod tests {
         assert_eq!(*queue.0.lock().unwrap(), vec![other.id]);
     }
 
+    /// The daily pass queues every eligible request, however many there are, so none is left out
+    /// day after day because others come first in the list.
+    #[tokio::test]
+    async fn the_daily_pass_queues_every_eligible_request() {
+        let open: Vec<IndexingRequest> = (0..3).map(|_| request(3)).collect();
+        let registry = MockRegistry {
+            open: open.clone(),
+            ..MockRegistry::default()
+        };
+        let config = ReassignmentConfig {
+            batch_size: 1,
+            ..ReassignmentConfig::default()
+        };
+        let (ctx, queue) = ctx(registry, Some(Vec::new()), config);
+        let (_tx, mut rx) = mpsc::channel(1);
+
+        run_due_passes(&ctx, true, false, &mut rx).await;
+
+        let all: Vec<IndexingRequestId> = open.iter().map(|r| r.id).collect();
+        assert_eq!(*queue.0.lock().unwrap(), all);
+    }
+
     /// Requests already waiting for a reassessment don't use up the full pass's batch.
     #[tokio::test]
     async fn requests_already_waiting_dont_use_up_the_full_pass_batch() {
