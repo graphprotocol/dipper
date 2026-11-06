@@ -605,6 +605,45 @@ async fn finds_short_requests_on_deployments_with_recently_ended_agreements() {
     assert_eq!(request_cancelled, 0, "a cancelled request");
 }
 
+/// Every open request flagged short is listed, however new, and nothing else is.
+#[tokio::test]
+async fn lists_open_requests_flagged_short_whatever_their_age() {
+    //* Given
+    let (db, _temp_db) = temp_registry_db().await;
+    run_fixture(&db, include_str!("fixtures/0002_indexing_agreements.sql"))
+        .await
+        .expect("Failed to run fixture");
+    let registry = PgRegistry::new(db.clone());
+    let short_after = |sql: &'static str| {
+        let (db, registry) = (db.clone(), &registry);
+        async move {
+            run_fixture(&db, sql)
+                .await
+                .expect("Failed to apply the change");
+            registry
+                .get_short_open_indexing_requests(10)
+                .await
+                .expect("Failed to query")
+                .len()
+        }
+    };
+
+    //* When
+    let not_short =
+        short_after("UPDATE dipper_reg_indexing_requests SET shortfall_active = false;").await;
+    let short_and_new = short_after(
+        "UPDATE dipper_reg_indexing_requests \
+         SET shortfall_active = true, created_at = timezone('UTC', now());",
+    )
+    .await;
+    let short_but_closed = short_after("UPDATE dipper_reg_indexing_requests SET status = 1;").await;
+
+    //* Then
+    assert_eq!(not_short, 0, "a request that isn't short");
+    assert_eq!(short_and_new, 1, "a short request made just now");
+    assert_eq!(short_but_closed, 0, "a closed request");
+}
+
 #[tokio::test]
 async fn get_pending_agreement_indexers_by_deployment_aggregation() {
     //* Given

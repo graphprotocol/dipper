@@ -126,6 +126,7 @@ pub async fn main() -> anyhow::Result<()> {
     let liveness_agreement_conf = agreement_conf.clone();
     let escrow_reconciler_agreement_conf = agreement_conf.clone();
     let cancel_retry_agreement_conf = agreement_conf.clone();
+    let reassignment_agreement_conf = agreement_conf.clone();
 
     // Canonical chain id and RecurringCollector address, read once and shared by the
     // admin signer, the gRPC proposal signer, and the on-chain chain client so their
@@ -424,6 +425,12 @@ pub async fn main() -> anyhow::Result<()> {
     //- Worker liveness watermark, shared with the health endpoint below.
     let worker_liveness = health::Liveness::new();
 
+    // IISA's DIPs-accepting set per chain, shared by reassessments and the reassignment top-up.
+    let dips_accepting_cache = worker::DipsAcceptingCache::new(std::time::Duration::from_secs(
+        agreement_conf.dips_accepting_cache_ttl_seconds(),
+    ));
+    let reassignment_networks = (networks_registry.clone(), additional_networks.clone());
+
     //- The worker service
     let (worker_handle, worker_service) = {
         // Each loop can hold up to three pooled connections at once and shares
@@ -462,9 +469,6 @@ pub async fn main() -> anyhow::Result<()> {
         // A single global reassess lock, shared across all worker loops.
         let reassess_lock = Arc::new(tokio::sync::Mutex::new(()));
         let unresponsive_breaker = Arc::new(worker::UnresponsiveBreaker::new());
-        let dips_accepting_cache = worker::DipsAcceptingCache::new(std::time::Duration::from_secs(
-            agreement_conf.dips_accepting_cache_ttl_seconds(),
-        ));
         let ctx = worker::Ctx {
             queue,
             signer: signer.clone(),
@@ -489,7 +493,7 @@ pub async fn main() -> anyhow::Result<()> {
             liveness: worker_liveness.clone(),
             reassess_lock,
             unresponsive_breaker,
-            dips_accepting_cache,
+            dips_accepting_cache: dips_accepting_cache.clone(),
             concurrency: conf.worker_concurrency,
             subgraph_indexing_agreements_events_emitter:
                 subgraph_indexing_agreements_events_emitter.clone(),
@@ -501,10 +505,16 @@ pub async fn main() -> anyhow::Result<()> {
     //- The reassignment service (optional, enabled by config)
     let reassignment_handle = match conf.reassignment {
         Some(ref reassignment_conf) if reassignment_conf.enabled => {
+            let (networks_registry, additional_networks) = reassignment_networks;
             let ctx = network::service::reassignment::Ctx {
                 registry: registry.clone(),
                 worker_queue: worker_handle.queue().clone(),
                 config: reassignment_conf.clone(),
+                iisa: iisa_client.clone(),
+                dips_accepting_cache,
+                agreement_conf: reassignment_agreement_conf,
+                networks_registry,
+                additional_networks,
             };
             let (handle, service) = network::service::reassignment::new(ctx);
             Some((handle, service))

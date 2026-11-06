@@ -380,6 +380,12 @@ pub struct ReassignmentConfig {
     #[serde_as(as = "serde_with::DurationSeconds<u64>")]
     #[serde(default = "default_reassignment_min_age")]
     pub min_request_age: Duration,
+
+    /// Seconds between top-ups of requests left short of indexers, whatever their age, when an
+    /// indexer that could take an offer is free (default: 3600s, 0 = off)
+    #[serde_as(as = "serde_with::DurationSeconds<u64>")]
+    #[serde(default = "default_reassignment_top_up_interval")]
+    pub top_up_interval: Duration,
 }
 
 fn default_reassignment_enabled() -> bool {
@@ -412,6 +418,10 @@ fn default_reassignment_min_age() -> Duration {
     Duration::from_secs(86400)
 }
 
+fn default_reassignment_top_up_interval() -> Duration {
+    Duration::from_secs(3600)
+}
+
 impl Default for ReassignmentConfig {
     fn default() -> Self {
         Self {
@@ -420,6 +430,7 @@ impl Default for ReassignmentConfig {
             run_at_utc_hour: default_reassignment_run_at_utc_hour(),
             batch_size: default_reassignment_batch_size(),
             min_request_age: default_reassignment_min_age(),
+            top_up_interval: default_reassignment_top_up_interval(),
         }
     }
 }
