@@ -575,9 +575,15 @@ mod tests {
         }
         async fn get_short_open_indexing_requests(
             &self,
-            _batch_size: i64,
+            batch_size: i64,
         ) -> crate::registry::Result<Vec<IndexingRequest>> {
-            Ok(self.short.clone())
+            let limit = usize::try_from(batch_size).ok().filter(|n| *n > 0);
+            Ok(self
+                .short
+                .iter()
+                .take(limit.unwrap_or(usize::MAX))
+                .cloned()
+                .collect())
         }
     }
 
@@ -876,6 +882,29 @@ mod tests {
         let queued = top_up(registry, Some(pool)).await;
 
         assert!(queued.is_empty(), "{queued:?}");
+    }
+
+    /// The batch limits how many requests are queued, not how many are looked at, so requests a
+    /// free indexer can't fill don't crowd out those it can.
+    #[tokio::test]
+    async fn the_batch_counts_only_requests_a_free_indexer_could_fill() {
+        let (full, fillable) = (request(2), request(3));
+        let registry = MockRegistry {
+            agreements: vec![holding(&full, indexer('a')), holding(&full, indexer('b'))],
+            short: vec![full, fillable.clone()],
+            ..MockRegistry::default()
+        };
+        let config = ReassignmentConfig {
+            batch_size: 1,
+            ..ReassignmentConfig::default()
+        };
+        let pool = "abc".chars().map(indexer).collect();
+        let (ctx, queue) = ctx(registry, Some(pool), config);
+        let (_tx, mut rx) = mpsc::channel(1);
+
+        run_due_passes(&ctx, false, true, &mut rx).await;
+
+        assert_eq!(*queue.0.lock().unwrap(), vec![fillable.id]);
     }
 
     #[tokio::test]
