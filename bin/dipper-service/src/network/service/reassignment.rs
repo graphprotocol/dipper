@@ -125,6 +125,11 @@ where
 
     let service = async move {
         let config = &ctx.config;
+        if config.interval.is_zero() {
+            anyhow::bail!(
+                "reassignment.interval must be at least 1 second; set enabled to false to turn it off"
+            );
+        }
         let (started, clock) = (Instant::now(), OffsetDateTime::now_utc());
         let initial_delay = duration_until_utc_hour(clock, config.run_at_utc_hour);
         let mut next_full = started + initial_delay;
