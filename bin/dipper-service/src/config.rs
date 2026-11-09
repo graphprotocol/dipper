@@ -1128,6 +1128,11 @@ pub struct DipsAgreementConfig {
     #[serde(default = "default_unresponsive_indexer_lookback_days")]
     pub unresponsive_indexer_lookback_days: i32,
 
+    /// Minutes between test offers to an indexer that let 2 rounds of offers lapse since it last
+    /// accepted one; it gets no other offer until it accepts again. Default: 60.
+    #[serde(default = "default_non_accepting_test_interval_minutes")]
+    pub non_accepting_test_interval_minutes: i32,
+
     /// Fraction of the DIPs-accepting pool that must be unresponsive before the
     /// breaker trips and suppresses the network-wide exclusion. Default 0.50.
     #[serde(default = "default_mass_unresponsive_trip_fraction")]
@@ -1206,6 +1211,13 @@ impl DipsAgreementConfig {
         if !(fallback.is_finite() && fallback > 0.0) {
             return Err(format!(
                 "fallback_max_grt_per_30_days ({fallback}) must be a positive number"
+            ));
+        }
+        // A test offer due at once means an indexer that stopped accepting is never held back.
+        if self.non_accepting_test_interval_minutes <= 0 {
+            return Err(format!(
+                "non_accepting_test_interval_minutes ({}) must be positive",
+                self.non_accepting_test_interval_minutes
             ));
         }
         if self.mass_unresponsive_reset_fraction >= self.mass_unresponsive_trip_fraction {
@@ -1353,6 +1365,10 @@ fn default_uncertain_rejection_lookback_days() -> i32 {
 
 fn default_unresponsive_indexer_lookback_days() -> i32 {
     1
+}
+
+fn default_non_accepting_test_interval_minutes() -> i32 {
+    60
 }
 
 fn default_mass_unresponsive_trip_fraction() -> f64 {
@@ -1507,6 +1523,8 @@ pub struct IndexingAgreementConfig {
     pub uncertain_rejection_lookback_days: i32,
     /// Number of days to skip an unresponsive indexer across all deployments.
     pub unresponsive_indexer_lookback_days: i32,
+    /// Minutes between test offers to an indexer that stopped accepting offers.
+    pub non_accepting_test_interval_minutes: i32,
     /// Breaker trip fraction (see `DipsAgreementConfig`).
     pub mass_unresponsive_trip_fraction: f64,
     /// Breaker reset fraction.
@@ -1547,6 +1565,7 @@ impl IndexingAgreementConfig {
             transient_rejection_lookback_minutes: 0,
             uncertain_rejection_lookback_days: 0,
             unresponsive_indexer_lookback_days: 0,
+            non_accepting_test_interval_minutes: default_non_accepting_test_interval_minutes(),
             mass_unresponsive_trip_fraction: 0.5,
             mass_unresponsive_reset_fraction: 0.25,
             dips_accepting_snapshot_max_age_hours: 48,
@@ -1631,6 +1650,10 @@ impl IndexingAgreementConfig {
         self.unresponsive_indexer_lookback_days
     }
 
+    pub fn non_accepting_test_interval_minutes(&self) -> i32 {
+        self.non_accepting_test_interval_minutes
+    }
+
     pub fn mass_unresponsive_trip_fraction(&self) -> f64 {
         self.mass_unresponsive_trip_fraction
     }
@@ -1681,6 +1704,7 @@ impl From<DipsAgreementConfig>
             transient_rejection_lookback_minutes: value.transient_rejection_lookback_minutes,
             uncertain_rejection_lookback_days: value.uncertain_rejection_lookback_days,
             unresponsive_indexer_lookback_days: value.unresponsive_indexer_lookback_days,
+            non_accepting_test_interval_minutes: value.non_accepting_test_interval_minutes,
             mass_unresponsive_trip_fraction: value.mass_unresponsive_trip_fraction,
             mass_unresponsive_reset_fraction: value.mass_unresponsive_reset_fraction,
             dips_accepting_snapshot_max_age_hours: value.dips_accepting_snapshot_max_age_hours,

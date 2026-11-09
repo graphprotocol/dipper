@@ -216,6 +216,7 @@ where
         ctx.agreement_conf.transient_rejection_lookback_minutes(),
         ctx.agreement_conf.uncertain_rejection_lookback_days(),
         ctx.agreement_conf.unresponsive_indexer_lookback_days(),
+        ctx.agreement_conf.non_accepting_test_interval_minutes(),
         *deployment_chain_id,
         &ctx.entity_count_cache,
     )

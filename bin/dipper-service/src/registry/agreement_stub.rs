@@ -82,6 +82,14 @@ pub trait StubAgreementRegistry: Send + Sync {
         unimplemented!("get_unresponsive_indexers")
     }
 
+    // Selection and the top-up both ask, so most mocks would otherwise need it.
+    async fn get_indexers_to_withhold_offers_from(
+        &self,
+        _test_interval_minutes: i32,
+    ) -> Result<Vec<IndexerId>> {
+        Ok(Vec::new())
+    }
+
     async fn get_indexing_agreements_by_indexing_request_id(
         &self,
         _request_id: &IndexingRequestId,
@@ -421,6 +429,14 @@ impl<T: StubAgreementRegistry> AgreementRegistry for T {
         chain_id: ChainId,
     ) -> Result<Vec<IndexerId>> {
         StubAgreementRegistry::get_unresponsive_indexers(self, lookback_days, chain_id).await
+    }
+
+    async fn get_indexers_to_withhold_offers_from(
+        &self,
+        test_interval_minutes: i32,
+    ) -> Result<Vec<IndexerId>> {
+        StubAgreementRegistry::get_indexers_to_withhold_offers_from(self, test_interval_minutes)
+            .await
     }
 
     async fn get_indexing_agreements_by_indexing_request_id(

@@ -358,6 +358,16 @@ impl AgreementRegistry for RegistryProvider {
             .await?)
     }
 
+    async fn get_indexers_to_withhold_offers_from(
+        &self,
+        test_interval_minutes: i32,
+    ) -> RegistryResult<Vec<IndexerId>> {
+        Ok(self
+            .inner
+            .get_indexers_to_withhold_offers_from(test_interval_minutes)
+            .await?)
+    }
+
     async fn get_indexing_agreements_by_indexing_request_id(
         &self,
         request_id: &IndexingRequestId,

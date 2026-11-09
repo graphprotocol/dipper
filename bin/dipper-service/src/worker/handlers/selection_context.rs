@@ -25,6 +25,7 @@ const WEI_PER_GRT: f64 = 1e18;
 /// - Which indexers already have active agreements for this deployment
 /// - What pending agreements exist across all deployments
 /// - Which indexers have recently declined agreements (within lookback windows)
+/// - Which indexers have stopped accepting offers, and get none until their test offer is due
 /// - Which indexers are on the denylist and should be excluded entirely
 /// - Optimistic DIPs fees from accepted agreement vouchers, enriched with
 ///   entity counts from the shared cache when available
@@ -37,6 +38,7 @@ pub async fn gather_selection_context<R>(
     transient_rejection_lookback_minutes: i32,
     uncertain_rejection_lookback_days: i32,
     unresponsive_indexer_lookback_days: i32,
+    non_accepting_test_interval_minutes: i32,
     deployment_chain_id: ChainId,
     entity_count_cache: &EntityCountCache,
 ) -> JobResult<(SelectionContext, Vec<IndexerId>)>
@@ -89,6 +91,25 @@ where
         .into_iter()
         .filter(|id| !already_denied.contains(id))
         .collect();
+
+    // Sent as declined, not denylisted: IISA would drop a denylisted group member, cancelling an
+    // agreement it may still serve, when it has only stopped taking new ones.
+    let withheld: Vec<IndexerId> = registry
+        .get_indexers_to_withhold_offers_from(non_accepting_test_interval_minutes)
+        .await
+        .map_err(|err| JobError::Fatal(err.into()))?
+        .into_iter()
+        .filter(|id| !already_denied.contains(id))
+        .collect();
+    if !withheld.is_empty() {
+        tracing::info!(
+            deployment_id = %deployment_id,
+            withheld = withheld.len(),
+            indexers = ?withheld,
+            "withholding new offers from indexers that have stopped accepting them"
+        );
+        add_declined(&mut declined_indexers, *deployment_id, withheld);
+    }
 
     // Compute optimistic DIPs fees from active agreements, enriched with
     // entity counts from the shared cache when available.
@@ -190,11 +211,20 @@ fn exclude_cancelling_indexers(
         .filter(|a| a.status == IndexingAgreementStatus::Cancelling)
         .map(|a| a.indexer.id)
         .collect::<Vec<_>>();
-    if cancelling.is_empty() {
+    add_declined(declined, deployment_id, cancelling);
+}
+
+/// Add `indexers` to the deployment's declined list, each once, adding no entry for none.
+fn add_declined(
+    declined: &mut HashMap<DeploymentId, Vec<IndexerId>>,
+    deployment_id: DeploymentId,
+    indexers: Vec<IndexerId>,
+) {
+    if indexers.is_empty() {
         return;
     }
     let excluded = declined.entry(deployment_id).or_default();
-    for indexer in cancelling {
+    for indexer in indexers {
         if !excluded.contains(&indexer) {
             excluded.push(indexer);
         }

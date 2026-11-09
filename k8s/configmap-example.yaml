@@ -41,7 +41,8 @@ data:
           "sepolia": 50
         },
         "fallback_max_grt_per_30_days": 4500,
-        "max_grt_per_billion_entities_per_30_days": 2000
+        "max_grt_per_billion_entities_per_30_days": 2000,
+        "non_accepting_test_interval_minutes": 60
       },
       "admin_rpc": {
         "listen_addr": "0.0.0.0:8545",
