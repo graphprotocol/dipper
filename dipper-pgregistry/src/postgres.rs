@@ -276,6 +276,11 @@ const TERMINATED_TX_WAIT_MINUTES: i32 = 60;
 /// How far back missed offers count when deciding whether an indexer has stopped accepting them.
 const NON_ACCEPTING_LOOKBACK_HOURS: i32 = 24;
 
+/// How long a missed offer benches the indexer on that subgraph when it is the 1st miss in a
+/// row there, and when it is the 2nd. A 3rd or later earns the standard bench.
+const FIRST_MISS_BENCH_DAYS: i32 = 1;
+const SECOND_MISS_BENCH_DAYS: i32 = 7;
+
 /// Statuses an on-chain cancel by dipper ends.
 const CANCEL_BY_REQUESTER_FROM: &[IndexingAgreementStatus] = &[
     IndexingAgreementStatus::Created,
@@ -802,29 +807,61 @@ impl PgRegistry {
             .collect())
     }
 
-    /// Get declined `CanceledByIndexer`/`Expired`/`Rejected` indexers, and those whose agreement
-    /// dipper ended `AbandonedByIndexer`, grouped by deployment (deployment id -> indexer ids).
-    /// Each rejection reason gets its own exclusion window, as does an expiry that never had an
-    /// offer transaction.
-    pub async fn get_declined_indexers_by_deployment(
-        &self,
-        default_lookback_days: i32,
-        price_lookback_days: i32,
-        transient_lookback_minutes: i32,
-        uncertain_lookback_days: i32,
-    ) -> Result<HashMap<DeploymentId, Vec<IndexerId>>, Error> {
-        use crate::rejection_reason::{
-            AGREEMENT_EXPIRED, CAPACITY_EXCEEDED, DEADLINE_EXPIRED, INDEXER_UNAVAILABLE,
-            INVALID_SIGNATURE, PRICE_TOO_LOW, REPLAY_DETECTED, SENDER_NOT_TRUSTED,
-            SUBGRAPH_MANIFEST_UNAVAILABLE, UNEXPECTED_SERVICE_PROVIDER, UNSPECIFIED,
-            UNSUPPORTED_METADATA_VERSION,
-        };
-
-        let rows: Vec<(PgDeploymentId, Vec<PgIndexerId>)> = sqlx::query_as(
-            r#"
-            SELECT
-                deployment_id,
-                array_agg(DISTINCT indexer_id) as indexer_ids
+    /// The query behind [`Self::get_declined_indexers_by_deployment`], kept beside it so its
+    /// placeholders sit near the binds that fill them; the method's doc says what each window is
+    /// for.
+    const DECLINED_INDEXERS_SQL: &str = r#"
+            -- Misses count towards a bench for 2 standard benches, so 1 from months ago doesn't
+            -- lengthen the bench for a fresh one.
+            WITH missed AS (
+                SELECT deployment_id, indexer_id, created_at, updated_at,
+                       CAST(terms->>'deadline' AS bigint) AS deadline
+                FROM dipper_reg_indexing_agreements
+                WHERE status = $2 AND offer_tx_hash IS NOT NULL AND rejection_reason IS NULL
+                  AND updated_at >= timezone('UTC', now()) - make_interval(days => 2 * $5)
+            ),
+            -- accepted_at is chain seconds; read it the way updated_at is written, through
+            -- timezone('UTC', ...), so the 2 compare like for like. Only acceptances after the
+            -- oldest counted miss can matter, so older ones are left out to keep this small.
+            accepted AS (
+                SELECT deployment_id, indexer_id, accepted_at,
+                       timezone('UTC', to_timestamp(accepted_at)) AS at
+                FROM dipper_reg_indexing_agreements
+                WHERE accepted_at >= EXTRACT(EPOCH FROM now() - make_interval(days => 2 * $5 + 1))
+            ),
+            -- The misses on each subgraph since the indexer last accepted an offer there.
+            streaks AS (
+                SELECT m.deployment_id, m.indexer_id, count(*) AS misses,
+                       max(m.updated_at) AS last_miss, max(m.deadline) AS last_deadline
+                FROM missed m
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM accepted a
+                    WHERE a.deployment_id = m.deployment_id
+                      AND a.indexer_id = m.indexer_id
+                      AND a.at > m.created_at
+                )
+                GROUP BY m.deployment_id, m.indexer_id
+            ),
+            benched_for_missing AS (
+                SELECT s.deployment_id, s.indexer_id
+                FROM streaks s
+                WHERE (s.misses = 1
+                       AND s.last_miss >= timezone('UTC', now()) - make_interval(days => LEAST($21, $5))
+                       -- Only a 1st-miss bench lifts on an acceptance elsewhere, or accepting
+                       -- other subgraphs would wipe every longer bench on this one. Both times
+                       -- are chain seconds, and dipper marks a miss only a grace after its
+                       -- deadline, so the deadline is when the indexer missed it.
+                       AND NOT EXISTS (
+                           SELECT 1 FROM accepted a
+                           WHERE a.indexer_id = s.indexer_id AND a.accepted_at > s.last_deadline
+                       ))
+                   OR (s.misses = 2
+                       AND s.last_miss >= timezone('UTC', now()) - make_interval(days => LEAST($22, $5)))
+                   OR (s.misses >= 3
+                       AND s.last_miss >= timezone('UTC', now()) - make_interval(days => $5))
+            ),
+            declined AS (
+            SELECT deployment_id, indexer_id
             FROM dipper_reg_indexing_agreements
             WHERE status IN ($1, $2, $3, $20)
               AND (
@@ -854,36 +891,73 @@ impl PgRegistry {
                 (status = $2 AND offer_tx_hash IS NULL AND rejection_reason IS NULL
                  AND updated_at >= timezone('UTC', now()) - make_interval(mins => $7))
                 OR
-                -- All other rejections/expirations/cancellations: standard lookback
+                -- All other rejections/expirations/cancellations: standard lookback. A missed
+                -- offer, an expiry with no reason, is benched by benched_for_missing instead.
                 (COALESCE(rejection_reason, '') NOT IN ($6, $8, $9, $10, $11, $12, $13, $14, $15, $16, $18, $19)
-                 AND NOT (status = $2 AND offer_tx_hash IS NULL AND rejection_reason IS NULL)
+                 AND NOT (status = $2 AND rejection_reason IS NULL)
                  AND updated_at >= timezone('UTC', now()) - make_interval(days => $5))
               )
+            )
+            SELECT deployment_id, array_agg(DISTINCT indexer_id) AS indexer_ids
+            FROM (
+                SELECT deployment_id, indexer_id FROM declined
+                UNION ALL
+                SELECT deployment_id, indexer_id FROM benched_for_missing
+            ) benched
             GROUP BY deployment_id
-            "#,
-        )
-        .bind(IndexingAgreementStatus::CanceledByIndexer) // $1
-        .bind(IndexingAgreementStatus::Expired) // $2
-        .bind(IndexingAgreementStatus::Rejected) // $3
-        .bind(price_lookback_days) // $4
-        .bind(default_lookback_days) // $5
-        .bind(PRICE_TOO_LOW) // $6
-        .bind(transient_lookback_minutes) // $7
-        .bind(DEADLINE_EXPIRED) // $8
-        .bind(SUBGRAPH_MANIFEST_UNAVAILABLE) // $9
-        .bind(UNEXPECTED_SERVICE_PROVIDER) // $10
-        .bind(AGREEMENT_EXPIRED) // $11
-        .bind(UNSUPPORTED_METADATA_VERSION) // $12
-        .bind(CAPACITY_EXCEEDED) // $13
-        .bind(INDEXER_UNAVAILABLE) // $14
-        .bind(INVALID_SIGNATURE) // $15
-        .bind(REPLAY_DETECTED) // $16
-        .bind(uncertain_lookback_days) // $17
-        .bind(SENDER_NOT_TRUSTED) // $18
-        .bind(UNSPECIFIED) // $19
-        .bind(IndexingAgreementStatus::AbandonedByIndexer) // $20
-        .fetch_all(&self.pool)
-        .await?;
+            "#;
+
+    /// Get declined `CanceledByIndexer`/`Expired`/`Rejected` indexers, and those whose agreement
+    /// dipper ended `AbandonedByIndexer`, grouped by deployment (deployment id -> indexer ids).
+    /// Each rejection reason gets its own exclusion window, as does an expiry that never had an
+    /// offer transaction.
+    ///
+    /// An offer that landed on chain and expired with no reason given is a missed offer: the
+    /// indexer had one to accept and didn't. Its bench grows with the misses in a row on that
+    /// subgraph since the indexer last accepted there: 1 day, then 7 days, then
+    /// `default_lookback_days`, and never longer than that standard bench. A 1st miss is often a
+    /// blip on the indexer's side, so its bench also lifts once the indexer accepts any offer
+    /// after it.
+    pub async fn get_declined_indexers_by_deployment(
+        &self,
+        default_lookback_days: i32,
+        price_lookback_days: i32,
+        transient_lookback_minutes: i32,
+        uncertain_lookback_days: i32,
+    ) -> Result<HashMap<DeploymentId, Vec<IndexerId>>, Error> {
+        use crate::rejection_reason::{
+            AGREEMENT_EXPIRED, CAPACITY_EXCEEDED, DEADLINE_EXPIRED, INDEXER_UNAVAILABLE,
+            INVALID_SIGNATURE, PRICE_TOO_LOW, REPLAY_DETECTED, SENDER_NOT_TRUSTED,
+            SUBGRAPH_MANIFEST_UNAVAILABLE, UNEXPECTED_SERVICE_PROVIDER, UNSPECIFIED,
+            UNSUPPORTED_METADATA_VERSION,
+        };
+
+        let rows: Vec<(PgDeploymentId, Vec<PgIndexerId>)> =
+            sqlx::query_as(Self::DECLINED_INDEXERS_SQL)
+                .bind(IndexingAgreementStatus::CanceledByIndexer) // $1
+                .bind(IndexingAgreementStatus::Expired) // $2
+                .bind(IndexingAgreementStatus::Rejected) // $3
+                .bind(price_lookback_days) // $4
+                .bind(default_lookback_days) // $5
+                .bind(PRICE_TOO_LOW) // $6
+                .bind(transient_lookback_minutes) // $7
+                .bind(DEADLINE_EXPIRED) // $8
+                .bind(SUBGRAPH_MANIFEST_UNAVAILABLE) // $9
+                .bind(UNEXPECTED_SERVICE_PROVIDER) // $10
+                .bind(AGREEMENT_EXPIRED) // $11
+                .bind(UNSUPPORTED_METADATA_VERSION) // $12
+                .bind(CAPACITY_EXCEEDED) // $13
+                .bind(INDEXER_UNAVAILABLE) // $14
+                .bind(INVALID_SIGNATURE) // $15
+                .bind(REPLAY_DETECTED) // $16
+                .bind(uncertain_lookback_days) // $17
+                .bind(SENDER_NOT_TRUSTED) // $18
+                .bind(UNSPECIFIED) // $19
+                .bind(IndexingAgreementStatus::AbandonedByIndexer) // $20
+                .bind(FIRST_MISS_BENCH_DAYS) // $21
+                .bind(SECOND_MISS_BENCH_DAYS) // $22
+                .fetch_all(&self.pool)
+                .await?;
 
         Ok(rows
             .into_iter()
