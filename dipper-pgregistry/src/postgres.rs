@@ -278,12 +278,13 @@ const DECLINED_INDEXERS_SQL: &str = r#"
                   AND updated_at >= timezone('UTC', now()) - make_interval(days => 2 * $5)
             ),
             -- accepted_at is chain seconds; read it the way updated_at is written, through
-            -- timezone('UTC', ...), so the 2 compare like for like.
+            -- timezone('UTC', ...), so the 2 compare like for like. Only acceptances after the
+            -- oldest counted miss can matter, so older ones are left out to keep this small.
             accepted AS (
                 SELECT deployment_id, indexer_id, accepted_at,
                        timezone('UTC', to_timestamp(accepted_at)) AS at
                 FROM dipper_reg_indexing_agreements
-                WHERE accepted_at IS NOT NULL
+                WHERE accepted_at >= EXTRACT(EPOCH FROM now() - make_interval(days => 2 * $5 + 1))
             ),
             -- The misses on each subgraph since the indexer last accepted an offer there.
             streaks AS (
