@@ -297,7 +297,7 @@ const DECLINED_INDEXERS_SQL: &str = r#"
                 SELECT s.deployment_id, s.indexer_id
                 FROM streaks s
                 WHERE (s.misses = 1
-                       AND s.last_miss >= timezone('UTC', now()) - make_interval(days => $21)
+                       AND s.last_miss >= timezone('UTC', now()) - make_interval(days => LEAST($21, $5))
                        -- Only a 1st-miss bench lifts on an acceptance elsewhere, or accepting
                        -- other subgraphs would wipe every longer bench on this one.
                        AND NOT EXISTS (
@@ -305,7 +305,7 @@ const DECLINED_INDEXERS_SQL: &str = r#"
                            WHERE a.indexer_id = s.indexer_id AND a.at > s.last_miss
                        ))
                    OR (s.misses = 2
-                       AND s.last_miss >= timezone('UTC', now()) - make_interval(days => $22))
+                       AND s.last_miss >= timezone('UTC', now()) - make_interval(days => LEAST($22, $5)))
                    OR (s.misses >= 3
                        AND s.last_miss >= timezone('UTC', now()) - make_interval(days => $5))
             ),
@@ -895,8 +895,9 @@ impl PgRegistry {
     /// An offer that landed on chain and expired with no reason given is a missed offer: the
     /// indexer had one to accept and didn't. Its bench grows with the misses in a row on that
     /// subgraph since the indexer last accepted there: 1 day, then 7 days, then
-    /// `default_lookback_days`. A 1st miss is often a blip on
-    /// the indexer's side, so its bench also lifts once the indexer accepts any offer after it.
+    /// `default_lookback_days`, and never longer than that standard bench. A 1st miss is often a
+    /// blip on the indexer's side, so its bench also lifts once the indexer accepts any offer
+    /// after it.
     pub async fn get_declined_indexers_by_deployment(
         &self,
         default_lookback_days: i32,
