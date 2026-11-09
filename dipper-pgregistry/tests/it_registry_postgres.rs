@@ -543,6 +543,10 @@ async fn get_indexing_agreements_by_indexing_request_id() {
 }
 
 /// Apply `sql` to the fixture, then count the short requests the cancel sweep would reassess.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper; a failure should stop the test"
+)]
 async fn short_requests_after(db: &Pool<Postgres>, registry: &PgRegistry, sql: &str) -> usize {
     run_fixture(db, sql)
         .await
