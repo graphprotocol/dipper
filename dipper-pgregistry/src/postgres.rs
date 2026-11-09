@@ -909,6 +909,51 @@ impl PgRegistry {
         Ok(rows.into_iter().map(|(id,)| id.0).collect())
     }
 
+    /// Indexers that, since their last on-chain acceptance (or ever), missed an offer made after
+    /// an earlier missed offer had already expired: 2 rounds unanswered. Each is left out until
+    /// `test_interval_minutes` pass with no offer made to it, which lets 1 test offer through.
+    pub async fn get_indexers_to_withhold_offers_from(
+        &self,
+        test_interval_minutes: i32,
+    ) -> Result<Vec<IndexerId>, Error> {
+        let rows: Vec<(PgIndexerId,)> = sqlx::query_as(
+            r#"
+            WITH missed AS (
+                -- An expiry with an offer transaction and no rejection is an offer the
+                -- indexer had on-chain and let lapse.
+                SELECT m.indexer_id, m.created_at, m.updated_at
+                FROM dipper_reg_indexing_agreements m
+                WHERE m.status = $1
+                  AND m.offer_tx_hash IS NOT NULL
+                  AND m.rejection_reason IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM dipper_reg_indexing_agreements a
+                      WHERE a.indexer_id = m.indexer_id
+                        AND a.accepted_at IS NOT NULL
+                        AND timezone('UTC', to_timestamp(a.accepted_at)) >= m.created_at
+                  )
+            )
+            SELECT missed.indexer_id
+            FROM missed
+            GROUP BY missed.indexer_id
+            HAVING MAX(missed.created_at) >= MIN(missed.updated_at)
+               AND EXISTS (
+                   SELECT 1
+                   FROM dipper_reg_indexing_agreements o
+                   WHERE o.indexer_id = missed.indexer_id
+                     AND o.created_at >= timezone('UTC', now()) - make_interval(mins => $2)
+               )
+            "#,
+        )
+        .bind(IndexingAgreementStatus::Expired)
+        .bind(test_interval_minutes)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(|(id,)| id.0).collect())
+    }
+
     pub async fn get_indexing_agreements_by_indexing_request_id(
         &self,
         request_id: &IndexingRequestId,
