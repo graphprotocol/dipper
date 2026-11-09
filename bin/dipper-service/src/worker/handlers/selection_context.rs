@@ -107,7 +107,7 @@ where
         .filter(|id| !already_denied.contains(id))
         .collect();
     if !withheld.is_empty() {
-        tracing::info!(
+        tracing::debug!(
             deployment_id = %deployment_id,
             withheld = withheld.len(),
             indexers = ?withheld,
