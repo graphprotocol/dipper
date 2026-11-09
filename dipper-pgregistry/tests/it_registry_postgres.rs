@@ -1237,6 +1237,179 @@ async fn get_unresponsive_indexers_is_scoped_to_chain() {
 }
 
 // =============================================================================
+// get_indexers_to_withhold_offers_from tests
+// =============================================================================
+
+/// The indexer whose offers these tests record. Fixture 0003 has none for it.
+const QUIET_INDEXER: IndexerId = indexer_id!("4444444444444444444444444444444444444444");
+
+/// Load fixture 0003 with its agreements retired, so none of its indexers is held back.
+#[expect(
+    clippy::expect_used,
+    reason = "test setup; a failure should stop the test"
+)]
+async fn registry_with_retired_fixture() -> (Pool<Postgres>, PgTempDB) {
+    let (db, temp_db) = temp_registry_db().await;
+    run_fixture(
+        &db,
+        include_str!("fixtures/0003_multi_indexer_agreements.sql"),
+    )
+    .await
+    .expect("Failed to run fixture");
+    run_fixture(&db, "UPDATE dipper_reg_indexing_agreements SET status = 3;")
+        .await
+        .expect("Failed to retire the fixture's agreements");
+    (db, temp_db)
+}
+
+/// Record an offer to [`QUIET_INDEXER`] with an offer transaction, made `made_mins_ago` and last
+/// changed `changed_mins_ago`, accepted on-chain `accepted_mins_ago` if given. Copies the rest
+/// from a fixture row and returns the new row's id.
+#[expect(
+    clippy::expect_used,
+    reason = "test setup; a failure should stop the test"
+)]
+async fn record_offer(
+    db: &Pool<Postgres>,
+    status: IndexingAgreementStatus,
+    made_mins_ago: i32,
+    changed_mins_ago: i32,
+    accepted_mins_ago: Option<i32>,
+) -> Vec<u8> {
+    let (id,): (Vec<u8>,) = sqlx::query_as(
+        r#"
+        INSERT INTO dipper_reg_indexing_agreements
+            (id, nonce_uuid, created_at, updated_at, status, indexing_request_id, deployment_id,
+             indexer_id, indexer_url, terms, offer_tx_hash, accepted_at)
+        SELECT
+            decode(replace(gen_random_uuid()::text, '-', ''), 'hex'),
+            gen_random_uuid(),
+            timezone('UTC', now()) - make_interval(mins => $1),
+            timezone('UTC', now()) - make_interval(mins => $2),
+            $3,
+            indexing_request_id,
+            deployment_id,
+            $4,
+            indexer_url,
+            terms,
+            offer_tx_hash,
+            (EXTRACT(EPOCH FROM now()) - $5::int * 60)::bigint
+        FROM dipper_reg_indexing_agreements
+        WHERE id = '\xcc000000000000000000000000000001'::bytea
+        RETURNING id
+        "#,
+    )
+    .bind(made_mins_ago)
+    .bind(changed_mins_ago)
+    .bind(status)
+    .bind(QUIET_INDEXER.as_slice())
+    .bind(accepted_mins_ago)
+    .fetch_one(db)
+    .await
+    .expect("Failed to record the offer");
+    id
+}
+
+/// The indexers held back with a 60-minute test interval.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper; a failure should stop the test"
+)]
+async fn held_back(db: &Pool<Postgres>) -> Vec<IndexerId> {
+    PgRegistry::new(db.clone())
+        .get_indexers_to_withhold_offers_from(60)
+        .await
+        .expect("Failed to get the indexers to withhold offers from")
+}
+
+/// A round of offers that all expire before the next is made is what a brief agent restart
+/// costs, so it isn't enough to hold the indexer back.
+#[tokio::test]
+async fn one_round_of_missed_offers_does_not_hold_an_indexer_back() {
+    //* Given
+    let (db, _temp_db) = registry_with_retired_fixture().await;
+    for made in [17, 16, 15] {
+        record_offer(&db, IndexingAgreementStatus::Expired, made, 1, None).await;
+    }
+
+    //* When
+    let held = held_back(&db).await;
+
+    //* Then
+    assert!(held.is_empty(), "{held:?}");
+}
+
+#[tokio::test]
+async fn an_indexer_that_missed_two_rounds_is_held_back() {
+    //* Given
+    let (db, _temp_db) = registry_with_retired_fixture().await;
+    record_offer(&db, IndexingAgreementStatus::Expired, 35, 20, None).await;
+    // Made after the first round had expired, and missed as well.
+    record_offer(&db, IndexingAgreementStatus::Expired, 18, 2, None).await;
+
+    //* When
+    let held = held_back(&db).await;
+
+    //* Then
+    assert_eq!(held, vec![QUIET_INDEXER]);
+}
+
+/// Without an offer in the last hour the indexer's test is due, so it is let through until that
+/// test offer is made.
+#[tokio::test]
+async fn an_indexer_held_back_gets_a_test_offer_once_an_hour_passes_without_one() {
+    //* Given
+    let (db, _temp_db) = registry_with_retired_fixture().await;
+    record_offer(&db, IndexingAgreementStatus::Expired, 150, 135, None).await;
+    record_offer(&db, IndexingAgreementStatus::Expired, 130, 115, None).await;
+
+    //* When
+    let test_due = held_back(&db).await;
+    record_offer(&db, IndexingAgreementStatus::Created, 1, 1, None).await;
+    let test_made = held_back(&db).await;
+
+    //* Then
+    assert!(test_due.is_empty(), "{test_due:?}");
+    assert_eq!(test_made, vec![QUIET_INDEXER]);
+}
+
+#[tokio::test]
+async fn an_acceptance_after_the_missed_offers_lets_the_indexer_back_in() {
+    //* Given
+    let (db, _temp_db) = registry_with_retired_fixture().await;
+    let accepted = record_offer(
+        &db,
+        IndexingAgreementStatus::AcceptedOnChain,
+        50,
+        40,
+        Some(40),
+    )
+    .await;
+    record_offer(&db, IndexingAgreementStatus::Expired, 35, 20, None).await;
+    record_offer(&db, IndexingAgreementStatus::Expired, 18, 2, None).await;
+
+    //* When
+    let accepted_before = held_back(&db).await;
+    sqlx::query(
+        "UPDATE dipper_reg_indexing_agreements \
+         SET accepted_at = EXTRACT(EPOCH FROM now())::bigint - 60 WHERE id = $1",
+    )
+    .bind(accepted)
+    .execute(&db)
+    .await
+    .expect("Failed to move the acceptance");
+    let accepted_after = held_back(&db).await;
+
+    //* Then
+    assert_eq!(
+        accepted_before,
+        vec![QUIET_INDEXER],
+        "an acceptance before the misses"
+    );
+    assert!(accepted_after.is_empty(), "{accepted_after:?}");
+}
+
+// =============================================================================
 // Deadline expiration tests
 // =============================================================================
 
