@@ -298,6 +298,11 @@ where
     ))
     .await?;
     let denylist = db(ctx.registry.get_indexer_denylist()).await?;
+    let withheld = db(ctx
+        .registry
+        .get_indexers_to_withhold_offers_from(conf.non_accepting_test_interval_minutes()))
+    .await?;
+    let unavailable: Vec<IndexerId> = denylist.into_iter().chain(withheld).collect();
 
     let mut chains: HashMap<ChainId, Option<ChainPool>> = HashMap::new();
     let mut fillable = Vec::new();
@@ -333,7 +338,7 @@ where
             request.deployment_id,
             &agreements,
             &declined,
-            &denylist,
+            &unavailable,
             &chain.unresponsive,
             &held,
         );
