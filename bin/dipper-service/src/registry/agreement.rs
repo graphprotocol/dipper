@@ -193,8 +193,8 @@ pub trait AgreementRegistry {
         chain_id: ChainId,
     ) -> RegistryResult<Vec<IndexerId>>;
 
-    /// Get indexers that let 2 rounds of offers lapse since they last accepted one, leaving out
-    /// any with no offer made in the last `test_interval_minutes`, which is due a test offer.
+    /// Get indexers that let 2 rounds of offers lapse since they last accepted one, within the last
+    /// 24 hours, leaving out any with no offer in the last `test_interval_minutes`: due a test.
     async fn get_indexers_to_withhold_offers_from(
         &self,
         test_interval_minutes: i32,

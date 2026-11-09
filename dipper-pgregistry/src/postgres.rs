@@ -265,6 +265,9 @@ impl sqlx::FromRow<'_, sqlx::postgres::PgRow> for CancellingAgreement {
 /// the wait lets the event carry it; after this the event goes out without one.
 const TERMINATED_TX_WAIT_MINUTES: i32 = 60;
 
+/// How far back missed offers count when deciding whether an indexer has stopped accepting them.
+const NON_ACCEPTING_LOOKBACK_HOURS: i32 = 24;
+
 /// Statuses an on-chain cancel by dipper ends.
 const CANCEL_BY_REQUESTER_FROM: &[IndexingAgreementStatus] = &[
     IndexingAgreementStatus::Created,
@@ -909,9 +912,9 @@ impl PgRegistry {
         Ok(rows.into_iter().map(|(id,)| id.0).collect())
     }
 
-    /// Indexers that, since their last on-chain acceptance (or ever), missed an offer made after
-    /// an earlier missed offer had already expired: 2 rounds unanswered. Each is left out until
-    /// `test_interval_minutes` pass with no offer made to it, which lets 1 test offer through.
+    /// Indexers that, since their last on-chain acceptance, missed an offer made after an earlier
+    /// missed offer had already expired: 2 rounds unanswered, counting misses that ended in the
+    /// last 24 hours. Each gets 1 test offer once `test_interval_minutes` pass with none made.
     pub async fn get_indexers_to_withhold_offers_from(
         &self,
         test_interval_minutes: i32,
@@ -926,6 +929,7 @@ impl PgRegistry {
                 WHERE m.status = $1
                   AND m.offer_tx_hash IS NOT NULL
                   AND m.rejection_reason IS NULL
+                  AND m.updated_at >= timezone('UTC', now()) - make_interval(hours => $3)
                   AND NOT EXISTS (
                       SELECT 1
                       FROM dipper_reg_indexing_agreements a
@@ -948,6 +952,7 @@ impl PgRegistry {
         )
         .bind(IndexingAgreementStatus::Expired)
         .bind(test_interval_minutes)
+        .bind(NON_ACCEPTING_LOOKBACK_HOURS)
         .fetch_all(&self.pool)
         .await?;
 
