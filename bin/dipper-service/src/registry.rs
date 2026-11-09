@@ -27,7 +27,7 @@ pub use self::{
         AgreementFeeRate, AgreementRegistry, CancelKind, CancellingAgreement, IndexingAgreement,
         NewAgreementParams, ReconciliationAudit, ReconciliationItem, ReconciliationOutcome,
         Status as IndexingAgreementStatus, Terms as IndexingAgreementTerms,
-        TermsMetadata as IndexingAgreementTermsMetadata,
+        TermsMetadata as IndexingAgreementTermsMetadata, WithheldIndexers,
     },
     dips_info::{DipsInfoChecks, DipsInfoRegistry},
     indexer_denylist::IndexerDenylistRegistry,
@@ -356,6 +356,21 @@ impl AgreementRegistry for RegistryProvider {
             .inner
             .get_unresponsive_indexers(lookback_days, chain_id)
             .await?)
+    }
+
+    async fn get_indexers_to_withhold_offers_from(
+        &self,
+        test_interval_minutes: i32,
+    ) -> RegistryResult<WithheldIndexers> {
+        let withheld = self
+            .inner
+            .get_indexers_to_withhold_offers_from(test_interval_minutes)
+            .await?;
+        Ok(WithheldIndexers {
+            indexers: withheld.indexers,
+            // A count is never negative; were it, the most offered keeps anyone being held back.
+            offered: usize::try_from(withheld.offered).unwrap_or(usize::MAX),
+        })
     }
 
     async fn get_indexing_agreements_by_indexing_request_id(

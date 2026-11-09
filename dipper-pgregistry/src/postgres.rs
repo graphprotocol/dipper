@@ -103,6 +103,14 @@ pub struct RecordedEnd {
     pub canceled_tx: Option<String>,
 }
 
+/// The indexers to withhold offers from, and how many indexers had an offer on-chain in the same
+/// 24 hours, so a caller can tell indexers that stopped accepting from a fault on dipper's side.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WithheldIndexers {
+    pub indexers: Vec<IndexerId>,
+    pub offered: i64,
+}
+
 /// What recording a cycle of DIPs info checks left, in seconds without a readable answer: each
 /// indexer still missing its DIPs info, and each one forgotten, with the time it had built up.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -264,6 +272,9 @@ impl sqlx::FromRow<'_, sqlx::postgres::PgRow> for CancellingAgreement {
 /// Dipper can mark an agreement ended before the chain listener records that transaction, so
 /// the wait lets the event carry it; after this the event goes out without one.
 const TERMINATED_TX_WAIT_MINUTES: i32 = 60;
+
+/// How far back missed offers count when deciding whether an indexer has stopped accepting them.
+const NON_ACCEPTING_LOOKBACK_HOURS: i32 = 24;
 
 /// How long a missed offer benches the indexer on that subgraph when it is the 1st miss in a
 /// row there, and when it is the 2nd. A 3rd or later earns the standard bench.
@@ -981,6 +992,72 @@ impl PgRegistry {
         .await?;
 
         Ok(rows.into_iter().map(|(id,)| id.0).collect())
+    }
+
+    /// Indexers that, since their last on-chain acceptance, missed an offer made after an earlier
+    /// missed offer had already expired: 2 rounds unanswered, counting misses that ended in the
+    /// last 24 hours. Each gets 1 test offer once `test_interval_minutes` pass with none made.
+    pub async fn get_indexers_to_withhold_offers_from(
+        &self,
+        test_interval_minutes: i32,
+    ) -> Result<WithheldIndexers, Error> {
+        let rows: Vec<(PgIndexerId,)> = sqlx::query_as(
+            r#"
+            WITH missed AS (
+                -- An expiry with an offer transaction and no rejection is an offer the
+                -- indexer had on-chain and let lapse.
+                SELECT m.indexer_id, m.created_at, m.updated_at
+                FROM dipper_reg_indexing_agreements m
+                WHERE m.status = $1
+                  AND m.offer_tx_hash IS NOT NULL
+                  AND m.rejection_reason IS NULL
+                  AND m.updated_at >= timezone('UTC', now()) - make_interval(hours => $3)
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM dipper_reg_indexing_agreements a
+                      WHERE a.indexer_id = m.indexer_id
+                        AND a.accepted_at IS NOT NULL
+                        AND timezone('UTC', to_timestamp(a.accepted_at)) >= m.created_at
+                  )
+            )
+            SELECT missed.indexer_id
+            FROM missed
+            GROUP BY missed.indexer_id
+            HAVING MAX(missed.created_at) >= MIN(missed.updated_at)
+               AND EXISTS (
+                   SELECT 1
+                   FROM dipper_reg_indexing_agreements o
+                   WHERE o.indexer_id = missed.indexer_id
+                     AND o.created_at >= timezone('UTC', now()) - make_interval(mins => $2)
+               )
+            "#,
+        )
+        .bind(IndexingAgreementStatus::Expired)
+        .bind(test_interval_minutes)
+        .bind(NON_ACCEPTING_LOOKBACK_HOURS)
+        .fetch_all(&self.pool)
+        .await?;
+
+        // The second branch takes in every miss counted above, even one made before the window.
+        let (offered,): (i64,) = sqlx::query_as(
+            r#"
+            SELECT COUNT(DISTINCT indexer_id)
+            FROM dipper_reg_indexing_agreements
+            WHERE offer_tx_hash IS NOT NULL
+              AND (created_at >= timezone('UTC', now()) - make_interval(hours => $2)
+                   OR (status = $1
+                       AND updated_at >= timezone('UTC', now()) - make_interval(hours => $2)))
+            "#,
+        )
+        .bind(IndexingAgreementStatus::Expired)
+        .bind(NON_ACCEPTING_LOOKBACK_HOURS)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(WithheldIndexers {
+            indexers: rows.into_iter().map(|(id,)| id.0).collect(),
+            offered,
+        })
     }
 
     pub async fn get_indexing_agreements_by_indexing_request_id(

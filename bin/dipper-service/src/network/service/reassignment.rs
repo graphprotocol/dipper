@@ -22,8 +22,10 @@ use crate::{
         AgreementRegistry, IndexerDenylistRegistry, IndexingRequest, IndexingRequestRegistry,
     },
     worker::{
-        DipsAcceptingCache, is_active_agreement, offerable_indexers, resolve_chain_name,
+        DipsAcceptingCache, add_declined, is_active_agreement, offerable_indexers,
+        resolve_chain_name,
         service::{JobPriority, WorkerQueue},
+        withheld_unless_dipper_fault,
     },
 };
 
@@ -290,7 +292,7 @@ where
     }
 
     let conf = &ctx.agreement_conf;
-    let declined = db(ctx.registry.get_declined_indexers_by_deployment(
+    let mut declined = db(ctx.registry.get_declined_indexers_by_deployment(
         conf.declined_indexer_lookback_days(),
         conf.price_rejection_lookback_days(),
         conf.transient_rejection_lookback_minutes(),
@@ -298,6 +300,13 @@ where
     ))
     .await?;
     let denylist = db(ctx.registry.get_indexer_denylist()).await?;
+    // Declined on every subgraph, as selection treats them, until their test offer is due.
+    let withheld = withheld_unless_dipper_fault(
+        db(ctx
+            .registry
+            .get_indexers_to_withhold_offers_from(conf.non_accepting_test_interval_minutes()))
+        .await?,
+    );
 
     let mut chains: HashMap<ChainId, Option<ChainPool>> = HashMap::new();
     let mut fillable = Vec::new();
@@ -328,6 +337,7 @@ where
             continue;
         }
 
+        add_declined(&mut declined, request.deployment_id, &withheld);
         let free = offerable_indexers(
             &chain.dips.indexers,
             request.deployment_id,
@@ -520,7 +530,7 @@ mod tests {
         cancel_dispatch::tests::agreement,
         registry::{
             IndexingAgreement, IndexingAgreementStatus, IndexingRequestStatus, SetTargetOutcome,
-            StubAgreementRegistry,
+            StubAgreementRegistry, WithheldIndexers,
         },
         worker::queue::JobId,
     };
@@ -567,6 +577,8 @@ mod tests {
         declined: HashMap<DeploymentId, Vec<IndexerId>>,
         denylist: Vec<IndexerId>,
         unresponsive: Vec<IndexerId>,
+        withheld: Vec<IndexerId>,
+        offered: usize,
         held: Vec<IndexerId>,
     }
 
@@ -653,6 +665,15 @@ mod tests {
             _chain_id: ChainId,
         ) -> crate::registry::Result<Vec<IndexerId>> {
             Ok(self.unresponsive.clone())
+        }
+        async fn get_indexers_to_withhold_offers_from(
+            &self,
+            _test_interval_minutes: i32,
+        ) -> crate::registry::Result<WithheldIndexers> {
+            Ok(WithheldIndexers {
+                indexers: self.withheld.clone(),
+                offered: self.offered,
+            })
         }
         async fn get_abandoned_indexers_holding_slots(
             &self,
@@ -915,14 +936,33 @@ mod tests {
             declined: HashMap::from([(deployment(), vec![indexer('b')])]),
             denylist: vec![indexer('c')],
             unresponsive: vec![indexer('d')],
+            withheld: vec![indexer('e')],
             short: vec![short],
             ..MockRegistry::default()
         };
 
-        let pool = "abcd".chars().map(indexer).collect();
+        let pool = "abcde".chars().map(indexer).collect();
         let queued = top_up(registry, Some(pool)).await;
 
         assert!(queued.is_empty(), "{queued:?}");
+    }
+
+    /// Half of those offered to stopping at once points at dipper, so the top-up holds back no one.
+    #[tokio::test]
+    async fn tops_up_with_indexers_held_back_when_half_of_those_offered_to_are() {
+        let short = request(3);
+        let registry = MockRegistry {
+            agreements: vec![holding(&short, indexer('a'))],
+            withheld: vec![indexer('b'), indexer('c')],
+            offered: 4,
+            short: vec![short.clone()],
+            ..MockRegistry::default()
+        };
+
+        let pool = "abc".chars().map(indexer).collect();
+        let queued = top_up(registry, Some(pool)).await;
+
+        assert_eq!(queued, vec![short.id]);
     }
 
     #[tokio::test]
