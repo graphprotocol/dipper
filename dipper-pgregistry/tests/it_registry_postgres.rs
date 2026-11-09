@@ -543,6 +543,10 @@ async fn get_indexing_agreements_by_indexing_request_id() {
 }
 
 /// Apply `sql` to the fixture, then count the short requests the cancel sweep would reassess.
+#[expect(
+    clippy::expect_used,
+    reason = "a test helper: a failed step should fail the test that called it"
+)]
 async fn short_requests_after(db: &Pool<Postgres>, registry: &PgRegistry, sql: &str) -> usize {
     run_fixture(db, sql)
         .await
@@ -2697,9 +2701,9 @@ async fn get_declined_indexers_expiry_without_offer_tx_excluded_after_5_minutes(
 }
 
 /// The mirror case: the offer did land, so the indexer had one on chain and let the window
-/// close, which is their decision and does earn the standard bench.
+/// close, which is their decision and earns a missed-offer bench (1 day for a 1st miss).
 #[tokio::test]
-async fn get_declined_indexers_expiry_with_offer_tx_included_within_30_days() {
+async fn get_declined_indexers_expiry_with_offer_tx_benches_the_indexer() {
     //* Given
     let (db, _temp_db) = temp_registry_db().await;
     run_fixture(
@@ -2754,6 +2758,253 @@ async fn get_declined_indexers_expiry_with_offer_tx_included_within_30_days() {
     assert!(
         declined.contains(&indexer_a),
         "an expiry after the offer landed should still bench the indexer, got {declined:?}"
+    );
+}
+
+/// A registry holding only the agreements a missed-offer test adds: the fixture's rows are moved
+/// out of every bench, and serve only as the template new rows copy their terms from.
+#[expect(
+    clippy::expect_used,
+    reason = "a test helper: a failed step should fail the test that called it"
+)]
+async fn missed_offer_registry() -> (PgRegistry, Pool<Postgres>, PgTempDB) {
+    let (db, temp_db) = temp_registry_db().await;
+    run_fixture(
+        &db,
+        include_str!("fixtures/0003_multi_indexer_agreements.sql"),
+    )
+    .await
+    .expect("Failed to run fixture");
+    sqlx::query("UPDATE dipper_reg_indexing_agreements SET status = 3")
+        .execute(&db)
+        .await
+        .expect("Failed to retire the fixture agreements");
+    (PgRegistry::new(db.clone()), db, temp_db)
+}
+
+/// Indexer A, whose benches the missed-offer tests check.
+const MISS_INDEXER: &str = "1111111111111111111111111111111111111111";
+/// The subgraph the missed offers are for, and another one indexer A takes offers on.
+const MISS_DEPLOYMENT: &str = "QmAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA1a";
+const OTHER_DEPLOYMENT: &str = "QmBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB2b";
+
+/// Add an offer to indexer A on `deployment`, made 10 minutes before it was last updated
+/// `minutes_ago`, with its deadline 5 minutes before that update, as dipper marks an offer expired
+/// a grace after its deadline. A missed offer is one that landed on chain and expired with no
+/// reason given.
+async fn add_missed_offer(db: &Pool<Postgres>, n: u8, deployment: &str, minutes_ago: i32) {
+    add_offer(db, n, deployment, 5, minutes_ago, None).await;
+}
+
+/// Add an offer to indexer A on `deployment` that it accepted on chain `minutes_ago`. It is
+/// cancelled now, so it holds no active slot and benches no one.
+async fn add_accepted_offer(db: &Pool<Postgres>, n: u8, deployment: &str, minutes_ago: i32) {
+    add_offer(db, n, deployment, 3, minutes_ago, Some(minutes_ago)).await;
+}
+
+/// The id of the `n`th offer a missed-offer test adds.
+fn offer_id(n: u8) -> Vec<u8> {
+    let mut id = vec![0xdd; 16];
+    id[15] = n;
+    id
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "a test helper: a failed step should fail the test that called it"
+)]
+async fn add_offer(
+    db: &Pool<Postgres>,
+    n: u8,
+    deployment: &str,
+    status: i32,
+    minutes_ago: i32,
+    accepted_minutes_ago: Option<i32>,
+) {
+    sqlx::query(
+        r#"
+        INSERT INTO dipper_reg_indexing_agreements
+            (id, nonce_uuid, created_at, updated_at, status, indexing_request_id, deployment_id,
+             indexer_id, indexer_url, terms, offer_tx_hash, accepted_at)
+        SELECT $1, gen_random_uuid(),
+               timezone('UTC', now()) - make_interval(mins => $4 + 10),
+               timezone('UTC', now()) - make_interval(mins => $4),
+               $3, indexing_request_id, $2, decode($5, 'hex'), indexer_url,
+               jsonb_set(terms::jsonb, '{deadline}',
+                         to_jsonb(extract(epoch FROM now() - make_interval(mins => $4 + 5))::bigint))::json,
+               decode(repeat('11', 32), 'hex'),
+               CASE WHEN $6::int IS NULL THEN NULL
+                    ELSE extract(epoch FROM now() - make_interval(mins => $6::int))::bigint END
+        FROM dipper_reg_indexing_agreements
+        WHERE id = '\xaa000000000000000000000000000001'::bytea
+        "#,
+    )
+    .bind(offer_id(n))
+    .bind(deployment)
+    .bind(status)
+    .bind(minutes_ago)
+    .bind(MISS_INDEXER)
+    .bind(accepted_minutes_ago)
+    .execute(db)
+    .await
+    .expect("Failed to add offer");
+}
+
+/// Whether indexer A is benched on the missed-offer subgraph, with a 30-day standard bench.
+#[expect(
+    clippy::expect_used,
+    reason = "a test helper: a failed step should fail the test that called it"
+)]
+async fn benched_on_missed_subgraph(registry: &PgRegistry) -> bool {
+    let deployment: DeploymentId = MISS_DEPLOYMENT.parse().expect("valid deployment id");
+    let indexer: IndexerId = indexer_id!("1111111111111111111111111111111111111111");
+    registry
+        .get_declined_indexers_by_deployment(30, 1, 5, 1)
+        .await
+        .expect("Failed to get declined indexers")
+        .get(&deployment)
+        .is_some_and(|indexers| indexers.contains(&indexer))
+}
+
+const HOUR: i32 = 60;
+const DAY: i32 = 24 * HOUR;
+
+/// 1 missed offer is often a blip on the indexer's side, so it benches for 1 day, not 30.
+#[tokio::test]
+async fn a_first_missed_offer_benches_the_indexer_for_a_day() {
+    let (registry, db, _temp_db) = missed_offer_registry().await;
+    add_missed_offer(&db, 1, MISS_DEPLOYMENT, 23 * HOUR).await;
+    assert!(
+        benched_on_missed_subgraph(&registry).await,
+        "benched within the day"
+    );
+
+    sqlx::query(
+        "UPDATE dipper_reg_indexing_agreements SET updated_at = updated_at - interval '2 hours' \
+         WHERE id = $1",
+    )
+    .bind(offer_id(1))
+    .execute(&db)
+    .await
+    .expect("Failed to age the miss");
+    assert!(
+        !benched_on_missed_subgraph(&registry).await,
+        "free once the day is over"
+    );
+}
+
+/// A 2nd miss in a row on the same subgraph benches for 7 days.
+#[tokio::test]
+async fn a_second_missed_offer_in_a_row_benches_the_indexer_for_7_days() {
+    let (registry, db, _temp_db) = missed_offer_registry().await;
+    add_missed_offer(&db, 1, MISS_DEPLOYMENT, 10 * DAY).await;
+    add_missed_offer(&db, 2, MISS_DEPLOYMENT, 6 * DAY).await;
+    assert!(
+        benched_on_missed_subgraph(&registry).await,
+        "benched within 7 days"
+    );
+
+    let (registry, db, _temp_db) = missed_offer_registry().await;
+    add_missed_offer(&db, 1, MISS_DEPLOYMENT, 10 * DAY).await;
+    add_missed_offer(&db, 2, MISS_DEPLOYMENT, 8 * DAY).await;
+    assert!(
+        !benched_on_missed_subgraph(&registry).await,
+        "free after 7 days"
+    );
+}
+
+/// A 3rd miss in a row benches for the standard 30 days.
+#[tokio::test]
+async fn a_third_missed_offer_in_a_row_benches_the_indexer_for_30_days() {
+    let (registry, db, _temp_db) = missed_offer_registry().await;
+    add_missed_offer(&db, 1, MISS_DEPLOYMENT, 40 * DAY).await;
+    add_missed_offer(&db, 2, MISS_DEPLOYMENT, 35 * DAY).await;
+    add_missed_offer(&db, 3, MISS_DEPLOYMENT, 29 * DAY).await;
+    assert!(
+        benched_on_missed_subgraph(&registry).await,
+        "benched within 30 days"
+    );
+
+    let (registry, db, _temp_db) = missed_offer_registry().await;
+    add_missed_offer(&db, 1, MISS_DEPLOYMENT, 40 * DAY).await;
+    add_missed_offer(&db, 2, MISS_DEPLOYMENT, 35 * DAY).await;
+    add_missed_offer(&db, 3, MISS_DEPLOYMENT, 31 * DAY).await;
+    assert!(
+        !benched_on_missed_subgraph(&registry).await,
+        "free after 30 days"
+    );
+}
+
+/// Accepting an offer on the subgraph wipes the misses before it, so the next miss is a 1st.
+#[tokio::test]
+async fn accepting_on_the_subgraph_starts_the_misses_again() {
+    let (registry, db, _temp_db) = missed_offer_registry().await;
+    add_missed_offer(&db, 1, MISS_DEPLOYMENT, 20 * DAY).await;
+    add_missed_offer(&db, 2, MISS_DEPLOYMENT, 15 * DAY).await;
+    add_accepted_offer(&db, 3, MISS_DEPLOYMENT, 10 * DAY).await;
+    add_missed_offer(&db, 4, MISS_DEPLOYMENT, 2 * DAY).await;
+    assert!(
+        !benched_on_missed_subgraph(&registry).await,
+        "a miss after an acceptance is a 1st miss, whose day has passed"
+    );
+}
+
+/// Accepting any offer after a 1st miss shows the blip is over, so that bench comes off.
+#[tokio::test]
+async fn a_first_miss_bench_lifts_once_the_indexer_accepts_elsewhere() {
+    let (registry, db, _temp_db) = missed_offer_registry().await;
+    add_missed_offer(&db, 1, MISS_DEPLOYMENT, HOUR).await;
+    add_accepted_offer(&db, 2, OTHER_DEPLOYMENT, 2 * HOUR).await;
+    assert!(
+        benched_on_missed_subgraph(&registry).await,
+        "an acceptance before the miss says nothing about recovery"
+    );
+
+    add_accepted_offer(&db, 3, OTHER_DEPLOYMENT, 30).await;
+    assert!(
+        !benched_on_missed_subgraph(&registry).await,
+        "an acceptance after the miss lifts the 1st-miss bench"
+    );
+}
+
+/// An indexer that recovers in the gap between the deadline and dipper marking the offer expired
+/// has still recovered after missing it, so the 1st-miss bench lifts.
+#[tokio::test]
+async fn a_first_miss_bench_lifts_on_an_acceptance_before_dipper_marks_the_miss() {
+    let (registry, db, _temp_db) = missed_offer_registry().await;
+    add_missed_offer(&db, 1, MISS_DEPLOYMENT, HOUR).await;
+    add_accepted_offer(&db, 2, OTHER_DEPLOYMENT, HOUR + 2).await;
+    assert!(
+        !benched_on_missed_subgraph(&registry).await,
+        "accepted after the deadline, though before the miss was marked"
+    );
+}
+
+/// Misses from long ago don't count towards the next one, so a fresh miss after months without
+/// an offer on the subgraph is a 1st miss again.
+#[tokio::test]
+async fn misses_from_long_ago_do_not_lengthen_a_new_bench() {
+    let (registry, db, _temp_db) = missed_offer_registry().await;
+    add_missed_offer(&db, 1, MISS_DEPLOYMENT, 90 * DAY).await;
+    add_missed_offer(&db, 2, MISS_DEPLOYMENT, 80 * DAY).await;
+    add_missed_offer(&db, 3, MISS_DEPLOYMENT, 2 * DAY).await;
+    assert!(
+        !benched_on_missed_subgraph(&registry).await,
+        "the old misses are past counting, so this 1st miss's day is over"
+    );
+}
+
+/// Only a 1st-miss bench lifts early. Otherwise an indexer could reset its longer benches on 1
+/// subgraph forever by accepting offers on others.
+#[tokio::test]
+async fn a_second_miss_bench_holds_when_the_indexer_accepts_elsewhere() {
+    let (registry, db, _temp_db) = missed_offer_registry().await;
+    add_missed_offer(&db, 1, MISS_DEPLOYMENT, 2 * DAY).await;
+    add_missed_offer(&db, 2, MISS_DEPLOYMENT, HOUR).await;
+    add_accepted_offer(&db, 3, OTHER_DEPLOYMENT, 30).await;
+    assert!(
+        benched_on_missed_subgraph(&registry).await,
+        "the 7-day bench holds"
     );
 }
 
