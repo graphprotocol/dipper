@@ -374,6 +374,23 @@ mod tests {
     }
 
     #[test]
+    fn holds_back_no_one_once_half_of_those_offered_to_would_be_held_back() {
+        let held_back = |count: usize, offered: usize| {
+            withheld_unless_dipper_fault(WithheldIndexers {
+                indexers: "abcdef".chars().take(count).map(indexer).collect(),
+                offered,
+            })
+            .len()
+        };
+
+        assert_eq!(held_back(2, 4), 0, "half");
+        assert_eq!(held_back(3, 4), 0, "over half");
+        assert_eq!(held_back(2, 5), 2, "under half");
+        assert_eq!(held_back(1, 1), 1, "1 is never enough to point at dipper");
+        assert_eq!(held_back(0, 0), 0, "none");
+    }
+
+    #[test]
     fn test_wei_per_second_to_grt_per_28d() {
         let one_grt_per_sec = 1e18;
         let result = wei_per_second_to_grt_per_28d(one_grt_per_sec);

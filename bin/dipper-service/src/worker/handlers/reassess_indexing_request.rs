@@ -959,7 +959,7 @@ mod lifecycle_event_tests {
             IndexingAgreementStatus, IndexingAgreementTerms, IndexingAgreementTermsMetadata,
             IndexingRequest, IndexingRequestRegistry, IndexingRequestStatus, NewAgreementParams,
             PendingCancellation, PendingCancellationRegistry, Result as RegistryResult,
-            SetTargetOutcome,
+            SetTargetOutcome, WithheldIndexers,
         },
         signing::eip712::Eip712Signer,
         test_support::{CapturedEvent, CapturingEventsProducer},
@@ -1187,8 +1187,9 @@ mod lifecycle_event_tests {
         held: Vec<IndexerId>,
         /// Indexers reported as recently unresponsive, which wakes the breaker.
         unresponsive: Vec<IndexerId>,
-        /// Indexers reported as having stopped accepting offers.
+        /// Indexers reported as having stopped accepting offers, and how many were offered to.
         withheld: Vec<IndexerId>,
+        offered: usize,
         /// The stored request the job reads its target from.
         request: Option<IndexingRequest>,
     }
@@ -1314,8 +1315,11 @@ mod lifecycle_event_tests {
         async fn get_indexers_to_withhold_offers_from(
             &self,
             _test_interval_minutes: i32,
-        ) -> RegistryResult<Vec<IndexerId>> {
-            Ok(self.withheld.clone())
+        ) -> RegistryResult<WithheldIndexers> {
+            Ok(WithheldIndexers {
+                indexers: self.withheld.clone(),
+                offered: self.offered,
+            })
         }
         async fn count_created_agreements_by_indexer(
             &self,
@@ -1785,6 +1789,7 @@ mod lifecycle_event_tests {
                     IndexingAgreementStatus::AcceptedOnChain,
                 )],
                 withheld: vec![member, outsider],
+                offered: 10,
                 ..Default::default()
             },
             iisa,
@@ -1802,6 +1807,33 @@ mod lifecycle_event_tests {
         assert!(contexts[0].indexer_denylist.is_empty());
         let declined: Vec<_> = contexts[0].declined_indexers.values().flatten().collect();
         assert_eq!(declined, vec![&member, &outsider]);
+    }
+
+    #[tokio::test]
+    async fn holds_back_no_one_when_half_of_those_offered_to_stopped_accepting() {
+        // That many at once points at dipper, such as a short escrow or a stalled chain reader.
+        let iisa = MockIisa::default();
+        let contexts = Arc::clone(&iisa.contexts);
+        let ctx = build_ctx(
+            MockRegistry {
+                withheld: vec![indexer_id(0x62), indexer_id(0x63)],
+                offered: 4,
+                ..Default::default()
+            },
+            iisa,
+            MockQueue::default(),
+            MockChainClient::default(),
+            CapturingEventsProducer::new(),
+            indexer_urls::Snapshot::new(),
+        );
+
+        run(ctx, 1).await.expect("handler ok");
+
+        let contexts = contexts.lock().unwrap();
+        assert_eq!(contexts.len(), 1, "IISA asked once: {contexts:?}");
+        assert!(contexts[0].indexer_denylist.is_empty());
+        let declined: Vec<_> = contexts[0].declined_indexers.values().flatten().collect();
+        assert!(declined.is_empty(), "{declined:?}");
     }
 
     #[tokio::test]
@@ -2225,6 +2257,7 @@ mod lifecycle_event_tests {
             held: Vec::new(),
             unresponsive: Vec::new(),
             withheld: Vec::new(),
+            offered: 0,
             request: None,
         };
         let ctx = build_ctx(
@@ -2268,6 +2301,7 @@ mod lifecycle_event_tests {
             held: Vec::new(),
             unresponsive: Vec::new(),
             withheld: Vec::new(),
+            offered: 0,
             request: None,
         };
         let ctx = build_ctx(
@@ -2417,6 +2451,7 @@ mod lifecycle_event_tests {
             held: Vec::new(),
             unresponsive: Vec::new(),
             withheld: Vec::new(),
+            offered: 0,
             request: None,
         };
         let ctx = build_ctx(
@@ -2479,6 +2514,7 @@ mod lifecycle_event_tests {
             held: Vec::new(),
             unresponsive: Vec::new(),
             withheld: Vec::new(),
+            offered: 0,
             request: None,
         };
         let ctx = build_ctx(
@@ -2549,6 +2585,7 @@ mod lifecycle_event_tests {
             held: Vec::new(),
             unresponsive: Vec::new(),
             withheld: Vec::new(),
+            offered: 0,
             request: None,
         };
         let ctx = build_ctx(
@@ -2689,6 +2726,7 @@ mod lifecycle_event_tests {
             held: Vec::new(),
             unresponsive: Vec::new(),
             withheld: Vec::new(),
+            offered: 0,
             request: None,
         };
         let ctx = build_ctx(

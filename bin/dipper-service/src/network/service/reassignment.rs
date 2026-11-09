@@ -527,7 +527,7 @@ mod tests {
         cancel_dispatch::tests::agreement,
         registry::{
             IndexingAgreement, IndexingAgreementStatus, IndexingRequestStatus, SetTargetOutcome,
-            StubAgreementRegistry,
+            StubAgreementRegistry, WithheldIndexers,
         },
         worker::queue::JobId,
     };
@@ -575,6 +575,7 @@ mod tests {
         denylist: Vec<IndexerId>,
         unresponsive: Vec<IndexerId>,
         withheld: Vec<IndexerId>,
+        offered: usize,
         held: Vec<IndexerId>,
     }
 
@@ -665,8 +666,11 @@ mod tests {
         async fn get_indexers_to_withhold_offers_from(
             &self,
             _test_interval_minutes: i32,
-        ) -> crate::registry::Result<Vec<IndexerId>> {
-            Ok(self.withheld.clone())
+        ) -> crate::registry::Result<WithheldIndexers> {
+            Ok(WithheldIndexers {
+                indexers: self.withheld.clone(),
+                offered: self.offered,
+            })
         }
         async fn get_abandoned_indexers_holding_slots(
             &self,
@@ -938,6 +942,24 @@ mod tests {
         let queued = top_up(registry, Some(pool)).await;
 
         assert!(queued.is_empty(), "{queued:?}");
+    }
+
+    /// Half of those offered to stopping at once points at dipper, so the top-up holds back no one.
+    #[tokio::test]
+    async fn tops_up_with_indexers_held_back_when_half_of_those_offered_to_are() {
+        let short = request(3);
+        let registry = MockRegistry {
+            agreements: vec![holding(&short, indexer('a'))],
+            withheld: vec![indexer('b'), indexer('c')],
+            offered: 4,
+            short: vec![short.clone()],
+            ..MockRegistry::default()
+        };
+
+        let pool = "abc".chars().map(indexer).collect();
+        let queued = top_up(registry, Some(pool)).await;
+
+        assert_eq!(queued, vec![short.id]);
     }
 
     #[tokio::test]
