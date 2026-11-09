@@ -268,10 +268,13 @@ const TERMINATED_TX_WAIT_MINUTES: i32 = 60;
 /// The query behind [`PgRegistry::get_declined_indexers_by_deployment`]; its doc comment says
 /// what each window is for.
 const DECLINED_INDEXERS_SQL: &str = r#"
+            -- Misses count towards a bench for 2 standard benches, so 1 from months ago doesn't
+            -- lengthen the bench for a fresh one.
             WITH missed AS (
                 SELECT deployment_id, indexer_id, created_at, updated_at
                 FROM dipper_reg_indexing_agreements
                 WHERE status = $2 AND offer_tx_hash IS NOT NULL AND rejection_reason IS NULL
+                  AND updated_at >= timezone('UTC', now()) - make_interval(days => 2 * $5)
             ),
             -- accepted_at is chain seconds; read it the way updated_at is written, through
             -- timezone('UTC', ...), so the 2 compare like for like.
