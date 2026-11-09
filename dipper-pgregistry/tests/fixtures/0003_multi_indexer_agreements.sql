@@ -62,9 +62,9 @@ VALUES ('\xbb000000000000000000000000000001'::bytea, '01930100-0002-7000-8000-00
 
 -- Indexer C: 0x3333333333333333333333333333333333333333
 -- Has NO active agreements (only expired). The expiry carries an offer transaction, so it is an
--- indexer who had an offer on chain and let the window close, which earns the standard exclusion.
+-- indexer who had an offer on chain and let the window close, which earns a missed-offer bench.
 -- Leave the transaction set: without it the row reads as dipper failing to submit, and every test
--- that expects this row on the standard window would silently move to the short one instead.
+-- that expects this row benched would silently move to the 5-minute dipper-side window instead.
 INSERT INTO dipper_reg_indexing_agreements (id, nonce_uuid, created_at, updated_at, status, indexing_request_id, deployment_id, indexer_id, indexer_url, terms, offer_tx_hash)
 VALUES ('\xcc000000000000000000000000000001'::bytea, '01930100-0003-7000-8000-000000000001'::uuid, timezone('UTC', now()), timezone('UTC', now()),
         5, -- Expired

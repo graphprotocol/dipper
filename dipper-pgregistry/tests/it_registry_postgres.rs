@@ -2701,9 +2701,9 @@ async fn get_declined_indexers_expiry_without_offer_tx_excluded_after_5_minutes(
 }
 
 /// The mirror case: the offer did land, so the indexer had one on chain and let the window
-/// close, which is their decision and does earn the standard bench.
+/// close, which is their decision and earns a missed-offer bench (1 day for a 1st miss).
 #[tokio::test]
-async fn get_declined_indexers_expiry_with_offer_tx_included_within_30_days() {
+async fn get_declined_indexers_expiry_with_offer_tx_benches_the_indexer() {
     //* Given
     let (db, _temp_db) = temp_registry_db().await;
     run_fixture(
