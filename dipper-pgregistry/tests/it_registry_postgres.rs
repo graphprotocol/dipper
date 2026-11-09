@@ -2788,8 +2788,10 @@ const MISS_INDEXER: &str = "1111111111111111111111111111111111111111";
 const MISS_DEPLOYMENT: &str = "QmAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA1a";
 const OTHER_DEPLOYMENT: &str = "QmBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB2b";
 
-/// Add an offer to indexer A on `deployment`, made 5 minutes before it was last updated
-/// `minutes_ago`. A missed offer is one that landed on chain and expired with no reason given.
+/// Add an offer to indexer A on `deployment`, made 10 minutes before it was last updated
+/// `minutes_ago`, with its deadline 5 minutes before that update, as dipper marks an offer expired
+/// a grace after its deadline. A missed offer is one that landed on chain and expired with no
+/// reason given.
 async fn add_missed_offer(db: &Pool<Postgres>, n: u8, deployment: &str, minutes_ago: i32) {
     add_offer(db, n, deployment, 5, minutes_ago, None).await;
 }
@@ -2825,9 +2827,11 @@ async fn add_offer(
             (id, nonce_uuid, created_at, updated_at, status, indexing_request_id, deployment_id,
              indexer_id, indexer_url, terms, offer_tx_hash, accepted_at)
         SELECT $1, gen_random_uuid(),
-               timezone('UTC', now()) - make_interval(mins => $4 + 5),
+               timezone('UTC', now()) - make_interval(mins => $4 + 10),
                timezone('UTC', now()) - make_interval(mins => $4),
-               $3, indexing_request_id, $2, decode($5, 'hex'), indexer_url, terms,
+               $3, indexing_request_id, $2, decode($5, 'hex'), indexer_url,
+               jsonb_set(terms::jsonb, '{deadline}',
+                         to_jsonb(extract(epoch FROM now() - make_interval(mins => $4 + 5))::bigint))::json,
                decode(repeat('11', 32), 'hex'),
                CASE WHEN $6::int IS NULL THEN NULL
                     ELSE extract(epoch FROM now() - make_interval(mins => $6::int))::bigint END
@@ -2960,6 +2964,33 @@ async fn a_first_miss_bench_lifts_once_the_indexer_accepts_elsewhere() {
     assert!(
         !benched_on_missed_subgraph(&registry).await,
         "an acceptance after the miss lifts the 1st-miss bench"
+    );
+}
+
+/// An indexer that recovers in the gap between the deadline and dipper marking the offer expired
+/// has still recovered after missing it, so the 1st-miss bench lifts.
+#[tokio::test]
+async fn a_first_miss_bench_lifts_on_an_acceptance_before_dipper_marks_the_miss() {
+    let (registry, db, _temp_db) = missed_offer_registry().await;
+    add_missed_offer(&db, 1, MISS_DEPLOYMENT, HOUR).await;
+    add_accepted_offer(&db, 2, OTHER_DEPLOYMENT, HOUR + 2).await;
+    assert!(
+        !benched_on_missed_subgraph(&registry).await,
+        "accepted after the deadline, though before the miss was marked"
+    );
+}
+
+/// Misses from long ago don't count towards the next one, so a fresh miss after months without
+/// an offer on the subgraph is a 1st miss again.
+#[tokio::test]
+async fn misses_from_long_ago_do_not_lengthen_a_new_bench() {
+    let (registry, db, _temp_db) = missed_offer_registry().await;
+    add_missed_offer(&db, 1, MISS_DEPLOYMENT, 90 * DAY).await;
+    add_missed_offer(&db, 2, MISS_DEPLOYMENT, 80 * DAY).await;
+    add_missed_offer(&db, 3, MISS_DEPLOYMENT, 2 * DAY).await;
+    assert!(
+        !benched_on_missed_subgraph(&registry).await,
+        "the old misses are past counting, so this 1st miss's day is over"
     );
 }
 
