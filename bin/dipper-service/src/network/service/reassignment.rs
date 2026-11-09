@@ -22,7 +22,8 @@ use crate::{
         AgreementRegistry, IndexerDenylistRegistry, IndexingRequest, IndexingRequestRegistry,
     },
     worker::{
-        DipsAcceptingCache, is_active_agreement, offerable_indexers, resolve_chain_name,
+        DipsAcceptingCache, add_declined, is_active_agreement, offerable_indexers,
+        resolve_chain_name,
         service::{JobPriority, WorkerQueue},
     },
 };
@@ -290,7 +291,7 @@ where
     }
 
     let conf = &ctx.agreement_conf;
-    let declined = db(ctx.registry.get_declined_indexers_by_deployment(
+    let mut declined = db(ctx.registry.get_declined_indexers_by_deployment(
         conf.declined_indexer_lookback_days(),
         conf.price_rejection_lookback_days(),
         conf.transient_rejection_lookback_minutes(),
@@ -298,11 +299,11 @@ where
     ))
     .await?;
     let denylist = db(ctx.registry.get_indexer_denylist()).await?;
+    // Declined on every subgraph, as selection treats them, until their test offer is due.
     let withheld = db(ctx
         .registry
         .get_indexers_to_withhold_offers_from(conf.non_accepting_test_interval_minutes()))
     .await?;
-    let unavailable: Vec<IndexerId> = denylist.into_iter().chain(withheld).collect();
 
     let mut chains: HashMap<ChainId, Option<ChainPool>> = HashMap::new();
     let mut fillable = Vec::new();
@@ -333,12 +334,13 @@ where
             continue;
         }
 
+        add_declined(&mut declined, request.deployment_id, &withheld);
         let free = offerable_indexers(
             &chain.dips.indexers,
             request.deployment_id,
             &agreements,
             &declined,
-            &unavailable,
+            &denylist,
             &chain.unresponsive,
             &held,
         );

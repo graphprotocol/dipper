@@ -108,7 +108,7 @@ where
             indexers = ?withheld,
             "withholding new offers from indexers that have stopped accepting them"
         );
-        add_declined(&mut declined_indexers, *deployment_id, withheld);
+        add_declined(&mut declined_indexers, *deployment_id, &withheld);
     }
 
     // Compute optimistic DIPs fees from active agreements, enriched with
@@ -211,22 +211,22 @@ fn exclude_cancelling_indexers(
         .filter(|a| a.status == IndexingAgreementStatus::Cancelling)
         .map(|a| a.indexer.id)
         .collect::<Vec<_>>();
-    add_declined(declined, deployment_id, cancelling);
+    add_declined(declined, deployment_id, &cancelling);
 }
 
 /// Add `indexers` to the deployment's declined list, each once, adding no entry for none.
-fn add_declined(
+pub(crate) fn add_declined(
     declined: &mut HashMap<DeploymentId, Vec<IndexerId>>,
     deployment_id: DeploymentId,
-    indexers: Vec<IndexerId>,
+    indexers: &[IndexerId],
 ) {
     if indexers.is_empty() {
         return;
     }
     let excluded = declined.entry(deployment_id).or_default();
     for indexer in indexers {
-        if !excluded.contains(&indexer) {
-            excluded.push(indexer);
+        if !excluded.contains(indexer) {
+            excluded.push(*indexer);
         }
     }
 }
