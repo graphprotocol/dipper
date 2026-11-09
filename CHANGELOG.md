@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.9](https://github.com/graphprotocol/dipper/compare/v0.2.8...v0.2.9) (2026-11-09)
+
+
+### Added
+
+* hold offers back from indexers that stopped accepting ([#791](https://github.com/graphprotocol/dipper/issues/791)) ([cfad912](https://github.com/graphprotocol/dipper/commit/cfad9123d6ed426e66c408ddf9f0f3027e2e9033))
+
+
+### Fixed
+
+* **registry:** bench missed offers for 1, 7, then 30 days ([#790](https://github.com/graphprotocol/dipper/issues/790)) ([2969c54](https://github.com/graphprotocol/dipper/commit/2969c54184ec01fe9329a9487272f39d819284cf))
+
 ## [0.2.8](https://github.com/graphprotocol/dipper/compare/v0.2.7...v0.2.8) (2026-11-06)
 
 
