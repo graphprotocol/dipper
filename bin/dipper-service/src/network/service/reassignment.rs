@@ -567,6 +567,7 @@ mod tests {
         declined: HashMap<DeploymentId, Vec<IndexerId>>,
         denylist: Vec<IndexerId>,
         unresponsive: Vec<IndexerId>,
+        withheld: Vec<IndexerId>,
         held: Vec<IndexerId>,
     }
 
@@ -653,6 +654,12 @@ mod tests {
             _chain_id: ChainId,
         ) -> crate::registry::Result<Vec<IndexerId>> {
             Ok(self.unresponsive.clone())
+        }
+        async fn get_indexers_to_withhold_offers_from(
+            &self,
+            _test_interval_minutes: i32,
+        ) -> crate::registry::Result<Vec<IndexerId>> {
+            Ok(self.withheld.clone())
         }
         async fn get_abandoned_indexers_holding_slots(
             &self,
@@ -915,11 +922,12 @@ mod tests {
             declined: HashMap::from([(deployment(), vec![indexer('b')])]),
             denylist: vec![indexer('c')],
             unresponsive: vec![indexer('d')],
+            withheld: vec![indexer('e')],
             short: vec![short],
             ..MockRegistry::default()
         };
 
-        let pool = "abcd".chars().map(indexer).collect();
+        let pool = "abcde".chars().map(indexer).collect();
         let queued = top_up(registry, Some(pool)).await;
 
         assert!(queued.is_empty(), "{queued:?}");

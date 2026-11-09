@@ -1186,6 +1186,8 @@ mod lifecycle_event_tests {
         held: Vec<IndexerId>,
         /// Indexers reported as recently unresponsive, which wakes the breaker.
         unresponsive: Vec<IndexerId>,
+        /// Indexers reported as having stopped accepting offers.
+        withheld: Vec<IndexerId>,
         /// The stored request the job reads its target from.
         request: Option<IndexingRequest>,
     }
@@ -1307,6 +1309,12 @@ mod lifecycle_event_tests {
             _chain_id: ChainId,
         ) -> RegistryResult<Vec<IndexerId>> {
             Ok(self.unresponsive.clone())
+        }
+        async fn get_indexers_to_withhold_offers_from(
+            &self,
+            _test_interval_minutes: i32,
+        ) -> RegistryResult<Vec<IndexerId>> {
+            Ok(self.withheld.clone())
         }
         async fn count_created_agreements_by_indexer(
             &self,
@@ -1762,6 +1770,40 @@ mod lifecycle_event_tests {
     }
 
     #[tokio::test]
+    async fn sends_indexers_that_stopped_accepting_offers_as_declined_not_denylisted() {
+        // A member that stopped accepting new offers may still serve the agreement it holds, which
+        // a denylisting would cancel, so it and an outsider are only kept from new offers.
+        let member = indexer_id(0x60);
+        let outsider = indexer_id(0x61);
+        let iisa = MockIisa::default();
+        let contexts = Arc::clone(&iisa.contexts);
+        let ctx = build_ctx(
+            MockRegistry {
+                active_agreements: vec![agreement(
+                    member,
+                    IndexingAgreementStatus::AcceptedOnChain,
+                )],
+                withheld: vec![member, outsider],
+                ..Default::default()
+            },
+            iisa,
+            MockQueue::default(),
+            MockChainClient::default(),
+            CapturingEventsProducer::new(),
+            indexer_urls::Snapshot::new(),
+        );
+
+        run(ctx, 1).await.expect("handler ok");
+
+        let contexts = contexts.lock().unwrap();
+        assert_eq!(contexts.len(), 1, "IISA asked once: {contexts:?}");
+        assert_eq!(contexts[0].existing_indexers, vec![member]);
+        assert!(contexts[0].indexer_denylist.is_empty());
+        let declined: Vec<_> = contexts[0].declined_indexers.values().flatten().collect();
+        assert_eq!(declined, vec![&member, &outsider]);
+    }
+
+    #[tokio::test]
     async fn holds_back_no_unresponsive_indexer_while_the_breaker_is_tripped() {
         // 2 of the chain's 3 DIPs-accepting indexers stopped replying at once, which points at
         // dipper rather than at them, so neither is held back from new offers.
@@ -2181,6 +2223,7 @@ mod lifecycle_event_tests {
             marked_cancelling: Arc::default(),
             held: Vec::new(),
             unresponsive: Vec::new(),
+            withheld: Vec::new(),
             request: None,
         };
         let ctx = build_ctx(
@@ -2223,6 +2266,7 @@ mod lifecycle_event_tests {
             marked_cancelling: Arc::default(),
             held: Vec::new(),
             unresponsive: Vec::new(),
+            withheld: Vec::new(),
             request: None,
         };
         let ctx = build_ctx(
@@ -2371,6 +2415,7 @@ mod lifecycle_event_tests {
             marked_cancelling: Arc::default(),
             held: Vec::new(),
             unresponsive: Vec::new(),
+            withheld: Vec::new(),
             request: None,
         };
         let ctx = build_ctx(
@@ -2432,6 +2477,7 @@ mod lifecycle_event_tests {
             marked_cancelling: Arc::default(),
             held: Vec::new(),
             unresponsive: Vec::new(),
+            withheld: Vec::new(),
             request: None,
         };
         let ctx = build_ctx(
@@ -2501,6 +2547,7 @@ mod lifecycle_event_tests {
             marked_cancelling: Arc::default(),
             held: Vec::new(),
             unresponsive: Vec::new(),
+            withheld: Vec::new(),
             request: None,
         };
         let ctx = build_ctx(
@@ -2640,6 +2687,7 @@ mod lifecycle_event_tests {
             marked_cancelling: Arc::default(),
             held: Vec::new(),
             unresponsive: Vec::new(),
+            withheld: Vec::new(),
             request: None,
         };
         let ctx = build_ctx(

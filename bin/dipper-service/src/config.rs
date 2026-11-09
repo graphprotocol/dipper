@@ -2237,6 +2237,7 @@ mod tests {
             Some(100),
             "max_in_flight_offers_total should default to 100"
         );
+        assert_eq!(config.non_accepting_test_interval_minutes, 60);
 
         // Test the From conversion - None should map to u64::MAX
         let (agreement_config, _) = <(
@@ -2258,6 +2259,31 @@ mod tests {
             Some(100),
             "total cap should survive the From conversion"
         );
+        assert_eq!(agreement_config.non_accepting_test_interval_minutes(), 60);
+    }
+
+    /// With no time between test offers, an indexer that stopped accepting would never be held
+    /// back at all.
+    #[test]
+    fn validate_rejects_a_test_offer_interval_that_is_not_positive() {
+        let mut conf: DipsAgreementConfig = serde_json::from_str(
+            r#"{
+                "data_service": "0x1111111111111111111111111111111111111111",
+                "recurring_collector": "0x2222222222222222222222222222222222222222",
+                "recurring_agreement_manager": "0x3333333333333333333333333333333333333333",
+                "min_seconds_per_collection": 60,
+                "max_seconds_per_collection": 3600,
+                "pricing_table": {}
+            }"#,
+        )
+        .expect("deserialization");
+        for minutes in [0, -1] {
+            conf.non_accepting_test_interval_minutes = minutes;
+            let err = conf.validate().expect_err(&format!("{minutes}"));
+            assert!(err.contains("non_accepting_test_interval_minutes"), "{err}");
+        }
+        conf.non_accepting_test_interval_minutes = 1;
+        assert!(conf.validate().is_ok());
     }
 
     #[test]
