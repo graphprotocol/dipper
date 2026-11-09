@@ -11,7 +11,7 @@ use super::{
     agreement::{
         AgreementFeeRate, AgreementRegistry, CancelKind, CancellingAgreement, IndexingAgreement,
         NewAgreementParams, PendingAcceptedEvent, PendingExpiredEvent, PendingTerminatedEvent,
-        ReconciliationItem, ReconciliationOutcome,
+        ReconciliationItem, ReconciliationOutcome, WithheldIndexers,
     },
     result::Result,
 };
@@ -86,8 +86,8 @@ pub trait StubAgreementRegistry: Send + Sync {
     async fn get_indexers_to_withhold_offers_from(
         &self,
         _test_interval_minutes: i32,
-    ) -> Result<Vec<IndexerId>> {
-        Ok(Vec::new())
+    ) -> Result<WithheldIndexers> {
+        Ok(WithheldIndexers::default())
     }
 
     async fn get_indexing_agreements_by_indexing_request_id(
@@ -434,7 +434,7 @@ impl<T: StubAgreementRegistry> AgreementRegistry for T {
     async fn get_indexers_to_withhold_offers_from(
         &self,
         test_interval_minutes: i32,
-    ) -> Result<Vec<IndexerId>> {
+    ) -> Result<WithheldIndexers> {
         StubAgreementRegistry::get_indexers_to_withhold_offers_from(self, test_interval_minutes)
             .await
     }

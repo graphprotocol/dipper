@@ -9,6 +9,7 @@ use crate::{
     network::service::entity_count_cache::EntityCountCache,
     registry::{
         AgreementRegistry, IndexerDenylistRegistry, IndexingAgreement, IndexingAgreementStatus,
+        WithheldIndexers,
     },
     worker::result::{JobError, JobResult},
 };
@@ -18,6 +19,9 @@ const SECONDS_PER_28_DAYS: f64 = 86400.0 * 28.0;
 
 /// 1 GRT = 10^18 wei.
 const WEI_PER_GRT: f64 = 1e18;
+
+/// Fewest indexers held back at once that can point at a fault on dipper's side.
+const MIN_WITHHELD_FOR_DIPPER_FAULT: usize = 2;
 
 /// Gather load balancing context for IISA selection.
 ///
@@ -94,10 +98,11 @@ where
 
     // Sent as declined, not denylisted: IISA would drop a denylisted group member, cancelling an
     // agreement it may still serve, when it has only stopped taking new ones.
-    let withheld: Vec<IndexerId> = registry
+    let withheld = registry
         .get_indexers_to_withhold_offers_from(non_accepting_test_interval_minutes)
         .await
-        .map_err(|err| JobError::Fatal(err.into()))?
+        .map_err(|err| JobError::Fatal(err.into()))?;
+    let withheld: Vec<IndexerId> = withheld_unless_dipper_fault(withheld)
         .into_iter()
         .filter(|id| !already_denied.contains(id))
         .collect();
@@ -212,6 +217,23 @@ fn exclude_cancelling_indexers(
         .map(|a| a.indexer.id)
         .collect::<Vec<_>>();
     add_declined(declined, deployment_id, &cancelling);
+}
+
+/// The indexers to hold back from new offers, or none when at least half of those offered to in
+/// the last 24 hours (and at least 2) would be: that many at once points at a fault on dipper's
+/// side, such as a short escrow or a stalled chain reader, rather than at the indexers.
+pub(crate) fn withheld_unless_dipper_fault(withheld: WithheldIndexers) -> Vec<IndexerId> {
+    let count = withheld.indexers.len();
+    if count >= MIN_WITHHELD_FOR_DIPPER_FAULT && count.saturating_mul(2) >= withheld.offered {
+        tracing::warn!(
+            withheld = count,
+            offered = withheld.offered,
+            "at least half of the indexers offered to in the last 24 hours look like they stopped \
+             accepting, which points at dipper; holding back none of them"
+        );
+        return Vec::new();
+    }
+    withheld.indexers
 }
 
 /// Add `indexers` to the deployment's declined list, each once, adding no entry for none.

@@ -25,6 +25,7 @@ use crate::{
         DipsAcceptingCache, add_declined, is_active_agreement, offerable_indexers,
         resolve_chain_name,
         service::{JobPriority, WorkerQueue},
+        withheld_unless_dipper_fault,
     },
 };
 
@@ -300,10 +301,12 @@ where
     .await?;
     let denylist = db(ctx.registry.get_indexer_denylist()).await?;
     // Declined on every subgraph, as selection treats them, until their test offer is due.
-    let withheld = db(ctx
-        .registry
-        .get_indexers_to_withhold_offers_from(conf.non_accepting_test_interval_minutes()))
-    .await?;
+    let withheld = withheld_unless_dipper_fault(
+        db(ctx
+            .registry
+            .get_indexers_to_withhold_offers_from(conf.non_accepting_test_interval_minutes()))
+        .await?,
+    );
 
     let mut chains: HashMap<ChainId, Option<ChainPool>> = HashMap::new();
     let mut fillable = Vec::new();

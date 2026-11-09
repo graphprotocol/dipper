@@ -103,6 +103,14 @@ pub struct RecordedEnd {
     pub canceled_tx: Option<String>,
 }
 
+/// The indexers to withhold offers from, and how many indexers had an offer on-chain in the same
+/// 24 hours, so a caller can tell indexers that stopped accepting from a fault on dipper's side.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WithheldIndexers {
+    pub indexers: Vec<IndexerId>,
+    pub offered: i64,
+}
+
 /// What recording a cycle of DIPs info checks left, in seconds without a readable answer: each
 /// indexer still missing its DIPs info, and each one forgotten, with the time it had built up.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -918,7 +926,7 @@ impl PgRegistry {
     pub async fn get_indexers_to_withhold_offers_from(
         &self,
         test_interval_minutes: i32,
-    ) -> Result<Vec<IndexerId>, Error> {
+    ) -> Result<WithheldIndexers, Error> {
         let rows: Vec<(PgIndexerId,)> = sqlx::query_as(
             r#"
             WITH missed AS (
@@ -956,7 +964,26 @@ impl PgRegistry {
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows.into_iter().map(|(id,)| id.0).collect())
+        // The second branch takes in every miss counted above, even one made before the window.
+        let (offered,): (i64,) = sqlx::query_as(
+            r#"
+            SELECT COUNT(DISTINCT indexer_id)
+            FROM dipper_reg_indexing_agreements
+            WHERE offer_tx_hash IS NOT NULL
+              AND (created_at >= timezone('UTC', now()) - make_interval(hours => $2)
+                   OR (status = $1
+                       AND updated_at >= timezone('UTC', now()) - make_interval(hours => $2)))
+            "#,
+        )
+        .bind(IndexingAgreementStatus::Expired)
+        .bind(NON_ACCEPTING_LOOKBACK_HOURS)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(WithheldIndexers {
+            indexers: rows.into_iter().map(|(id,)| id.0).collect(),
+            offered,
+        })
     }
 
     pub async fn get_indexing_agreements_by_indexing_request_id(
