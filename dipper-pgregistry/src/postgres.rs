@@ -271,7 +271,8 @@ const DECLINED_INDEXERS_SQL: &str = r#"
             -- Misses count towards a bench for 2 standard benches, so 1 from months ago doesn't
             -- lengthen the bench for a fresh one.
             WITH missed AS (
-                SELECT deployment_id, indexer_id, created_at, updated_at
+                SELECT deployment_id, indexer_id, created_at, updated_at,
+                       CAST(terms->>'deadline' AS bigint) AS deadline
                 FROM dipper_reg_indexing_agreements
                 WHERE status = $2 AND offer_tx_hash IS NOT NULL AND rejection_reason IS NULL
                   AND updated_at >= timezone('UTC', now()) - make_interval(days => 2 * $5)
@@ -279,14 +280,15 @@ const DECLINED_INDEXERS_SQL: &str = r#"
             -- accepted_at is chain seconds; read it the way updated_at is written, through
             -- timezone('UTC', ...), so the 2 compare like for like.
             accepted AS (
-                SELECT deployment_id, indexer_id, timezone('UTC', to_timestamp(accepted_at)) AS at
+                SELECT deployment_id, indexer_id, accepted_at,
+                       timezone('UTC', to_timestamp(accepted_at)) AS at
                 FROM dipper_reg_indexing_agreements
                 WHERE accepted_at IS NOT NULL
             ),
             -- The misses on each subgraph since the indexer last accepted an offer there.
             streaks AS (
                 SELECT m.deployment_id, m.indexer_id, count(*) AS misses,
-                       max(m.updated_at) AS last_miss
+                       max(m.updated_at) AS last_miss, max(m.deadline) AS last_deadline
                 FROM missed m
                 WHERE NOT EXISTS (
                     SELECT 1 FROM accepted a
@@ -302,10 +304,12 @@ const DECLINED_INDEXERS_SQL: &str = r#"
                 WHERE (s.misses = 1
                        AND s.last_miss >= timezone('UTC', now()) - make_interval(days => LEAST($21, $5))
                        -- Only a 1st-miss bench lifts on an acceptance elsewhere, or accepting
-                       -- other subgraphs would wipe every longer bench on this one.
+                       -- other subgraphs would wipe every longer bench on this one. Both times
+                       -- are chain seconds, and dipper marks a miss only a grace after its
+                       -- deadline, so the deadline is when the indexer missed it.
                        AND NOT EXISTS (
                            SELECT 1 FROM accepted a
-                           WHERE a.indexer_id = s.indexer_id AND a.at > s.last_miss
+                           WHERE a.indexer_id = s.indexer_id AND a.accepted_at > s.last_deadline
                        ))
                    OR (s.misses = 2
                        AND s.last_miss >= timezone('UTC', now()) - make_interval(days => LEAST($22, $5)))
