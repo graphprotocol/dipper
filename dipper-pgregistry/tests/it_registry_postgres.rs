@@ -1329,7 +1329,7 @@ async fn held_back(db: &Pool<Postgres>) -> Vec<IndexerId> {
 /// A round of offers that all expire before the next is made is what a brief agent restart
 /// costs, so it isn't enough to hold the indexer back.
 #[tokio::test]
-async fn one_round_of_missed_offers_does_not_hold_an_indexer_back() {
+async fn missing_1_round_of_offers_does_not_hold_an_indexer_back() {
     //* Given
     let (db, _temp_db) = registry_with_retired_fixture().await;
     for made in [17, 16, 15] {
@@ -1344,7 +1344,7 @@ async fn one_round_of_missed_offers_does_not_hold_an_indexer_back() {
 }
 
 #[tokio::test]
-async fn an_indexer_that_missed_two_rounds_is_held_back() {
+async fn an_indexer_that_missed_2_rounds_is_held_back() {
     //* Given
     let (db, _temp_db) = registry_with_retired_fixture().await;
     record_offer(&db, IndexingAgreementStatus::Expired, 35, 20, None).await;
@@ -1358,10 +1358,10 @@ async fn an_indexer_that_missed_two_rounds_is_held_back() {
     assert_eq!(held, vec![QUIET_INDEXER]);
 }
 
-/// Without an offer in the last hour the indexer's test is due, so it is let through until that
-/// test offer is made.
+/// Without an offer in the last 60 minutes the indexer's test is due, so it is let through until
+/// that test offer is made.
 #[tokio::test]
-async fn an_indexer_held_back_gets_a_test_offer_once_an_hour_passes_without_one() {
+async fn an_indexer_held_back_gets_a_test_offer_after_60_minutes_with_none() {
     //* Given
     let (db, _temp_db) = registry_with_retired_fixture().await;
     record_offer(&db, IndexingAgreementStatus::Expired, 150, 135, None).await;
