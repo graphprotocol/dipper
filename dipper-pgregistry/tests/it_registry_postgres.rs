@@ -1377,6 +1377,23 @@ async fn an_indexer_held_back_gets_a_test_offer_after_60_minutes_with_none() {
     assert_eq!(test_made, vec![QUIET_INDEXER]);
 }
 
+/// Only misses from the last 24 hours count. A held-back indexer's missed test offers keep its
+/// record fresh, so this only lets go of one nobody has offered anything for a day.
+#[tokio::test]
+async fn missed_offers_that_ended_over_24_hours_ago_do_not_hold_an_indexer_back() {
+    //* Given
+    let (db, _temp_db) = registry_with_retired_fixture().await;
+    record_offer(&db, IndexingAgreementStatus::Expired, 1_560, 1_545, None).await;
+    record_offer(&db, IndexingAgreementStatus::Expired, 1_540, 1_525, None).await;
+    record_offer(&db, IndexingAgreementStatus::Created, 1, 1, None).await;
+
+    //* When
+    let held = held_back(&db).await;
+
+    //* Then
+    assert!(held.is_empty(), "{held:?}");
+}
+
 #[tokio::test]
 async fn an_acceptance_after_the_missed_offers_lets_the_indexer_back_in() {
     //* Given
