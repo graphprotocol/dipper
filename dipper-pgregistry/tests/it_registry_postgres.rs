@@ -543,6 +543,10 @@ async fn get_indexing_agreements_by_indexing_request_id() {
 }
 
 /// Apply `sql` to the fixture, then count the short requests the cancel sweep would reassess.
+#[expect(
+    clippy::expect_used,
+    reason = "a test helper: a failed step should fail the test that called it"
+)]
 async fn short_requests_after(db: &Pool<Postgres>, registry: &PgRegistry, sql: &str) -> usize {
     run_fixture(db, sql)
         .await
@@ -2759,6 +2763,10 @@ async fn get_declined_indexers_expiry_with_offer_tx_included_within_30_days() {
 
 /// A registry holding only the agreements a missed-offer test adds: the fixture's rows are moved
 /// out of every bench, and serve only as the template new rows copy their terms from.
+#[expect(
+    clippy::expect_used,
+    reason = "a test helper: a failed step should fail the test that called it"
+)]
 async fn missed_offer_registry() -> (PgRegistry, Pool<Postgres>, PgTempDB) {
     let (db, temp_db) = temp_registry_db().await;
     run_fixture(
@@ -2799,6 +2807,10 @@ fn offer_id(n: u8) -> Vec<u8> {
     id
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "a test helper: a failed step should fail the test that called it"
+)]
 async fn add_offer(
     db: &Pool<Postgres>,
     n: u8,
@@ -2835,6 +2847,10 @@ async fn add_offer(
 }
 
 /// Whether indexer A is benched on the missed-offer subgraph, with a 30-day standard bench.
+#[expect(
+    clippy::expect_used,
+    reason = "a test helper: a failed step should fail the test that called it"
+)]
 async fn benched_on_missed_subgraph(registry: &PgRegistry) -> bool {
     let deployment: DeploymentId = MISS_DEPLOYMENT.parse().expect("valid deployment id");
     let indexer: IndexerId = indexer_id!("1111111111111111111111111111111111111111");
