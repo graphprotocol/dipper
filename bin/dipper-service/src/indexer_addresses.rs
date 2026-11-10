@@ -151,9 +151,9 @@ fn is_public(ip: IpAddr) -> bool {
     }
 }
 
-/// IPv4 ranges that are not public, from IANA's special-purpose address registry, each as its
-/// first address and the number of leading bits every address in it shares with that one.
-const NOT_PUBLIC_V4: [(Ipv4Addr, u32); 14] = [
+/// IPv4 ranges that are not public, from IANA's special-purpose address registry plus 1 cloud
+/// address, each as its first address and the number of leading bits every address in it shares.
+const NOT_PUBLIC_V4: [(Ipv4Addr, u32); 15] = [
     // "This network".
     (Ipv4Addr::new(0, 0, 0, 0), 8),
     // Private networks.
@@ -162,6 +162,9 @@ const NOT_PUBLIC_V4: [(Ipv4Addr, u32); 14] = [
     (Ipv4Addr::new(100, 64, 0, 0), 10),
     // The machine itself.
     (Ipv4Addr::new(127, 0, 0, 0), 8),
+    // Azure's host endpoint for health probes, name lookups and its machine agent. It lies in
+    // public space, but every Azure machine reaches it inside Azure.
+    (Ipv4Addr::new(168, 63, 129, 16), 32),
     // A single network link, home to the cloud metadata service at 169.254.169.254.
     (Ipv4Addr::new(169, 254, 0, 0), 16),
     // Private networks.
@@ -259,6 +262,8 @@ mod tests {
             "127.255.255.255",
             // The metadata service of AWS, Google Cloud and Azure.
             "169.254.169.254",
+            // Azure's own host endpoint.
+            "168.63.129.16",
             "172.16.0.0",
             "172.31.255.255",
             "192.0.0.1",
@@ -305,6 +310,8 @@ mod tests {
             "100.128.0.0",
             "126.255.255.255",
             "128.0.0.0",
+            "168.63.129.15",
+            "168.63.129.17",
             "169.253.255.255",
             "169.255.0.0",
             "172.15.255.255",
