@@ -26,8 +26,10 @@ use crate::{
     registry::{DipsInfoChecks, DipsInfoRegistry},
 };
 
-/// The longest `/dips/info` reply that is read. A real one is a few hundred bytes.
-const DIPS_INFO_REPLY_LIMIT_BYTES: usize = 1024 * 1024;
+/// The longest `/dips/info` reply that is read. A real one is about 55 bytes for each network the
+/// indexer prices, so this fits over 1,000 networks. It is kept that close because parsing a
+/// reply can take about 16 times its length in memory, and several are read at once.
+const DIPS_INFO_REPLY_LIMIT_BYTES: usize = 64 * 1024;
 
 /// Handle for controlling the DIPs info watcher's lifecycle.
 #[derive(Clone)]
@@ -702,6 +704,47 @@ mod tests {
 
         //* Then
         let why = answer.expect_err("a reply over the limit must not be read");
+        assert!(why.contains("longer than the limit"), "{why}");
+    }
+
+    #[tokio::test]
+    async fn the_dips_info_limit_fits_a_real_reply_and_little_more() {
+        //* Given the reply of an indexer that prices 200 networks, more than any does
+        let prices: Vec<String> = (0..200)
+            .map(|n| format!(r#""network-number-{n}": "450.5""#))
+            .collect();
+        let networks: Vec<String> = (0..200)
+            .map(|n| format!(r#""network-number-{n}""#))
+            .collect();
+        let real = format!(
+            r#"{{"pricing": {{"min_grt_per_30_days": {{{}}}, "min_grt_per_billion_entities_per_30_days": "2000"}}, "supported_networks": [{}]}}"#,
+            prices.join(", "),
+            networks.join(", ")
+        );
+        //* And a readable reply 16 times as long
+        let padded = format!(r#"{{"note": "{}"}}"#, "x".repeat(16 * real.len()));
+        let honest = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/dips/info"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(real))
+            .mount(&honest)
+            .await;
+        let bloated = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/dips/info"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(padded))
+            .mount(&bloated)
+            .await;
+        let url = |server: &MockServer| format!("{}/", server.uri()).parse().unwrap();
+        let client = reqwest::Client::new();
+
+        //* When
+        let real_answer = ask_dips_info(&client, &url(&honest)).await;
+        let padded_answer = ask_dips_info(&client, &url(&bloated)).await;
+
+        //* Then
+        assert_eq!(real_answer, Ok(()));
+        let why = padded_answer.expect_err("a reply 16 times a large real one must not be read");
         assert!(why.contains("longer than the limit"), "{why}");
     }
 
