@@ -992,17 +992,16 @@ where
             let reason = format!("{err:#}");
             failing.extend(set_aside.iter().map(|c| (c.agreement_id, reason.clone())));
         }
-        Ok((snapshots, mut agreements)) => {
+        Ok((read, mut agreements)) => {
             for change in &set_aside {
                 if rx_stop.try_recv().is_ok() {
                     stopped = true;
                     break;
                 }
-                let snapshot = snapshots.get(&change.agreement_id);
                 let agreement = agreements.remove(&change.agreement_id);
                 match apply_set_aside_change(
                     change,
-                    snapshot,
+                    read.state_of(change),
                     agreement,
                     registry,
                     chain_client,
@@ -1025,6 +1024,41 @@ where
     stopped
 }
 
+/// What a read of the subgraph showed for the set-aside agreements, and the block it was read at.
+struct SetAsideRead {
+    snapshots: std::collections::HashMap<IndexingAgreementId, AgreementStateSnapshot>,
+    unreadable: std::collections::HashSet<IndexingAgreementId>,
+    block: u64,
+}
+
+/// What the subgraph showed for 1 set-aside agreement.
+enum SetAsideState<'a> {
+    /// The subgraph hadn't yet indexed the block of the change, so it can't show it.
+    Behind { indexed: u64 },
+    /// The agreement's state came back in a form that couldn't be read.
+    Unreadable,
+    /// The subgraph, indexed past the change, has no state for the agreement.
+    Gone,
+    /// The agreement's state as the subgraph, indexed past the change, has it.
+    Readable(&'a AgreementStateSnapshot),
+}
+
+impl SetAsideRead {
+    fn state_of(&self, change: &SetAsideChange) -> SetAsideState<'_> {
+        if self.block < change.block {
+            SetAsideState::Behind {
+                indexed: self.block,
+            }
+        } else if let Some(snapshot) = self.snapshots.get(&change.agreement_id) {
+            SetAsideState::Readable(snapshot)
+        } else if self.unreadable.contains(&change.agreement_id) {
+            SetAsideState::Unreadable
+        } else {
+            SetAsideState::Gone
+        }
+    }
+}
+
 /// Read each set-aside agreement's current state from the subgraph and its row from the
 /// registry, by agreement. Either failing leaves every change to try again.
 async fn read_set_aside<R, E>(
@@ -1032,7 +1066,7 @@ async fn read_set_aside<R, E>(
     event_source: &E,
     set_aside: &[SetAsideChange],
 ) -> anyhow::Result<(
-    std::collections::HashMap<IndexingAgreementId, AgreementStateSnapshot>,
+    SetAsideRead,
     std::collections::HashMap<IndexingAgreementId, IndexingAgreement>,
 )>
 where
@@ -1040,7 +1074,7 @@ where
     E: ChainEventSource,
 {
     let ids: Vec<IndexingAgreementId> = set_aside.iter().map(|c| c.agreement_id).collect();
-    let snapshots = event_source
+    let found = event_source
         .get_agreement_snapshots(&ids)
         .await
         .context("failed to read their current state from the subgraph")?;
@@ -1048,18 +1082,25 @@ where
         .get_indexing_agreements_by_ids(&ids)
         .await
         .context("failed to read the agreements from the database")?;
-    let snapshots = snapshots
-        .into_iter()
-        .map(|snapshot| (snapshot.agreement_id, snapshot))
-        .collect();
-    Ok((snapshots, agreements))
+    let read = SetAsideRead {
+        snapshots: found
+            .snapshots
+            .into_iter()
+            .map(|snapshot| (snapshot.agreement_id, snapshot))
+            .collect(),
+        unreadable: found.unreadable.into_iter().collect(),
+        block: found.block,
+    };
+    Ok((read, agreements))
 }
 
-/// Apply the current state of 1 agreement whose change was set aside, with the same steps as a
-/// page. Ok once it applied or there was nothing to apply.
+/// Apply the current state of 1 agreement whose change was set aside, once the subgraph has
+/// indexed past the change: what it shows then is the chain as it is, even if a reorg or a change
+/// of the payer address took the change away. Ok once the state applied, there was nothing to
+/// apply, or the subgraph has no state for the agreement.
 async fn apply_set_aside_change<R, T, W>(
     change: &SetAsideChange,
-    snapshot: Option<&AgreementStateSnapshot>,
+    state: SetAsideState<'_>,
     agreement: Option<IndexingAgreement>,
     registry: &R,
     chain_client: &T,
@@ -1071,16 +1112,52 @@ where
     T: ChainClient + Sync,
     W: WorkerQueue + Sync,
 {
-    let snapshot = snapshot.context("the subgraph returned no readable state for the agreement")?;
-    // A state from before the change, such as from a subgraph behind the one the change was read
-    // from, would show nothing to apply, and the change would be dropped.
-    if snapshot.last_state_change_block < change.block {
-        anyhow::bail!(
-            "the subgraph's state for the agreement is from block {}, before its change at {}",
-            snapshot.last_state_change_block,
+    let snapshot = match state {
+        SetAsideState::Behind { indexed } => anyhow::bail!(
+            "the subgraph has indexed up to block {indexed}, before the change at {}",
             change.block
-        );
+        ),
+        SetAsideState::Unreadable => {
+            anyhow::bail!(
+                "the subgraph returned the agreement's state in a form that can't be read"
+            )
+        }
+        SetAsideState::Gone => {
+            warn_set_aside_change_gone(change, None);
+            return Ok(());
+        }
+        SetAsideState::Readable(snapshot) => snapshot,
+    };
+    apply_snapshot(
+        snapshot,
+        agreement,
+        registry,
+        chain_client,
+        live_checks,
+        config,
+    )
+    .await?;
+    // Warned only once the state applied, as the change then leaves the record.
+    if snapshot.last_state_change_block < change.block {
+        warn_set_aside_change_gone(change, Some(snapshot.last_state_change_block));
     }
+    Ok(())
+}
+
+/// Apply 1 agreement's state with the same steps as a page, on its own.
+async fn apply_snapshot<R, T, W>(
+    snapshot: &AgreementStateSnapshot,
+    agreement: Option<IndexingAgreement>,
+    registry: &R,
+    chain_client: &T,
+    live_checks: &mut LiveChecks<W>,
+    config: &crate::config::IndexingAgreementConfig,
+) -> anyhow::Result<()>
+where
+    R: AgreementRegistry + PendingCancellationRegistry + Sync,
+    T: ChainClient + Sync,
+    W: WorkerQueue + Sync,
+{
     let Some(prep) = prepare_reconciliation(snapshot, agreement, registry, live_checks).await?
     else {
         return Ok(());
@@ -1104,6 +1181,20 @@ where
         );
     }
     Ok(())
+}
+
+/// Warn that a set-aside change is no longer on the chain as the subgraph, indexed past it, has
+/// it, so it's no longer tried: the agreement's latest change there is older, or there is none.
+fn warn_set_aside_change_gone(change: &SetAsideChange, latest_change_block: Option<u64>) {
+    tracing::warn!(
+        event = "chain_listener_set_aside_change_gone",
+        agreement_id = %change.agreement_id,
+        change_block = change.block,
+        latest_change_block = ?latest_change_block,
+        "On-chain change set aside at this block is no longer on the chain as the subgraph has it, \
+         as after a reorg or a change of payer address; recorded the agreement as the subgraph has \
+         it now, if at all, and no longer trying the change"
+    );
 }
 
 /// Remove from the record the set-aside changes that applied or had nothing left to apply.
@@ -4384,9 +4475,11 @@ mod tests {
         async fn get_agreement_snapshots(
             &self,
             _agreement_ids: &[IndexingAgreementId],
-        ) -> Result<Vec<AgreementStateSnapshot>, super::super::chain_events::ChainEventError>
-        {
-            Ok(vec![])
+        ) -> Result<
+            super::super::chain_events::AgreementSnapshots,
+            super::super::chain_events::ChainEventError,
+        > {
+            Ok(super::super::chain_events::AgreementSnapshots::default())
         }
     }
 
@@ -5249,6 +5342,7 @@ mod tests {
     async fn test_retry_applies_set_aside_changes_1_at_a_time() {
         let registry = MockRegistry::new();
         let event_source = super::super::chain_events::mock::MockEventSource::new();
+        event_source.set_latest_block(100);
         let applies = IndexingAgreementId::from_bytes([1; 16]);
         let fails = IndexingAgreementId::from_bytes([2; 16]);
         for id in [applies, fails] {
@@ -5275,35 +5369,128 @@ mod tests {
         );
     }
 
-    /// A state from before the change, as a subgraph behind the one it was read from reports,
-    /// shows nothing to apply; the change stays recorded until the subgraph reaches it.
+    /// A subgraph that hasn't yet indexed the block of a set-aside change, such as one behind the
+    /// subgraph the change was read from, shows the agreement as it was before the change, or not
+    /// at all. Either way the change stays recorded until the subgraph reaches it.
     #[tokio::test]
-    async fn test_retry_keeps_a_set_aside_change_until_the_subgraph_reaches_it() {
+    async fn test_retry_keeps_a_set_aside_change_while_the_subgraph_is_behind_it() {
+        for before_the_accept in [false, true] {
+            let registry = MockRegistry::new();
+            let event_source = super::super::chain_events::mock::MockEventSource::new();
+            event_source.set_latest_block(99);
+            let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+            registry.add_agreement(agreement_id, IndexingAgreementStatus::Created);
+            if before_the_accept {
+                let mut snapshot =
+                    make_snapshot(agreement_id, AgreementState::NotAccepted, Address::ZERO);
+                snapshot.last_state_change_block = 90;
+                event_source.add_snapshots(vec![snapshot]);
+            }
+            set_aside_at(&registry, agreement_id, 100).await;
+            let mut warning = SetAsideWarning::default();
+
+            retry_set_aside(&registry, &event_source, &mut warning).await;
+
+            assert!(!registry.was_marked_accepted_on_chain(&agreement_id));
+            assert_eq!(
+                registry.set_aside().len(),
+                1,
+                "still recorded, the subgraph showing the state before the accept: {before_the_accept}"
+            );
+
+            event_source.set_latest_block(100);
+            event_source.add_snapshots(vec![make_snapshot(
+                agreement_id,
+                AgreementState::Accepted,
+                Address::ZERO,
+            )]);
+            retry_set_aside(&registry, &event_source, &mut warning).await;
+
+            assert!(registry.was_marked_accepted_on_chain(&agreement_id));
+            assert!(registry.set_aside().is_empty());
+        }
+    }
+
+    /// Once the subgraph has indexed past a set-aside change, what it shows is the chain as it
+    /// is. A state older than the change, as when a reorg dropped the change, is applied, and the
+    /// change is no longer tried, with a warning saying so.
+    #[tokio::test]
+    async fn test_retry_applies_an_older_state_once_the_subgraph_is_past_the_change() {
         let registry = MockRegistry::new();
         let event_source = super::super::chain_events::mock::MockEventSource::new();
+        event_source.set_latest_block(200);
         let agreement_id = IndexingAgreementId::from_bytes(rand::random());
         registry.add_agreement(agreement_id, IndexingAgreementStatus::Created);
-        let mut before_the_accept =
-            make_snapshot(agreement_id, AgreementState::NotAccepted, Address::ZERO);
-        before_the_accept.last_state_change_block = 90;
-        event_source.add_snapshots(vec![before_the_accept]);
+        let mut accepted_earlier =
+            make_snapshot(agreement_id, AgreementState::Accepted, Address::ZERO);
+        accepted_earlier.last_state_change_block = 90;
+        event_source.add_snapshots(vec![accepted_earlier]);
         set_aside_at(&registry, agreement_id, 100).await;
-        let mut warning = SetAsideWarning::default();
 
-        retry_set_aside(&registry, &event_source, &mut warning).await;
+        let logged = crate::test_support::logged(retry_set_aside(
+            &registry,
+            &event_source,
+            &mut SetAsideWarning::default(),
+        ))
+        .await;
+
+        assert!(registry.was_marked_accepted_on_chain(&agreement_id));
+        assert!(registry.set_aside().is_empty());
+        let warned = logged
+            .lines()
+            .find(|line| line.contains(r#"event="chain_listener_set_aside_change_gone""#))
+            .expect("the change dropping out is logged");
+        assert!(warned.contains("WARN"), "{warned}");
+    }
+
+    /// An agreement the subgraph has no state for at all, once it has indexed past the change,
+    /// as after a reorg or a change of the payer address, is no longer tried, with a warning.
+    #[tokio::test]
+    async fn test_retry_forgets_a_set_aside_change_the_subgraph_past_it_has_no_state_for() {
+        let registry = MockRegistry::new();
+        let event_source = super::super::chain_events::mock::MockEventSource::new();
+        event_source.set_latest_block(200);
+        let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+        registry.add_agreement(agreement_id, IndexingAgreementStatus::Created);
+        set_aside_at(&registry, agreement_id, 100).await;
+
+        let logged = crate::test_support::logged(retry_set_aside(
+            &registry,
+            &event_source,
+            &mut SetAsideWarning::default(),
+        ))
+        .await;
 
         assert!(!registry.was_marked_accepted_on_chain(&agreement_id));
-        assert_eq!(registry.set_aside().len(), 1, "still recorded");
+        assert!(registry.set_aside().is_empty());
+        let warned = logged
+            .lines()
+            .find(|line| line.contains(r#"event="chain_listener_set_aside_change_gone""#))
+            .expect("the change dropping out is logged");
+        assert!(warned.contains("WARN"), "{warned}");
+    }
 
+    /// A state the subgraph returns in a form that can't be read says nothing about the
+    /// agreement, so its change stays recorded however far the subgraph has indexed.
+    #[tokio::test]
+    async fn test_retry_keeps_a_set_aside_change_whose_state_cannot_be_read() {
+        let registry = MockRegistry::new();
+        let event_source = super::super::chain_events::mock::MockEventSource::new();
+        event_source.set_latest_block(200);
+        let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+        registry.add_agreement(agreement_id, IndexingAgreementStatus::Created);
         event_source.add_snapshots(vec![make_snapshot(
             agreement_id,
             AgreementState::Accepted,
             Address::ZERO,
         )]);
-        retry_set_aside(&registry, &event_source, &mut warning).await;
+        event_source.set_unreadable(vec![agreement_id]);
+        set_aside_at(&registry, agreement_id, 100).await;
 
-        assert!(registry.was_marked_accepted_on_chain(&agreement_id));
-        assert!(registry.set_aside().is_empty());
+        retry_set_aside(&registry, &event_source, &mut SetAsideWarning::default()).await;
+
+        assert!(!registry.was_marked_accepted_on_chain(&agreement_id));
+        assert_eq!(registry.set_aside().len(), 1, "still recorded");
     }
 
     /// The retry runs every poll, so changes that keep failing are warned about once, not on
