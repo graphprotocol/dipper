@@ -1,9 +1,9 @@
 # The functions, events and errors of the contracts dipper calls, as compiled from
 # graphprotocol/contracts at f0bd90ae3726dbb013846a1791bcb669f0e22992.
 # Written by scripts/snapshot-contract-interfaces.py: do not edit it by hand.
-# The declarations in abi.rs are tested against it.
+# The declarations in the chain client are tested against it.
 
-[IRecurringCollector]
+[RecurringCollector]
 error AuthorizableInvalidSignerProof()
 error AuthorizableInvalidSignerProofDeadline(uint256 proofDeadline, uint256 currentTimestamp)
 error AuthorizableSignerAlreadyAuthorized(address authorizer, address signer, bool revoked)
@@ -95,7 +95,7 @@ function thawSigner(address signer)
 function unpause()
 function update((bytes16 agreementId, uint64 deadline, uint64 endsAt, uint256 maxInitialTokens, uint256 maxOngoingTokensPerSecond, uint32 minSecondsPerCollection, uint32 maxSecondsPerCollection, uint16 conditions, uint32 nonce, bytes metadata) rcau, bytes signature)
 
-[IRecurringAgreementManager]
+[RecurringAgreementManager]
 error AccessControlBadConfirmation()
 error AccessControlUnauthorizedAccount(address account, bytes32 neededRole)
 error AgreementIdZero()

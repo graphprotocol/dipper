@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Write the snapshot of the contracts' interfaces that dipper's own declarations are tested against.
 
-Dipper declares the contract functions, events and errors it uses by hand, in
-bin/dipper-service/src/chain_client/abi.rs. A test there compares each declaration with the
+Dipper declares the contract functions, events and errors it uses by hand, most of them in
+bin/dipper-service/src/chain_client/abi.rs. Tests there compare each declaration with the
 snapshot this script writes, so a declaration that has drifted from the contracts fails the build.
 
 Run it from the root of this repo, giving it a graphprotocol/contracts checkout with its
@@ -26,8 +26,8 @@ SNAPSHOT = pathlib.Path("bin/dipper-service/src/chain_client/contract_interfaces
 # Each contract dipper calls: the package that holds it, and what to compile it from. An interface
 # is listed beside its implementation because only the interface names every parameter.
 SECTIONS = {
-    "IRecurringCollector": ("horizon", ["IRecurringCollector", "RecurringCollector"]),
-    "IRecurringAgreementManager": (
+    "RecurringCollector": ("horizon", ["IRecurringCollector", "RecurringCollector"]),
+    "RecurringAgreementManager": (
         "issuance",
         [
             "IRecurringAgreementManagement",
@@ -125,7 +125,7 @@ def main():
         "# The functions, events and errors of the contracts dipper calls, as compiled from",
         f"# graphprotocol/contracts at {commit}.",
         "# Written by scripts/snapshot-contract-interfaces.py: do not edit it by hand.",
-        "# The declarations in abi.rs are tested against it.",
+        "# The declarations in the chain client are tested against it.",
     ]
     with tempfile.TemporaryDirectory() as scratch:
         built = {}

@@ -1,9 +1,9 @@
 //! Contract ABI definitions for on-chain interactions.
 //!
-//! These are written by hand, as the subset of each contract dipper uses. A test below compares
-//! every declaration with `contract_interfaces.txt`, a snapshot of the contracts' own interfaces
-//! written by `scripts/snapshot-contract-interfaces.py`, so one that has drifted from the
-//! contracts fails the build. After the contracts change, write the snapshot again.
+//! These are written by hand, as the subset of each contract dipper uses. The tests below
+//! compare every declaration with `contract_interfaces.txt`, a snapshot of the contracts' own
+//! interfaces written by `scripts/snapshot-contract-interfaces.py`, so one that has drifted from
+//! the contracts fails the build. After the contracts change, write the snapshot again.
 
 use thegraph_core::alloy::{sol, sol_types::SolInterface};
 
@@ -12,6 +12,7 @@ sol! {
     /// needs). Full contract: `RecurringCollector.sol` in `graphprotocol/contracts`.
     #[allow(missing_docs)]
     #[derive(Debug)]
+    #[sol(abi)]
     interface IRecurringCollector {
         /// Agreement details returned from `offer()`. `state` is a bitmask of the
         /// flags in `IAgreementCollector.sol` (REGISTERED=1 through UPDATE=128;
@@ -106,6 +107,7 @@ sol! {
     /// unsigned operator while the manager funds escrow.
     #[allow(missing_docs)]
     #[derive(Debug)]
+    #[sol(abi)]
     interface IRecurringAgreementManager {
         /// Offer an agreement through the manager. `offerType` mirrors
         /// `RecurringCollector` (1 = OFFER_TYPE_NEW); `offerData` is the
@@ -215,20 +217,22 @@ pub(crate) fn decode_revert_reason(selector: [u8; 4], data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use dipper_rpc::indexer::indexer_client::sol::RecurringCollectionAgreement;
+    use thegraph_core::alloy::{
+        json_abi::{JsonAbi, Param, StateMutability},
+        sol_types::{SolError, SolStruct},
+    };
 
-    use thegraph_core::alloy::sol_types::SolError;
-
-    use super::*;
+    use super::{super::manager_role::IAccessControl, *};
 
     /// The contracts' own interfaces, written by `scripts/snapshot-contract-interfaces.py`.
     const CONTRACT_INTERFACES: &str = include_str!("contract_interfaces.txt");
 
-    /// The lines the snapshot lists under `[interface]`.
-    fn in_the_contracts(interface: &str) -> Vec<&'static str> {
+    /// The lines the snapshot lists for `contract`.
+    fn in_the_contracts(contract: &str) -> Vec<&'static str> {
         let (_, section) = CONTRACT_INTERFACES
-            .split_once(&format!("[{interface}]\n"))
-            .expect("the snapshot has a section for the interface");
+            .split_once(&format!("[{contract}]\n"))
+            .expect("the snapshot has a section for the contract");
         section
             .lines()
             .take_while(|line| !line.starts_with('['))
@@ -236,150 +240,151 @@ mod tests {
             .collect()
     }
 
-    /// What this file declares between the braces of `interface {name} { ... }`, without its
-    /// comments and attributes.
-    fn interface_body(name: &str) -> String {
-        let code = include_str!("abi.rs")
-            .lines()
-            .map(|line| line.split("//").next().unwrap_or_default())
-            .filter(|line| !line.trim_start().starts_with("#["))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let start = code
-            .find(&format!("interface {name} {{"))
-            .expect("the interface is declared");
-        let open = start + code[start..].find('{').unwrap();
-        let mut depth = 0;
-        for (offset, character) in code[open..].char_indices() {
-            match character {
-                '{' => depth += 1,
-                '}' => depth -= 1,
-                _ => {}
-            }
-            if depth == 0 {
-                return code[open + 1..open + offset].to_string();
-            }
-        }
-        panic!("interface {name} is never closed");
+    /// Each interface the chain client declares by hand: its name, the contract it is a part
+    /// of, and its declarations as the `sol!` macro read them.
+    fn declared_by_hand() -> [(&'static str, &'static str, JsonAbi); 3] {
+        [
+            (
+                "IRecurringCollector",
+                "RecurringCollector",
+                IRecurringCollector::abi::contract(),
+            ),
+            (
+                "IRecurringAgreementManager",
+                "RecurringAgreementManager",
+                IRecurringAgreementManager::abi::contract(),
+            ),
+            (
+                "IAccessControl",
+                "RecurringAgreementManager",
+                IAccessControl::abi::contract(),
+            ),
+        ]
     }
 
-    /// The statements of an interface body, each on 1 line: a `struct` with its braces, and a
-    /// function, event or error up to its `;`.
-    fn statements(body: &str) -> Vec<String> {
-        let mut statements = Vec::new();
-        let (mut statement, mut depth) = (String::new(), 0);
-        for character in body.chars() {
-            statement.push(character);
-            match character {
-                '{' => depth += 1,
-                '}' => depth -= 1,
-                _ => {}
-            }
-            if depth == 0 && matches!(character, ';' | '}') {
-                let words: Vec<_> = statement.split_whitespace().collect();
-                statements.push(words.join(" "));
-                statement.clear();
-            }
-        }
-        assert!(statement.trim().is_empty(), "unfinished: {statement}");
-        statements
-    }
-
-    /// Each `struct` among `statements` by name, as the tuple of its fields the snapshot writes
-    /// in its place, such as `(uint256 balance, uint256 tokensThawing)`.
-    fn structs(statements: &[String]) -> HashMap<&str, String> {
-        statements
+    /// A type the way the snapshot writes it: a struct as the tuple of its fields.
+    fn kind(kind: &str, fields: &[Param]) -> String {
+        let Some(array) = kind.strip_prefix("tuple") else {
+            return kind.to_string();
+        };
+        let fields: Vec<_> = fields
             .iter()
-            .filter_map(|statement| statement.strip_prefix("struct "))
-            .map(|declared| {
-                let (name, fields) = declared.split_once('{').unwrap();
-                let fields: Vec<_> = fields
-                    .trim_end_matches('}')
-                    .split(';')
-                    .map(str::trim)
-                    .filter(|field| !field.is_empty())
-                    .collect();
-                (name.trim(), format!("({})", fields.join(", ")))
+            .map(|field| {
+                format!(
+                    "{} {}",
+                    self::kind(&field.ty, &field.components),
+                    field.name
+                )
             })
-            .collect()
+            .collect();
+        format!("({}){array}", fields.join(", "))
     }
 
-    /// A parameter list the way the snapshot writes it: no `calldata` or `memory`, and a struct
-    /// as the tuple of its fields.
-    fn parameters(list: &str, structs: &HashMap<&str, String>) -> String {
-        let parameters = list.split(',').map(str::trim).filter(|p| !p.is_empty());
+    /// A parameter list the way the snapshot writes it: each parameter's type, then its name
+    /// where it has one.
+    fn parameters(parameters: &[Param]) -> String {
         let written: Vec<_> = parameters
+            .iter()
             .map(|parameter| {
-                let mut words = parameter
-                    .split_whitespace()
-                    .filter(|word| !matches!(*word, "calldata" | "memory"));
-                let kind = words.next().unwrap();
-                let (base, array) = kind.split_at(kind.find('[').unwrap_or(kind.len()));
-                let kind = structs.get(base).map_or(base, String::as_str);
-                let rest: String = words.map(|word| format!(" {word}")).collect();
-                format!("{kind}{array}{rest}")
+                let kind = kind(&parameter.ty, &parameter.components);
+                format!("{kind} {}", parameter.name).trim().to_string()
             })
             .collect();
         written.join(", ")
     }
 
-    /// A function, event or error statement the way the snapshot writes it.
-    fn declaration(statement: &str, structs: &HashMap<&str, String>) -> String {
-        let (head, rest) = statement.split_once('(').unwrap();
-        let (inputs, tail) = rest.split_once(')').unwrap();
-        let mut written = format!("{}({})", head.trim(), parameters(inputs, structs));
-        for word in ["view", "pure"] {
-            if tail.split_whitespace().any(|found| found == word) {
-                written += &format!(" {word}");
+    /// Every function, event and error of an interface, the way the snapshot writes them.
+    fn declarations(interface: &JsonAbi) -> Vec<String> {
+        let functions = interface.functions().map(|function| {
+            let mut written = format!(
+                "function {}({})",
+                function.name,
+                parameters(&function.inputs)
+            );
+            written += match function.state_mutability {
+                StateMutability::View => " view",
+                StateMutability::Pure => " pure",
+                _ => "",
+            };
+            if !function.outputs.is_empty() {
+                written += &format!(" returns ({})", parameters(&function.outputs));
             }
-        }
-        if let Some((_, outputs)) = tail.split_once("returns") {
-            let outputs = outputs.trim().trim_start_matches('(');
-            let outputs = outputs.trim_end_matches(';').trim().trim_end_matches(')');
-            written += &format!(" returns ({})", parameters(outputs, structs));
-        }
-        written
+            written
+        });
+        let events = interface.events().map(|event| {
+            let inputs: Vec<_> = event
+                .inputs
+                .iter()
+                .map(|input| {
+                    let indexed = if input.indexed { " indexed" } else { "" };
+                    let kind = kind(&input.ty, &input.components);
+                    format!("{kind}{indexed} {}", input.name).trim().to_string()
+                })
+                .collect();
+            format!("event {}({})", event.name, inputs.join(", "))
+        });
+        let errors = interface
+            .errors()
+            .map(|error| format!("error {}({})", error.name, parameters(&error.inputs)));
+        functions.chain(events).chain(errors).collect()
     }
 
-    /// Every function, event and error this file declares in `interface`, the way the snapshot
-    /// writes them. Panics on a statement that is none of those, so nothing is passed over.
-    fn declared_here(interface: &str) -> Vec<String> {
-        let statements = statements(&interface_body(interface));
-        let structs = structs(&statements);
-        statements
-            .iter()
-            .filter(|statement| !statement.starts_with("struct "))
-            .map(|statement| {
-                let known = ["function ", "event ", "error "];
-                assert!(
-                    known.iter().any(|kind| statement.starts_with(kind)),
-                    "neither a function, an event nor an error: {statement}"
-                );
-                declaration(statement, &structs)
-            })
-            .collect()
-    }
-
-    /// Every function, event and error declared above exists in the contracts exactly as
+    /// Every function, event and error declared by hand exists in the contracts exactly as
     /// declared: its name, each parameter's type and name, which event parameters are indexed,
     /// whether it only reads, and what it returns.
     #[test]
     fn every_declaration_matches_the_contracts() {
-        for interface in ["IRecurringCollector", "IRecurringAgreementManager"] {
-            let in_the_contracts = in_the_contracts(interface);
-            let declared_here = declared_here(interface);
-            assert!(!declared_here.is_empty(), "{interface} declares nothing");
+        for (interface, contract, declared) in declared_by_hand() {
+            let in_the_contracts = in_the_contracts(contract);
+            let declarations = declarations(&declared);
+            assert!(!declarations.is_empty(), "{interface} declares nothing");
 
-            let drifted: Vec<_> = declared_here
+            let drifted: Vec<_> = declarations
                 .iter()
                 .filter(|declared| !in_the_contracts.contains(&declared.as_str()))
                 .collect();
 
             assert!(
                 drifted.is_empty(),
-                "{interface} declares what the contracts do not have: {drifted:#?}"
+                "{interface} declares what {contract} does not have: {drifted:#?}"
             );
         }
+    }
+
+    /// The check above only covers the interfaces it lists, so a new one has to be added to it.
+    #[test]
+    fn no_interface_declared_by_hand_is_left_unchecked() {
+        let interfaces = [include_str!("abi.rs"), include_str!("manager_role.rs")]
+            .iter()
+            .flat_map(|source| source.lines())
+            .filter(|line| line.trim_start().starts_with("interface "))
+            .count();
+
+        assert_eq!(
+            interfaces,
+            declared_by_hand().len(),
+            "an interface in the chain client is missing from `declared_by_hand`"
+        );
+    }
+
+    /// The agreement dipper signs and posts is declared by hand too, in `dipper-rpc`. Its fields
+    /// are those the collector's `accept` takes, in the same order.
+    #[test]
+    fn the_agreement_matches_the_contracts() {
+        let declared = RecurringCollectionAgreement::eip712_root_type();
+        let fields = declared
+            .strip_prefix("RecurringCollectionAgreement(")
+            .and_then(|fields| fields.strip_suffix(')'))
+            .expect("the type is written as its name, then its fields in brackets")
+            .replace(',', ", ");
+        let accept = format!(
+            "function accept(({fields}) rca, bytes signature) returns (bytes16 agreementId)"
+        );
+
+        assert!(
+            in_the_contracts("RecurringCollector").contains(&accept.as_str()),
+            "the collector has no `{accept}`"
+        );
     }
 
     #[test]
