@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.10](https://github.com/graphprotocol/dipper/compare/v0.2.9...v0.2.10) (2026-11-10)
+
+
+### Fixed
+
+* reconnect to Kafka after the brokers are replaced ([#794](https://github.com/graphprotocol/dipper/issues/794)) ([571cc9f](https://github.com/graphprotocol/dipper/commit/571cc9f8f6ce7de98f3e5637a9ec3f4e3eb2437a))
+
+
+### Documentation
+
+* ask fixes to remove the cause of a failure ([#793](https://github.com/graphprotocol/dipper/issues/793)) ([f365f06](https://github.com/graphprotocol/dipper/commit/f365f064e6ac4c3e8638910738af5e43e98a1369))
+
 ## [0.2.9](https://github.com/graphprotocol/dipper/compare/v0.2.8...v0.2.9) (2026-11-09)
 
 
