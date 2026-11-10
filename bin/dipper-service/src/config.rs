@@ -211,10 +211,11 @@ impl Config {
                     event: "chain_listener_off",
                 },
                 message: "chain_listener is turned off in its config section: dipper will not \
-                          learn that indexers accepted or cancelled agreements on-chain, so an \
-                          accepted offer stays pending and is never expired either, since expiry \
-                          runs on the chain time the listener records; the entity counts used in \
-                          fee estimates are not fetched"
+                          learn that indexers accepted or cancelled agreements on-chain, and as \
+                          expiry runs on the chain time the listener records, no offer expires, \
+                          accepted or not, so a request whose offer goes unanswered never gets a \
+                          replacement indexer; the entity counts used in fee estimates are not \
+                          fetched either"
                     .to_string(),
             });
         }
@@ -322,8 +323,7 @@ enum Switch {
 }
 
 /// What to add to the config to run the chain listener.
-const RUN_CHAIN_LISTENER: &str =
-    r#""chain_listener": {"subgraph_endpoint": "<URL of the indexing-payments subgraph>"}"#;
+const RUN_CHAIN_LISTENER: &str = r#""chain_listener": {"subgraph_endpoint": "<URL of the indexing-payments subgraph, usually the same as indexer_urls.subgraph_endpoint>"}"#;
 
 /// What to add to the config to run without the chain listener.
 const SKIP_CHAIN_LISTENER: &str = r#""chain_listener": {"enabled": false}"#;
@@ -2927,7 +2927,11 @@ mod tests {
 
         assert!(config.validate_chain_listener().is_ok());
         let listener = config.chain_listener.as_ref().expect("the example has one");
-        assert!(listener.running_endpoint().is_some(), "the listener runs");
+        assert_eq!(
+            listener.running_endpoint(),
+            Some(&config.indexer_urls.subgraph_endpoint),
+            "the listener runs, on the subgraph the startup error says it usually shares"
+        );
         assert_eq!(
             services_off(&config),
             [
@@ -2956,6 +2960,10 @@ mod tests {
         assert!(
             err.contains(r#""chain_listener": {"enabled": false}"#),
             "the error says what to add to run without it: {err}"
+        );
+        assert!(
+            err.contains("indexer_urls.subgraph_endpoint"),
+            "the error says where the subgraph's URL usually is already: {err}"
         );
     }
 
@@ -3009,11 +3017,17 @@ mod tests {
                 event: "chain_listener_off"
             }
         );
-        assert!(
-            reported[0].message.contains("accepted or cancelled"),
-            "the warning says what being off means: {}",
-            reported[0].message
-        );
+        for meaning in [
+            "accepted or cancelled",
+            "no offer expires, accepted or not",
+            "never gets a replacement indexer",
+        ] {
+            assert!(
+                reported[0].message.contains(meaning),
+                "the warning says what being off means: {}",
+                reported[0].message
+            );
+        }
     }
 
     #[test]

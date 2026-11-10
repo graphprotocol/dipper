@@ -547,7 +547,7 @@ pub async fn main() -> anyhow::Result<()> {
         _ => None,
     };
 
-    //- The chain listener service (optional, enabled by config)
+    //- The chain listener service, on unless its config section turns it off
     // Monitors on-chain events for agreement acceptance/cancellation via subgraph
     let chain_listener_handle = match running_chain_listener {
         Some((chain_listener_conf, endpoint)) => {
