@@ -1192,6 +1192,13 @@ mod lifecycle_event_tests {
         offered: usize,
         /// The stored request the job reads its target from.
         request: Option<IndexingRequest>,
+        /// Agreements on the deployment that hold no slot of the request, such as one dipper is
+        /// still cancelling.
+        other_agreements_on_deployment: Vec<IndexingAgreement>,
+        /// Per deployment, the indexers reported as having recently declined it.
+        declined: HashMap<DeploymentId, Vec<IndexerId>>,
+        /// Per deployment, the indexers reported as holding an agreement on it.
+        pending: HashMap<DeploymentId, Vec<IndexerId>>,
     }
 
     #[async_trait]
@@ -1248,21 +1255,26 @@ mod lifecycle_event_tests {
 
     #[async_trait]
     impl crate::registry::StubAgreementRegistry for MockRegistry {
-        // gather_selection_context: all active agreements for the deployment.
+        // gather_selection_context: every agreement on the deployment.
         async fn get_indexing_agreements_by_deployment_id(
             &self,
             _deployment_id: &DeploymentId,
         ) -> RegistryResult<Vec<IndexingAgreement>> {
-            Ok(self.active_agreements.clone())
+            Ok(self
+                .active_agreements
+                .iter()
+                .chain(&self.other_agreements_on_deployment)
+                .cloned()
+                .collect())
         }
-        // gather_selection_context: no pending agreements.
+        // gather_selection_context: pending agreements, none unless a test sets them.
         async fn get_pending_agreement_indexers_by_deployment(
             &self,
             _indexer_ids: &[IndexerId],
         ) -> RegistryResult<HashMap<DeploymentId, Vec<IndexerId>>> {
-            Ok(HashMap::new())
+            Ok(self.pending.clone())
         }
-        // gather_selection_context: no declined indexers.
+        // gather_selection_context: declined indexers, none unless a test sets them.
         async fn get_declined_indexers_by_deployment(
             &self,
             _default_lookback_days: i32,
@@ -1270,7 +1282,7 @@ mod lifecycle_event_tests {
             _transient_lookback_minutes: i32,
             _uncertain_lookback_days: i32,
         ) -> RegistryResult<HashMap<DeploymentId, Vec<IndexerId>>> {
-            Ok(HashMap::new())
+            Ok(self.declined.clone())
         }
         // The handler's current-state baseline for the diff.
         async fn get_active_indexing_agreements_by_indexing_request_id(
@@ -1462,14 +1474,14 @@ mod lifecycle_event_tests {
     /// Returns the assembled `Ctx`. `events` is shared (clone) so the caller can
     /// assert on it after `handle` runs.
     #[allow(clippy::type_complexity)]
-    fn build_ctx(
+    fn build_ctx<I>(
         registry: MockRegistry,
-        iisa: MockIisa,
+        iisa: I,
         queue: MockQueue,
         chain_client: MockChainClient,
         events: CapturingEventsProducer,
         snapshot: indexer_urls::Snapshot,
-    ) -> Ctx<MockRegistry, MockQueue, MockIisa, MockChainClient> {
+    ) -> Ctx<MockRegistry, MockQueue, I, MockChainClient> {
         let network = NetworkProviderService::new(indexer_urls::Handle::for_test(snapshot));
         Ctx {
             signer: Arc::new(test_signer()),
@@ -1537,8 +1549,8 @@ mod lifecycle_event_tests {
     }
 
     /// Run the handler for a request whose stored target is `num_candidates`.
-    async fn run(
-        mut ctx: Ctx<MockRegistry, MockQueue, MockIisa, MockChainClient>,
+    async fn run<I: CandidateSelection>(
+        mut ctx: Ctx<MockRegistry, MockQueue, I, MockChainClient>,
         num_candidates: usize,
     ) -> JobResult<()> {
         let request = stored_request(num_candidates);
@@ -1807,6 +1819,107 @@ mod lifecycle_event_tests {
         assert!(contexts[0].indexer_denylist.is_empty());
         let declined: Vec<_> = contexts[0].declined_indexers.values().flatten().collect();
         assert_eq!(declined, vec![&member, &outsider]);
+    }
+
+    /// IISA is asked only about the deployment being reassessed, yet still gets every indexer
+    /// the reassessment keeps from a new offer there. Each kind of hold-back is added to the
+    /// deployment's declines at a different step, and declines and agreements recorded on 1,000
+    /// other deployments stay out of the request.
+    #[tokio::test]
+    async fn asks_iisa_about_only_the_deployment_it_reassesses() {
+        let member = indexer_id(0x70);
+        let declined_here = indexer_id(0x71);
+        let cancelling = indexer_id(0x72);
+        let stopped_accepting = indexer_id(0x73);
+        let unresponsive = indexer_id(0x74);
+        let declined_elsewhere = indexer_id(0x75);
+        let elsewhere = |n: u32| -> DeploymentId { format!("0x{n:064x}").parse().unwrap() };
+        let mut declined: HashMap<DeploymentId, Vec<IndexerId>> = (1..=1_000)
+            .map(|n| (elsewhere(n), vec![declined_elsewhere]))
+            .collect();
+        declined.insert(deployment(), vec![declined_here]);
+        let mut pending: HashMap<DeploymentId, Vec<IndexerId>> =
+            (1..=1_000).map(|n| (elsewhere(n), vec![member])).collect();
+        pending.insert(deployment(), vec![member]);
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/dips-indexers"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "computed_at": null, "indexers": [] })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/select-indexers"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "deployment_id": deployment().to_string(),
+                    "indexers": [format!("{member:#x}")],
+                })),
+            )
+            .mount(&server)
+            .await;
+        let iisa = dipper_iisa::HttpIisaClient::with_config(
+            server.uri(),
+            dipper_iisa::HttpClientConfig {
+                max_retries: 0,
+                ..Default::default()
+            },
+        );
+        let ctx = build_ctx(
+            MockRegistry {
+                active_agreements: vec![agreement(
+                    member,
+                    IndexingAgreementStatus::AcceptedOnChain,
+                )],
+                other_agreements_on_deployment: vec![agreement(
+                    cancelling,
+                    IndexingAgreementStatus::Cancelling,
+                )],
+                declined,
+                pending,
+                withheld: vec![stopped_accepting],
+                offered: 10,
+                unresponsive: vec![unresponsive],
+                ..Default::default()
+            },
+            iisa,
+            MockQueue::default(),
+            MockChainClient::default(),
+            CapturingEventsProducer::new(),
+            indexer_urls::Snapshot::new(),
+        );
+
+        run(ctx, 1).await.expect("handler ok");
+
+        let requests = server.received_requests().await.unwrap();
+        let selections: Vec<_> = requests
+            .iter()
+            .filter(|request| request.url.path() == "/select-indexers")
+            .collect();
+        assert_eq!(selections.len(), 1, "IISA asked once");
+        let body: serde_json::Value = serde_json::from_slice(&selections[0].body).unwrap();
+        let deployments_in = |field: &str| body[field].as_object().map(serde_json::Map::len);
+        assert_eq!(deployments_in("declined_indexers"), Some(1));
+        assert_eq!(deployments_in("pending_agreements"), Some(1));
+        let hex = |id: IndexerId| format!("{id:#x}");
+        assert_eq!(
+            body["declined_indexers"],
+            serde_json::json!({
+                deployment().to_string(): [
+                    hex(declined_here),
+                    hex(cancelling),
+                    hex(stopped_accepting),
+                    hex(unresponsive),
+                ]
+            })
+        );
+        assert_eq!(
+            body["pending_agreements"],
+            serde_json::json!({ deployment().to_string(): [hex(member)] })
+        );
     }
 
     #[tokio::test]
@@ -2259,6 +2372,7 @@ mod lifecycle_event_tests {
             withheld: Vec::new(),
             offered: 0,
             request: None,
+            ..Default::default()
         };
         let ctx = build_ctx(
             registry,
@@ -2303,6 +2417,7 @@ mod lifecycle_event_tests {
             withheld: Vec::new(),
             offered: 0,
             request: None,
+            ..Default::default()
         };
         let ctx = build_ctx(
             registry,
@@ -2453,6 +2568,7 @@ mod lifecycle_event_tests {
             withheld: Vec::new(),
             offered: 0,
             request: None,
+            ..Default::default()
         };
         let ctx = build_ctx(
             registry,
@@ -2516,6 +2632,7 @@ mod lifecycle_event_tests {
             withheld: Vec::new(),
             offered: 0,
             request: None,
+            ..Default::default()
         };
         let ctx = build_ctx(
             registry,
@@ -2587,6 +2704,7 @@ mod lifecycle_event_tests {
             withheld: Vec::new(),
             offered: 0,
             request: None,
+            ..Default::default()
         };
         let ctx = build_ctx(
             registry,
@@ -2728,6 +2846,7 @@ mod lifecycle_event_tests {
             withheld: Vec::new(),
             offered: 0,
             request: None,
+            ..Default::default()
         };
         let ctx = build_ctx(
             registry,
