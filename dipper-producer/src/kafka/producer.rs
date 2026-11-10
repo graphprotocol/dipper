@@ -294,6 +294,33 @@ pub enum Error {
     },
 }
 
+impl Error {
+    /// Whether the brokers couldn't be reached, as opposed to refusing the request. rskafka retries
+    /// connection failures with no deadline, so an unreachable cluster mostly shows as a timeout.
+    pub fn is_unreachable(&self) -> bool {
+        match self {
+            Self::Timeout => true,
+            Self::Connection(e) | Self::PartitionClient(e) | Self::Send(e) => {
+                !matches!(e, rskafka::client::error::Error::ServerError { .. })
+            }
+            _ => false,
+        }
+    }
+
+    /// A send the broker received and refused.
+    #[cfg(test)]
+    pub(crate) fn refused() -> Self {
+        use rskafka::client::error::{Error as Rskafka, ProtocolError, RequestContext};
+        Self::Send(Rskafka::ServerError {
+            protocol_error: ProtocolError::MessageTooLarge,
+            error_message: None,
+            request: RequestContext::Topic("test".to_string()),
+            response: None,
+            is_virtual: false,
+        })
+    }
+}
+
 /// Supported SASL authentication mechanisms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SaslMechanism {
@@ -415,6 +442,16 @@ mod tests {
             KafkaProducer::new(&config).await,
             Err(Error::InvalidPartitionCount)
         ));
+    }
+
+    #[test]
+    fn timeouts_and_connection_failures_count_as_unreachable_but_refusals_do_not() {
+        use rskafka::client::error::Error as Rskafka;
+        assert!(Error::Timeout.is_unreachable());
+        assert!(Error::Send(Rskafka::InvalidResponse("bad".to_string())).is_unreachable());
+        assert!(Error::Connection(Rskafka::Timeout).is_unreachable());
+        assert!(!Error::refused().is_unreachable());
+        assert!(!Error::InvalidPartitionCount.is_unreachable());
     }
 
     // -------- Test helpers --------
