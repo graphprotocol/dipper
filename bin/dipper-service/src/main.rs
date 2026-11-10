@@ -119,7 +119,10 @@ pub async fn main() -> anyhow::Result<()> {
     if let Err(err) = conf.validate_chain_listener() {
         anyhow::bail!("invalid chain listener config: {err}");
     }
-    log_background_services_off(&conf);
+    // 1 line for each background service that will not run, so none is off unnoticed.
+    for off in conf.background_services_off() {
+        off.log();
+    }
 
     // TODO: Decouple the config file format from the internal representation
     let (agreement_conf, pricing_table) = conf.dips.into();
@@ -918,23 +921,6 @@ enum SignalHandlerError {
 }
 
 // -------- Private app helpers --------
-
-/// Logs 1 line for each background service that will not run, so none is off unnoticed.
-fn log_background_services_off(conf: &config::Config) {
-    for off in conf.background_services_off() {
-        match off.level {
-            config::OffNoticeLevel::Debug => {
-                tracing::debug!(section = off.section, "{}", off.message)
-            }
-            config::OffNoticeLevel::Info => {
-                tracing::info!(section = off.section, "{}", off.message)
-            }
-            config::OffNoticeLevel::Warn => {
-                tracing::warn!(section = off.section, "{}", off.message)
-            }
-        }
-    }
-}
 
 /// Stop one service, giving up after [`STOP_STEP_TIMEOUT`]. Returns whether it stopped in time,
 /// naming the service when it did not so the errors it goes on to log are attributable.

@@ -153,8 +153,8 @@ pub enum OffNoticeLevel {
     /// A service its own config section turns off.
     Info,
     /// A service whose absence leaves dipper without a safeguard, with nothing in the config to
-    /// show that anyone chose to give it up.
-    Warn,
+    /// show that anyone chose to give it up. `event` tags the line for the Slack alerts.
+    Warn { event: &'static str },
 }
 
 /// A background service that will not run, as startup reports it.
@@ -166,6 +166,18 @@ pub struct ServiceOff {
     pub level: OffNoticeLevel,
     /// What being off means, and how to turn it on where the section is missing.
     pub message: String,
+}
+
+impl ServiceOff {
+    /// Logs the notice at its level.
+    pub fn log(&self) {
+        let section = self.section;
+        match self.level {
+            OffNoticeLevel::Debug => tracing::debug!(section, "{}", self.message),
+            OffNoticeLevel::Info => tracing::info!(section, "{}", self.message),
+            OffNoticeLevel::Warn { event } => tracing::warn!(event, section, "{}", self.message),
+        }
+    }
 }
 
 impl Config {
@@ -195,7 +207,9 @@ impl Config {
         if self.chain_listener.as_ref().is_some_and(|c| !c.enabled) {
             off.push(ServiceOff {
                 section: "chain_listener",
-                level: OffNoticeLevel::Warn,
+                level: OffNoticeLevel::Warn {
+                    event: "chain_listener_off",
+                },
                 message: "chain_listener is turned off in its config section: dipper will not \
                           learn that indexers accepted or cancelled agreements on-chain, so an \
                           accepted offer stays pending and is never expired either, since expiry \
@@ -204,7 +218,12 @@ impl Config {
                     .to_string(),
             });
         }
-        for (section, switch, level_when_missing, consequence) in self.background_services() {
+        for (section, switch, event, consequence) in self.background_services() {
+            // A section left out says nothing about whether anyone chose it, so a safety service
+            // left off that way is a warning, alerted on under its own event.
+            let unannounced = event.map_or(OffNoticeLevel::Debug, |event| OffNoticeLevel::Warn {
+                event,
+            });
             let (level, message) = match switch {
                 Switch::On => continue,
                 Switch::Off => (
@@ -212,7 +231,7 @@ impl Config {
                     format!("{section} is turned off in its config section: {consequence}"),
                 ),
                 Switch::LeftOut => (
-                    OffNoticeLevel::Warn,
+                    unannounced,
                     format!(
                         "{section} is off because its config section leaves out \"enabled\", \
                          which defaults to false: {consequence}; add \"enabled\": true to the \
@@ -220,7 +239,7 @@ impl Config {
                     ),
                 ),
                 Switch::Missing => (
-                    level_when_missing,
+                    unannounced,
                     format!(
                         "{section} is off because the config has no {section} section: \
                          {consequence}; add the section with \"enabled\": true to run it"
@@ -237,10 +256,11 @@ impl Config {
     }
 
     /// Each background service besides the listener: its section, what the config says about
-    /// it, how loudly to report it when its section is missing, and what being off means. A
-    /// missing section is a warning, as nothing shows anyone chose it, except for the escrow
-    /// reconciler, which is documented as opt-in.
-    fn background_services(&self) -> [(&'static str, Switch, OffNoticeLevel, &'static str); 5] {
+    /// it, the alert event for a safety service, and what being off means. The escrow
+    /// reconciler is documented as opt-in, so it has no event and is noted only in debug logs.
+    fn background_services(
+        &self,
+    ) -> [(&'static str, Switch, Option<&'static str>, &'static str); 5] {
         let on_unless_off = |enabled: Option<bool>| match enabled {
             None => Switch::Missing,
             Some(true) => Switch::On,
@@ -255,34 +275,34 @@ impl Config {
             (
                 "expiration",
                 on_unless_off(self.expiration.as_ref().map(|c| c.enabled)),
-                OffNoticeLevel::Warn,
+                Some("expiration_off"),
                 "offers no indexer accepts by their deadline are never marked expired, so their \
                  requests get no replacement indexers",
             ),
             (
                 "reassignment",
                 on_unless_off(self.reassignment.as_ref().map(|c| c.enabled)),
-                OffNoticeLevel::Warn,
+                Some("reassignment_off"),
                 "requests left short of indexers are not topped up, and the daily reassessment of \
                  open requests does not run",
             ),
             (
                 "liveness_checker",
                 off_unless_on(self.liveness_checker.as_ref().map(|c| c.enabled)),
-                OffNoticeLevel::Warn,
+                Some("liveness_checker_off"),
                 "agreements whose indexer stops indexing are not cancelled or replaced",
             ),
             (
                 "dips_info_watcher",
                 off_unless_on(self.dips_info_watcher.as_ref().map(|c| c.enabled)),
-                OffNoticeLevel::Warn,
+                Some("dips_info_watcher_off"),
                 "indexers holding agreements whose DIPs info endpoint stops answering are neither \
                  alerted on nor blocked",
             ),
             (
                 "escrow_reconciler",
                 on_unless_off(self.escrow_reconciler.as_ref().map(|c| c.enabled)),
-                OffNoticeLevel::Debug,
+                None,
                 "escrow the agreement manager holds for ended agreements is not reclaimed",
             ),
         ]
@@ -351,6 +371,11 @@ impl Default for AlertsConfig {
                 "dips_info_missing",
                 "dips_info_checks_paused",
                 "dips_info_missing_denylisted",
+                "chain_listener_off",
+                "expiration_off",
+                "reassignment_off",
+                "liveness_checker_off",
+                "dips_info_watcher_off",
             ]
             .map(str::to_owned)
             .to_vec(),
@@ -2978,7 +3003,12 @@ mod tests {
             .filter(|off| off.section == "chain_listener")
             .collect();
         assert_eq!(reported.len(), 1, "{reported:?}");
-        assert_eq!(reported[0].level, OffNoticeLevel::Warn);
+        assert_eq!(
+            reported[0].level,
+            OffNoticeLevel::Warn {
+                event: "chain_listener_off"
+            }
+        );
         assert!(
             reported[0].message.contains("accepted or cancelled"),
             "the warning says what being off means: {}",
@@ -3016,7 +3046,10 @@ mod tests {
             };
 
             let left_out = report(None).expect("a service its section leaves off is reported");
-            assert_eq!(left_out.level, OffNoticeLevel::Warn, "{section}");
+            assert!(
+                matches!(left_out.level, OffNoticeLevel::Warn { .. }),
+                "{section}: {left_out:?}"
+            );
             assert!(
                 left_out.message.contains(r#"leaves out "enabled""#)
                     && !left_out
@@ -3050,6 +3083,84 @@ mod tests {
         assert_eq!(runs(r#"{"enabled": true}"#), (true, true));
     }
 
+    /// The level and `event` tag of each line logged while `log` runs.
+    fn logged(log: impl FnOnce()) -> Vec<(tracing::Level, Option<String>)> {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        type Line = (tracing::Level, Option<String>);
+        struct Lines(Arc<std::sync::Mutex<Vec<Line>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Lines {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut tag = Tag(None);
+                event.record(&mut tag);
+                let line = (*event.metadata().level(), tag.0);
+                self.0.lock().expect("not poisoned").push(line);
+            }
+        }
+        struct Tag(Option<String>);
+        impl tracing::field::Visit for Tag {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "event" {
+                    self.0 = Some(format!("{value:?}").trim_matches('"').to_string());
+                }
+            }
+        }
+
+        let lines = Arc::default();
+        let subscriber = tracing_subscriber::registry().with(Lines(Arc::clone(&lines)));
+        tracing::subscriber::with_default(subscriber, log);
+        std::mem::take(&mut *lines.lock().expect("not poisoned"))
+    }
+
+    /// The Slack alerts pick lines out by their `event` tag, so a warning that a service is off
+    /// reaches an operator only with a tag that is alerted on by default.
+    #[test]
+    fn each_service_off_warning_carries_an_event_alerted_on_by_default() {
+        let config = example_config_edited(|config| {
+            remove_sections(config, &["expiration", "reassignment", "escrow_reconciler"]);
+            config["chain_listener"] = serde_json::json!({"enabled": false});
+            config["liveness_checker"] = serde_json::json!({"interval": 300});
+            config["dips_info_watcher"] = serde_json::json!({"enabled": false});
+        });
+        let alerted = AlertsConfig::default().events;
+
+        let lines = logged(|| {
+            config
+                .background_services_off()
+                .iter()
+                .for_each(ServiceOff::log)
+        });
+
+        let warnings: Vec<_> = lines
+            .iter()
+            .filter(|(level, _)| *level == tracing::Level::WARN)
+            .map(|(_, event)| event.clone().expect("a warning carries an event tag"))
+            .collect();
+        assert_eq!(warnings.len(), 4, "{lines:?}");
+        for event in &warnings {
+            assert!(
+                alerted.contains(event),
+                "{event} is not alerted on by default"
+            );
+        }
+        let distinct: std::collections::BTreeSet<_> = warnings.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            warnings.len(),
+            "each service has its own tag, so the throttle cannot fold 1 into another: {lines:?}"
+        );
+        for (level, event) in &lines {
+            assert!(
+                *level == tracing::Level::WARN || event.is_none(),
+                "only the warnings are tagged for alerts: {lines:?}"
+            );
+        }
+    }
+
     #[test]
     fn startup_reports_each_background_service_that_is_off() {
         const SECTIONS: [&str; 5] = [
@@ -3069,10 +3180,30 @@ mod tests {
         assert_eq!(
             services_off(&missing),
             [
-                ("expiration", OffNoticeLevel::Warn),
-                ("reassignment", OffNoticeLevel::Warn),
-                ("liveness_checker", OffNoticeLevel::Warn),
-                ("dips_info_watcher", OffNoticeLevel::Warn),
+                (
+                    "expiration",
+                    OffNoticeLevel::Warn {
+                        event: "expiration_off"
+                    }
+                ),
+                (
+                    "reassignment",
+                    OffNoticeLevel::Warn {
+                        event: "reassignment_off"
+                    }
+                ),
+                (
+                    "liveness_checker",
+                    OffNoticeLevel::Warn {
+                        event: "liveness_checker_off"
+                    }
+                ),
+                (
+                    "dips_info_watcher",
+                    OffNoticeLevel::Warn {
+                        event: "dips_info_watcher_off"
+                    }
+                ),
                 ("escrow_reconciler", OffNoticeLevel::Debug),
             ]
         );
