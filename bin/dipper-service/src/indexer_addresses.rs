@@ -2,9 +2,17 @@
 //! unchecked it could point dipper, directly or by a redirect, at a service inside dipper's own
 //! network, such as the cloud metadata service. Dipper refuses every address that is not public.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::{
+    error::Error,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
+};
 
 use url::{Host, Url};
+
+/// The most redirects dipper follows in 1 call to an indexer. Indexer software answers in place, so
+/// a redirect comes from a server in front of it, such as one from http to https.
+const MAX_REDIRECTS: usize = 3;
 
 /// The addresses dipper may call indexers at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,6 +52,62 @@ impl AddressRule {
             Err(Refused::Address(ip))
         }
     }
+
+    /// A builder for an HTTP client that calls indexers only at addresses this rule allows, judging
+    /// a name by what it resolves to as it connects, and follows at most `MAX_REDIRECTS` redirects.
+    pub fn http_client(self) -> reqwest::ClientBuilder {
+        // Behind an HTTP proxy the proxy looks names up, so only addresses written in URLs are
+        // judged. A proxy at a private address must be given by its address: its name is judged.
+        reqwest::Client::builder()
+            .dns_resolver(Arc::new(Resolver(self)))
+            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                // The first URL in `previous` is the request itself, not a redirect.
+                if attempt.previous().len() > MAX_REDIRECTS {
+                    return attempt.error(format!("more than {MAX_REDIRECTS} redirects"));
+                }
+                match self.check_url(attempt.url()) {
+                    Ok(()) => attempt.follow(),
+                    Err(refused) => attempt.error(refused),
+                }
+            }))
+    }
+
+    /// Look `name` up and keep the addresses this rule allows, failing when none is left.
+    async fn resolve(self, name: &str) -> Result<Vec<SocketAddr>, Box<dyn Error + Send + Sync>> {
+        let found: Vec<SocketAddr> = tokio::net::lookup_host((name, 0)).await?.collect();
+        if found.is_empty() {
+            return Err(format!("no addresses found for {name}").into());
+        }
+        let (allowed, refused): (Vec<SocketAddr>, Vec<SocketAddr>) =
+            found.into_iter().partition(|addr| self.allows(addr.ip()));
+        if allowed.is_empty() {
+            return Err(Box::new(Refused::Name {
+                name: name.to_string(),
+                addresses: refused.iter().map(SocketAddr::ip).collect(),
+            }));
+        }
+        if !refused.is_empty() {
+            tracing::debug!(
+                name,
+                refused = %join(&refused.iter().map(SocketAddr::ip).collect::<Vec<_>>()),
+                "connecting only to the public addresses a name resolves to"
+            );
+        }
+        Ok(allowed)
+    }
+}
+
+/// Looks names up for an HTTP client, under an `AddressRule`.
+struct Resolver(AddressRule);
+
+impl reqwest::dns::Resolve for Resolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let rule = self.0;
+        Box::pin(async move {
+            let addrs = rule.resolve(name.as_str()).await?;
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
 }
 
 /// Dipper's refusal to connect to an address that is not public.
@@ -52,6 +116,28 @@ pub enum Refused {
     /// A host written as an address that is not public.
     #[error("refused {0}: not a public address")]
     Address(IpAddr),
+    /// A name that resolves only to addresses that are not public.
+    #[error("refused {name}: it resolves only to addresses that are not public ({})", join(.addresses))]
+    Name {
+        name: String,
+        addresses: Vec<IpAddr>,
+    },
+}
+
+impl Refused {
+    /// The refusal behind `err`, if dipper refused the address a call went to.
+    pub fn behind<'a>(err: &'a (dyn Error + 'static)) -> Option<&'a Self> {
+        std::iter::successors(Some(err), |err| (*err).source())
+            .find_map(|err| err.downcast_ref::<Self>())
+    }
+}
+
+fn join(addresses: &[IpAddr]) -> String {
+    addresses
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Whether `ip` is public: reachable across the internet, rather than kept for a private network,
@@ -149,6 +235,11 @@ fn in_v6(ip: Ipv6Addr, (first, bits): (Ipv6Addr, u32)) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{any, path},
+    };
+
     use super::*;
 
     #[test]
@@ -279,5 +370,162 @@ mod tests {
     fn the_switch_sets_the_rule() {
         assert_eq!(AddressRule::new(false), AddressRule::PublicOnly);
         assert_eq!(AddressRule::new(true), AddressRule::Any);
+    }
+
+    /// A server that answers every request.
+    async fn server() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// `server`'s URL with `localhost`, which resolves only to addresses on this machine, as its
+    /// host.
+    fn by_name(server: &MockServer, path: &str) -> String {
+        format!("http://localhost:{}{path}", server.address().port())
+    }
+
+    /// An indexer whose server answers `/to-address` with a redirect to `target` by its address,
+    /// and `/to-name` with a redirect to it by name.
+    async fn redirecting_to(target: &MockServer) -> MockServer {
+        let indexer = MockServer::start().await;
+        for (from, to) in [
+            ("/to-address", format!("{}/admin?confirm=yes", target.uri())),
+            ("/to-name", by_name(target, "/admin?confirm=yes")),
+        ] {
+            Mock::given(path(from))
+                .respond_with(ResponseTemplate::new(307).insert_header("Location", to.as_str()))
+                .mount(&indexer)
+                .await;
+        }
+        indexer
+    }
+
+    fn client(rule: AddressRule) -> reqwest::Client {
+        rule.http_client().build().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_name_that_resolves_only_to_addresses_that_are_not_public_is_refused_on_connecting() {
+        //* Given
+        let server = server().await;
+
+        //* When
+        let err = client(AddressRule::PublicOnly)
+            .get(by_name(&server, "/"))
+            .send()
+            .await
+            .unwrap_err();
+
+        //* Then
+        let refused = Refused::behind(&err).map(ToString::to_string);
+        assert!(
+            refused
+                .as_deref()
+                .is_some_and(|refused| refused.starts_with("refused localhost: it resolves only")),
+            "{err:?}"
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    /// The indexer's own address is judged when its URL is read from the subgraph, not by the
+    /// client, so a server on this machine can stand in for an indexer at a public address.
+    #[tokio::test]
+    async fn a_redirect_to_an_address_that_is_not_public_is_not_followed() {
+        //* Given an internal service, and an indexer that redirects to it
+        let internal = server().await;
+        let indexer = redirecting_to(&internal).await;
+
+        for (from, refusal) in [
+            ("/to-address", "refused 127.0.0.1: not a public address"),
+            ("/to-name", "refused localhost: it resolves only"),
+        ] {
+            //* When
+            let err = client(AddressRule::PublicOnly)
+                .post(format!("{}{from}", indexer.uri()))
+                .send()
+                .await
+                .unwrap_err();
+
+            //* Then
+            let refused = Refused::behind(&err).map(ToString::to_string);
+            assert!(
+                refused
+                    .as_deref()
+                    .is_some_and(|refused| refused.starts_with(refusal)),
+                "{from}: {err:?}"
+            );
+        }
+        let calls = internal.received_requests().await.unwrap();
+        assert!(
+            calls.is_empty(),
+            "dipper followed the redirect and called {}",
+            calls[0].url
+        );
+    }
+
+    #[tokio::test]
+    async fn with_private_addresses_allowed_names_and_redirects_reach_this_machine() {
+        //* Given
+        let internal = server().await;
+        let indexer = redirecting_to(&internal).await;
+        let client = client(AddressRule::Any);
+
+        //* When
+        let by_name = client.get(by_name(&internal, "/")).send().await;
+        let redirects = [
+            client
+                .post(format!("{}/to-address", indexer.uri()))
+                .send()
+                .await,
+            client
+                .post(format!("{}/to-name", indexer.uri()))
+                .send()
+                .await,
+        ];
+
+        //* Then
+        assert_eq!(by_name.unwrap().status(), 200);
+        for redirect in redirects {
+            assert_eq!(redirect.unwrap().status(), 200);
+        }
+        assert_eq!(internal.received_requests().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn at_most_3_redirects_are_followed() {
+        //* Given a server that redirects /0 to /1, and on, up to /4
+        let server = MockServer::start().await;
+        for hop in 0..4 {
+            Mock::given(path(format!("/{hop}")))
+                .respond_with(
+                    ResponseTemplate::new(302).insert_header("Location", format!("/{}", hop + 1)),
+                )
+                .mount(&server)
+                .await;
+        }
+        Mock::given(path("/4"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let client = client(AddressRule::Any);
+
+        //* When
+        let three = client.get(format!("{}/1", server.uri())).send().await;
+        let four = client.get(format!("{}/0", server.uri())).send().await;
+
+        //* Then
+        assert_eq!(three.unwrap().status(), 200);
+        let err = four.unwrap_err();
+        assert!(err.is_redirect(), "{err:?}");
+        let last = server.received_requests().await.unwrap().pop().unwrap();
+        assert_eq!(
+            last.url.path(),
+            "/3",
+            "the 4th redirect, to /4, is not followed"
+        );
     }
 }

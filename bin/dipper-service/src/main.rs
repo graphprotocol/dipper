@@ -611,6 +611,7 @@ pub async fn main() -> anyhow::Result<()> {
                 network: network_provider.clone(),
                 agreement_conf: liveness_agreement_conf.clone(),
                 config: lc_conf.clone(),
+                addresses,
             };
             let (handle, service) = network::service::liveness_checker::new(ctx);
             Some((handle, service))
@@ -626,6 +627,7 @@ pub async fn main() -> anyhow::Result<()> {
                 registry: registry.clone(),
                 network: network_provider.clone(),
                 config: watcher_conf.clone(),
+                addresses,
             };
             Some(network::service::dips_info_watcher::new(ctx))
         }
