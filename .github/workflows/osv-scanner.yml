@@ -32,10 +32,11 @@ jobs:
       # The scanner's image is named by its digest (release v2.7.0), so its tag cannot be pointed at
       # other code later. It is run directly rather than through Google's action, whose wrapper
       # reports success when it finds no lock file, and which hands the image this job's cache
-      # token and the runner's Docker socket.
+      # token and the runner's Docker socket. The lock file is named rather than searched for:
+      # the search skips whatever git ignores, so it can come back having read nothing.
       - name: Scan dependencies against the OSV database
         run: |
           docker run --rm --volume "$PWD:/src:ro" --workdir /src \
             --entrypoint /root/osv-scanner \
             ghcr.io/google/osv-scanner-action@sha256:d54770fe0b09493894e76a02aaed9f51a0513fa57c5186452a755d257b0068a6 \
-            --config=osv-scanner.toml --recursive ./
+            --config=osv-scanner.toml --lockfile=Cargo.lock
