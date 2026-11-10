@@ -173,18 +173,19 @@ where
 
 /// Shared re-queue UPDATE for both the failure-retry and deferral paths, so the
 /// touched columns can't drift. `count_attempt` set: bump `attempt_count`, go
-/// `Failed` at `max_attempts`. Clear: leave the count, always re-queue.
+/// `Failed` at `max_attempts`. Clear: leave the count, always re-queue. Returns
+/// the status the job was left in.
 async fn requeue<'q, E>(
     executor: E,
     id: &JobId,
     scheduled_for: OffsetDateTime,
     count_attempt: bool,
-) -> anyhow::Result<()>
+) -> anyhow::Result<PgJobStatus>
 where
     E: sqlx::Executor<'q, Database = Postgres>,
 {
     let increment: i32 = if count_attempt { 1 } else { 0 };
-    sqlx::query(
+    let (status,) = sqlx::query_as(
         r#"UPDATE pgmq_queue
            SET
                updated_at = timezone('UTC', now()),
@@ -195,31 +196,45 @@ where
                scheduled_for = (CASE
                    WHEN $5 = 0 OR attempt_count + 1 < max_attempts THEN $4 ELSE scheduled_for
                END)
-           WHERE id = $1"#,
+           WHERE id = $1
+           RETURNING status"#,
     )
     .bind(id)
     .bind(PgJobStatus::Failed)
     .bind(PgJobStatus::Queued)
     .bind(scheduled_for)
     .bind(increment)
-    .execute(executor)
+    .fetch_one(executor)
     .await?;
-    Ok(())
+    Ok(status)
+}
+
+/// What recording a failed attempt left the job as.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum RetryOutcome {
+    /// It is queued to run again.
+    WillRetry,
+    /// That was its last allowed attempt, so it stays failed and never runs again.
+    GaveUp,
 }
 
 /// Mark a job as failed; see `requeue` for the attempt/backoff/give-up rules.
-// TODO(post-mvp): Return the updated job status and failed attempts, so the caller can check if the
-//  job was marked as failed
 pub async fn mark_as_failed<'q, E>(
     executor: E,
     id: &JobId,
     scheduled_for: Option<OffsetDateTime>,
-) -> anyhow::Result<()>
+) -> anyhow::Result<RetryOutcome>
 where
     E: sqlx::Executor<'q, Database = Postgres>,
 {
     let scheduled_for = scheduled_for.unwrap_or_else(OffsetDateTime::now_utc);
-    requeue(executor, id, scheduled_for, true).await
+    match requeue(executor, id, scheduled_for, true).await? {
+        PgJobStatus::Queued => Ok(RetryOutcome::WillRetry),
+        PgJobStatus::Failed => Ok(RetryOutcome::GaveUp),
+        PgJobStatus::Running => {
+            anyhow::bail!("job {id} was left running after its failed attempt was recorded")
+        }
+    }
 }
 
 /// Re-queue a job for a later time without recording a failed attempt, so a
@@ -233,7 +248,8 @@ pub async fn reschedule<'q, E>(
 where
     E: sqlx::Executor<'q, Database = Postgres>,
 {
-    requeue(executor, id, scheduled_for, false).await
+    requeue(executor, id, scheduled_for, false).await?;
+    Ok(())
 }
 
 /// Send a job available notification to the `pgmq_jobs_available` channel
