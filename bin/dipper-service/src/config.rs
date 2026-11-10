@@ -181,6 +181,7 @@ impl Default for AlertsConfig {
                 "dips_info_missing",
                 "dips_info_checks_paused",
                 "dips_info_missing_denylisted",
+                "job_failed_permanently",
             ]
             .map(str::to_owned)
             .to_vec(),
