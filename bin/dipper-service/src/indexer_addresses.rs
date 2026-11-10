@@ -53,8 +53,9 @@ impl AddressRule {
         }
     }
 
-    /// A builder for an HTTP client that calls indexers only at addresses this rule allows, judging
-    /// a name by what it resolves to as it connects, and follows at most `MAX_REDIRECTS` redirects.
+    /// A builder for an HTTP client that judges each name it resolves and each redirect it is sent,
+    /// following at most `MAX_REDIRECTS`. It does not judge the URL a request starts at: check that
+    /// with `check_url` first, as the indexer URLs service does for every registered URL.
     pub fn http_client(self) -> reqwest::ClientBuilder {
         // Proxy variables are ignored: the check is worth something only if dipper makes the
         // connection itself, since a proxy would look the indexer's name up in its place.
