@@ -137,6 +137,7 @@ This command will:
 > [!IMPORTANT]
 > When saving to a file, the command will display a security warning about storing private keys in environment files. 
 > Consider using a secure credential manager instead.
+> On Linux and macOS the file is written so that only your user can read it, including when it replaces a file that others could read.
 
 ### Creating 1Password Templates
 
