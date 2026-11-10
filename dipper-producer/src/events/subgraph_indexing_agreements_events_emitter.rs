@@ -562,8 +562,8 @@ enum Delivery {
 const RESEND_PAUSE: Duration = Duration::from_secs(1);
 
 /// Sends one diagnostic event, resending it while the brokers are unreachable. Each such failure is
-/// reported to `conn`, which rebuilds the client after a few, so the event goes out once the
-/// cluster's current brokers are found.
+/// reported to `conn`, which rebuilds the client once they have gone on for a minute, so the event
+/// goes out once the cluster's current brokers are found.
 async fn deliver<T, S, Fut>(
     conn: &Reconnecting<T>,
     shutdown: &Notify,

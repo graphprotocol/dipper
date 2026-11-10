@@ -1,21 +1,20 @@
-//! A broker client that reconnects from the bootstrap addresses after repeated failures. rskafka
+//! A broker client that reconnects from the bootstrap addresses once sends keep failing. rskafka
 //! only goes back to the bootstrap (seed) addresses when it knows no brokers, so a cluster that
 //! replaces every broker under new names leaves a long-lived client dialling names that are gone.
 
 use std::{
     fmt::Display,
     future::Future,
-    sync::{
-        Arc, Mutex, MutexGuard,
-        atomic::{AtomicU32, Ordering},
-    },
+    sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
 
-use tokio::sync::Notify;
+use tokio::{sync::Notify, time::Instant};
 
-/// Consecutive failures to reach the brokers after which the client is dropped and rebuilt.
-pub const RECONNECT_AFTER_FAILURES: u32 = 3;
+/// How long sends must keep failing to reach the brokers, with none getting through, before the
+/// client is dropped and rebuilt. Measured in time rather than failures, so sends that time out
+/// together in 1 brief stall don't count as an outage.
+pub const RECONNECT_AFTER: Duration = Duration::from_secs(60);
 
 /// The longest wait between attempts to connect.
 const MAX_CONNECT_BACKOFF_SECS: u64 = 30;
@@ -27,18 +26,23 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Failed connect attempts between repeated warnings, after the first.
 const WARN_EVERY: u32 = 5;
 
-/// A client connected in the background and rebuilt after [`RECONNECT_AFTER_FAILURES`] consecutive
-/// failures to reach the brokers. Callers report each attempt with `report_success` or
-/// `report_unreachable`; `current` returns `None` while the client is being (re)built.
+/// A client connected in the background and rebuilt once sends have failed to reach the brokers for
+/// [`RECONNECT_AFTER`]. Callers report each attempt with `report_success` or `report_unreachable`;
+/// `current` returns `None` while the client is being (re)built.
 pub struct Reconnecting<T> {
     shared: Arc<Shared<T>>,
 }
 
 struct Shared<T> {
     name: &'static str,
-    client: Mutex<Option<Arc<T>>>,
-    failures: AtomicU32,
+    state: Mutex<State<T>>,
     rebuild: Notify,
+}
+
+/// The client and, while sends through it are failing, when the first of those failures was seen.
+struct State<T> {
+    client: Option<Arc<T>>,
+    failing_since: Option<Instant>,
 }
 
 impl<T> Clone for Reconnecting<T> {
@@ -50,10 +54,10 @@ impl<T> Clone for Reconnecting<T> {
 }
 
 impl<T> Shared<T> {
-    /// The guarded `Option` is always valid, so a panic elsewhere while holding the lock must not
-    /// take the client down with it.
-    fn lock(&self) -> MutexGuard<'_, Option<Arc<T>>> {
-        self.client.lock().unwrap_or_else(|e| e.into_inner())
+    /// The guarded state is always valid, so a panic elsewhere while holding the lock must not take
+    /// the client down with it.
+    fn lock(&self) -> MutexGuard<'_, State<T>> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -68,16 +72,20 @@ impl<T: Send + Sync + 'static> Reconnecting<T> {
     {
         let shared = Arc::new(Shared {
             name,
-            client: Mutex::new(None),
-            failures: AtomicU32::new(0),
+            state: Mutex::new(State {
+                client: None,
+                failing_since: None,
+            }),
             rebuild: Notify::new(),
         });
         let task = shared.clone();
         tokio::spawn(async move {
             loop {
                 let client = connect_with_retry(name, &connect).await;
-                task.failures.store(0, Ordering::Relaxed);
-                *task.lock() = Some(Arc::new(client));
+                *task.lock() = State {
+                    client: Some(Arc::new(client)),
+                    failing_since: None,
+                };
                 tracing::info!(broker = name, "connected to the brokers");
                 // `notify_one` stores a permit, so a rebuild asked for before this wait starts is
                 // not missed.
@@ -89,31 +97,39 @@ impl<T: Send + Sync + 'static> Reconnecting<T> {
 
     /// The client, or `None` while it is being (re)built.
     pub fn current(&self) -> Option<Arc<T>> {
-        self.shared.lock().clone()
+        self.shared.lock().client.clone()
     }
 
     /// Records that a request through the current client reached the brokers.
     pub fn report_success(&self) {
-        self.shared.failures.store(0, Ordering::Relaxed);
+        self.shared.lock().failing_since = None;
     }
 
-    /// Records that a request through `client` couldn't reach the brokers; after
-    /// [`RECONNECT_AFTER_FAILURES`] in a row, drops it so the background task connects again.
+    /// Records that a request through `client` couldn't reach the brokers; once sends have failed for
+    /// [`RECONNECT_AFTER`] with none getting through, drops it so the background task connects again.
     /// Ignores a client that was already replaced. Returns whether this call dropped the client.
     pub fn report_unreachable(&self, client: &Arc<T>) -> bool {
-        let mut current = self.shared.lock();
-        if !current.as_ref().is_some_and(|c| Arc::ptr_eq(c, client)) {
+        let mut state = self.shared.lock();
+        if !state
+            .client
+            .as_ref()
+            .is_some_and(|c| Arc::ptr_eq(c, client))
+        {
             return false;
         }
-        let failures = self.shared.failures.fetch_add(1, Ordering::Relaxed) + 1;
-        if failures < RECONNECT_AFTER_FAILURES {
+        let now = Instant::now();
+        let since = *state.failing_since.get_or_insert(now);
+        if now - since < RECONNECT_AFTER {
             return false;
         }
-        *current = None;
-        drop(current);
+        *state = State {
+            client: None,
+            failing_since: None,
+        };
+        drop(state);
         tracing::warn!(
             broker = self.shared.name,
-            failures,
+            failing_for_secs = (now - since).as_secs(),
             "brokers unreachable; connecting again from the bootstrap addresses"
         );
         self.shared.rebuild.notify_one();
@@ -153,7 +169,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::*;
 
@@ -225,24 +241,22 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn connects_again_after_repeated_failures_to_reach_the_brokers() {
+    async fn connects_again_once_sends_keep_failing_to_reach_the_brokers() {
         let (attempts, connect) = connector(0);
         let conn = Reconnecting::spawn("test", connect);
         let first = next_client(&conn, None).await;
 
-        for _ in 1..RECONNECT_AFTER_FAILURES {
-            assert!(!conn.report_unreachable(&first));
-        }
+        assert!(!conn.report_unreachable(&first));
+        tokio::time::sleep(RECONNECT_AFTER - Duration::from_secs(1)).await;
+        assert!(!conn.report_unreachable(&first));
         assert_eq!(
             conn.current().as_ref(),
             Some(&first),
-            "kept until the last allowed failure"
+            "kept until the failures have gone on long enough"
         );
+        tokio::time::sleep(Duration::from_secs(1)).await;
         assert!(conn.report_unreachable(&first));
-        assert!(
-            conn.current().is_none(),
-            "dropped once the failures reach the limit"
-        );
+        assert!(conn.current().is_none(), "dropped once they have");
 
         let second = next_client(&conn, Some(&first)).await;
         assert_eq!(*second, Client(2));
@@ -250,20 +264,33 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_success_starts_the_failure_count_again() {
+    async fn sends_failing_together_in_one_stall_keep_the_client() {
         let (attempts, connect) = connector(0);
         let conn = Reconnecting::spawn("test", connect);
         let client = next_client(&conn, None).await;
 
-        for _ in 1..RECONNECT_AFTER_FAILURES {
-            conn.report_unreachable(&client);
-        }
-        conn.report_success();
-        for _ in 1..RECONNECT_AFTER_FAILURES {
+        // Several sends waiting on the same slow broker time out at once.
+        for _ in 0..5 {
             assert!(!conn.report_unreachable(&client));
         }
 
-        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(conn.current().as_ref(), Some(&client));
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_success_starts_the_clock_again() {
+        let (attempts, connect) = connector(0);
+        let conn = Reconnecting::spawn("test", connect);
+        let client = next_client(&conn, None).await;
+
+        conn.report_unreachable(&client);
+        tokio::time::sleep(RECONNECT_AFTER - Duration::from_secs(1)).await;
+        conn.report_success();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!conn.report_unreachable(&client));
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
         assert_eq!(conn.current().as_ref(), Some(&client));
         assert_eq!(attempts.load(Ordering::Relaxed), 1);
     }
@@ -273,17 +300,16 @@ mod tests {
         let (attempts, connect) = connector(0);
         let conn = Reconnecting::spawn("test", connect);
         let first = next_client(&conn, None).await;
-        for _ in 0..RECONNECT_AFTER_FAILURES {
-            conn.report_unreachable(&first);
-        }
+        conn.report_unreachable(&first);
+        tokio::time::sleep(RECONNECT_AFTER).await;
+        assert!(conn.report_unreachable(&first));
         let second = next_client(&conn, Some(&first)).await;
 
         // A send still in flight on the first client reports its failure after the second took over.
-        for _ in 0..RECONNECT_AFTER_FAILURES {
-            assert!(!conn.report_unreachable(&first));
-        }
+        assert!(!conn.report_unreachable(&first));
+        tokio::time::sleep(RECONNECT_AFTER).await;
+        assert!(!conn.report_unreachable(&first));
 
-        tokio::time::sleep(Duration::from_secs(60)).await;
         assert_eq!(conn.current().as_ref(), Some(&second));
         assert_eq!(attempts.load(Ordering::Relaxed), 2);
     }
