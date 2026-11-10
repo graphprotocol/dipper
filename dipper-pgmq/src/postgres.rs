@@ -309,9 +309,14 @@ impl From<i16> for JobPriority {
     }
 }
 
+/// Stored as the column's own `SMALLINT`, so reading it back doesn't rest on matching type names.
 impl sqlx::Type<Postgres> for JobPriority {
     fn type_info() -> sqlx::postgres::PgTypeInfo {
-        sqlx::postgres::PgTypeInfo::with_name("INT2")
+        <i16 as sqlx::Type<Postgres>>::type_info()
+    }
+
+    fn compatible(ty: &sqlx::postgres::PgTypeInfo) -> bool {
+        <i16 as sqlx::Type<Postgres>>::compatible(ty)
     }
 }
 
@@ -361,9 +366,14 @@ impl From<i32> for PgJobStatus {
     }
 }
 
+/// Stored as the column's own `INT`, so reading it back doesn't rest on matching type names.
 impl sqlx::Type<Postgres> for PgJobStatus {
     fn type_info() -> sqlx::postgres::PgTypeInfo {
-        sqlx::postgres::PgTypeInfo::with_name("INT")
+        <i32 as sqlx::Type<Postgres>>::type_info()
+    }
+
+    fn compatible(ty: &sqlx::postgres::PgTypeInfo) -> bool {
+        <i32 as sqlx::Type<Postgres>>::compatible(ty)
     }
 }
 
@@ -387,7 +397,25 @@ impl sqlx::Decode<'_, Postgres> for PgJobStatus {
 
 #[cfg(test)]
 mod tests {
-    use super::JobPriority;
+    use sqlx::{Postgres, Type};
+
+    use super::{JobPriority, PgJobStatus};
+    use crate::id::JobId;
+
+    /// How a type declares itself to the database library.
+    fn declared<T: Type<Postgres>>() -> String {
+        format!("{:?}", T::type_info())
+    }
+
+    /// The job id, status and priority are read back as well as written, so each declares the
+    /// built-in type of its column rather than a name, whose match to the column's type would
+    /// rest on how the database library compares names.
+    #[test]
+    fn stored_job_fields_declare_their_columns_built_in_types() {
+        assert_eq!(declared::<PgJobStatus>(), declared::<i32>());
+        assert_eq!(declared::<JobPriority>(), declared::<i16>());
+        assert_eq!(declared::<JobId>(), declared::<uuid::Uuid>());
+    }
 
     /// A stored priority reads back as the level it was written at, and anything below
     /// Background, as an older release could never have written, reads as Sweep.
