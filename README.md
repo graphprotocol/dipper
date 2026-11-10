@@ -92,12 +92,12 @@ When an offer fails, dipper temporarily stops offering that indexer new work. Ho
 | Your price was too high for the deployment | 1 day |
 | You never replied to the offer | 1 day, on every deployment on that chain |
 | You let an offer that reached the chain expire | On that deployment: 1 day, lifted early if you accept any offer after it; 7 days for a 2nd miss in a row there; 30 days from the 3rd |
-| You let offers expire 2 rounds running since you last accepted one | All new offers are held back, apart from 1 test offer an hour, until you accept again |
+| You let offers expire 2 rounds running since you last accepted one, counting only offers that lapsed in the last 24 hours | All new offers are held back, apart from 1 test offer an hour, until you accept again; it also lifts on its own if no test offer lapses for 24 hours |
 | A transient failure, including offers that never reached the chain | 5 minutes |
 | The operator denylist | Until removed, and agreements you hold are cancelled |
 | Only where the operator turns on the `/dips/info` watcher, which is off by default: your `/dips/info` gave no readable answer for 48 hours while you held an agreement | Until it answers readably again, and agreements you hold are cancelled |
 
-Two safeguards keep this honest. If more than 50% of the DIPs-accepting indexers on a chain stop replying at once, dipper assumes the fault is on its side and suspends that chain's exclusion until the situation recovers. And a liveness checker (disabled by default) watches accepted agreements for indexers that stop making progress; an abandoned agreement is cancelled on-chain and reassigned.
+Three safeguards keep this honest. If more than 50% of the DIPs-accepting indexers on a chain stop replying at once, dipper assumes the fault is on its side and suspends that chain's exclusion until the situation recovers. If at least 2 indexers, and at least half of those offered to in the last 24 hours, would have their offers held back at once, dipper again assumes the fault is its own and holds back none of them. And a liveness checker (disabled by default) watches accepted agreements for indexers that stop making progress; an abandoned agreement is cancelled on-chain and reassigned.
 
 ---
 
