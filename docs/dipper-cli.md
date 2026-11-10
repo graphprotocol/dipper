@@ -105,10 +105,18 @@ DIPS_SERVER_URL=https://admin.dips.example.com
 DIPS_SIGNING_KEY={{ op://mainnet/dips/signing-key-1 }}
 ```
 
-2. Use `op inject` to inject the secrets:
+2. Use `op inject` to write a copy of the template with the secrets filled in, then point the CLI at that copy:
 ```bash
-op inject --in-file .env.template --out-file .env.injected -- dipper-cli indexings --env-file .env.injected <subcommand>
+op inject --in-file .env.template --out-file .env.injected
+dipper-cli indexings --env-file .env.injected <subcommand>
 ```
+
+3. The injected file holds the signing key in plain text, so delete it once you are done:
+```bash
+rm .env.injected
+```
+
+As with any `--env-file` file, a value already set in the shell or in an automatically found `.env` file beats the one in `.env.injected`.
 
 This approach is beneficial when:
 - Managing multiple secrets
@@ -162,10 +170,11 @@ DIPS_SERVER_URL=https://admin.dips.example.com
 DIPS_SIGNING_KEY={{ op://mainnet/dips/signing-key-1 }}
 ```
 
-To use the generated template:
+To use the generated template, inject the secrets into a copy, run the command with it, then delete the copy, which holds the signing key in plain text:
 ```bash
-# Inject secrets and run a command
-op inject --in-file .env.template --out-file .env.injected -- dipper-cli indexings --env-file .env.injected <subcommand>
+op inject --in-file .env.template --out-file .env.injected
+dipper-cli indexings --env-file .env.injected <subcommand>
+rm .env.injected
 ```
 
 ## Development
