@@ -372,28 +372,18 @@ async fn partition_loop<R, W>(
                 // log end when the topic was recreated or truncated. Clamp to
                 // the nearest live edge; always rewinding to earliest would
                 // replay the whole retained topic in the truncation case.
-                let earliest = with_consumer(&consumer, &mut shutdown_rx, |c| async move {
-                    c.offset(partition, OffsetAt::Earliest).await
+                // Both edges through 1 client, so a rebuild between them can't mix up 2 clusters.
+                let range = match with_consumer(&consumer, &mut shutdown_rx, |c| async move {
+                    let earliest = c.offset(partition, OffsetAt::Earliest).await?;
+                    let latest = c.offset(partition, OffsetAt::Latest).await?;
+                    Ok((earliest, latest))
                 })
-                .await;
-                let range = match earliest {
+                .await
+                {
                     None => return,
-                    Some(Ok(earliest)) => {
-                        let latest = with_consumer(&consumer, &mut shutdown_rx, |c| async move {
-                            c.offset(partition, OffsetAt::Latest).await
-                        })
-                        .await;
-                        match latest {
-                            None => return,
-                            Some(Ok(latest)) => Some((earliest, latest)),
-                            Some(Err(err)) => {
-                                tracing::error!(partition, error = %err, "failed to query latest offset");
-                                None
-                            }
-                        }
-                    }
+                    Some(Ok(range)) => Some(range),
                     Some(Err(err)) => {
-                        tracing::error!(partition, error = %err, "failed to query earliest offset");
+                        tracing::error!(partition, error = %err, "failed to query the retained offset range");
                         None
                     }
                 };
