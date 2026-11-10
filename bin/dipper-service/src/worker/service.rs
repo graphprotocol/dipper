@@ -652,10 +652,24 @@ async fn settle_job(job: impl FinishedJob, result: JobResult<()>) {
         Ok(..) => remove_job(job).await,
         Err(JobError::Retryable(err, base_delay)) => retry_job(job, &err, base_delay).await,
         Err(JobError::Deferred(delay)) => defer_job(job, delay).await,
-        Err(JobError::Fatal(err)) => {
-            log_job_failure(&FailedJob::of(&job), &err, AfterFailure::NotRetryable);
-            remove_job(job).await;
-        }
+        Err(JobError::Fatal(err)) => drop_job(job, &err).await,
+    }
+}
+
+/// Takes a job that failed in a way a retry can't fix off the queue, and only then alerts that it
+/// will not run again: if the removal fails, the job rolls back into the queue and runs again.
+async fn drop_job(job: impl FinishedJob, err: &anyhow::Error) {
+    let failed = FailedJob::of(&job);
+    match job.remove().await {
+        Ok(()) => log_job_failure(&failed, err, AfterFailure::NotRetryable),
+        Err(remove_err) => tracing::error!(
+            job_id = %failed.id,
+            kind = failed.kind,
+            job_error = %format_args!("{err:#}"),
+            error = %format_args!("{remove_err:#}"),
+            "Job failed with an error a retry can't fix, but couldn't be taken off the queue, so it \
+             will run again"
+        ),
     }
 }
 
@@ -1591,6 +1605,32 @@ mod tests {
         assert_eq!(alerts.len(), 1, "{logs}");
         assert!(alerts[0].contains("ERROR"), "{logs}");
         assert!(alerts[0].contains("no network name"), "{logs}");
+    }
+
+    /// A job whose removal fails rolls back into the queue and runs again, so its unretryable
+    /// failure must not be alerted on as final; the log says what is true instead.
+    #[tokio::test]
+    async fn an_unretryable_failure_left_in_the_queue_does_not_alert() {
+        let job = TestJob {
+            remove_fails: true,
+            ..TestJob::on_attempt(1)
+        };
+
+        let (asked, logs) = settle(
+            job,
+            Err(JobError::Fatal(anyhow::anyhow!("database read failed"))),
+        )
+        .await;
+
+        assert_eq!(asked, ["remove"]);
+        assert_eq!(alerts(&logs), Vec::<&str>::new(), "{logs}");
+        let line = logs
+            .lines()
+            .find(|line| line.contains("database read failed"))
+            .unwrap_or_else(|| panic!("the job's failure is logged:\n{logs}"));
+        assert!(line.contains("ERROR"), "{line}");
+        assert!(line.contains("will run again"), "{line}");
+        assert!(line.contains("the database is unavailable"), "{line}");
     }
 
     /// The queue's answer, not the worker's count, says a failed attempt was the last: then the
