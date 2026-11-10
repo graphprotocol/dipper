@@ -1,4 +1,9 @@
 //! Contract ABI definitions for on-chain interactions.
+//!
+//! These are written by hand, as the subset of each contract dipper uses. A test below compares
+//! every declaration with `contract_interfaces.txt`, a snapshot of the contracts' own interfaces
+//! written by `scripts/snapshot-contract-interfaces.py`, so one that has drifted from the
+//! contracts fails the build. After the contracts change, write the snapshot again.
 
 use thegraph_core::alloy::{sol, sol_types::SolInterface};
 
@@ -137,10 +142,13 @@ sol! {
         }
 
         /// Number of providers the manager tracks escrow for under `collector`.
-        function getProviderCount(address collector) external view returns (uint256);
+        function getProviderCount(address collector) external view returns (uint256 count);
 
         /// The provider at `index` in the manager's tracked set for `collector`.
-        function getProviderAt(address collector, uint256 index) external view returns (address);
+        function getProviderAt(address collector, uint256 index)
+            external
+            view
+            returns (address provider);
 
         /// The manager's escrow account with `provider` under `collector`.
         function getEscrowAccount(address collector, address provider)
@@ -149,20 +157,23 @@ sol! {
             returns (EscrowAccount memory account);
 
         /// Number of agreements the manager tracks for `provider` under `collector`.
-        function getAgreementCount(address collector, address provider) external view returns (uint256);
+        function getAgreementCount(address collector, address provider)
+            external
+            view
+            returns (uint256 count);
 
         /// The agreement at `index` among those the manager tracks for `provider`.
         function getAgreementAt(address collector, address provider, uint256 index)
             external
             view
-            returns (bytes16);
+            returns (bytes16 agreementId);
 
         /// Emitted when the manager stores a new agreement.
         event AgreementAdded(
             bytes16 indexed agreementId,
             address indexed collector,
-            address indexed dataService,
-            address provider
+            address dataService,
+            address indexed provider
         );
 
         /// Emitted when the manager cancels an agreement.
@@ -204,9 +215,172 @@ pub(crate) fn decode_revert_reason(selector: [u8; 4], data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use thegraph_core::alloy::sol_types::SolError;
 
     use super::*;
+
+    /// The contracts' own interfaces, written by `scripts/snapshot-contract-interfaces.py`.
+    const CONTRACT_INTERFACES: &str = include_str!("contract_interfaces.txt");
+
+    /// The lines the snapshot lists under `[interface]`.
+    fn in_the_contracts(interface: &str) -> Vec<&'static str> {
+        let (_, section) = CONTRACT_INTERFACES
+            .split_once(&format!("[{interface}]\n"))
+            .expect("the snapshot has a section for the interface");
+        section
+            .lines()
+            .take_while(|line| !line.starts_with('['))
+            .filter(|line| !line.is_empty())
+            .collect()
+    }
+
+    /// What this file declares between the braces of `interface {name} { ... }`, without its
+    /// comments and attributes.
+    fn interface_body(name: &str) -> String {
+        let code = include_str!("abi.rs")
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or_default())
+            .filter(|line| !line.trim_start().starts_with("#["))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let start = code
+            .find(&format!("interface {name} {{"))
+            .expect("the interface is declared");
+        let open = start + code[start..].find('{').unwrap();
+        let mut depth = 0;
+        for (offset, character) in code[open..].char_indices() {
+            match character {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 {
+                return code[open + 1..open + offset].to_string();
+            }
+        }
+        panic!("interface {name} is never closed");
+    }
+
+    /// The statements of an interface body, each on 1 line: a `struct` with its braces, and a
+    /// function, event or error up to its `;`.
+    fn statements(body: &str) -> Vec<String> {
+        let mut statements = Vec::new();
+        let (mut statement, mut depth) = (String::new(), 0);
+        for character in body.chars() {
+            statement.push(character);
+            match character {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 && matches!(character, ';' | '}') {
+                let words: Vec<_> = statement.split_whitespace().collect();
+                statements.push(words.join(" "));
+                statement.clear();
+            }
+        }
+        assert!(statement.trim().is_empty(), "unfinished: {statement}");
+        statements
+    }
+
+    /// Each `struct` among `statements` by name, as the tuple of its fields the snapshot writes
+    /// in its place, such as `(uint256 balance, uint256 tokensThawing)`.
+    fn structs(statements: &[String]) -> HashMap<&str, String> {
+        statements
+            .iter()
+            .filter_map(|statement| statement.strip_prefix("struct "))
+            .map(|declared| {
+                let (name, fields) = declared.split_once('{').unwrap();
+                let fields: Vec<_> = fields
+                    .trim_end_matches('}')
+                    .split(';')
+                    .map(str::trim)
+                    .filter(|field| !field.is_empty())
+                    .collect();
+                (name.trim(), format!("({})", fields.join(", ")))
+            })
+            .collect()
+    }
+
+    /// A parameter list the way the snapshot writes it: no `calldata` or `memory`, and a struct
+    /// as the tuple of its fields.
+    fn parameters(list: &str, structs: &HashMap<&str, String>) -> String {
+        let parameters = list.split(',').map(str::trim).filter(|p| !p.is_empty());
+        let written: Vec<_> = parameters
+            .map(|parameter| {
+                let mut words = parameter
+                    .split_whitespace()
+                    .filter(|word| !matches!(*word, "calldata" | "memory"));
+                let kind = words.next().unwrap();
+                let (base, array) = kind.split_at(kind.find('[').unwrap_or(kind.len()));
+                let kind = structs.get(base).map_or(base, String::as_str);
+                let rest: String = words.map(|word| format!(" {word}")).collect();
+                format!("{kind}{array}{rest}")
+            })
+            .collect();
+        written.join(", ")
+    }
+
+    /// A function, event or error statement the way the snapshot writes it.
+    fn declaration(statement: &str, structs: &HashMap<&str, String>) -> String {
+        let (head, rest) = statement.split_once('(').unwrap();
+        let (inputs, tail) = rest.split_once(')').unwrap();
+        let mut written = format!("{}({})", head.trim(), parameters(inputs, structs));
+        for word in ["view", "pure"] {
+            if tail.split_whitespace().any(|found| found == word) {
+                written += &format!(" {word}");
+            }
+        }
+        if let Some((_, outputs)) = tail.split_once("returns") {
+            let outputs = outputs.trim().trim_start_matches('(');
+            let outputs = outputs.trim_end_matches(';').trim().trim_end_matches(')');
+            written += &format!(" returns ({})", parameters(outputs, structs));
+        }
+        written
+    }
+
+    /// Every function, event and error this file declares in `interface`, the way the snapshot
+    /// writes them. Panics on a statement that is none of those, so nothing is passed over.
+    fn declared_here(interface: &str) -> Vec<String> {
+        let statements = statements(&interface_body(interface));
+        let structs = structs(&statements);
+        statements
+            .iter()
+            .filter(|statement| !statement.starts_with("struct "))
+            .map(|statement| {
+                let known = ["function ", "event ", "error "];
+                assert!(
+                    known.iter().any(|kind| statement.starts_with(kind)),
+                    "neither a function, an event nor an error: {statement}"
+                );
+                declaration(statement, &structs)
+            })
+            .collect()
+    }
+
+    /// Every function, event and error declared above exists in the contracts exactly as
+    /// declared: its name, each parameter's type and name, which event parameters are indexed,
+    /// whether it only reads, and what it returns.
+    #[test]
+    fn every_declaration_matches_the_contracts() {
+        for interface in ["IRecurringCollector", "IRecurringAgreementManager"] {
+            let in_the_contracts = in_the_contracts(interface);
+            let declared_here = declared_here(interface);
+            assert!(!declared_here.is_empty(), "{interface} declares nothing");
+
+            let drifted: Vec<_> = declared_here
+                .iter()
+                .filter(|declared| !in_the_contracts.contains(&declared.as_str()))
+                .collect();
+
+            assert!(
+                drifted.is_empty(),
+                "{interface} declares what the contracts do not have: {drifted:#?}"
+            );
+        }
+    }
 
     #[test]
     fn decodes_the_observed_collection_window_revert() {
