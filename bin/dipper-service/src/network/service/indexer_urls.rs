@@ -11,6 +11,8 @@ use tokio::{
 };
 use url::Url;
 
+use crate::indexer_addresses::AddressRule;
+
 /// Timeout for subgraph queries.
 const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -76,6 +78,8 @@ pub struct Ctx {
     pub api_key: Option<String>,
     /// Refresh interval.
     pub update_interval: Duration,
+    /// The addresses dipper may call indexers at.
+    pub addresses: AddressRule,
 }
 
 /// Fetch a full snapshot of registered indexer URLs from the subgraph.
@@ -153,6 +157,22 @@ fn parse_indexer_entry(entry: &IndexerEntity) -> Option<(IndexerId, Url)> {
     Some((id, url))
 }
 
+/// `snapshot` without the indexers whose URL `addresses` refuses, each skipped with a warning.
+pub fn keep_allowed(mut snapshot: Snapshot, addresses: AddressRule) -> Snapshot {
+    snapshot.retain(|indexer, url| match addresses.check_url(url) {
+        Ok(()) => true,
+        Err(refused) => {
+            tracing::warn!(
+                indexer = %indexer,
+                error = %refused,
+                "skipping indexer whose URL is at an address that is not public"
+            );
+            false
+        }
+    });
+    snapshot
+}
+
 /// Create a new indexer URLs service: refetches the full set of registered
 /// indexers at regular intervals and publishes the result. Failed or empty
 /// refreshes preserve the previous snapshot.
@@ -185,7 +205,7 @@ pub fn new(ctx: Ctx, init: Snapshot) -> (Handle, impl Future<Output = anyhow::Re
 
             let snapshot =
                 match fetch_snapshot(&client, &ctx.endpoint, ctx.api_key.as_deref()).await {
-                    Ok(snapshot) => snapshot,
+                    Ok(snapshot) => keep_allowed(snapshot, ctx.addresses),
                     Err(err) => {
                         tracing::warn!(error = %err, "failed to fetch indexer URLs update");
                         continue;
@@ -323,6 +343,7 @@ mod tests {
                 endpoint: "http://localhost:9999/subgraphs/name/test".parse().unwrap(),
                 api_key: None,
                 update_interval: Duration::from_secs(3600),
+                addresses: AddressRule::PublicOnly,
             },
             init,
         );
@@ -341,6 +362,7 @@ mod tests {
                 endpoint: "http://localhost:9999/subgraphs/name/test".parse().unwrap(),
                 api_key: None,
                 update_interval: Duration::from_secs(3600),
+                addresses: AddressRule::PublicOnly,
             },
             Snapshot::new(),
         );
@@ -351,5 +373,58 @@ mod tests {
         // Should complete without error
         let result = tokio::time::timeout(Duration::from_secs(2), task).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_indexer_registered_at_an_address_that_is_not_public_is_skipped() {
+        //* Given
+        let urls = [
+            "http://10.0.0.5:8545/",
+            "http://169.254.169.254/",
+            "http://[::1]/",
+            "https://8.8.8.8/",
+            "https://indexer.example.com/",
+            "http://localhost/",
+        ];
+        let snapshot: Snapshot = urls
+            .iter()
+            .enumerate()
+            .map(|(n, url)| {
+                let id = format!("0x{:040x}", n + 1).parse::<IndexerId>().unwrap();
+                (id, url.parse::<Url>().unwrap())
+            })
+            .collect();
+        let kept = |snapshot: &Snapshot| -> Vec<String> {
+            snapshot.values().map(ToString::to_string).collect()
+        };
+
+        //* When
+        let mut public_only = Snapshot::new();
+        let logs = crate::test_support::logged(async {
+            public_only = keep_allowed(snapshot.clone(), AddressRule::PublicOnly);
+        })
+        .await;
+        let any = keep_allowed(snapshot.clone(), AddressRule::Any);
+
+        //* Then a name is left to be judged when dipper connects
+        assert_eq!(
+            kept(&public_only),
+            [
+                "https://8.8.8.8/",
+                "https://indexer.example.com/",
+                "http://localhost/"
+            ]
+        );
+        assert_eq!(kept(&any), kept(&snapshot));
+        assert_eq!(
+            logs.matches("skipping indexer whose URL is at an address that is not public")
+                .count(),
+            3,
+            "{logs}"
+        );
+        assert!(
+            logs.contains("refused 169.254.169.254: not a public address"),
+            "{logs}"
+        );
     }
 }

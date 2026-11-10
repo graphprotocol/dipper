@@ -26,6 +26,7 @@ mod chain_client;
 mod config;
 mod db;
 mod health;
+mod indexer_addresses;
 mod indexer_rpc_client;
 mod network;
 mod registry;
@@ -225,6 +226,15 @@ pub async fn main() -> anyhow::Result<()> {
     //- The registry component
     let registry = RegistryProvider::new(db_conn.clone());
 
+    //- The addresses dipper may call indexers at
+    let addresses = indexer_addresses::AddressRule::new(conf.indexer_urls.allow_private_addresses);
+    if conf.indexer_urls.allow_private_addresses {
+        tracing::warn!(
+            "indexer_urls.allow_private_addresses is on: dipper calls indexers at private \
+             addresses too, which only a local network should allow"
+        );
+    }
+
     //- The indexer client component (signs each outbound proposal; see DipsIndexerClient).
     let indexer_client = indexer_rpc_client::DipsIndexerClient::with_config(
         conf.indexer_client,
@@ -252,6 +262,7 @@ pub async fn main() -> anyhow::Result<()> {
                     api_key.as_deref(),
                 )
                 .await
+                .map(|snapshot| network::service::indexer_urls::keep_allowed(snapshot, addresses))
                 {
                     Ok(s) if !s.is_empty() => break s,
                     Ok(s) if conf.indexer_urls.allow_empty_at_startup => {
@@ -296,6 +307,7 @@ pub async fn main() -> anyhow::Result<()> {
                 endpoint: subgraph_endpoint,
                 api_key,
                 update_interval: conf.indexer_urls.update_interval,
+                addresses,
             },
             init_snapshot,
         )

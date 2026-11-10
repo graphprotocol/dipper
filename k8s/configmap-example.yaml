@@ -58,7 +58,8 @@ data:
         "subgraph_endpoint": "https://api.studio.thegraph.com/query/REPLACE_ME_USER_ID/REPLACE_ME_INDEXING_PAYMENTS_SLUG/version/latest",
         "api_key": "REPLACE_ME_OR_REMOVE_IF_ENDPOINT_NEEDS_NO_AUTH",
         "update_interval": 60,
-        "allow_empty_at_startup": false
+        "allow_empty_at_startup": false,
+        "allow_private_addresses": false
       },
       "signer": {
         "secret_key": "REPLACE_ME",
