@@ -3,8 +3,10 @@
 
 Dipper asks IISA which indexers to offer agreements to and which indexers accept them, through
 the client in dipper-iisa/src/http_client.rs. Tests beside it compare what the client sends and
-reads with the OpenAPI schema this script writes, so a client that has drifted from IISA fails
-the build.
+reads with the OpenAPI schema this script writes, so the build fails when the client drifts from
+the recording committed here. IISA drifting from that recording fails nothing by itself: the
+scheduled iisa-drift workflow records IISA's main branch afresh with this script, into a file of
+its own given by --output, and runs the same tests against it.
 
 Run it from the root of this repo, giving it a checkout of IISA
 (graphprotocol/subgraph-dips-indexer-selection). It needs `uv`:
@@ -43,7 +45,14 @@ def git(iisa, *args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("iisa", type=pathlib.Path, help="a checkout of IISA")
-    iisa = parser.parse_args().iisa.resolve()
+    parser.add_argument(
+        "--output",
+        type=pathlib.Path,
+        default=SNAPSHOT,
+        help=f"where to write the recording (default: {SNAPSHOT}, the copy the tests read)",
+    )
+    arguments = parser.parse_args()
+    iisa = arguments.iisa.resolve()
 
     if git(iisa, "status", "--porcelain"):
         sys.exit(f"{iisa} has uncommitted changes: the snapshot must match a commit")
@@ -64,8 +73,8 @@ def main():
         "iisa_commit": commit,
         "schema": json.loads(result.stdout),
     }
-    SNAPSHOT.write_text(json.dumps(snapshot, indent=2, sort_keys=True) + "\n")
-    print(f"wrote {SNAPSHOT} from IISA {commit[:8]}")
+    arguments.output.write_text(json.dumps(snapshot, indent=2, sort_keys=True) + "\n")
+    print(f"wrote {arguments.output} from IISA {commit[:8]}")
 
 
 if __name__ == "__main__":

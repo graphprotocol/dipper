@@ -1,0 +1,64 @@
+name: iisa-drift
+on:
+  schedule:
+    - cron: '30 6 * * *'
+  workflow_dispatch:
+  # A schedule runs only from the default branch, so a change to the check itself proves it here.
+  pull_request:
+    paths:
+      - .github/workflows/iisa-drift.yml
+      - scripts/snapshot-iisa-openapi.py
+      - dipper-iisa/src/http_client/iisa_openapi.json
+      - dipper-iisa/src/http_client/contract_tests.rs
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The contract tests in PR CI compare dipper's IISA client with the committed recording, so IISA
+  # changing a field dipper sends or reads goes unnoticed there. This records IISA's main branch
+  # afresh and runs the same tests against it, failing only on a change the client feels.
+  check-iisa-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
+        with:
+          persist-credentials: false
+
+      - name: Check out IISA's main branch
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
+        with:
+          repository: graphprotocol/subgraph-dips-indexer-selection
+          ref: main
+          path: iisa
+          persist-credentials: false
+
+      # The uv version IISA's own CI uses.
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.12.24"
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1
+        with:
+          cache: false
+          rustflags: ''
+
+      - name: Record IISA's API from its main branch
+        run: scripts/snapshot-iisa-openapi.py iisa --output "$RUNNER_TEMP/iisa_openapi.json"
+
+      - name: Check dipper's IISA client against it
+        env:
+          IISA_OPENAPI_RECORDING: ${{ runner.temp }}/iisa_openapi.json
+        run: |
+          if ! cargo test -p dipper-iisa contract_tests; then
+            echo "::error::IISA's main branch no longer fits what dipper's IISA client sends or reads (the failing test above names the field). Re-record with scripts/snapshot-iisa-openapi.py and bring the client in line."
+            exit 1
+          fi

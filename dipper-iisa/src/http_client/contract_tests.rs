@@ -1,6 +1,6 @@
 //! Checks that what the client sends to IISA, and what it reads from IISA's replies, match IISA's
 //! own description of its API: the OpenAPI schema in `iisa_openapi.json`, written from an IISA
-//! checkout by `scripts/snapshot-iisa-openapi.py`. After IISA's API changes, write it again.
+//! checkout by `scripts/snapshot-iisa-openapi.py`, or the recording `RECORDING` names.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -17,6 +17,10 @@ use super::*;
 /// IISA's OpenAPI schema, with the IISA commit it was written from.
 const SNAPSHOT: &str = include_str!("iisa_openapi.json");
 
+/// Names a recording to check against instead of the committed one. The scheduled drift check
+/// sets it to one written from IISA's main branch that day.
+const RECORDING: &str = "IISA_OPENAPI_RECORDING";
+
 /// The client's own source, to find every type it sends or reads and every path it calls.
 const CLIENT: &str = include_str!("../http_client.rs");
 
@@ -25,7 +29,12 @@ const IF_IISA_CHANGED: &str = "If IISA is the side that changed, write the snaps
                                scripts/snapshot-iisa-openapi.py and bring the client in line.";
 
 fn api() -> Value {
-    let snapshot: Value = serde_json::from_str(SNAPSHOT).expect("the snapshot is JSON");
+    let snapshot = match std::env::var(RECORDING) {
+        Ok(path) => std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("{RECORDING} names {path}, which cannot be read: {err}")),
+        Err(_) => SNAPSHOT.to_string(),
+    };
+    let snapshot: Value = serde_json::from_str(&snapshot).expect("the recording is JSON");
     snapshot["schema"].clone()
 }
 
