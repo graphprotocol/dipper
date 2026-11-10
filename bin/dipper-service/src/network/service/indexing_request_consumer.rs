@@ -532,16 +532,10 @@ where
     F: FnOnce(Arc<KafkaConsumer>) -> Fut,
     Fut: Future<Output = Result<T, ConsumerError>>,
 {
-    let client = tokio::select! {
-        _ = shutdown_rx.changed() => return None,
-        client = consumer.connected() => client,
-    };
-    let result = tokio::select! {
-        _ = shutdown_rx.changed() => return None,
-        result = call(Arc::clone(&client)) => result,
-    };
-    consumer.report(&client, &result);
-    Some(result)
+    tokio::select! {
+        _ = shutdown_rx.changed() => None,
+        result = consumer.call(call) => Some(result),
+    }
 }
 
 /// Wait out a backoff, returning `true` when shutdown was requested instead.
