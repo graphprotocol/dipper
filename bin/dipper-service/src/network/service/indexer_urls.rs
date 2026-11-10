@@ -85,7 +85,7 @@ pub struct Ctx {
 /// Fetch a full snapshot of registered indexer URLs from the subgraph.
 /// Fails on query or decode errors; an empty result is not an error (no
 /// indexers have registered yet).
-pub async fn fetch_snapshot(
+pub(in crate::network) async fn fetch_snapshot(
     client: &reqwest::Client,
     endpoint: &Url,
     api_key: Option<&str>,
@@ -157,8 +157,20 @@ fn parse_indexer_entry(entry: &IndexerEntity) -> Option<(IndexerId, Url)> {
     Some((id, url))
 }
 
+/// Fetch the registered indexers' URLs and keep those `addresses` allows, each other skipped with
+/// a warning. Startup and every refresh read the URLs through this, so none skips the check.
+pub async fn fetch_allowed(
+    client: &reqwest::Client,
+    endpoint: &Url,
+    api_key: Option<&str>,
+    addresses: AddressRule,
+) -> anyhow::Result<Snapshot> {
+    let snapshot = fetch_snapshot(client, endpoint, api_key).await?;
+    Ok(keep_allowed(snapshot, addresses))
+}
+
 /// `snapshot` without the indexers whose URL `addresses` refuses, each skipped with a warning.
-pub fn keep_allowed(mut snapshot: Snapshot, addresses: AddressRule) -> Snapshot {
+fn keep_allowed(mut snapshot: Snapshot, addresses: AddressRule) -> Snapshot {
     snapshot.retain(|indexer, url| match addresses.check_url(url) {
         Ok(()) => true,
         Err(refused) => {
@@ -203,14 +215,20 @@ pub fn new(ctx: Ctx, init: Snapshot) -> (Handle, impl Future<Output = anyhow::Re
                 _ = timer.tick() => {},
             }
 
-            let snapshot =
-                match fetch_snapshot(&client, &ctx.endpoint, ctx.api_key.as_deref()).await {
-                    Ok(snapshot) => keep_allowed(snapshot, ctx.addresses),
-                    Err(err) => {
-                        tracing::warn!(error = %err, "failed to fetch indexer URLs update");
-                        continue;
-                    }
-                };
+            let snapshot = match fetch_allowed(
+                &client,
+                &ctx.endpoint,
+                ctx.api_key.as_deref(),
+                ctx.addresses,
+            )
+            .await
+            {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    tracing::warn!(error = %err, "failed to fetch indexer URLs update");
+                    continue;
+                }
+            };
 
             // Guard against refreshes that produce zero indexers: a subgraph
             // serving a partially indexed dataset would otherwise wipe every
@@ -426,5 +444,78 @@ mod tests {
             logs.contains("refused 169.254.169.254: not a public address"),
             "{logs}"
         );
+    }
+
+    const PRIVATE_INDEXER: &str = "0x1111111111111111111111111111111111111111";
+    const PUBLIC_INDEXER: &str = "0x2222222222222222222222222222222222222222";
+
+    /// A subgraph that answers every query with 1 indexer registered at `http://10.0.0.5/`, a
+    /// private address, and 1 at a public name.
+    async fn subgraph_with_a_private_indexer() -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data": {"indexers": [
+                        {"id": PRIVATE_INDEXER, "url": "http://10.0.0.5/"},
+                        {"id": PUBLIC_INDEXER, "url": "https://indexer.example.com/"},
+                    ]}
+                })),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn a_refresh_publishes_no_indexer_registered_at_an_address_that_is_not_public() {
+        //* Given
+        let subgraph = subgraph_with_a_private_indexer().await;
+        let (handle, service) = new(
+            Ctx {
+                endpoint: subgraph.uri().parse().unwrap(),
+                api_key: None,
+                update_interval: Duration::from_millis(50),
+                addresses: AddressRule::PublicOnly,
+            },
+            Snapshot::new(),
+        );
+        let service = tokio::spawn(service);
+        let public: IndexerId = PUBLIC_INDEXER.parse().unwrap();
+        let private: IndexerId = PRIVATE_INDEXER.parse().unwrap();
+
+        //* When the service publishes its first refresh
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while handle.get_indexer_url(&public).is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no refresh published within 5s"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        //* Then
+        assert_eq!(handle.get_indexer_url(&private), None);
+        handle.stop().await;
+        assert!(service.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn startup_takes_no_indexer_registered_at_an_address_that_is_not_public() {
+        //* Given
+        let subgraph = subgraph_with_a_private_indexer().await;
+        let endpoint: Url = subgraph.uri().parse().unwrap();
+        let client = reqwest::Client::new();
+        let ids = |snapshot: Snapshot| -> Vec<String> {
+            snapshot.keys().map(ToString::to_string).collect()
+        };
+
+        //* When
+        let public_only = fetch_allowed(&client, &endpoint, None, AddressRule::PublicOnly).await;
+        let any = fetch_allowed(&client, &endpoint, None, AddressRule::Any).await;
+
+        //* Then
+        assert_eq!(ids(public_only.unwrap()), [PUBLIC_INDEXER]);
+        assert_eq!(ids(any.unwrap()), [PRIVATE_INDEXER, PUBLIC_INDEXER]);
     }
 }

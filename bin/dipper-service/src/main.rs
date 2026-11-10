@@ -256,13 +256,13 @@ pub async fn main() -> anyhow::Result<()> {
                 .expect("failed to build HTTP client");
             let mut attempt: u32 = 0;
             loop {
-                match network::service::indexer_urls::fetch_snapshot(
+                match network::service::indexer_urls::fetch_allowed(
                     &client,
                     &subgraph_endpoint,
                     api_key.as_deref(),
+                    addresses,
                 )
                 .await
-                .map(|snapshot| network::service::indexer_urls::keep_allowed(snapshot, addresses))
                 {
                     Ok(s) if !s.is_empty() => break s,
                     Ok(s) if conf.indexer_urls.allow_empty_at_startup => {
