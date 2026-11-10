@@ -474,6 +474,30 @@ async fn every_call_dipper_makes_is_one_iisa_serves() {
     }
 }
 
+/// Wherever IISA asks for the bearer token, by reading the authorization header or by answering
+/// 401, a client given a token sends it; without it every such call would be refused.
+#[tokio::test]
+async fn dipper_sends_its_token_wherever_iisa_asks_for_one() {
+    let api = api();
+    for request in calls_to_iisa().await {
+        let route = request.url.path().to_string();
+        let operation = &api["paths"][&route][request.method.as_str().to_lowercase()];
+        let authorization = ("header".to_string(), "authorization".to_string());
+        let asks = parameters(operation).contains_key(&authorization)
+            || operation["responses"].get("401").is_some();
+        let sent = request
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok());
+
+        assert!(
+            !asks || sent == Some("Bearer token"),
+            "IISA asks for the bearer token on {route}, which dipper does not send ({sent:?}). \
+             {IF_IISA_CHANGED}"
+        );
+    }
+}
+
 /// The check above only covers the calls it makes, so every path the client builds is one of them.
 #[tokio::test]
 async fn every_path_the_client_calls_is_checked() {
