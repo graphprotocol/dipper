@@ -257,6 +257,12 @@ impl super::reconnect::CallError for ConsumerError {
     fn is_unreachable(&self) -> bool {
         ConsumerError::is_unreachable(self)
     }
+
+    /// A partition the client didn't learn when it connected, such as one the topic gained or one
+    /// missing from a cluster that was still starting up, stays unknown until a new client.
+    fn needs_new_client(&self) -> bool {
+        matches!(self, ConsumerError::UnknownPartition { .. })
+    }
 }
 
 impl ConsumerError {
@@ -287,6 +293,7 @@ impl ConsumerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kafka::CallError;
 
     #[test]
     fn only_failures_to_reach_the_brokers_count_as_unreachable() {
@@ -314,6 +321,11 @@ mod tests {
             topic: "test".to_string(),
         };
         assert!(!unknown.is_unreachable());
+        assert!(
+            unknown.needs_new_client(),
+            "only a new client learns the partition"
+        );
+        assert!(!out_of_range.needs_new_client());
     }
 
     #[test]

@@ -26,6 +26,12 @@ const WARN_EVERY: u32 = 5;
 pub trait CallError {
     /// The call never reached the brokers, so a new client might succeed where this one can't.
     fn is_unreachable(&self) -> bool;
+
+    /// The brokers answered, but this client can't serve the call however long it waits, such as a
+    /// partition missing from what it learned when it connected, so only a new client can.
+    fn needs_new_client(&self) -> bool {
+        false
+    }
 }
 
 /// A client connected in the background and rebuilt once calls have failed to reach the brokers for
@@ -60,6 +66,9 @@ impl<T> Drop for Shared<T> {
 struct State<T> {
     client: Option<Arc<T>>,
     failing_since: Option<Instant>,
+    /// When the client was connected, so a client that can't serve a call is replaced at most
+    /// once per [`RECONNECT_AFTER`] rather than in a loop.
+    connected_at: Instant,
 }
 
 impl<T> Clone for Reconnecting<T> {
@@ -126,6 +135,7 @@ impl<T: Send + Sync + 'static> Reconnecting<T> {
             state: Mutex::new(State {
                 client: client.map(Arc::new),
                 failing_since: None,
+                connected_at: Instant::now(),
             }),
             signals: signals.clone(),
         });
@@ -143,6 +153,7 @@ impl<T: Send + Sync + 'static> Reconnecting<T> {
                     *shared.lock() = State {
                         client: Some(Arc::new(client)),
                         failing_since: None,
+                        connected_at: Instant::now(),
                     };
                     drop(shared);
                     signals.connected.notify_waiters();
@@ -199,6 +210,7 @@ impl<T: Send + Sync + 'static> Reconnecting<T> {
             Err(e) if e.is_unreachable() => {
                 self.report_unreachable(client);
             }
+            Err(e) if e.needs_new_client() => self.report_unservable(client),
             Err(_) => {}
         }
     }
@@ -214,6 +226,30 @@ impl<T: Send + Sync + 'static> Reconnecting<T> {
         {
             state.failing_since = None;
         }
+    }
+
+    /// Drops `client`, which the brokers answered but which can't serve a call, so the background
+    /// task connects again, unless it was replaced since or connected less than
+    /// [`RECONNECT_AFTER`] ago. Other calls succeeding through it don't save it.
+    fn report_unservable(&self, client: &Arc<T>) {
+        let mut state = self.shared.lock();
+        let current = state
+            .client
+            .as_ref()
+            .is_some_and(|c| Arc::ptr_eq(c, client));
+        let age = state.connected_at.elapsed();
+        if !current || age < RECONNECT_AFTER {
+            return;
+        }
+        state.client = None;
+        state.failing_since = None;
+        drop(state);
+        tracing::warn!(
+            broker = self.shared.name,
+            connected_for_secs = age.as_secs(),
+            "the client can't serve a call the brokers answered; connecting again"
+        );
+        self.shared.signals.rebuild.notify_one();
     }
 
     /// Records that a request through `client` couldn't reach the brokers; once sends have failed for
@@ -233,10 +269,8 @@ impl<T: Send + Sync + 'static> Reconnecting<T> {
         if now - since < RECONNECT_AFTER {
             return false;
         }
-        *state = State {
-            client: None,
-            failing_since: None,
-        };
+        state.client = None;
+        state.failing_since = None;
         drop(state);
         tracing::warn!(
             broker = self.shared.name,
@@ -451,6 +485,41 @@ mod tests {
 
         // The connector, which holds the broker credentials, went with the background task.
         assert_eq!(Arc::strong_count(&held), 1);
+    }
+
+    /// An answer from the brokers that this client can't serve, such as a partition it never learned.
+    #[derive(Debug)]
+    struct Unservable;
+
+    impl CallError for Unservable {
+        fn is_unreachable(&self) -> bool {
+            false
+        }
+
+        fn needs_new_client(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replaces_a_client_that_cant_serve_a_call_at_most_once_a_minute() {
+        let (attempts, connect) = connector(0);
+        let conn = Reconnecting::with_client("test", Client(0), TIMEOUT, connect);
+        let first = conn.current().unwrap();
+        let unservable = Err::<(), _>(Unservable);
+
+        conn.report(&first, &Ok::<(), Unservable>(()));
+        conn.report(&first, &unservable);
+        assert!(conn.current().is_some(), "a client this new is kept");
+
+        tokio::time::sleep(RECONNECT_AFTER).await;
+        conn.report(&first, &unservable);
+        assert!(
+            conn.current().is_none(),
+            "even while other calls through it succeed"
+        );
+        assert_eq!(*conn.connected().await, Client(1));
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test(start_paused = true)]
