@@ -73,7 +73,7 @@ Once accepted, fees accrue continuously: elapsed seconds multiplied by your toke
 ## How to receive offers
 
 - **Register a working query URL.** Dipper discovers your endpoint from the indexing-payments subgraph. A URL that does not parse as http or https with a host means you are skipped outright and never receive an offer.
-- **Run indexer software with DIPs support.** Offers arrive over gRPC at the host of your registered URL on port 7602, whatever port the URL itself names, so your indexer service must expose the DIPs endpoint that receives them there.
+- **Run indexer software with DIPs support.** Offers arrive over gRPC at the host of your registered URL on port 7602, whatever port the URL itself names, so your indexer service must expose the DIPs endpoint that receives them there. The URL's scheme is kept and decides the connection: with an https URL dipper connects over TLS, so you must serve TLS gRPC on port 7602; with http it connects without TLS. The fixed port is a current limitation of dipper, not a design choice.
 - **Trust the payer.** Your indexer only accepts agreements from payers it trusts. If the DIPs payer address is not in your trusted set, offers are rejected as `SENDER_NOT_TRUSTED` and dipper retries after 1 day.
 - **Price within reach.** Asking more than 10 times the published minimum for a chain drops you from selection until your price comes down.
 - **Answer, and accept quickly.** No reply at all costs more than declining (see the table below), and an accepted offer still has to land on-chain within the 10-minute deadline.
