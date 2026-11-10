@@ -39,11 +39,13 @@ struct Shared<T> {
     signals: Arc<Signals>,
 }
 
-/// Wakes the background task: to connect again, or to stop once every handle is gone.
+/// Wakes the background task, to connect again or to stop once every handle is gone, and wakes
+/// callers waiting for a client once one is connected.
 #[derive(Default)]
 struct Signals {
     rebuild: Notify,
     closed: Notify,
+    connected: Notify,
 }
 
 impl<T> Drop for Shared<T> {
@@ -83,11 +85,32 @@ impl<T: Send + Sync + 'static> Reconnecting<T> {
         Fut: Future<Output = Result<T, E>> + Send,
         E: Display + Send,
     {
+        Self::start(name, None, connect)
+    }
+
+    /// Like [`spawn`](Self::spawn), starting from a client the caller already connected, so the
+    /// caller decides what a failed first connect means; `connect` is used only for rebuilds.
+    pub fn with_client<F, Fut, E>(name: &'static str, client: T, connect: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<T, E>> + Send,
+        E: Display + Send,
+    {
+        Self::start(name, Some(client), connect)
+    }
+
+    fn start<F, Fut, E>(name: &'static str, client: Option<T>, connect: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<T, E>> + Send,
+        E: Display + Send,
+    {
+        let mut connected = client.is_some();
         let signals = Arc::new(Signals::default());
         let shared = Arc::new(Shared {
             name,
             state: Mutex::new(State {
-                client: None,
+                client: client.map(Arc::new),
                 failing_since: None,
             }),
             signals: signals.clone(),
@@ -95,28 +118,45 @@ impl<T: Send + Sync + 'static> Reconnecting<T> {
         let task = Arc::downgrade(&shared);
         tokio::spawn(async move {
             loop {
-                let client = tokio::select! {
-                    client = connect_with_retry(name, &connect) => client,
-                    _ = signals.closed.notified() => return,
-                };
-                let Some(shared) = task.upgrade() else {
-                    return;
-                };
-                *shared.lock() = State {
-                    client: Some(Arc::new(client)),
-                    failing_since: None,
-                };
-                drop(shared);
-                tracing::info!(broker = name, "connected to the brokers");
+                if !connected {
+                    let client = tokio::select! {
+                        client = connect_with_retry(name, &connect) => client,
+                        _ = signals.closed.notified() => return,
+                    };
+                    let Some(shared) = task.upgrade() else {
+                        return;
+                    };
+                    *shared.lock() = State {
+                        client: Some(Arc::new(client)),
+                        failing_since: None,
+                    };
+                    drop(shared);
+                    signals.connected.notify_waiters();
+                    tracing::info!(broker = name, "connected to the brokers");
+                }
                 // `notify_one` stores a permit, so a rebuild or close asked for before this wait
                 // starts is not missed.
                 tokio::select! {
-                    _ = signals.rebuild.notified() => {}
+                    _ = signals.rebuild.notified() => connected = false,
                     _ = signals.closed.notified() => return,
                 }
             }
         });
         Self { shared }
+    }
+
+    /// Waits for a client, returning at once when one is connected.
+    pub async fn connected(&self) -> Arc<T> {
+        loop {
+            // Registered before the check, so a client swapped in between the two still wakes it.
+            let notified = self.shared.signals.connected.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(client) = self.current() {
+                return client;
+            }
+            notified.await;
+        }
     }
 
     /// The client, or `None` while it is being (re)built.
@@ -243,6 +283,32 @@ mod tests {
 
         assert_eq!(*client, Client(3));
         assert_eq!(attempts.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hands_out_a_client_connected_by_the_caller_without_connecting() {
+        let (attempts, connect) = connector(0);
+        let conn = Reconnecting::with_client("test", Client(0), connect);
+
+        assert_eq!(conn.current().as_deref(), Some(&Client(0)));
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(attempts.load(Ordering::Relaxed), 0);
+
+        let first = conn.current().unwrap();
+        conn.report_unreachable(&first);
+        tokio::time::sleep(RECONNECT_AFTER).await;
+        assert!(conn.report_unreachable(&first));
+        assert_eq!(*conn.connected().await, Client(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn waits_for_a_client_while_one_is_connected() {
+        let (_, connect) = connector(2);
+        let conn = Reconnecting::spawn("test", connect);
+
+        let waited = tokio::time::timeout(Duration::from_secs(60), conn.connected()).await;
+
+        assert_eq!(waited.as_deref(), Ok(&Client(3)));
     }
 
     #[tokio::test(start_paused = true)]
