@@ -152,20 +152,27 @@ fn write_config(server_url: &Url, signing_key: &str, output_path: &Path) -> Resu
 fn write_private(path: &Path, content: &str) -> std::io::Result<()> {
     use std::io::Write as _;
 
+    // Opened without emptying it: if the permissions below can't be set, the file still holds
+    // what it held before.
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create(true).truncate(false);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
     }
     let mut file = options.open(path)?;
-    // That mode only applies to a file this call creates. A file that was already there keeps
-    // its own, so close it to other users before the key goes in.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    // A pipe or a device such as `/dev/stdout` has no contents to replace and no permissions
+    // this user can set, so only a file of its own gets either.
+    if file.metadata()?.is_file() {
+        // The mode above only applies to a file this call creates. A file that was already
+        // there keeps its own, so close it to other users before the key goes in.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        file.set_len(0)?;
     }
     file.write_all(content.as_bytes())
 }
@@ -248,6 +255,13 @@ mod tests {
         write_key_file(&key_file.0);
 
         assert_eq!(mode(&key_file.0), "600");
+    }
+
+    /// Output that is not a file of its own, such as a pipe or `/dev/stdout`, has no permissions
+    /// this user can set, and still gets the key written to it.
+    #[test]
+    fn test_the_key_can_be_written_to_output_that_is_not_a_file() {
+        write_key_file(Path::new("/dev/null"));
     }
 
     #[test]
