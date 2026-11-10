@@ -4,6 +4,10 @@ on:
   pull_request:
   push:
     branches: [ 'main' ]
+  # A new advisory can be published while nothing here is changing. Without a daily run it would
+  # only show up on whichever pull request came next, or not at all during a quiet spell.
+  schedule:
+    - cron: '23 6 * * *'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
