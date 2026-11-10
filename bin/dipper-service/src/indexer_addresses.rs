@@ -56,9 +56,10 @@ impl AddressRule {
     /// A builder for an HTTP client that calls indexers only at addresses this rule allows, judging
     /// a name by what it resolves to as it connects, and follows at most `MAX_REDIRECTS` redirects.
     pub fn http_client(self) -> reqwest::ClientBuilder {
-        // Behind an HTTP proxy the proxy looks names up, so only addresses written in URLs are
-        // judged. A proxy at a private address must be given by its address: its name is judged.
+        // Proxy variables are ignored: the check is worth something only if dipper makes the
+        // connection itself, since a proxy would look the indexer's name up in its place.
         reqwest::Client::builder()
+            .no_proxy()
             .dns_resolver(Arc::new(Resolver(self)))
             .redirect(reqwest::redirect::Policy::custom(move |attempt| {
                 // The first URL in `previous` is the request itself, not a redirect.
@@ -527,5 +528,57 @@ mod tests {
             "/3",
             "the 4th redirect, to /4, is not followed"
         );
+    }
+
+    /// The environment variable that hands the indexer's URL to the test run in its own process.
+    const INDEXER_URL_VARIABLE: &str = "DIPPER_TEST_INDEXER_URL";
+
+    /// Proxy variables are read once per process and shared by every test in it, so this check
+    /// runs the test below in a process of its own, with every proxy variable set.
+    #[tokio::test]
+    async fn the_client_ignores_proxy_variables_and_connects_to_the_indexer_itself() {
+        //* Given an indexer, and a proxy that would answer in its place
+        let indexer = server().await;
+        let proxy = server().await;
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "indexer_addresses::tests::call_an_indexer_with_proxy_variables_set",
+            ])
+            .args(["--ignored", "--nocapture"])
+            .env(INDEXER_URL_VARIABLE, indexer.uri());
+        for variable in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] {
+            command.env(variable, proxy.uri());
+        }
+        for variable in ["NO_PROXY", "no_proxy", "REQUEST_METHOD"] {
+            command.env_remove(variable);
+        }
+
+        //* When
+        let run = tokio::task::spawn_blocking(move || command.output())
+            .await
+            .unwrap()
+            .unwrap();
+
+        //* Then
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stdout)
+        );
+        assert_eq!(indexer.received_requests().await.unwrap().len(), 1);
+        assert!(proxy.received_requests().await.unwrap().is_empty());
+    }
+
+    /// Run by the test above, which hands it the indexer's URL; does nothing when run on its own.
+    #[tokio::test]
+    #[ignore = "run in a process of its own by the proxy variables test"]
+    async fn call_an_indexer_with_proxy_variables_set() {
+        let Ok(url) = std::env::var(INDEXER_URL_VARIABLE) else {
+            return;
+        };
+        let answer = client(AddressRule::Any).get(url).send().await.unwrap();
+        assert_eq!(answer.status(), 200);
     }
 }
