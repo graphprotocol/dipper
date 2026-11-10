@@ -6,8 +6,11 @@ use std::{
     error::Error,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
 };
 
+use hyper_util::client::legacy::connect::{HttpConnector, dns::Name};
 use url::{Host, Url};
 
 /// The most redirects dipper follows in 1 call to an indexer. Indexer software answers in place, so
@@ -72,6 +75,18 @@ impl AddressRule {
             }))
     }
 
+    /// A connector for gRPC calls to indexers that connects only to addresses this rule allows,
+    /// judging a name by what it resolves to. An address written in the URL skips that lookup, so
+    /// check the URL with `check_url` first.
+    pub fn grpc_connector(self, connect_timeout: Duration) -> HttpConnector<Resolver> {
+        let mut connector = HttpConnector::new_with_resolver(Resolver(self));
+        // gRPC adds TLS on top for an https URL, so this connector must take https URLs too.
+        connector.enforce_http(false);
+        connector.set_nodelay(true);
+        connector.set_connect_timeout(Some(connect_timeout));
+        connector
+    }
+
     /// Look `name` up and keep the addresses this rule allows, failing when none is left.
     async fn resolve(self, name: &str) -> Result<Vec<SocketAddr>, Box<dyn Error + Send + Sync>> {
         let found: Vec<SocketAddr> = tokio::net::lookup_host((name, 0)).await?.collect();
@@ -97,21 +112,42 @@ impl AddressRule {
     }
 }
 
-/// Looks names up for an HTTP client, under an `AddressRule`.
-struct Resolver(AddressRule);
+/// Looks names up for a connection to an indexer, under an `AddressRule`.
+#[derive(Clone)]
+pub struct Resolver(AddressRule);
 
-impl reqwest::dns::Resolve for Resolver {
-    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+impl Resolver {
+    fn lookup(&self, name: String) -> reqwest::dns::Resolving {
         let rule = self.0;
         Box::pin(async move {
-            let addrs = rule.resolve(name.as_str()).await?;
+            let addrs = rule.resolve(&name).await?;
             Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
         })
     }
 }
 
+impl reqwest::dns::Resolve for Resolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        self.lookup(name.as_str().to_string())
+    }
+}
+
+impl tower_service::Service<Name> for Resolver {
+    type Response = reqwest::dns::Addrs;
+    type Error = Box<dyn Error + Send + Sync>;
+    type Future = reqwest::dns::Resolving;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, name: Name) -> Self::Future {
+        self.lookup(name.as_str().to_string())
+    }
+}
+
 /// Dipper's refusal to connect to an address that is not public.
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum Refused {
     /// A host written as an address that is not public.
     #[error("refused {0}: not a public address")]

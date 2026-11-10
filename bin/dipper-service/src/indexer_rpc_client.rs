@@ -33,7 +33,11 @@ use thegraph_core::alloy::{
 use tonic::transport::ClientTlsConfig;
 use url::Url;
 
-use crate::{config::IndexerClientConfig, registry::IndexingAgreementTerms};
+use crate::{
+    config::IndexerClientConfig,
+    indexer_addresses::{AddressRule, Refused},
+    registry::IndexingAgreementTerms,
+};
 
 /// The indexer client error type for DIPs endpoint
 #[derive(Debug, thiserror::Error)]
@@ -47,6 +51,9 @@ pub enum DipsError {
 
     #[error("Error signing the agreement: {0}")]
     SigningError(Box<dyn std::error::Error + Send + Sync>),
+
+    #[error(transparent)]
+    NotPublicAddress(Refused),
 }
 
 /// Indexer client's DIPs trait
@@ -73,6 +80,7 @@ pub struct DipsIndexerClient {
     connect_timeout: Duration,
     request_timeout: Duration,
     max_retries: u32,
+    addresses: AddressRule,
 }
 
 impl DipsIndexerClient {
@@ -83,6 +91,7 @@ impl DipsIndexerClient {
         config: IndexerClientConfig,
         signer: PrivateKeySigner,
         rca_domain: Arc<RwLock<Eip712Domain>>,
+        addresses: AddressRule,
     ) -> Self {
         Self {
             signer,
@@ -90,6 +99,7 @@ impl DipsIndexerClient {
             connect_timeout: config.connect_timeout,
             request_timeout: config.request_timeout,
             max_retries: config.max_retries,
+            addresses,
         }
     }
 
@@ -143,6 +153,9 @@ impl DipsIndexerClient {
         &self,
         indexer_url: &Url,
     ) -> Result<rpc::IndexerDipsServiceClient<tonic::transport::Channel>, DipsError> {
+        self.addresses
+            .check_url(indexer_url)
+            .map_err(DipsError::NotPublicAddress)?;
         let mut endpoint = tonic::transport::Endpoint::from_str(indexer_url.as_str())
             .map_err(|err| DipsError::ConnectionError(err.into()))?
             .connect_timeout(self.connect_timeout)
@@ -158,7 +171,9 @@ impl DipsIndexerClient {
                 .tls_config(tls)
                 .map_err(|err| DipsError::ConnectionError(err.into()))?;
         }
-        let channel = endpoint.connect_lazy();
+        // The endpoint still adds its TLS and connect timeout around this connector.
+        let channel = endpoint
+            .connect_with_connector_lazy(self.addresses.grpc_connector(self.connect_timeout));
         let client = rpc::IndexerDipsServiceClient::new(channel);
         Ok(client)
     }
@@ -214,6 +229,10 @@ where
         match make_request(client).await {
             Ok(result) => return Ok(result),
             Err(status) => {
+                // Asking again would only be refused again.
+                if let Some(refused) = Refused::behind(&status) {
+                    return Err(DipsError::NotPublicAddress(refused.clone()));
+                }
                 if attempt < max_retries && is_retryable_status(&status) {
                     let delay = calculate_retry_delay(attempt);
                     tracing::warn!(
@@ -494,6 +513,7 @@ mod tests {
             connect_timeout: Duration::from_secs(1),
             request_timeout: Duration::from_secs(1),
             max_retries: 0,
+            addresses: AddressRule::Any,
         }
     }
 
@@ -637,14 +657,15 @@ mod tests {
         assert_eq!(calculate_retry_delay(100), Duration::from_secs(30));
     }
 
-    /// Send a proposal to a local port under the given URL scheme and return the
-    /// first `n` bytes the client writes there. Nothing answers, so the proposal
-    /// itself fails; only what the client opens the connection with matters.
-    async fn first_bytes_of_a_proposal(scheme: &str, n: usize) -> Vec<u8> {
+    /// Send a proposal to a local port under the given URL scheme and host and return the first 5
+    /// bytes the client writes there, and the rest of the record when they open a TLS one. Nothing
+    /// answers, so the proposal fails; only how the client opens the connection matters.
+    async fn first_bytes_of_a_proposal(scheme: &str, host: &str) -> Vec<u8> {
         use tokio::io::AsyncReadExt;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = Url::parse(&format!("{scheme}://{}/", listener.local_addr().unwrap())).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = Url::parse(&format!("{scheme}://{host}:{port}/")).unwrap();
         let mut client = signing_test_client(PrivateKeySigner::random())
             .get_client(&url)
             .expect("the client should build");
@@ -656,11 +677,20 @@ mod tests {
 
         let read = async {
             let (mut socket, _) = listener.accept().await.expect("the client should connect");
-            let mut bytes = vec![0u8; n];
+            let mut bytes = vec![0u8; 5];
             socket
                 .read_exact(&mut bytes)
                 .await
                 .expect("the client should write to the connection");
+            // A TLS record's 5 byte header ends with the length of the rest.
+            if bytes[0] == 0x16 {
+                let mut rest = vec![0u8; usize::from(u16::from_be_bytes([bytes[3], bytes[4]]))];
+                socket
+                    .read_exact(&mut rest)
+                    .await
+                    .expect("the client should write the whole record");
+                bytes.extend(rest);
+            }
             bytes
         };
         let bytes = tokio::time::timeout(Duration::from_secs(5), read)
@@ -673,10 +703,94 @@ mod tests {
     #[tokio::test]
     async fn test_https_indexer_is_reached_over_tls() {
         //* Act
-        let bytes = first_bytes_of_a_proposal("https", 1).await;
+        let bytes = first_bytes_of_a_proposal("https", "127.0.0.1").await;
 
         //* Assert - 0x16 opens a TLS handshake record (the ClientHello)
-        assert_eq!(bytes, [0x16]);
+        assert_eq!(bytes[0], 0x16);
+    }
+
+    #[tokio::test]
+    async fn test_https_indexer_found_by_name_is_reached_over_tls_for_that_name() {
+        //* Act - with private addresses allowed, as the test client has them
+        let bytes = first_bytes_of_a_proposal("https", "localhost").await;
+
+        //* Assert - a TLS handshake that names the host, so its certificate is checked against it
+        assert_eq!(bytes[0], 0x16);
+        assert!(
+            bytes.windows(9).any(|window| window == b"localhost"),
+            "{bytes:?}"
+        );
+    }
+
+    /// Send a proposal, under `addresses`, to a local port at `host`, allowing 3 retries. Returns
+    /// the outcome, how long it took, and whether anything connected to the port.
+    async fn propose_to_this_machine(
+        host: &str,
+        addresses: AddressRule,
+    ) -> (
+        Result<SubmitAgreementProposalResponse, DipsError>,
+        Duration,
+        bool,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = Url::parse(&format!("http://{host}:{port}/")).unwrap();
+        let client = DipsIndexerClient {
+            addresses,
+            max_retries: 3,
+            ..signing_test_client(PrivateKeySigner::random())
+        };
+
+        let started = tokio::time::Instant::now();
+        let outcome = client
+            .send_indexing_agreement_proposal(
+                &url,
+                IndexingAgreementId::from_bytes(rand::random()),
+                signing_test_terms(),
+                uuid::Uuid::now_v7(),
+            )
+            .await;
+        let took = started.elapsed();
+        let connected = tokio::time::timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_ok();
+        (outcome, took, connected)
+    }
+
+    #[tokio::test]
+    async fn an_indexer_whose_name_resolves_only_to_addresses_that_are_not_public_gets_no_offer() {
+        //* Act
+        let (outcome, took, connected) =
+            propose_to_this_machine("localhost", AddressRule::PublicOnly).await;
+
+        //* Assert
+        let err = outcome.unwrap_err();
+        let refused = match &err {
+            DipsError::NotPublicAddress(Refused::Name { name, .. }) => Some(name.as_str()),
+            _ => None,
+        };
+        assert_eq!(refused, Some("localhost"), "{err:?}");
+        assert!(!connected, "the offer reached the port");
+        assert!(
+            took < Duration::from_secs(1),
+            "a refusal is not retried, yet it took {took:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_offer_to_an_address_that_is_not_public_is_refused_before_connecting() {
+        //* Act
+        let (outcome, _, connected) =
+            propose_to_this_machine("127.0.0.1", AddressRule::PublicOnly).await;
+
+        //* Assert
+        let err = outcome.unwrap_err();
+        assert_eq!(err.to_string(), "refused 127.0.0.1: not a public address");
+        assert!(
+            format!("{err:?}").starts_with("NotPublicAddress("),
+            "{err:?}"
+        );
+        assert!(!connected, "the offer reached the port");
     }
 
     #[tokio::test]
@@ -718,9 +832,9 @@ mod tests {
     #[tokio::test]
     async fn test_http_indexer_is_reached_without_tls() {
         //* Act
-        let bytes = first_bytes_of_a_proposal("http", 3).await;
+        let bytes = first_bytes_of_a_proposal("http", "127.0.0.1").await;
 
         //* Assert - plaintext gRPC opens with the HTTP/2 preface, "PRI * HTTP/2.0"
-        assert_eq!(bytes, b"PRI");
+        assert_eq!(bytes, b"PRI *");
     }
 }
