@@ -174,6 +174,7 @@ impl Default for AlertsConfig {
                 "rpc_blocks_refused",
                 "nonce_gap_fill_failed",
                 "chain_listener_changes_skipped",
+                "chain_listener_set_aside_change_gone",
                 "chain_listener_fetch_failing",
                 "stale_agreement_uncancellable",
                 "liveness_abandonment_paused",
