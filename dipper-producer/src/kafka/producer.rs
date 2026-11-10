@@ -206,21 +206,20 @@ pub enum Error {
     InvalidPartitionCount,
 }
 
+impl super::reconnect::CallError for Error {
+    fn is_unreachable(&self) -> bool {
+        Error::is_unreachable(self)
+    }
+}
+
 impl Error {
     /// Whether a send failed to reach the brokers, so a resend through a new client can help; a broker
     /// that refused it or answered unreadably would do the same again. rskafka retries connection
     /// failures with no deadline, so an unreachable cluster mostly shows as a timeout.
     pub fn is_unreachable(&self) -> bool {
-        use rskafka::client::error::{Error as Rskafka, RequestError};
         match self {
             Self::Timeout => true,
-            Self::Send(e) => matches!(
-                e,
-                Rskafka::Connection(_)
-                    | Rskafka::Timeout
-                    | Rskafka::RetryFailed(_)
-                    | Rskafka::Request(RequestError::IO(_) | RequestError::Poisoned(_))
-            ),
+            Self::Send(e) => connection::is_unreachable(e),
             _ => false,
         }
     }

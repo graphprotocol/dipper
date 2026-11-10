@@ -157,6 +157,19 @@ impl std::str::FromStr for SaslMechanism {
     }
 }
 
+/// Whether an rskafka call failed to reach the brokers, as opposed to a broker answering with a
+/// refusal or something unreadable, which a new client would get again.
+pub(crate) fn is_unreachable(e: &rskafka::client::error::Error) -> bool {
+    use rskafka::client::error::{Error as Rskafka, RequestError};
+    matches!(
+        e,
+        Rskafka::Connection(_)
+            | Rskafka::Timeout
+            | Rskafka::RetryFailed(_)
+            | Rskafka::Request(RequestError::IO(_) | RequestError::Poisoned(_))
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

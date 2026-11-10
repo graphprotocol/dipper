@@ -7,7 +7,7 @@ use std::{future::Future, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use dipper_producer::{
     events::SubgraphIndexingAgreementEventsProducer,
-    kafka::{ConsumerError, KafkaConsumer, OffsetAt},
+    kafka::{ConsumerError, KafkaConsumer, KafkaConsumerConfig, OffsetAt, Reconnecting},
     prost::Message as _,
     proto::studio,
 };
@@ -121,26 +121,28 @@ where
     let (tx_stop, mut rx_stop) = mpsc::channel(1);
 
     let service = async move {
-        let consumer = match connect_with_retries(&ctx.config, &mut rx_stop).await {
-            Ok(Some(consumer)) => Arc::new(consumer),
+        let first = match connect_with_retries(&ctx.config, &mut rx_stop).await {
+            Ok(Some(consumer)) => consumer,
             // Stop was requested while still connecting; a clean exit.
             Ok(None) => return Ok(()),
             Err(err) => return Err(err),
         };
 
-        let partitions = consumer.partitions();
+        let partitions = first.partitions();
+        let topic = first.topic().to_string();
         tracing::info!(
-            topic = consumer.topic(),
+            topic,
             partitions = partitions.len(),
             requested_by = %ctx.config.requested_by,
             "indexing request consumer started"
         );
+        let consumer = reconnecting(first, ctx.config.kafka.clone());
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut tasks: JoinSet<()> = JoinSet::new();
         for partition in partitions {
             tasks.spawn(partition_loop(
-                Arc::clone(&consumer),
+                consumer.clone(),
                 partition,
                 ctx.registry.clone(),
                 ctx.worker_queue.clone(),
@@ -177,16 +179,18 @@ where
                     )),
                 },
                 _ = metadata_check.tick() => {
+                    // While the client is being rebuilt there is nothing to ask; the next tick does.
+                    let Some(client) = consumer.current() else { continue };
                     let count = tokio::time::timeout(
                         PARTITION_METADATA_CHECK_TIMEOUT,
-                        consumer.current_partition_count(),
+                        client.current_partition_count(),
                     )
                     .await;
                     match count {
                         Ok(Ok(count)) if count > serving => break Err(anyhow::anyhow!(
                             "topic '{}' now has {count} partitions but this consumer serves \
                              {serving}; restarting to consume the full set",
-                            consumer.topic()
+                            topic
                         )),
                         // Kafka partitions only ever grow, so a lower count is a
                         // stale or partial metadata read, never a real change;
@@ -260,6 +264,30 @@ async fn connect_with_retries(
     }
 }
 
+/// Wraps the first consumer client so it is rebuilt from the bootstrap addresses when needed, since
+/// rskafka never goes back to them while it knows any broker, even after the cluster replaces them.
+fn reconnecting(first: KafkaConsumer, kafka: KafkaConsumerConfig) -> Reconnecting<KafkaConsumer> {
+    // `connect` enforces its own deadline, so each attempt allows a little longer and that
+    // deadline's error is the one logged.
+    let connect_timeout = Duration::from_secs(kafka.connect_timeout_secs.saturating_add(5));
+    Reconnecting::with_client("indexing requests", first, connect_timeout, move || {
+        let kafka = kafka.clone();
+        async move {
+            let connected = KafkaConsumer::connect(&kafka).await;
+            // Retried like any other failure, since stopping dipper would also stop its offers,
+            // but no Studio request arrives until someone restores the topic.
+            if let Err(error @ ConsumerError::TopicNotFound { .. }) = &connected {
+                tracing::error!(
+                    %error,
+                    "the indexing request topic is gone from the brokers; no requests from \
+                     Studio arrive until it is back"
+                );
+            }
+            connected
+        }
+    })
+}
+
 /// Consumes one partition sequentially: fetch from the persisted offset, apply
 /// each record, then persist the offset past it. Delivery is at-least-once;
 /// redelivering an open request's count is a registry no-op, though a replay
@@ -273,7 +301,7 @@ async fn connect_with_retries(
     reason = "predates this lint; fix when next touched"
 )]
 async fn partition_loop<R, W>(
-    consumer: Arc<KafkaConsumer>,
+    consumer: Reconnecting<KafkaConsumer>,
     partition: i32,
     registry: R,
     worker_queue: W,
@@ -287,7 +315,8 @@ async fn partition_loop<R, W>(
     R: IndexingRequestRegistry + KafkaConsumerOffsetRegistry + Send + Sync,
     W: WorkerQueue + Send + Sync,
 {
-    let topic = consumer.topic().to_string();
+    let topic = config.kafka.topic.clone();
+    let fetch_max_bytes = config.fetch_max_bytes;
     let expected_network = format!("eip155:{protocol_chain_id}");
     let max_wait_ms = i32::try_from(config.max_wait.as_millis()).unwrap_or(i32::MAX);
 
@@ -307,9 +336,14 @@ async fn partition_loop<R, W>(
         };
         match restored {
             Some(offset) => break offset,
-            None => match consumer.offset(partition, OffsetAt::Earliest).await {
-                Ok(earliest) => break earliest,
-                Err(err) => {
+            None => match with_consumer(&consumer, &mut shutdown_rx, |c| async move {
+                c.offset(partition, OffsetAt::Earliest).await
+            })
+            .await
+            {
+                None => return,
+                Some(Ok(earliest)) => break earliest,
+                Some(Err(err)) => {
                     tracing::error!(partition, error = %err, "failed to query earliest offset, retrying");
                     if sleep_or_shutdown(&mut shutdown_rx, RETRY_BACKOFF).await {
                         return;
@@ -321,9 +355,13 @@ async fn partition_loop<R, W>(
     tracing::debug!(partition, next_offset, "partition consumer resuming");
 
     loop {
-        let fetch = tokio::select! {
-            _ = shutdown_rx.changed() => return,
-            fetch = consumer.fetch(partition, next_offset, config.fetch_max_bytes, max_wait_ms) => fetch,
+        let Some(fetch) = with_consumer(&consumer, &mut shutdown_rx, |c| async move {
+            c.fetch(partition, next_offset, fetch_max_bytes, max_wait_ms)
+                .await
+        })
+        .await
+        else {
+            return;
         };
 
         let (records, high_watermark) = match fetch {
@@ -334,16 +372,18 @@ async fn partition_loop<R, W>(
                 // log end when the topic was recreated or truncated. Clamp to
                 // the nearest live edge; always rewinding to earliest would
                 // replay the whole retained topic in the truncation case.
-                let range = match consumer.offset(partition, OffsetAt::Earliest).await {
-                    Ok(earliest) => match consumer.offset(partition, OffsetAt::Latest).await {
-                        Ok(latest) => Some((earliest, latest)),
-                        Err(err) => {
-                            tracing::error!(partition, error = %err, "failed to query latest offset");
-                            None
-                        }
-                    },
-                    Err(err) => {
-                        tracing::error!(partition, error = %err, "failed to query earliest offset");
+                // Both edges through 1 client, so a rebuild between them can't mix up 2 clusters.
+                let range = match with_consumer(&consumer, &mut shutdown_rx, |c| async move {
+                    let earliest = c.offset(partition, OffsetAt::Earliest).await?;
+                    let latest = c.offset(partition, OffsetAt::Latest).await?;
+                    Ok((earliest, latest))
+                })
+                .await
+                {
+                    None => return,
+                    Some(Ok(range)) => Some(range),
+                    Some(Err(err)) => {
+                        tracing::error!(partition, error = %err, "failed to query the retained offset range");
                         None
                     }
                 };
@@ -467,6 +507,24 @@ async fn persist_offset<R: KafkaConsumerOffsetRegistry>(
             error = %err,
             "failed to persist consumer offset; progress will be re-delivered after a restart"
         );
+    }
+}
+
+/// Runs `call` on the current client, waiting while one is being connected, and reports whether it
+/// reached the brokers, so a client left dialling brokers that are gone gets rebuilt. Returns
+/// `None` if shutdown is requested first.
+async fn with_consumer<T, F, Fut>(
+    consumer: &Reconnecting<KafkaConsumer>,
+    shutdown_rx: &mut watch::Receiver<bool>,
+    call: F,
+) -> Option<Result<T, ConsumerError>>
+where
+    F: FnOnce(Arc<KafkaConsumer>) -> Fut,
+    Fut: Future<Output = Result<T, ConsumerError>>,
+{
+    tokio::select! {
+        _ = shutdown_rx.changed() => None,
+        result = consumer.call(call) => Some(result),
     }
 }
 

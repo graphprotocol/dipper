@@ -253,7 +253,29 @@ pub enum ConsumerError {
     Timeout,
 }
 
+impl super::reconnect::CallError for ConsumerError {
+    fn is_unreachable(&self) -> bool {
+        ConsumerError::is_unreachable(self)
+    }
+
+    /// A partition the client didn't learn when it connected, such as one the topic gained or one
+    /// missing from a cluster that was still starting up, stays unknown until a new client.
+    fn needs_new_client(&self) -> bool {
+        matches!(self, ConsumerError::UnknownPartition { .. })
+    }
+}
+
 impl ConsumerError {
+    /// Whether a call failed to reach the brokers, so a new client might succeed where this one
+    /// can't.
+    pub fn is_unreachable(&self) -> bool {
+        match self {
+            Self::Timeout => true,
+            Self::Metadata(e) | Self::Fetch(e) | Self::Offset(e) => connection::is_unreachable(e),
+            _ => false,
+        }
+    }
+
     /// Whether this is the broker refusing a fetch offset outside its retained
     /// range. Callers recover by re-anchoring to the earliest available offset
     /// (records below it were deleted by retention).
@@ -271,6 +293,40 @@ impl ConsumerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kafka::CallError;
+
+    #[test]
+    fn only_failures_to_reach_the_brokers_count_as_unreachable() {
+        use rskafka::client::error::{
+            Error as Rskafka, ProtocolError, RequestContext, RequestError,
+        };
+        let reset = || std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        assert!(ConsumerError::Timeout.is_unreachable());
+        assert!(ConsumerError::Fetch(Rskafka::Request(RequestError::IO(reset()))).is_unreachable());
+        assert!(ConsumerError::Offset(Rskafka::Timeout).is_unreachable());
+
+        let out_of_range = ConsumerError::Fetch(Rskafka::ServerError {
+            protocol_error: ProtocolError::OffsetOutOfRange,
+            error_message: None,
+            request: RequestContext::Topic("test".to_string()),
+            response: None,
+            is_virtual: false,
+        });
+        assert!(!out_of_range.is_unreachable(), "the broker answered");
+        assert!(
+            !ConsumerError::Fetch(Rskafka::InvalidResponse("bad".to_string())).is_unreachable()
+        );
+        let unknown = ConsumerError::UnknownPartition {
+            partition: 9,
+            topic: "test".to_string(),
+        };
+        assert!(!unknown.is_unreachable());
+        assert!(
+            unknown.needs_new_client(),
+            "only a new client learns the partition"
+        );
+        assert!(!out_of_range.needs_new_client());
+    }
 
     #[test]
     fn config_deserializes_with_topic_and_defaults() {
