@@ -257,28 +257,28 @@ pub async fn main() -> anyhow::Result<()> {
                 .expect("failed to build HTTP client");
             let mut attempt: u32 = 0;
             loop {
-                match network::service::indexer_urls::fetch_snapshot(
+                match network::service::indexer_urls::fetch_allowed(
                     &client,
                     &subgraph_endpoint,
                     api_key.as_deref(),
+                    addresses,
                 )
                 .await
-                .map(|snapshot| network::service::indexer_urls::keep_allowed(snapshot, addresses))
                 {
-                    Ok(s) if !s.is_empty() => break s,
-                    Ok(s) if conf.indexer_urls.allow_empty_at_startup => {
+                    Ok(allowed) if !allowed.snapshot.is_empty() => break allowed.snapshot,
+                    Ok(allowed) if conf.indexer_urls.allow_empty_at_startup => {
                         tracing::warn!(
-                            "subgraph reports 0 registered indexers; starting with an empty \
-                             snapshot (network.allow_empty_at_startup)"
+                            "{}; starting with an empty snapshot (network.allow_empty_at_startup)",
+                            allowed.none_left()
                         );
-                        break s;
+                        break allowed.snapshot;
                     }
                     // An empty snapshot is useless at startup (no offer can be
                     // sent) and usually means a wrong endpoint: retry like an
                     // error. The refresh loop tolerates empties separately.
                     result => {
                         let err = match result {
-                            Ok(_) => anyhow::anyhow!("subgraph returned 0 registered indexers"),
+                            Ok(allowed) => anyhow::anyhow!(allowed.none_left()),
                             Err(err) => err,
                         };
                         if attempt < INDEXER_URLS_FETCH_MAX_RETRIES {

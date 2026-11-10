@@ -785,7 +785,11 @@ mod tests {
 
         //* Assert
         let err = outcome.unwrap_err();
-        assert_eq!(err.to_string(), "refused 127.0.0.1: not a public address");
+        assert!(
+            err.to_string()
+                .starts_with("refused 127.0.0.1: not a public address"),
+            "{err}"
+        );
         assert!(
             format!("{err:?}").starts_with("NotPublicAddress("),
             "{err:?}"

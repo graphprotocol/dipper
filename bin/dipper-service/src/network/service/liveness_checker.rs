@@ -1817,7 +1817,10 @@ mod tests {
             calls[0].url
         );
         let err = heights.unwrap_err().to_string();
-        assert_eq!(err, "refused 127.0.0.1: not a public address");
+        assert!(
+            err.starts_with("refused 127.0.0.1: not a public address"),
+            "{err}"
+        );
     }
 
     #[test]

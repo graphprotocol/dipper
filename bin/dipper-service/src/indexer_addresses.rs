@@ -13,6 +13,10 @@ use std::{
 use hyper_util::client::legacy::connect::{HttpConnector, dns::Name};
 use url::{Host, Url};
 
+/// Ends each refusal the switch can lift, so an operator learns of it without reading it as advice
+/// to turn it on anywhere but a local network.
+pub const ONLY_FOR_LOCAL_NETWORKS: &str = "only a local network should allow private addresses, with indexer_urls.allow_private_addresses";
+
 /// The most redirects dipper follows in 1 call to an indexer. Indexer software answers in place, so
 /// a redirect comes from a server in front of it, such as one from http to https.
 const MAX_REDIRECTS: usize = 3;
@@ -41,9 +45,14 @@ impl AddressRule {
         self == Self::Any || is_public(ip)
     }
 
-    /// Refuse `url` if its host is written as an address this rule doesn't allow. A host written
-    /// as a name passes here: it is judged by what it resolves to, when dipper connects.
+    /// Refuse `url` if it is not http or https, or its host is written as an address this rule
+    /// doesn't allow. A host written as a name passes: it is judged as dipper connects.
     pub fn check_url(self, url: &Url) -> Result<(), Refused> {
+        // For any other scheme the URL parser keeps an address in the host as a name, so it can't
+        // be judged here, yet a connector would still reach it directly. Neither rule allows it.
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(Refused::Scheme(url.scheme().to_string()));
+        }
         let ip = match url.host() {
             Some(Host::Ipv4(ip)) => IpAddr::V4(ip),
             Some(Host::Ipv6(ip)) => IpAddr::V6(ip),
@@ -56,12 +65,14 @@ impl AddressRule {
         }
     }
 
-    /// A builder for an HTTP client that calls indexers only at addresses this rule allows, judging
-    /// a name by what it resolves to as it connects, and follows at most `MAX_REDIRECTS` redirects.
+    /// A builder for an HTTP client that judges each name it resolves and each redirect it is sent,
+    /// following at most `MAX_REDIRECTS`. It does not judge the URL a request starts at: check that
+    /// with `check_url` first, as the indexer URLs service does for every registered URL.
     pub fn http_client(self) -> reqwest::ClientBuilder {
-        // Behind an HTTP proxy the proxy looks names up, so only addresses written in URLs are
-        // judged. A proxy at a private address must be given by its address: its name is judged.
+        // Proxy variables are ignored: the check is worth something only if dipper makes the
+        // connection itself, since a proxy would look the indexer's name up in its place.
         reqwest::Client::builder()
+            .no_proxy()
             .dns_resolver(Arc::new(Resolver(self)))
             .redirect(reqwest::redirect::Policy::custom(move |attempt| {
                 // The first URL in `previous` is the request itself, not a redirect.
@@ -146,14 +157,22 @@ impl tower_service::Service<Name> for Resolver {
     }
 }
 
-/// Dipper's refusal to connect to an address that is not public.
+/// Dipper's refusal to connect to an indexer, at an address that is not public or by a URL it
+/// can't judge.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum Refused {
+    /// A URL whose scheme is not http or https.
+    #[error("refused a {0} URL: dipper calls indexers only over http or https")]
+    Scheme(String),
     /// A host written as an address that is not public.
-    #[error("refused {0}: not a public address")]
+    #[error("refused {0}: not a public address; {ONLY_FOR_LOCAL_NETWORKS}")]
     Address(IpAddr),
     /// A name that resolves only to addresses that are not public.
-    #[error("refused {name}: it resolves only to addresses that are not public ({})", join(.addresses))]
+    #[error(
+        "refused {name}: it resolves only to addresses that are not public ({}); {}",
+        join(.addresses),
+        ONLY_FOR_LOCAL_NETWORKS
+    )]
     Name {
         name: String,
         addresses: Vec<IpAddr>,
@@ -185,9 +204,9 @@ fn is_public(ip: IpAddr) -> bool {
     }
 }
 
-/// IPv4 ranges that are not public, from IANA's special-purpose address registry, each as its
-/// first address and the number of leading bits every address in it shares with that one.
-const NOT_PUBLIC_V4: [(Ipv4Addr, u32); 14] = [
+/// IPv4 ranges that are not public, from IANA's special-purpose address registry plus 1 cloud
+/// address, each as its first address and the number of leading bits every address in it shares.
+const NOT_PUBLIC_V4: [(Ipv4Addr, u32); 15] = [
     // "This network".
     (Ipv4Addr::new(0, 0, 0, 0), 8),
     // Private networks.
@@ -196,6 +215,9 @@ const NOT_PUBLIC_V4: [(Ipv4Addr, u32); 14] = [
     (Ipv4Addr::new(100, 64, 0, 0), 10),
     // The machine itself.
     (Ipv4Addr::new(127, 0, 0, 0), 8),
+    // Azure's host endpoint for health probes, name lookups and its machine agent. It lies in
+    // public space, but every Azure machine reaches it inside Azure.
+    (Ipv4Addr::new(168, 63, 129, 16), 32),
     // A single network link, home to the cloud metadata service at 169.254.169.254.
     (Ipv4Addr::new(169, 254, 0, 0), 16),
     // Private networks.
@@ -293,6 +315,8 @@ mod tests {
             "127.255.255.255",
             // The metadata service of AWS, Google Cloud and Azure.
             "169.254.169.254",
+            // Azure's own host endpoint.
+            "168.63.129.16",
             "172.16.0.0",
             "172.31.255.255",
             "192.0.0.1",
@@ -339,6 +363,8 @@ mod tests {
             "100.128.0.0",
             "126.255.255.255",
             "128.0.0.0",
+            "168.63.129.15",
+            "168.63.129.17",
             "169.253.255.255",
             "169.255.0.0",
             "172.15.255.255",
@@ -396,10 +422,63 @@ mod tests {
                 .check_url(&url)
                 .err()
                 .map(|refused| refused.to_string());
-            let expected = refused.map(|ip| format!("refused {ip}: not a public address"));
+            let expected = refused.map(|ip| Refused::Address(ip.parse().unwrap()).to_string());
             assert_eq!(refusal, expected, "{url}");
             assert!(AddressRule::Any.check_url(&url).is_ok(), "{url}");
         }
+    }
+
+    #[test]
+    fn a_url_that_is_not_http_or_https_is_refused_whatever_the_switch() {
+        // For these schemes the URL parser keeps `10.0.0.5` as a name, not an address.
+        for url in [
+            "grpc://10.0.0.5:7602/",
+            "ftp://8.8.8.8/",
+            "grpc://indexer.example.com/",
+        ] {
+            let url: Url = url.parse().unwrap();
+            let scheme = url.scheme().to_string();
+            for rule in [AddressRule::PublicOnly, AddressRule::Any] {
+                let refusal = rule
+                    .check_url(&url)
+                    .err()
+                    .map(|refused| refused.to_string());
+                assert_eq!(
+                    refusal,
+                    Some(format!(
+                        "refused a {scheme} URL: dipper calls indexers only over http or https"
+                    )),
+                    "{url} under {rule:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_refusal_names_the_setting_that_lifts_it_and_says_it_is_for_local_networks_only() {
+        let address = Refused::Address("10.0.0.5".parse().unwrap()).to_string();
+        let name = Refused::Name {
+            name: "indexer.internal".to_string(),
+            addresses: vec!["10.0.0.5".parse().unwrap(), "fd00::5".parse().unwrap()],
+        }
+        .to_string();
+        let scheme = Refused::Scheme("grpc".to_string()).to_string();
+
+        assert_eq!(
+            address,
+            "refused 10.0.0.5: not a public address; only a local network should allow private \
+             addresses, with indexer_urls.allow_private_addresses"
+        );
+        assert_eq!(
+            name,
+            "refused indexer.internal: it resolves only to addresses that are not public \
+             (10.0.0.5, fd00::5); only a local network should allow private addresses, with \
+             indexer_urls.allow_private_addresses"
+        );
+        assert!(
+            !scheme.contains("allow_private_addresses"),
+            "the setting does not lift it: {scheme}"
+        );
     }
 
     #[test]
@@ -563,5 +642,57 @@ mod tests {
             "/3",
             "the 4th redirect, to /4, is not followed"
         );
+    }
+
+    /// The environment variable that hands the indexer's URL to the test run in its own process.
+    const INDEXER_URL_VARIABLE: &str = "DIPPER_TEST_INDEXER_URL";
+
+    /// Proxy variables are read once per process and shared by every test in it, so this check
+    /// runs the test below in a process of its own, with every proxy variable set.
+    #[tokio::test]
+    async fn the_client_ignores_proxy_variables_and_connects_to_the_indexer_itself() {
+        //* Given an indexer, and a proxy that would answer in its place
+        let indexer = server().await;
+        let proxy = server().await;
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "indexer_addresses::tests::call_an_indexer_with_proxy_variables_set",
+            ])
+            .args(["--ignored", "--nocapture"])
+            .env(INDEXER_URL_VARIABLE, indexer.uri());
+        for variable in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] {
+            command.env(variable, proxy.uri());
+        }
+        for variable in ["NO_PROXY", "no_proxy", "REQUEST_METHOD"] {
+            command.env_remove(variable);
+        }
+
+        //* When
+        let run = tokio::task::spawn_blocking(move || command.output())
+            .await
+            .unwrap()
+            .unwrap();
+
+        //* Then
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stdout)
+        );
+        assert_eq!(indexer.received_requests().await.unwrap().len(), 1);
+        assert!(proxy.received_requests().await.unwrap().is_empty());
+    }
+
+    /// Run by the test above, which hands it the indexer's URL; does nothing when run on its own.
+    #[tokio::test]
+    #[ignore = "run in a process of its own by the proxy variables test"]
+    async fn call_an_indexer_with_proxy_variables_set() {
+        let Ok(url) = std::env::var(INDEXER_URL_VARIABLE) else {
+            return;
+        };
+        let answer = client(AddressRule::Any).get(url).send().await.unwrap();
+        assert_eq!(answer.status(), 200);
     }
 }
