@@ -85,9 +85,9 @@ struct SelectionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     declined_indexers: Option<HashMap<String, Vec<String>>>,
 
-    /// Chain ID (e.g. "arbitrum-one") for filtering by supported networks
-    #[serde(skip_serializing_if = "Option::is_none")]
-    chain_id: Option<String>,
+    /// Chain ID (e.g. "arbitrum-one") for filtering by supported networks. Always sent, since
+    /// IISA refuses a request without it.
+    chain_id: String,
 
     /// Payment ceiling: maximum GRT per 30 days
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -100,6 +100,36 @@ struct SelectionRequest {
     /// Expected DIPs fees per indexer in GRT per 30 days from accepted agreements
     #[serde(skip_serializing_if = "Option::is_none")]
     optimistic_dips_fees: Option<HashMap<String, f64>>,
+}
+
+impl SelectionRequest {
+    /// The request for `num_candidates` indexers for `deployment_id`, given what dipper knows.
+    /// Without the deployment's chain there is no request IISA would take, so none is made.
+    fn new(
+        deployment_id: DeploymentId,
+        num_candidates: usize,
+        context: &SelectionContext,
+    ) -> Result<Self, SelectionError> {
+        let Some(chain_id) = context.chain_id.clone() else {
+            return Err(SelectionError::Error(anyhow::anyhow!(
+                "cannot ask IISA to select indexers for {deployment_id} without the chain it is \
+                 on: IISA refuses a request with no chain_id"
+            )));
+        };
+        Ok(Self {
+            deployment_id: deployment_id.to_string(),
+            existing_indexers: HttpIisaClient::format_existing_indexers(context),
+            pending_agreements: HttpIisaClient::format_pending_agreements(context),
+            num_candidates,
+            blocklist: HttpIisaClient::format_blocklist(context),
+            declined_indexers: HttpIisaClient::format_declined_indexers(context),
+            chain_id,
+            max_grt_per_30_days: context.max_grt_per_30_days,
+            max_grt_per_billion_entities_per_30_days: context
+                .max_grt_per_billion_entities_per_30_days,
+            optimistic_dips_fees: HttpIisaClient::format_optimistic_dips_fees(context),
+        })
+    }
 }
 
 /// Response from the /select-indexers endpoint.
@@ -495,19 +525,7 @@ impl CandidateSelection for HttpIisaClient {
             return Ok(Vec::new());
         }
 
-        let request = SelectionRequest {
-            deployment_id: deployment_id.to_string(),
-            existing_indexers: Self::format_existing_indexers(context),
-            pending_agreements: Self::format_pending_agreements(context),
-            num_candidates,
-            blocklist: Self::format_blocklist(context),
-            declined_indexers: Self::format_declined_indexers(context),
-            chain_id: context.chain_id.clone(),
-            max_grt_per_30_days: context.max_grt_per_30_days,
-            max_grt_per_billion_entities_per_30_days: context
-                .max_grt_per_billion_entities_per_30_days,
-            optimistic_dips_fees: Self::format_optimistic_dips_fees(context),
-        };
+        let request = SelectionRequest::new(deployment_id, num_candidates, context)?;
 
         let url = format!("{}select-indexers", self.endpoint);
         let result: SelectionResponse = self.post_with_retry(&url, &request).await?;
@@ -578,6 +596,36 @@ mod tests {
     };
 
     use super::*;
+
+    /// The leanest context dipper sends a selection with: IISA needs the deployment's chain.
+    fn with_chain() -> SelectionContext {
+        SelectionContext {
+            chain_id: Some("arbitrum-one".to_string()),
+            ..SelectionContext::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_select_indexers_refuses_a_context_without_a_chain() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/select-indexers"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        let client = HttpIisaClient::new(mock_server.uri());
+        let deployment_id: DeploymentId = "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"
+            .parse()
+            .unwrap();
+
+        let err = client
+            .select_indexers(deployment_id, 2, &SelectionContext::default())
+            .await
+            .expect_err("a selection without a chain is refused");
+
+        assert!(err.to_string().contains("chain"), "{err}");
+    }
 
     #[test]
     fn test_endpoint_normalization() {
@@ -847,7 +895,7 @@ mod tests {
             .unwrap();
 
         let result = client
-            .select_indexers(deployment_id, 2, &SelectionContext::default())
+            .select_indexers(deployment_id, 2, &with_chain())
             .await;
 
         assert!(result.is_ok());
@@ -863,7 +911,7 @@ mod tests {
             .unwrap();
 
         let result = client
-            .select_indexers(deployment_id, 0, &SelectionContext::default())
+            .select_indexers(deployment_id, 0, &with_chain())
             .await;
 
         assert!(result.is_ok());
@@ -908,7 +956,7 @@ mod tests {
                     .parse()
                     .unwrap(),
                 1,
-                &SelectionContext::default(),
+                &with_chain(),
             )
             .await;
 
@@ -948,7 +996,7 @@ mod tests {
                     .parse()
                     .unwrap(),
                 1,
-                &SelectionContext::default(),
+                &with_chain(),
             )
             .await;
 
@@ -993,7 +1041,7 @@ mod tests {
                     .parse()
                     .unwrap(),
                 1,
-                &SelectionContext::default(),
+                &with_chain(),
             )
             .await
             .unwrap_err();
@@ -1056,7 +1104,7 @@ mod tests {
                     .parse()
                     .unwrap(),
                 1,
-                &SelectionContext::default(),
+                &with_chain(),
             )
             .await;
 
@@ -1098,7 +1146,7 @@ mod tests {
                     .parse()
                     .unwrap(),
                 1,
-                &SelectionContext::default(),
+                &with_chain(),
             )
             .await;
 
@@ -1130,7 +1178,7 @@ mod tests {
                     .parse()
                     .unwrap(),
                 1,
-                &SelectionContext::default(),
+                &with_chain(),
             )
             .await;
 
@@ -1261,7 +1309,7 @@ mod tests {
         let client = HttpIisaClient::with_config(mock_server.uri(), config);
         let context = SelectionContext {
             max_grt_per_billion_entities_per_30_days: Some(2000.0),
-            ..Default::default()
+            ..with_chain()
         };
         let result = client
             .select_indexers(
