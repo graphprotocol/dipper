@@ -41,10 +41,10 @@ The offer is a recurring collection agreement signed by dipper. It is first deli
 ```mermaid
 flowchart LR
     A["Indexing request<br/>registered"] --> B["IISA ranks<br/>every candidate"]
-    B --> C["Dipper signs an offer<br/>and sends it to you"]
+    B --> C["Dipper creates an offer,<br/>starting its 10-minute deadline,<br/>and sends it to you"]
     C --> D{"Your indexer<br/>accepts?"}
     D -->|Yes| E["Offer posted<br/>on-chain"]
-    E --> F{"Accepted on-chain<br/>within 10 minutes?"}
+    E --> F{"Accepted on-chain<br/>before the deadline?"}
     F -->|Yes| G["Agreement active,<br/>fees accrue per second"]
     F -->|No| H["Offer expires,<br/>a replacement is picked"]
     D -->|No| H
