@@ -7,7 +7,7 @@ use std::{future::Future, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use dipper_producer::{
     events::SubgraphIndexingAgreementEventsProducer,
-    kafka::{ConsumerError, KafkaConsumer, OffsetAt, Reconnecting},
+    kafka::{ConsumerError, KafkaConsumer, KafkaConsumerConfig, OffsetAt, Reconnecting},
     prost::Message as _,
     proto::studio,
 };
@@ -136,17 +136,7 @@ where
             requested_by = %ctx.config.requested_by,
             "indexing request consumer started"
         );
-        // rskafka never goes back to the bootstrap addresses while it knows any broker, so after
-        // the cluster replaces its brokers this rebuilds the client from them.
-        // `connect` enforces its own deadline, so the rebuild allows a little longer and that
-        // deadline's error is the one logged.
-        let kafka = ctx.config.kafka.clone();
-        let connect_timeout = Duration::from_secs(kafka.connect_timeout_secs.saturating_add(5));
-        let consumer =
-            Reconnecting::with_client("indexing requests", first, connect_timeout, move || {
-                let kafka = kafka.clone();
-                async move { KafkaConsumer::connect(&kafka).await }
-            });
+        let consumer = reconnecting(first, ctx.config.kafka.clone());
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut tasks: JoinSet<()> = JoinSet::new();
@@ -272,6 +262,30 @@ async fn connect_with_retries(
             }
         }
     }
+}
+
+/// Wraps the first consumer client so it is rebuilt from the bootstrap addresses when needed, since
+/// rskafka never goes back to them while it knows any broker, even after the cluster replaces them.
+fn reconnecting(first: KafkaConsumer, kafka: KafkaConsumerConfig) -> Reconnecting<KafkaConsumer> {
+    // `connect` enforces its own deadline, so each attempt allows a little longer and that
+    // deadline's error is the one logged.
+    let connect_timeout = Duration::from_secs(kafka.connect_timeout_secs.saturating_add(5));
+    Reconnecting::with_client("indexing requests", first, connect_timeout, move || {
+        let kafka = kafka.clone();
+        async move {
+            let connected = KafkaConsumer::connect(&kafka).await;
+            // Retried like any other failure, since stopping dipper would also stop its offers,
+            // but no Studio request arrives until someone restores the topic.
+            if let Err(error @ ConsumerError::TopicNotFound { .. }) = &connected {
+                tracing::error!(
+                    %error,
+                    "the indexing request topic is gone from the brokers; no requests from \
+                     Studio arrive until it is back"
+                );
+            }
+            connected
+        }
+    })
 }
 
 /// Consumes one partition sequentially: fetch from the persisted offset, apply
