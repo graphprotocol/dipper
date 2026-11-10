@@ -5,24 +5,26 @@ Dipper declares the contract functions, events and errors it uses by hand, in
 bin/dipper-service/src/chain_client/abi.rs. A test there compares each declaration with the
 snapshot this script writes, so a declaration that has drifted from the contracts fails the build.
 
-Run it from the root of this repo after building the contracts (`forge build` in
-packages/horizon and packages/issuance of a graphprotocol/contracts checkout):
+Run it from the root of this repo, giving it a graphprotocol/contracts checkout with its
+dependencies installed (`pnpm install`). It needs `forge`:
 
     scripts/snapshot-contract-interfaces.py ~/github/contracts
 
-Pass --horizon-out and --issuance-out when the build output is somewhere other than the
-packages' own `build` and `forge-artifacts` folders.
+The script compiles the contracts itself, into a temporary folder, and refuses a checkout with
+uncommitted changes, so the snapshot always holds what the commit it names compiles to.
 """
 
 import argparse
 import json
 import pathlib
 import subprocess
+import sys
+import tempfile
 
 SNAPSHOT = pathlib.Path("bin/dipper-service/src/chain_client/contract_interfaces.txt")
 
-# Each interface dipper declares, and the compiled contracts it is a subset of. An interface is
-# listed beside its implementation because only the interface names every parameter.
+# Each contract dipper calls: the package that holds it, and what to compile it from. An interface
+# is listed beside its implementation because only the interface names every parameter.
 SECTIONS = {
     "IRecurringCollector": ("horizon", ["IRecurringCollector", "RecurringCollector"]),
     "IRecurringAgreementManager": (
@@ -92,23 +94,32 @@ def declarations(abis):
     return lines
 
 
+def compiled(contracts, package, out):
+    """Compile 1 package of the contracts checkout into `out`, leaving the checkout untouched."""
+    subprocess.run(
+        ["forge", "build", "--skip", "test", "--skip", "script"]
+        + ["--out", str(out / "out"), "--cache-path", str(out / "cache")],
+        cwd=contracts / "packages" / package,
+        check=True,
+    )
+    return out / "out"
+
+
+def git(contracts, *args):
+    result = subprocess.run(
+        ["git", "-C", str(contracts), *args], check=True, capture_output=True, text=True
+    )
+    return result.stdout.strip()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("contracts", type=pathlib.Path, help="a graphprotocol/contracts checkout")
-    parser.add_argument("--horizon-out", type=pathlib.Path, help="build output of packages/horizon")
-    parser.add_argument("--issuance-out", type=pathlib.Path, help="build output of packages/issuance")
-    args = parser.parse_args()
+    contracts = parser.parse_args().contracts.resolve()
 
-    out = {
-        "horizon": args.horizon_out or args.contracts / "packages/horizon/build",
-        "issuance": args.issuance_out or args.contracts / "packages/issuance/forge-artifacts",
-    }
-    commit = subprocess.run(
-        ["git", "-C", str(args.contracts), "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
+    if git(contracts, "status", "--porcelain"):
+        sys.exit(f"{contracts} has uncommitted changes: the snapshot must match a commit")
+    commit = git(contracts, "rev-parse", "HEAD")
 
     text = [
         "# The functions, events and errors of the contracts dipper calls, as compiled from",
@@ -116,12 +127,16 @@ def main():
         "# Written by scripts/snapshot-contract-interfaces.py: do not edit it by hand.",
         "# The declarations in abi.rs are tested against it.",
     ]
-    for section, (package, contracts) in SECTIONS.items():
-        abis = [
-            json.loads((out[package] / f"{contract}.sol" / f"{contract}.json").read_text())["abi"]
-            for contract in contracts
-        ]
-        text += ["", f"[{section}]", *sorted(declarations(abis))]
+    with tempfile.TemporaryDirectory() as scratch:
+        built = {}
+        for section, (package, names) in SECTIONS.items():
+            if package not in built:
+                built[package] = compiled(contracts, package, pathlib.Path(scratch) / package)
+            abis = [
+                json.loads((built[package] / f"{name}.sol" / f"{name}.json").read_text())["abi"]
+                for name in names
+            ]
+            text += ["", f"[{section}]", *sorted(declarations(abis))]
     SNAPSHOT.write_text("\n".join(text) + "\n")
     print(f"wrote {SNAPSHOT} from contracts {commit[:8]}")
 
