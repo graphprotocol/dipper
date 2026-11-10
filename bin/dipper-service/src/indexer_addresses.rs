@@ -10,6 +10,10 @@ use std::{
 
 use url::{Host, Url};
 
+/// Ends each refusal the switch can lift, so an operator learns of it without reading it as advice
+/// to turn it on anywhere but a local network.
+pub const ONLY_FOR_LOCAL_NETWORKS: &str = "only a local network should allow private addresses, with indexer_urls.allow_private_addresses";
+
 /// The most redirects dipper follows in 1 call to an indexer. Indexer software answers in place, so
 /// a redirect comes from a server in front of it, such as one from http to https.
 const MAX_REDIRECTS: usize = 3;
@@ -125,10 +129,14 @@ pub enum Refused {
     #[error("refused a {0} URL: dipper calls indexers only over http or https")]
     Scheme(String),
     /// A host written as an address that is not public.
-    #[error("refused {0}: not a public address")]
+    #[error("refused {0}: not a public address; {ONLY_FOR_LOCAL_NETWORKS}")]
     Address(IpAddr),
     /// A name that resolves only to addresses that are not public.
-    #[error("refused {name}: it resolves only to addresses that are not public ({})", join(.addresses))]
+    #[error(
+        "refused {name}: it resolves only to addresses that are not public ({}); {}",
+        join(.addresses),
+        ONLY_FOR_LOCAL_NETWORKS
+    )]
     Name {
         name: String,
         addresses: Vec<IpAddr>,
@@ -378,7 +386,7 @@ mod tests {
                 .check_url(&url)
                 .err()
                 .map(|refused| refused.to_string());
-            let expected = refused.map(|ip| format!("refused {ip}: not a public address"));
+            let expected = refused.map(|ip| Refused::Address(ip.parse().unwrap()).to_string());
             assert_eq!(refusal, expected, "{url}");
             assert!(AddressRule::Any.check_url(&url).is_ok(), "{url}");
         }
@@ -408,6 +416,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_refusal_names_the_setting_that_lifts_it_and_says_it_is_for_local_networks_only() {
+        let address = Refused::Address("10.0.0.5".parse().unwrap()).to_string();
+        let name = Refused::Name {
+            name: "indexer.internal".to_string(),
+            addresses: vec!["10.0.0.5".parse().unwrap(), "fd00::5".parse().unwrap()],
+        }
+        .to_string();
+        let scheme = Refused::Scheme("grpc".to_string()).to_string();
+
+        assert_eq!(
+            address,
+            "refused 10.0.0.5: not a public address; only a local network should allow private \
+             addresses, with indexer_urls.allow_private_addresses"
+        );
+        assert_eq!(
+            name,
+            "refused indexer.internal: it resolves only to addresses that are not public \
+             (10.0.0.5, fd00::5); only a local network should allow private addresses, with \
+             indexer_urls.allow_private_addresses"
+        );
+        assert!(
+            !scheme.contains("allow_private_addresses"),
+            "the setting does not lift it: {scheme}"
+        );
     }
 
     #[test]
