@@ -1,0 +1,1225 @@
+{
+  "iisa_commit": "b241b97d3c7987e965f2baf63a7880ee598b906b",
+  "schema": {
+    "components": {
+      "schemas": {
+        "ChainScore": {
+          "description": "An indexer's weighted score and component scores, prices included, on one chain.\n\nScored against every indexer that supports the chain and has priced it, as selection does\nbefore it applies a request's budget, blocklist and expected fees.",
+          "properties": {
+            "components": {
+              "additionalProperties": {
+                "type": "number"
+              },
+              "default": {},
+              "title": "Components",
+              "type": "object"
+            },
+            "weighted_score": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Weighted Score"
+            }
+          },
+          "title": "ChainScore",
+          "type": "object"
+        },
+        "DipsIndexersResponse": {
+          "description": "Response for GET /dips-indexers: the indexers selection would pick for the\nrequested chain \u2014 answered their probe, support it, priced it. ``computed_at``\nmirrors the push so callers can reject a stale snapshot. Example::\n\n    {\"computed_at\": \"2026-06-23T09:00:00+00:00\", \"count\": 2, \"indexers\": [\"0xaa\", \"0xbb\"]}",
+          "properties": {
+            "computed_at": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Computed At"
+            },
+            "count": {
+              "default": 0,
+              "title": "Count",
+              "type": "integer"
+            },
+            "indexers": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "title": "Indexers",
+              "type": "array"
+            }
+          },
+          "title": "DipsIndexersResponse",
+          "type": "object"
+        },
+        "ErrorResponse": {
+          "description": "Body of each error answer other than a 422: what went wrong, in words.",
+          "properties": {
+            "detail": {
+              "title": "Detail",
+              "type": "string"
+            }
+          },
+          "required": [
+            "detail"
+          ],
+          "title": "ErrorResponse",
+          "type": "object"
+        },
+        "HTTPValidationError": {
+          "properties": {
+            "detail": {
+              "items": {
+                "$ref": "#/components/schemas/ValidationError"
+              },
+              "title": "Detail",
+              "type": "array"
+            }
+          },
+          "title": "HTTPValidationError",
+          "type": "object"
+        },
+        "HealthResponse": {
+          "description": "Response for the /health endpoint.",
+          "properties": {
+            "computed_at": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Computed At"
+            },
+            "data_loaded": {
+              "title": "Data Loaded",
+              "type": "boolean"
+            },
+            "scores_age_hours": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Scores Age Hours"
+            },
+            "status": {
+              "title": "Status",
+              "type": "string"
+            },
+            "sync_status_loaded": {
+              "default": false,
+              "title": "Sync Status Loaded",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "status",
+            "data_loaded"
+          ],
+          "title": "HealthResponse",
+          "type": "object"
+        },
+        "ScoreRequest": {
+          "description": "Request body for the /get-score endpoint.",
+          "properties": {
+            "indexer_id": {
+              "title": "Indexer Id",
+              "type": "string"
+            }
+          },
+          "required": [
+            "indexer_id"
+          ],
+          "title": "ScoreRequest",
+          "type": "object"
+        },
+        "ScoreResponse": {
+          "description": "Response for the /get-score endpoint.\n\nweighted_score and components compare the indexer with every loaded indexer and leave out\nprices, which depend on the chain. chains has the full score for each chain it has priced.",
+          "properties": {
+            "chains": {
+              "anyOf": [
+                {
+                  "additionalProperties": {
+                    "$ref": "#/components/schemas/ChainScore"
+                  },
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Chains"
+            },
+            "components": {
+              "anyOf": [
+                {
+                  "additionalProperties": {
+                    "type": "number"
+                  },
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Components"
+            },
+            "found": {
+              "title": "Found",
+              "type": "boolean"
+            },
+            "indexer_id": {
+              "title": "Indexer Id",
+              "type": "string"
+            },
+            "weighted_score": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Weighted Score"
+            }
+          },
+          "required": [
+            "indexer_id",
+            "found"
+          ],
+          "title": "ScoreResponse",
+          "type": "object"
+        },
+        "ScoresAcceptedResponse": {
+          "description": "Response returned by POST /scores on success.",
+          "properties": {
+            "rows": {
+              "title": "Rows",
+              "type": "integer"
+            },
+            "status": {
+              "title": "Status",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "rows"
+          ],
+          "title": "ScoresAcceptedResponse",
+          "type": "object"
+        },
+        "ScoresSnapshotResponse": {
+          "description": "Response for GET /scores: full snapshot of loaded scored indexers.\n\nIntended for ops debugging, external monitoring, and local-network test\nharnesses. The shape mirrors the POST /scores payload (list of records)\nso the round-trip is symmetric.",
+          "properties": {
+            "computed_at": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Computed At"
+            },
+            "count": {
+              "default": 0,
+              "title": "Count",
+              "type": "integer"
+            },
+            "scores": {
+              "default": [],
+              "items": {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              "title": "Scores",
+              "type": "array"
+            }
+          },
+          "title": "ScoresSnapshotResponse",
+          "type": "object"
+        },
+        "ScoresStatusResponse": {
+          "description": "Response for the GET /scores/status endpoint.\n\nUsed by the cronjob to decide whether today's scores have already been\ncomputed and pushed \u2014 lets the job skip a redundant run.",
+          "properties": {
+            "computed_at": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Computed At"
+            },
+            "rows": {
+              "default": 0,
+              "title": "Rows",
+              "type": "integer"
+            }
+          },
+          "title": "ScoresStatusResponse",
+          "type": "object"
+        },
+        "SelectedIndexer": {
+          "description": "Indexer entry in the selection response, including pricing info.",
+          "properties": {
+            "id": {
+              "title": "Id",
+              "type": "string"
+            },
+            "min_grt_per_30_days": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Min Grt Per 30 Days"
+            },
+            "min_grt_per_billion_entities_per_30_days": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Min Grt Per Billion Entities Per 30 Days"
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "title": "SelectedIndexer",
+          "type": "object"
+        },
+        "SelectionRequest": {
+          "description": "Request body for indexer selection endpoint.\n\nFollows the SelectionRequest struct in dipper's Rust HTTP client, which types chain_id\nas optional. Dipper's reassess job always sets it, and a request without one is a 422.",
+          "properties": {
+            "blocklist": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Blocklist"
+            },
+            "chain_id": {
+              "minLength": 1,
+              "title": "Chain Id",
+              "type": "string"
+            },
+            "declined_indexers": {
+              "anyOf": [
+                {
+                  "additionalProperties": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Declined Indexers"
+            },
+            "deployment_id": {
+              "title": "Deployment Id",
+              "type": "string"
+            },
+            "existing_indexers": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Existing Indexers"
+            },
+            "max_grt_per_30_days": {
+              "anyOf": [
+                {
+                  "minimum": 0.0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Max Grt Per 30 Days"
+            },
+            "max_grt_per_billion_entities_per_30_days": {
+              "anyOf": [
+                {
+                  "minimum": 0.0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Max Grt Per Billion Entities Per 30 Days"
+            },
+            "num_candidates": {
+              "title": "Num Candidates",
+              "type": "integer"
+            },
+            "optimistic_dips_fees": {
+              "anyOf": [
+                {
+                  "additionalProperties": {
+                    "minimum": 0.0,
+                    "type": "number"
+                  },
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Optimistic Dips Fees"
+            },
+            "pending_agreements": {
+              "anyOf": [
+                {
+                  "additionalProperties": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Pending Agreements"
+            }
+          },
+          "required": [
+            "deployment_id",
+            "num_candidates",
+            "chain_id"
+          ],
+          "title": "SelectionRequest",
+          "type": "object"
+        },
+        "SelectionResponse": {
+          "description": "Response for /select-indexers: the SHOULD-be-assigned indexer set.\n\nDetermined entirely by the currently loaded scores plus the request\ninputs, so a new /scores push between calls can change the response.\nCallers diff against their actual current state to compute adds/cancels.",
+          "properties": {
+            "deployment_id": {
+              "title": "Deployment Id",
+              "type": "string"
+            },
+            "indexers": {
+              "items": {
+                "$ref": "#/components/schemas/SelectedIndexer"
+              },
+              "title": "Indexers",
+              "type": "array"
+            }
+          },
+          "required": [
+            "deployment_id",
+            "indexers"
+          ],
+          "title": "SelectionResponse",
+          "type": "object"
+        },
+        "SyncStatusAcceptedResponse": {
+          "description": "Response returned by POST /sync-status on success.",
+          "properties": {
+            "indexers": {
+              "title": "Indexers",
+              "type": "integer"
+            },
+            "status": {
+              "title": "Status",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "indexers"
+          ],
+          "title": "SyncStatusAcceptedResponse",
+          "type": "object"
+        },
+        "ValidationError": {
+          "properties": {
+            "ctx": {
+              "title": "Context",
+              "type": "object"
+            },
+            "input": {
+              "title": "Input"
+            },
+            "loc": {
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "integer"
+                  }
+                ]
+              },
+              "title": "Location",
+              "type": "array"
+            },
+            "msg": {
+              "title": "Message",
+              "type": "string"
+            },
+            "type": {
+              "title": "Error Type",
+              "type": "string"
+            }
+          },
+          "required": [
+            "loc",
+            "msg",
+            "type"
+          ],
+          "title": "ValidationError",
+          "type": "object"
+        },
+        "WeightedScoreEntry": {
+          "description": "One indexer's scores, shaped like the /get-score response.",
+          "properties": {
+            "chains": {
+              "additionalProperties": {
+                "$ref": "#/components/schemas/ChainScore"
+              },
+              "default": {},
+              "title": "Chains",
+              "type": "object"
+            },
+            "components": {
+              "additionalProperties": {
+                "type": "number"
+              },
+              "default": {},
+              "title": "Components",
+              "type": "object"
+            },
+            "indexer": {
+              "title": "Indexer",
+              "type": "string"
+            },
+            "weighted_score": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Weighted Score"
+            }
+          },
+          "required": [
+            "indexer"
+          ],
+          "title": "WeightedScoreEntry",
+          "type": "object"
+        },
+        "WeightedScoresResponse": {
+          "description": "Response for GET /scores/weighted: bulk weighted-scores snapshot.\n\nSame per-row shape as POST /get-score but for every loaded indexer in\na single call. `computed_at` mirrors the underlying push so callers\ncan detect stale data without a second round-trip.",
+          "properties": {
+            "computed_at": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Computed At"
+            },
+            "count": {
+              "default": 0,
+              "title": "Count",
+              "type": "integer"
+            },
+            "scores": {
+              "default": [],
+              "items": {
+                "$ref": "#/components/schemas/WeightedScoreEntry"
+              },
+              "title": "Scores",
+              "type": "array"
+            }
+          },
+          "title": "WeightedScoresResponse",
+          "type": "object"
+        }
+      }
+    },
+    "info": {
+      "description": "Indexing Indexer Selection Algorithm for The Graph DIPs service",
+      "title": "IISA Service",
+      "version": "0.1.0"
+    },
+    "openapi": "3.1.0",
+    "paths": {
+      "/dips-indexers": {
+        "get": {
+          "description": "Indexers selection would pick for ``chain``: answered their DIPs probe, support\nthe chain, and priced within the optional ``max_grt_per_30_days`` and\n``max_grt_per_billion_entities_per_30_days`` ceilings (omit either to skip it).\nOmitting ``chain`` is a 422. Example: ``?chain=arbitrum-one&max_grt_per_30_days=4500``.",
+          "operationId": "dips_indexers_dips_indexers_get",
+          "parameters": [
+            {
+              "in": "query",
+              "name": "chain",
+              "required": true,
+              "schema": {
+                "title": "Chain",
+                "type": "string"
+              }
+            },
+            {
+              "in": "query",
+              "name": "max_grt_per_30_days",
+              "required": false,
+              "schema": {
+                "anyOf": [
+                  {
+                    "minimum": 0,
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Max Grt Per 30 Days"
+              }
+            },
+            {
+              "in": "query",
+              "name": "max_grt_per_billion_entities_per_30_days",
+              "required": false,
+              "schema": {
+                "anyOf": [
+                  {
+                    "minimum": 0,
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Max Grt Per Billion Entities Per 30 Days"
+              }
+            },
+            {
+              "in": "header",
+              "name": "authorization",
+              "required": false,
+              "schema": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Authorization"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/DipsIndexersResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "401": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "The bearer token is missing or wrong"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "summary": "Dips Indexers"
+        }
+      },
+      "/get-score": {
+        "post": {
+          "description": "Return one indexer's weighted score plus the component scores feeding it.\n\nUseful for debugging selection decisions and monitoring per-indexer\nperformance without running a full selection request.",
+          "operationId": "get_score_get_score_post",
+          "parameters": [
+            {
+              "in": "header",
+              "name": "authorization",
+              "required": false,
+              "schema": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Authorization"
+              }
+            }
+          ],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScoreRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/ScoreResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "400": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "The body could not be read as text"
+            },
+            "401": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "The bearer token is missing or wrong"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            },
+            "503": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "The service has not started or has no scores"
+            }
+          },
+          "summary": "Get Score"
+        }
+      },
+      "/health": {
+        "get": {
+          "description": "Report data-loaded state and how old the loaded scores are.\n\nstatus flips to \"degraded\" past the critical staleness threshold. Always\n200 (all three k8s probes hit this path; a restart reloads the same stale\nfile, so a non-200 would crashloop without fixing anything).",
+          "operationId": "health_check_health_get",
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HealthResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            }
+          },
+          "summary": "Health Check"
+        }
+      },
+      "/scores": {
+        "get": {
+          "description": "Return the loaded scores snapshot as a list of records.\n\nSymmetric with POST /scores \u2014 what the cronjob pushed is what's served\nhere. For ops debugging and external monitoring, not the selection hot\npath. Sync def so the DataFrame\u2192JSON conversion runs on the threadpool.",
+          "operationId": "scores_snapshot_scores_get",
+          "parameters": [
+            {
+              "in": "header",
+              "name": "authorization",
+              "required": false,
+              "schema": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Authorization"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/ScoresSnapshotResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "401": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "The bearer token is missing or wrong"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "summary": "Scores Snapshot"
+        },
+        "post": {
+          "description": "Accept a pushed scores snapshot from the cronjob.\n\nOrder: token \u2192 body \u2192 DataFrame \u2192 atomic write to cache PVC \u2192 in-memory\nupdate \u2192 row count. Parse-before-disk means a malformed payload 422s\nwithout mutating disk. Sync def so the blocking write hits the threadpool.",
+          "operationId": "push_scores_scores_post",
+          "parameters": [
+            {
+              "in": "header",
+              "name": "authorization",
+              "required": false,
+              "schema": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Authorization"
+              }
+            }
+          ],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  "minItems": 1,
+                  "title": "Payload",
+                  "type": "array"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/ScoresAcceptedResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "400": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "The body could not be read as text"
+            },
+            "401": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "The bearer token is missing or wrong"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            },
+            "503": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "The service has not started or has no scores"
+            }
+          },
+          "summary": "Push Scores"
+        }
+      },
+      "/scores/status": {
+        "get": {
+          "description": "Report computed_at of the currently loaded scores.\n\nThe cronjob GETs this before running so it can skip recomputation when\ntoday's scores are already pushed. Sync def for consistency with the\nother push endpoints \u2014 no awaitable work in the body.",
+          "operationId": "scores_status_scores_status_get",
+          "parameters": [
+            {
+              "in": "header",
+              "name": "authorization",
+              "required": false,
+              "schema": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Authorization"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/ScoresStatusResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "401": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "The bearer token is missing or wrong"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "summary": "Scores Status"
+        }
+      },
+      "/scores/weighted": {
+        "get": {
+          "description": "Bulk weighted-score snapshot \u2014 same shape as /get-score, every indexer.\n\nSingle pass across the loaded snapshot \u2014 saves N round-trips to /get-score.\nSelection can pass `max_grt_per_30_days` as a `price_ceiling`; this endpoint\ncannot, so each chain's prices are normalised against its observed max instead.",
+          "operationId": "scores_weighted_scores_weighted_get",
+          "parameters": [
+            {
+              "in": "header",
+              "name": "authorization",
+              "required": false,
+              "schema": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Authorization"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/WeightedScoresResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "401": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "The bearer token is missing or wrong"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "summary": "Scores Weighted"
+        }
+      },
+      "/select-indexers": {
+        "post": {
+          "description": "Select N indexers for a deployment via weighted scoring.\n\nReturns the SHOULD-be-assigned set; caller diffs against current state.\nPicks the top N by weighted aggregate, preferring >1 unique org / location\nwhen N > 1 (best-effort). Pass existing_indexers=[] for a fresh selection.",
+          "operationId": "select_indexers_select_indexers_post",
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SelectionRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/SelectionResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "400": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "The body could not be read as text"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            },
+            "503": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "The service has not started or has no scores"
+            }
+          },
+          "summary": "Select Indexers"
+        }
+      },
+      "/sync-status": {
+        "post": {
+          "description": "Accept a pushed sync-status snapshot from sync_status_fetcher.\n\nEmpty payloads mean \"no indexers currently synced\" \u2014 accepted. Sync def\nso the blocking _atomic_write_json runs on the threadpool rather than\nthe event loop.",
+          "operationId": "push_sync_status_sync_status_post",
+          "parameters": [
+            {
+              "in": "header",
+              "name": "authorization",
+              "required": false,
+              "schema": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Authorization"
+              }
+            }
+          ],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Payload",
+                  "type": "object"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/SyncStatusAcceptedResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "400": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "The body could not be read as text"
+            },
+            "401": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "The bearer token is missing or wrong"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            },
+            "503": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "The service has not started or has no scores"
+            }
+          },
+          "summary": "Push Sync Status"
+        }
+      }
+    }
+  },
+  "written_by": "scripts/snapshot-iisa-openapi.py: do not edit it by hand"
+}

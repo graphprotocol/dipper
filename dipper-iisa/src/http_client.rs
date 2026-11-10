@@ -156,14 +156,18 @@ struct SelectionResponse {
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum IndexerEntry {
-    WithPricing {
-        id: String,
-        #[serde(default)]
-        min_grt_per_30_days: Option<f64>,
-        #[serde(default)]
-        min_grt_per_billion_entities_per_30_days: Option<f64>,
-    },
+    WithPricing(PricedIndexer),
     LegacyId(String),
+}
+
+/// An indexer entry in the IISA response's object format, with the prices it advertises.
+#[derive(Debug, Deserialize)]
+struct PricedIndexer {
+    id: String,
+    #[serde(default)]
+    min_grt_per_30_days: Option<f64>,
+    #[serde(default)]
+    min_grt_per_billion_entities_per_30_days: Option<f64>,
 }
 
 /// Response from the `GET /dips-indexers` endpoint (the `count` field is ignored).
@@ -534,11 +538,11 @@ impl CandidateSelection for HttpIisaClient {
         let mut selected = Vec::with_capacity(result.indexers.len());
         for entry in result.indexers {
             let (id_str, min_grt, min_entity_grt) = match entry {
-                IndexerEntry::WithPricing {
+                IndexerEntry::WithPricing(PricedIndexer {
                     id,
                     min_grt_per_30_days,
                     min_grt_per_billion_entities_per_30_days,
-                } => (
+                }) => (
                     id,
                     min_grt_per_30_days,
                     min_grt_per_billion_entities_per_30_days,
@@ -585,6 +589,10 @@ impl CandidateSelection for HttpIisaClient {
         })
     }
 }
+
+// Checks the request and reply types above against IISA's own description of its API.
+#[cfg(test)]
+mod contract_tests;
 
 #[cfg(test)]
 mod tests {
