@@ -329,6 +329,22 @@ mod tests {
         functions.chain(events).chain(errors).collect()
     }
 
+    /// A declaration the contracts do not have, beside what they have under the same name.
+    fn drift(declared: &str, in_the_contracts: &[&str]) -> String {
+        let name = declared.split_inclusive('(').next().unwrap_or(declared);
+        let theirs: Vec<_> = in_the_contracts
+            .iter()
+            .filter(|line| line.starts_with(name))
+            .map(|line| format!("  the contracts: {line}"))
+            .collect();
+        let theirs = if theirs.is_empty() {
+            "  the contracts: nothing by that name".to_string()
+        } else {
+            theirs.join("\n")
+        };
+        format!("  declared here: {declared}\n{theirs}")
+    }
+
     /// Every function, event and error declared by hand exists in the contracts exactly as
     /// declared: its name, each parameter's type and name, which event parameters are indexed,
     /// whether it only reads, and what it returns.
@@ -342,11 +358,15 @@ mod tests {
             let drifted: Vec<_> = declarations
                 .iter()
                 .filter(|declared| !in_the_contracts.contains(&declared.as_str()))
+                .map(|declared| drift(declared, &in_the_contracts))
                 .collect();
 
             assert!(
                 drifted.is_empty(),
-                "{interface} declares what {contract} does not have: {drifted:#?}"
+                "{interface} declares what {contract} does not have:\n{}\nIf the contracts \
+                 are the ones that changed, write the snapshot again with \
+                 scripts/snapshot-contract-interfaces.py and bring the declarations in line.",
+                drifted.join("\n")
             );
         }
     }
