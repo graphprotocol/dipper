@@ -373,24 +373,134 @@ fn client_source() -> &'static str {
         .expect("split yields at least 1 part")
 }
 
-/// Every type in the client that serde writes or reads.
-fn serde_types_in_client() -> BTreeSet<&'static str> {
-    let mut lines = client_source().lines();
-    let mut names = BTreeSet::new();
-    while let Some(line) = lines.next() {
-        let derives_serde = line.contains("Serialize") || line.contains("Deserialize");
-        if !(line.starts_with("#[derive(") && derives_serde) {
-            continue;
+/// Every source file of this crate, outside its tests, by its path under `src`. Read from disk so
+/// a file added later is scanned too.
+fn crate_sources() -> Vec<(String, String)> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut folders = vec![root.clone()];
+    let mut sources = Vec::new();
+    while let Some(folder) = folders.pop() {
+        for entry in std::fs::read_dir(&folder).expect("the source folder can be read") {
+            let path = entry.expect("a folder entry").path();
+            let name = path.to_string_lossy().into_owned();
+            if path.is_dir() {
+                folders.push(path);
+            } else if name.ends_with(".rs") && !name.ends_with("_tests.rs") {
+                let text = std::fs::read_to_string(&path).expect("a source file can be read");
+                let outside_tests = text.split("#[cfg(test)]\nmod tests {").next();
+                let relative = path.strip_prefix(&root).unwrap_or(&path);
+                let relative = relative.to_string_lossy().into_owned();
+                sources.push((relative, outside_tests.unwrap_or_default().to_string()));
+            }
         }
-        let declaration = lines
-            .by_ref()
-            .find(|line| line.starts_with("struct ") || line.starts_with("enum "))
-            .expect("a derive is followed by its type");
-        let name = declaration
-            .split_whitespace()
-            .nth(1)
-            .expect("the type is named");
-        names.insert(name.trim_end_matches(['{', '(']));
+    }
+    sources
+}
+
+/// Where `position` falls in `text`, as `file:line`.
+fn place(file: &str, text: &str, position: usize) -> String {
+    format!("{file}:{}", text[..position].matches('\n').count() + 1)
+}
+
+/// The positions of `word` in `text` where it stands as a whole name, not part of a longer one.
+fn word_positions<'a>(text: &'a str, word: &'a str) -> impl Iterator<Item = usize> + 'a {
+    let part_of_a_name = |c: char| c.is_alphanumeric() || c == '_';
+    text.match_indices(word)
+        .map(|(at, _)| at)
+        .filter(move |&at| {
+            let before = text[..at].chars().next_back();
+            let after = text[at + word.len()..].chars().next();
+            !before.is_some_and(part_of_a_name) && !after.is_some_and(part_of_a_name)
+        })
+}
+
+/// The name of the struct or enum that `text` declares after any attributes and comments, or
+/// `None` when what follows is not one.
+fn item_declared(text: &str) -> Option<&str> {
+    let mut rest = text.trim_start();
+    loop {
+        if rest.starts_with("//") {
+            rest = rest
+                .split_once('\n')
+                .map_or("", |(_, after)| after)
+                .trim_start();
+        } else if rest.starts_with("#[") {
+            let mut depth = 0;
+            let end = rest.char_indices().find_map(|(at, c)| {
+                depth += match c {
+                    '[' => 1,
+                    ']' => -1,
+                    _ => 0,
+                };
+                (c == ']' && depth == 0).then_some(at)
+            })?;
+            rest = rest[end + 1..].trim_start();
+        } else {
+            break;
+        }
+    }
+    if let Some(after) = rest.strip_prefix("pub") {
+        rest = after.trim_start();
+        if rest.starts_with('(') {
+            rest = rest[rest.find(')')? + 1..].trim_start();
+        }
+    }
+    let rest = rest
+        .strip_prefix("struct ")
+        .or_else(|| rest.strip_prefix("enum "))?
+        .trim_start();
+    let end = rest
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    (end > 0).then(|| &rest[..end])
+}
+
+/// Every type in this crate that serde writes or reads. Any mention of serde's derives it cannot
+/// account for, such as a derive behind `cfg_attr` or a hand-written impl, fails the scan rather
+/// than leave a type out.
+fn serde_types_in_crate() -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for (file, text) in crate_sources() {
+        let mut derives = Vec::new();
+        for (start, _) in text.match_indices("#[derive(") {
+            let end = start + text[start..].find(")]").expect("a derive attribute ends") + 2;
+            let attribute = &text[start..end];
+            if !attribute.contains("Serialize") && !attribute.contains("Deserialize") {
+                continue;
+            }
+            let name = item_declared(&text[end..]).unwrap_or_else(|| {
+                panic!(
+                    "{}: cannot tell which type this serde derive is on",
+                    place(&file, &text, start)
+                )
+            });
+            names.insert(name.to_string());
+            derives.push(start..end);
+        }
+        for word in ["Serialize", "Deserialize"] {
+            for at in word_positions(&text, word) {
+                let line_start = text[..at].rfind('\n').map_or(0, |i| i + 1);
+                let line = text[line_start..].lines().next().unwrap_or_default().trim();
+                let statement = text[..at].rsplit(';').next().unwrap_or_default();
+                let in_use = statement
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty() && !line.starts_with("//"))
+                    .is_some_and(|first| {
+                        first.starts_with("use ") || first.starts_with("pub use ")
+                    });
+                let accounted = derives.iter().any(|derive| derive.contains(&at))
+                    || in_use
+                    || line.starts_with("//")
+                    || text[at + word.len()..].starts_with("<'de>");
+                assert!(
+                    accounted,
+                    "{}: cannot tell what this use of `{word}` is, so a type serde reads or writes \
+                     could be missed: {line}",
+                    place(&file, &text, at)
+                );
+            }
+        }
     }
     names
 }
@@ -409,18 +519,31 @@ fn request_fields_declared() -> BTreeSet<String> {
         .collect()
 }
 
-/// The paths the client builds onto IISA's address.
+/// The paths the client builds onto IISA's address. Any use of the address other than
+/// `format!("{}<path>", self.endpoint)`, however it is laid out, fails the scan rather than leave
+/// a call out.
 fn paths_the_client_builds() -> BTreeSet<String> {
-    client_source()
-        .split("format!(\"{}")
-        .skip(1)
-        .filter_map(|rest| {
-            let (path, after) = rest.split_once('"')?;
-            after
-                .starts_with(", self.endpoint)")
-                .then(|| format!("/{path}"))
-        })
-        .collect()
+    let mut paths = BTreeSet::new();
+    for (file, text) in crate_sources() {
+        for (at, use_of_address) in text.match_indices("self.endpoint") {
+            let end = at + use_of_address.len();
+            let start = text[..at].rfind("format!(").unwrap_or(at);
+            let mut written: String = text[start..end].split_whitespace().collect();
+            written.extend(text[end..].trim_start().chars().next());
+            let path = written
+                .strip_prefix("format!(\"{}")
+                .and_then(|rest| rest.strip_suffix("\",self.endpoint)"))
+                .filter(|path| !path.contains(['"', '{', '}']));
+            let path = path.unwrap_or_else(|| {
+                panic!(
+                    "{}: cannot read which path this use of IISA's address calls: {written}",
+                    place(&file, &text, at)
+                )
+            });
+            paths.insert(format!("/{path}"));
+        }
+    }
+    paths
 }
 
 fn deployment() -> DeploymentId {
@@ -762,8 +885,9 @@ fn no_request_or_reply_type_in_the_client_is_left_unchecked() {
     // the test of a selected indexer's prices.
     checked.insert("IndexerEntry");
 
+    let checked: BTreeSet<String> = checked.into_iter().map(str::to_string).collect();
     assert_eq!(
-        serde_types_in_client(),
+        serde_types_in_crate(),
         checked,
         "a type the client sends to or reads from IISA is missing from these checks"
     );
