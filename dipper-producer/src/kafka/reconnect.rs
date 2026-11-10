@@ -20,6 +20,10 @@ pub const RECONNECT_AFTER_FAILURES: u32 = 3;
 /// The longest wait between attempts to connect.
 const MAX_CONNECT_BACKOFF_SECS: u64 = 30;
 
+/// How long 1 attempt to connect may take. rskafka retries an unreachable bootstrap address with no
+/// deadline, so an attempt without a limit could hang with no retry and no warning.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Failed connect attempts between repeated warnings, after the first.
 const WARN_EVERY: u32 = 5;
 
@@ -128,22 +132,22 @@ where
 {
     let mut attempt: u32 = 0;
     loop {
-        match connect().await {
-            Ok(client) => return client,
-            Err(err) => {
-                attempt = attempt.saturating_add(1);
-                if attempt == 1 || attempt.is_multiple_of(WARN_EVERY) {
-                    tracing::warn!(
-                        broker = name,
-                        attempt,
-                        error = %err,
-                        "can't connect to the brokers; retrying"
-                    );
-                }
-                let backoff = MAX_CONNECT_BACKOFF_SECS.min(2u64.saturating_pow(attempt.min(5)));
-                tokio::time::sleep(Duration::from_secs(backoff)).await;
-            }
+        let error = match tokio::time::timeout(CONNECT_TIMEOUT, connect()).await {
+            Ok(Ok(client)) => return client,
+            Ok(Err(err)) => err.to_string(),
+            Err(_) => format!("timed out after {}s", CONNECT_TIMEOUT.as_secs()),
+        };
+        attempt = attempt.saturating_add(1);
+        if attempt == 1 || attempt.is_multiple_of(WARN_EVERY) {
+            tracing::warn!(
+                broker = name,
+                attempt,
+                error,
+                "can't connect to the brokers; retrying"
+            );
         }
+        let backoff = MAX_CONNECT_BACKOFF_SECS.min(2u64.saturating_pow(attempt.min(5)));
+        tokio::time::sleep(Duration::from_secs(backoff)).await;
     }
 }
 
@@ -199,6 +203,25 @@ mod tests {
 
         assert_eq!(*client, Client(3));
         assert_eq!(attempts.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gives_up_on_a_connect_attempt_that_never_finishes() {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let counted = attempts.clone();
+        let conn = Reconnecting::spawn("test", move || {
+            let n = counted.fetch_add(1, Ordering::Relaxed) + 1;
+            async move {
+                if n == 1 {
+                    std::future::pending::<()>().await;
+                }
+                Ok::<_, String>(Client(n))
+            }
+        });
+
+        let client = next_client(&conn, None).await;
+
+        assert_eq!(*client, Client(2));
     }
 
     #[tokio::test(start_paused = true)]
