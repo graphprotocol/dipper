@@ -1275,11 +1275,14 @@ impl DipsAgreementConfig {
         Ok(())
     }
 
-    /// The contract refuses an agreement priced above its own cap per second, and dipper offers
-    /// prices up to each ceiling and table prices as they stand, so a price allowed above the cap
-    /// makes offers no indexer can accept, then benches the indexers for missing them. Prices are
-    /// compared in wei per second, rounded up as dipper rounds them, since that is what the
-    /// contract compares; an agreement has no cap on the per-entity price.
+    /// The contract refuses an agreement whose base price per second is above its cap, and dipper
+    /// offers base prices up to each ceiling and table prices as they stand, so a base price
+    /// allowed above the cap makes offers no indexer can accept, then benches the indexers for
+    /// missing them. Prices are compared in wei per second, rounded up as dipper rounds them,
+    /// since that is what the contract compares. The per-entity price is not checked: nothing
+    /// checks it at acceptance, and what it adds depends on the deployment's entity count, which
+    /// the config can't know. Collection still pays at most the cap per second for the base and
+    /// per-entity parts together.
     fn validate_prices_within_agreement_cap(&self) -> Result<(), String> {
         let cap_grt = self.max_agreement_grt_per_30_days;
         let cap = crate::worker::grt_per_30_days_to_wei_per_second(cap_grt);
