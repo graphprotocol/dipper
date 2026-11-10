@@ -105,10 +105,13 @@ DIPS_SERVER_URL=https://admin.dips.example.com
 DIPS_SIGNING_KEY={{ op://mainnet/dips/signing-key-1 }}
 ```
 
-2. Use `op inject` to inject the secrets:
+2. Use `op inject` to write a copy with the secrets filled in, then point the CLI at that copy:
 ```bash
-op inject --in-file .env.template --out-file .env.injected -- dipper-cli --env-file .env.injected <command>
+op inject --in-file .env.template --out-file .env.injected
+dipper-cli indexings --env-file .env.injected <subcommand>
 ```
+
+The copy holds the secrets in plain text, so delete it when you are done.
 
 This approach is beneficial when:
 - Managing multiple secrets
@@ -151,7 +154,7 @@ dipper-cli init placeholder op://mainnet/dips/signing-key-1 --server-url https:/
 
 This command will:
 1. Create a template configuration file with 1Password references
-2. Show instructions for using `op inject` to inject secrets at runtime
+2. Show instructions for using `op inject` to fill in the secret
 3. Save the template to the specified output file (defaults to `.env.template`)
 
 The generated template will contain the 1Password reference wrapped in double curly braces, which is the format required by `op inject`:
@@ -164,8 +167,9 @@ DIPS_SIGNING_KEY={{ op://mainnet/dips/signing-key-1 }}
 
 To use the generated template:
 ```bash
-# Inject secrets and run a command
-op inject --in-file .env.template --out-file .env.injected -- dipper-cli --env-file .env.injected <command>
+# Write a copy with the secret filled in, then run a command with it
+op inject --in-file .env.template --out-file .env.injected
+dipper-cli indexings --env-file .env.injected <subcommand>
 ```
 
 ## Development

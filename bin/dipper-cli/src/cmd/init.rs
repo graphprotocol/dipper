@@ -84,28 +84,17 @@ fn placeholder(args: &ArgMatches) -> Result<()> {
         .get_one::<String>("PLACEHOLDER")
         .ok_or_else(|| anyhow::anyhow!("Placeholder is required"))?;
 
-    // For 1Password integration, we use the placeholder directly
-    // This will be replaced by `op inject` at runtime
-    indoc::eprintdoc! {r#"
-        Generated placeholder for 1Password's `op inject` integration:
-
-        Secret key placeholder: {placeholder}
-
-        This placeholder will be replaced by `op inject` at runtime
-        To use this configuration, run commands with:
-
-          op inject --in-file .env.template --out-file .env.injected -- dipper-cli --env-file .env.injected <command>
-    "#};
-
-    // Wrap the placeholder in double curly braces for `op inject` 1Password integration
-    let signing_key = format!("{{{{ {} }}}}", placeholder);
-
-    // If output path is not provided, do not write the config
+    // Without --output, the template is written to the current directory
     let output_path = if let Some(path) = output_path {
         path
     } else {
         &PathBuf::from(".env.template")
     };
+
+    eprint!("{}", placeholder_instructions(placeholder, output_path));
+
+    // Wrap the placeholder in double curly braces for `op inject` 1Password integration
+    let signing_key = format!("{{{{ {} }}}}", placeholder);
 
     // If server URL is not provided, we can't write the config
     let server_url = server_url
@@ -117,6 +106,27 @@ fn placeholder(args: &ArgMatches) -> Result<()> {
     eprintln!("\nConfiguration written to: {}", output_path.display());
 
     Ok(())
+}
+
+/// The file the printed instructions have `op inject` write the filled-in configuration to.
+const INJECTED_FILE_NAME: &str = ".env.injected";
+
+/// How to use the template at `template` that holds `placeholder` for the secret key.
+fn placeholder_instructions(placeholder: &str, template: &Path) -> String {
+    let template = template.display();
+    indoc::formatdoc! {r#"
+        Generated placeholder for 1Password's `op inject` integration:
+
+        Secret key placeholder: {placeholder}
+
+        To use this configuration, have 1Password write a copy with the secret filled in, then
+        point dipper-cli at that copy (the agreements command takes --env-file the same way):
+
+          op inject --in-file {template} --out-file {INJECTED_FILE_NAME}
+          dipper-cli indexings --env-file {INJECTED_FILE_NAME} <subcommand>
+
+        The copy holds the secret key in plain text, so delete it when you are done.
+    "#}
 }
 
 /// Helper function to write the configuration to a file
@@ -175,4 +185,53 @@ pub(super) fn cmd() -> Command {
                         .value_parser(value_parser!(PathBuf)),
                 ]),
         ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The printed commands must run as printed: `op inject` only writes the filled-in file (its
+    /// flags are --in-file, --out-file, --file-mode and --force), and `--env-file` belongs to the
+    /// command it configures, not to `dipper-cli` itself.
+    #[test]
+    fn the_placeholder_instructions_print_commands_that_run() {
+        let instructions = placeholder_instructions(
+            "op://mainnet/dips/signing-key-1",
+            Path::new("dips.template"),
+        );
+        let line_starting = |program: &str| -> Vec<&str> {
+            instructions
+                .lines()
+                .map(str::trim)
+                .find(|line| line.starts_with(program))
+                .unwrap_or_else(|| panic!("no line starting `{program}` in:\n{instructions}"))
+                .split_whitespace()
+                .collect()
+        };
+
+        assert_eq!(
+            line_starting("op "),
+            [
+                "op",
+                "inject",
+                "--in-file",
+                "dips.template",
+                "--out-file",
+                INJECTED_FILE_NAME
+            ]
+        );
+        let run = line_starting("dipper-cli ")
+            .into_iter()
+            .map(|arg| if arg == "<subcommand>" { "list" } else { arg });
+        let matches = crate::cmd::command()
+            .try_get_matches_from(run)
+            .unwrap_or_else(|err| panic!("the printed dipper-cli command does not parse: {err}"));
+        let (_, command) = matches.subcommand().unwrap();
+        let (_, subcommand) = command.subcommand().unwrap();
+        assert_eq!(
+            subcommand.get_one::<PathBuf>("env-file"),
+            Some(&PathBuf::from(INJECTED_FILE_NAME))
+        );
+    }
 }
