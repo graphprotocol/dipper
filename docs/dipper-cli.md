@@ -44,7 +44,7 @@ All environment variables used by the CLI are prefixed with `DIPS_`. The main co
 - `DIPS_SIGNING_KEY`: The secret key used to sign requests (in hex format)
 - `DIPS_IPFS_URL`: The IPFS API that subgraph manifests are read from (defaults to `https://ipfs.thegraph.com`)
 
-Environment variables take precedence over command-line arguments and can be used to avoid repeating common configuration:
+A command-line flag takes precedence over the matching environment variable. Environment variables can be used to avoid repeating common configuration:
 
 ```bash
 # Set the server URL in the environment
@@ -56,11 +56,13 @@ dipper-cli init keygen --output .env.unencrypted
 
 #### .env File
 
-You can use a `.env` file to store your configuration. The CLI will automatically look for a `.env` file in the current directory. You can also specify a custom path using the `--env-file` flag:
+You can use a `.env` file to store your configuration. The CLI looks for a `.env` file in the current directory only, never in the directories above it. The `indexings` and `agreements` commands also take a custom path with the `--env-file` flag, and a file named that way is read instead of the one in the current directory:
 
 ```bash
-dipper-cli --env-file /path/to/.env <command>
+dipper-cli indexings --env-file /path/to/.env <subcommand>
 ```
+
+Each setting comes from the first of these that sets it: a command-line flag, a variable already set in your shell, then the file. When a flag or a shell variable overrides a setting in the file named with `--env-file`, the CLI prints a warning naming that setting, without its value, so a variable left exported in your shell cannot quietly send a command to a different server.
 
 #### CLI Flags
 
