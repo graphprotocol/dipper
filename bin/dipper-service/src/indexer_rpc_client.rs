@@ -779,6 +779,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_url_that_is_not_http_or_https_gets_no_client_whatever_the_switch() {
+        // For such a scheme the URL parser keeps `10.0.0.5` as a name, which the connector would
+        // reach without a lookup.
+        let url = Url::parse("grpc://10.0.0.5:7602/").unwrap();
+        for addresses in [AddressRule::PublicOnly, AddressRule::Any] {
+            let client = DipsIndexerClient {
+                addresses,
+                ..signing_test_client(PrivateKeySigner::random())
+            };
+
+            let refused = match client.get_client(&url) {
+                Err(DipsError::NotPublicAddress(Refused::Scheme(scheme))) => Some(scheme),
+                _ => None,
+            };
+
+            assert_eq!(refused.as_deref(), Some("grpc"), "under {addresses:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn an_offer_to_an_address_that_is_not_public_is_refused_before_connecting() {
         //* Act
         let (outcome, _, connected) =
