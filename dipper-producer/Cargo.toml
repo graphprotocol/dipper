@@ -25,6 +25,9 @@ webpki-roots = "1.0.8"
 [target.'cfg(gen_event_proto)'.build-dependencies]
 prost-build = "0.14.4"
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
+
 [lints]
 workspace = true
 
