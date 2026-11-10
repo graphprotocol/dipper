@@ -1,12 +1,16 @@
 # Known vulnerabilities the dependency scan in CI lets through, each with the reason. Remove an
 # entry once the crate is updated past it or leaves Cargo.lock.
+#
+# An entry lets its advisory through for every crate version the advisory covers, not only the
+# version named in the reason. So when a crate named here changes version in Cargo.lock, read its
+# entry again: the reason may no longer hold for the new version.
 
 # In Cargo.lock but never built: `cargo tree --invert <crate> --target all --edges all
 # --all-features` finds no path to them from any dipper crate.
 
 [[IgnoredVulns]]
 id = "GHSA-8ffr-xgwf-xj56"
-reason = "aws-smithy-json is only reachable through alloy's AWS signer, which dipper does not build. The fixed release also needs Rust 1.94, newer than this repo's toolchain."
+reason = "aws-smithy-json is only reachable through alloy's AWS signer, which dipper does not build."
 
 [[IgnoredVulns]]
 id = "GHSA-h395-gr6q-cpjc"
@@ -24,11 +28,11 @@ reason = "rsa is only reachable through sqlx's MySQL driver. Dipper uses Postgre
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0387"
-reason = "Timing leaks in crypto-bigint 0.5, under the secp256k1 libraries alloy signs with. Only 0.7 is fixed, which needs new major releases of those libraries. Not checked: whether signing reaches the affected operations."
+reason = "Timing leaks in crypto-bigint, fixed only in 0.7.6. Dipper builds 0.5.5 under k256, the secp256k1 library alloy signs with, which uses it to add, subtract, negate and range-check secret values while signing and does its own multiplication and inversion. The fixes were made to 0.7 code; nobody has shown whether 0.5.5 leaks in the operations k256 uses, and no constant-time check has been run on it. Goes when alloy moves to k256 0.14."
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0258"
-reason = "h2 0.3 is built in only through the IPFS client in indexer-rs, which dipper never calls. No 0.3 release is fixed. Dipper's own HTTP/2 traffic uses h2 0.4, which is updated past the fix."
+reason = "h2 0.3 comes in under reqwest 0.11, which the networks registry client uses to fetch the registry at startup, and under the IPFS client in indexer-rs, which dipper never calls. That reqwest is built without the feature that negotiates HTTP/2 over TLS, so the registry fetch uses HTTP/1.1 and does not reach h2. No 0.3 release is fixed. Dipper's other HTTP/2 traffic uses h2 0.4, which is updated past the fix."
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0253"
@@ -62,7 +66,7 @@ reason = "proc-macro-error2 is unmaintained. It is a build-time macro under allo
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2025-0134"
-reason = "rustls-pemfile is unmaintained. Dipper reads the Kafka TLS certificate with it, which rustls-pki-types can now do instead; it also comes in through reqwest 0.11 in indexer-rs."
+reason = "rustls-pemfile is unmaintained. Dipper reads the Kafka TLS certificate with 2.2, which rustls-pki-types can now do instead. 1.0 also comes in under reqwest 0.11, which the networks registry client and indexer-rs use, so the entry stays until that goes too."
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2024-0449"
