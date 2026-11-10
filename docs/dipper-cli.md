@@ -56,11 +56,13 @@ dipper-cli init keygen --output .env.unencrypted
 
 #### .env File
 
-You can use a `.env` file to store your configuration. The CLI will automatically look for a `.env` file in the current directory. The `indexings` and `agreements` commands also take a custom path with the `--env-file` flag:
+You can use a `.env` file to store your configuration. The CLI automatically loads the first `.env` file it finds in the current directory or any directory above it. The `indexings` and `agreements` commands also take a custom path with the `--env-file` flag:
 
 ```bash
 dipper-cli indexings --env-file /path/to/.env <subcommand>
 ```
+
+The automatically found file is loaded first and the `--env-file` file after it, and neither replaces a variable that is already set. So a setting is taken from, in order: a command-line flag, then the shell environment, then the automatically found `.env` file, then the `--env-file` file. A value in the shell or in the automatically found file therefore beats the same key in the `--env-file` file.
 
 #### CLI Flags
 
