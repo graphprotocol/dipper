@@ -156,13 +156,14 @@ impl DipsIndexerClient {
         self.addresses
             .check_url(indexer_url)
             .map_err(DipsError::NotPublicAddress)?;
+        // The endpoint gets no connect timeout: tonic would time the whole connection with it and
+        // fail a stall as a status that is never retried. The connector and TLS time their parts.
         let mut endpoint = tonic::transport::Endpoint::from_str(indexer_url.as_str())
             .map_err(|err| DipsError::ConnectionError(err.into()))?
-            .connect_timeout(self.connect_timeout)
             .timeout(self.request_timeout);
         // An endpoint built from a URL string leaves TLS off, even for https. Built-in
         // roots avoid rereading the system store on every attempt, and the handshake
-        // needs its own timeout: neither of the endpoint's timeouts covers it.
+        // needs its own timeout: the connector's covers only the lookup and TCP connect.
         if indexer_url.scheme() == "https" {
             let tls = ClientTlsConfig::new()
                 .with_webpki_roots()
@@ -171,7 +172,7 @@ impl DipsIndexerClient {
                 .tls_config(tls)
                 .map_err(|err| DipsError::ConnectionError(err.into()))?;
         }
-        // The endpoint still adds its TLS and connect timeout around this connector.
+        // The endpoint still adds its TLS around this connector.
         let channel = endpoint
             .connect_with_connector_lazy(self.addresses.grpc_connector(self.connect_timeout));
         let client = rpc::IndexerDipsServiceClient::new(channel);
@@ -203,7 +204,7 @@ fn calculate_retry_delay(attempt: u32) -> Duration {
 /// Execute a gRPC call with retry on transient failures.
 ///
 /// Takes a client factory and a request executor. Creates a fresh client for each
-/// retry attempt (safe since `connect_lazy` doesn't make network calls until use).
+/// retry attempt (safe since a lazy channel makes no network calls until it is used).
 ///
 /// Note: `get_client` errors (e.g., invalid URL) are NOT retried - they fail immediately.
 /// This is intentional since URL parsing errors are permanent, not transient.
@@ -825,12 +826,64 @@ mod tests {
         .await;
         silent.abort();
 
-        //* Assert - the 1s connect timeout bounds the handshake, not the 600s request timeout
-        assert!(
-            result
-                .expect("the handshake should give up within 10s")
-                .is_err()
-        );
+        //* Assert - the 1s connect timeout bounds the handshake, not the 600s request timeout, and
+        //* fails it as a connection that can be tried again
+        let status = result
+            .expect("the handshake should give up within 10s")
+            .expect_err("nothing answered");
+        assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
+    }
+
+    #[tokio::test]
+    async fn an_indexer_that_stalls_the_handshake_is_asked_again() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        //* Arrange - a port that accepts every connection and never answers
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("https://{}/", listener.local_addr().unwrap())).unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let silent = tokio::spawn({
+            let accepted = Arc::clone(&accepted);
+            async move {
+                let mut held = Vec::new();
+                loop {
+                    let (socket, _) = listener.accept().await.unwrap();
+                    accepted.fetch_add(1, Ordering::SeqCst);
+                    held.push(socket);
+                }
+            }
+        });
+        let client = DipsIndexerClient {
+            connect_timeout: Duration::from_millis(200),
+            request_timeout: Duration::from_secs(60),
+            max_retries: 1,
+            ..signing_test_client(PrivateKeySigner::random())
+        };
+
+        //* Act
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.send_indexing_agreement_proposal(
+                &url,
+                IndexingAgreementId::from_bytes(rand::random()),
+                signing_test_terms(),
+                uuid::Uuid::now_v7(),
+            ),
+        )
+        .await
+        .expect("both attempts should give up within 10s");
+        silent.abort();
+
+        //* Assert
+        let err = outcome.unwrap_err();
+        let code = match &err {
+            DipsError::RequestError(source) => source
+                .downcast_ref::<tonic::Status>()
+                .map(tonic::Status::code),
+            _ => None,
+        };
+        assert_eq!(code, Some(tonic::Code::Unavailable), "{err:?}");
+        assert_eq!(accepted.load(Ordering::SeqCst), 2, "1 attempt and 1 retry");
     }
 
     #[tokio::test]
