@@ -575,8 +575,9 @@ where
 {
     let mut attempt: u32 = 0;
     loop {
-        let Some(client) = wait_for_client(conn, shutdown).await else {
-            return Delivery::Shutdown;
+        let client = tokio::select! {
+            client = conn.connected() => client,
+            _ = shutdown.notified() => return Delivery::Shutdown,
         };
         let result = send(client.clone()).await;
         report(conn, &client, &result);
@@ -617,24 +618,6 @@ fn report<T: Send + Sync + 'static>(
     result: &Result<(), kafka::Error>,
 ) {
     conn.report(client, result);
-}
-
-/// Waits until a client is available, checking every 250ms. Returns `None` if shutdown is
-/// signalled first, so the caller can stop waiting on brokers that may never come up.
-async fn wait_for_client<T: Send + Sync + 'static>(
-    conn: &Reconnecting<T>,
-    shutdown: &Notify,
-) -> Option<Arc<T>> {
-    const POLL: Duration = Duration::from_millis(250);
-    loop {
-        if let Some(client) = conn.current() {
-            return Some(client);
-        }
-        tokio::select! {
-            _ = tokio::time::sleep(POLL) => {}
-            _ = shutdown.notified() => return None,
-        }
-    }
 }
 
 /// A queued event: shared routing metadata plus its type-specific payload.
@@ -848,10 +831,33 @@ mod tests {
         (connects, conn)
     }
 
-    async fn connected(conn: &Reconnecting<FakeClient>) {
-        while conn.current().is_none() {
+    #[tokio::test(start_paused = true)]
+    async fn an_event_waiting_for_a_client_goes_out_as_soon_as_one_connects() {
+        let conn = Reconnecting::spawn("test", Duration::from_secs(30), || async {
             tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+            Ok::<_, String>(FakeClient(1))
+        });
+        let start = tokio::time::Instant::now();
+        let sent_after = Mutex::new(None);
+        let sent_after_ref = &sent_after;
+
+        let delivery = deliver(
+            &conn,
+            &Notify::new(),
+            SubgraphIndexingAgreementEventType::Proposed,
+            "key",
+            move |_client: Arc<FakeClient>| async move {
+                *sent_after_ref.lock().unwrap() = Some(start.elapsed());
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(matches!(delivery, Delivery::Sent));
+        assert_eq!(
+            *sent_after.lock().unwrap(),
+            Some(Duration::from_millis(100))
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -907,7 +913,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn shutdown_stops_resending_an_event_the_brokers_never_got() {
         let (_, conn) = fake_clients();
-        connected(&conn).await;
+        conn.connected().await;
         let shutdown = Notify::new();
         shutdown.notify_one();
 
