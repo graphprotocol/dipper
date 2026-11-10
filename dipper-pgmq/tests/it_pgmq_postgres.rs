@@ -577,6 +577,66 @@ async fn deferred_job_not_starved_by_fresh_jobs() {
     assert_eq!(popped.desc().data, old_msg.data);
 }
 
+/// Queued, waiting-to-retry and running jobs are unfinished; a removed job and 1 that failed for
+/// good are not.
+#[tokio::test]
+async fn lists_only_unfinished_jobs() {
+    //* Given
+    let (db, _temp_db) = temp_pgmq_db().await;
+    let queue = PgQueue::new(db.clone());
+    let msg = |data: &str| TestMsg {
+        data: data.to_string(),
+    };
+    for (data, retries) in [("done", 2), ("gave up", 0), ("retrying", 2), ("running", 2)] {
+        queue
+            .push(JobBuilder::new(msg(data)).max_retries(retries))
+            .await
+            .expect("Failed to push message");
+    }
+    queue
+        .push(msg("queued"))
+        .await
+        .expect("Failed to push message");
+    let pop = || async {
+        queue
+            .pop::<TestMsg>()
+            .await
+            .expect("Failed to pop job")
+            .expect("expected a job")
+    };
+    pop().await.remove().await.expect("Failed to remove job");
+    pop()
+        .await
+        .mark_as_failed()
+        .await
+        .expect("Failed to fail job");
+    let later = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
+    pop()
+        .await
+        .mark_as_failed_and_reschedule(later)
+        .await
+        .expect("Failed to fail job");
+    let running = pop().await;
+
+    //* When
+    let mut unfinished: Vec<String> = queue
+        .unfinished_descriptors()
+        .await
+        .expect("Failed to list unfinished jobs")
+        .iter()
+        .map(|d| {
+            serde_json::from_str::<TestMsg>(d)
+                .expect("a stored message")
+                .data
+        })
+        .collect();
+    unfinished.sort();
+    drop(running);
+
+    //* Then
+    assert_eq!(unfinished, ["queued", "retrying", "running"]);
+}
+
 #[tokio::test]
 async fn failed_job_gives_up_at_max_attempts() {
     // Regression: the give-up arm of requeue() (count_attempt=true,
@@ -731,6 +791,39 @@ async fn deferred_job_does_not_count_an_attempt() {
         .expect("expected the deferred job");
     assert_eq!(job.id(), &job_id);
     assert_eq!(job.failed_attempts(), 0);
+}
+
+/// A Background job, such as an offer a sweep's reassessment created, pops before Sweep jobs
+/// queued earlier, so a long sweep can't hold it up.
+#[tokio::test]
+async fn background_pops_before_earlier_sweep_jobs() {
+    //* Given
+    let (db, _temp_db) = temp_pgmq_db().await;
+    let queue = PgQueue::new(db);
+    for _ in 0..2 {
+        queue
+            .push(JobBuilder::new(Faker.fake::<TestMsg>()).priority(JobPriority::Sweep))
+            .await
+            .expect("Failed to push sweep job");
+    }
+    let background_id = queue
+        .push(JobBuilder::new(Faker.fake::<TestMsg>()).priority(JobPriority::Background))
+        .await
+        .expect("Failed to push background job");
+
+    //* When
+    let first = queue
+        .pop::<TestMsg>()
+        .await
+        .expect("Failed to pop")
+        .expect("expected a job");
+
+    //* Then
+    assert_eq!(
+        first.id(),
+        &background_id,
+        "background must pop before earlier sweep jobs"
+    );
 }
 
 #[tokio::test]

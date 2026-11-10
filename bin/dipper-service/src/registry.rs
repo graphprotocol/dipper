@@ -1,6 +1,7 @@
 mod agreement;
 #[cfg(test)]
 mod agreement_stub;
+mod dips_info;
 mod indexer_denylist;
 mod indexing_request;
 mod pending_cancellation;
@@ -26,8 +27,9 @@ pub use self::{
         AgreementFeeRate, AgreementRegistry, CancelKind, CancellingAgreement, IndexingAgreement,
         NewAgreementParams, ReconciliationAudit, ReconciliationItem, ReconciliationOutcome,
         Status as IndexingAgreementStatus, Terms as IndexingAgreementTerms,
-        TermsMetadata as IndexingAgreementTermsMetadata,
+        TermsMetadata as IndexingAgreementTermsMetadata, WithheldIndexers,
     },
+    dips_info::{DipsInfoChecks, DipsInfoRegistry},
     indexer_denylist::IndexerDenylistRegistry,
     indexing_request::{
         IndexingRequest, IndexingRequestRegistry, SetTargetOutcome, Status as IndexingRequestStatus,
@@ -141,11 +143,6 @@ impl RegistryProvider {
 
 #[async_trait]
 impl IndexingRequestRegistry for RegistryProvider {
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap,
-        reason = "predates this lint; fix when next touched"
-    )]
     async fn set_indexing_target_candidates(
         &self,
         requested_by: Address,
@@ -153,12 +150,16 @@ impl IndexingRequestRegistry for RegistryProvider {
         deployment_chain_id: ChainId,
         num_candidates: usize,
     ) -> RegistryResult<crate::registry::indexing_request::SetTargetOutcome> {
+        let num_candidates = i32::try_from(num_candidates).map_err(|_| Error::TooLarge {
+            field: "num_candidates",
+            value: num_candidates,
+        })?;
         self.inner
             .set_indexing_target_candidates(
                 requested_by,
                 deployment_id,
                 deployment_chain_id,
-                num_candidates as i32,
+                num_candidates,
             )
             .await
             .map_err(Into::into)
@@ -210,6 +211,35 @@ impl IndexingRequestRegistry for RegistryProvider {
         Ok(self
             .inner
             .get_open_indexing_requests_for_reassessment(min_age_seconds, batch_size)
+            .await?
+            .into_iter()
+            .map(IndexingRequest::try_from)
+            .filter_map(filter_map_with_logging)
+            .collect())
+    }
+
+    async fn get_short_requests_on_deployments_with_ended_agreements(
+        &self,
+        since_seconds: i64,
+        batch_size: i64,
+    ) -> RegistryResult<Vec<IndexingRequest>> {
+        Ok(self
+            .inner
+            .get_short_requests_on_deployments_with_ended_agreements(since_seconds, batch_size)
+            .await?
+            .into_iter()
+            .map(IndexingRequest::try_from)
+            .filter_map(filter_map_with_logging)
+            .collect())
+    }
+
+    async fn get_short_open_indexing_requests(
+        &self,
+        batch_size: i64,
+    ) -> RegistryResult<Vec<IndexingRequest>> {
+        Ok(self
+            .inner
+            .get_short_open_indexing_requests(batch_size)
             .await?
             .into_iter()
             .map(IndexingRequest::try_from)
@@ -326,6 +356,21 @@ impl AgreementRegistry for RegistryProvider {
             .inner
             .get_unresponsive_indexers(lookback_days, chain_id)
             .await?)
+    }
+
+    async fn get_indexers_to_withhold_offers_from(
+        &self,
+        test_interval_minutes: i32,
+    ) -> RegistryResult<WithheldIndexers> {
+        let withheld = self
+            .inner
+            .get_indexers_to_withhold_offers_from(test_interval_minutes)
+            .await?;
+        Ok(WithheldIndexers {
+            indexers: withheld.indexers,
+            // A count is never negative; were it, the most offered keeps anyone being held back.
+            offered: usize::try_from(withheld.offered).unwrap_or(usize::MAX),
+        })
     }
 
     async fn get_indexing_agreements_by_indexing_request_id(
@@ -850,6 +895,60 @@ impl IndexerDenylistRegistry for RegistryProvider {
 }
 
 #[async_trait]
+impl DipsInfoRegistry for RegistryProvider {
+    async fn get_indexers_with_accepted_agreements(&self) -> RegistryResult<Vec<IndexerId>> {
+        self.inner
+            .get_indexers_with_accepted_agreements()
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn record_dips_info_checks(
+        &self,
+        missing: &[IndexerId],
+        added: std::time::Duration,
+    ) -> RegistryResult<DipsInfoChecks> {
+        // The watcher adds at most 2 intervals, and its config keeps an interval to 1 day.
+        let added_secs = i64::try_from(added.as_secs()).unwrap_or(i64::MAX);
+        let checks = self
+            .inner
+            .record_dips_info_checks(missing, added_secs)
+            .await?;
+        let to_durations = |times: std::collections::HashMap<IndexerId, i64>| {
+            times
+                .into_iter()
+                .map(|(id, secs)| {
+                    (
+                        id,
+                        std::time::Duration::from_secs(secs.max(0).unsigned_abs()),
+                    )
+                })
+                .collect()
+        };
+        Ok(DipsInfoChecks {
+            missing: to_durations(checks.missing),
+            cleared: to_durations(checks.cleared),
+        })
+    }
+
+    async fn get_dips_info_blocks(&self) -> RegistryResult<Vec<IndexerId>> {
+        self.inner.get_dips_info_blocks().await.map_err(Into::into)
+    }
+
+    async fn block_missing_dips_info(
+        &self,
+        indexer_ids: &[IndexerId],
+        duration: std::time::Duration,
+    ) -> RegistryResult<Vec<IndexerId>> {
+        let for_secs = i64::try_from(duration.as_secs()).unwrap_or(i64::MAX);
+        self.inner
+            .block_missing_dips_info(indexer_ids, for_secs)
+            .await
+            .map_err(Into::into)
+    }
+}
+
+#[async_trait]
 impl PendingCancellationRegistry for RegistryProvider {
     async fn get_pending_cancellations_by_new_agreement(
         &self,
@@ -968,8 +1067,38 @@ mod tests {
     use dipper_core::ids::IndexingAgreementId;
     use dipper_pgregistry::{EndCorrection, RecordedEnd};
 
-    use super::warn_if_end_corrected;
+    use super::{IndexingRequestRegistry, RegistryProvider, warn_if_end_corrected};
     use crate::test_support::logged;
+
+    /// A count the 32-bit column can't hold is refused before any query, never wrapped or
+    /// saturated, so no live database is needed.
+    #[tokio::test]
+    async fn refuses_a_count_too_large_to_store() {
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/unused")
+            .expect("a lazy pool never connects");
+        let registry = RegistryProvider::new(db);
+
+        let result = registry
+            .set_indexing_target_candidates(
+                thegraph_core::alloy::primitives::Address::ZERO,
+                thegraph_core::deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv"),
+                1,
+                2_147_483_648,
+            )
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(crate::registry::Error::TooLarge {
+                    value: 2_147_483_648,
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+    }
 
     #[tokio::test]
     async fn warns_with_both_ends_when_an_announced_end_changes() {

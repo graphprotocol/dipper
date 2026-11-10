@@ -103,6 +103,22 @@ pub struct RecordedEnd {
     pub canceled_tx: Option<String>,
 }
 
+/// The indexers to withhold offers from, and how many indexers had an offer on-chain in the same
+/// 24 hours, so a caller can tell indexers that stopped accepting from a fault on dipper's side.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WithheldIndexers {
+    pub indexers: Vec<IndexerId>,
+    pub offered: i64,
+}
+
+/// What recording a cycle of DIPs info checks left, in seconds without a readable answer: each
+/// indexer still missing its DIPs info, and each one forgotten, with the time it had built up.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DipsInfoChecks {
+    pub missing: HashMap<IndexerId, i64>,
+    pub cleared: HashMap<IndexerId, i64>,
+}
+
 /// An announced end that a write replaced or cleared, so its `terminated` event goes out again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EndCorrection {
@@ -256,6 +272,14 @@ impl sqlx::FromRow<'_, sqlx::postgres::PgRow> for CancellingAgreement {
 /// Dipper can mark an agreement ended before the chain listener records that transaction, so
 /// the wait lets the event carry it; after this the event goes out without one.
 const TERMINATED_TX_WAIT_MINUTES: i32 = 60;
+
+/// How far back missed offers count when deciding whether an indexer has stopped accepting them.
+const NON_ACCEPTING_LOOKBACK_HOURS: i32 = 24;
+
+/// How long a missed offer benches the indexer on that subgraph when it is the 1st miss in a
+/// row there, and when it is the 2nd. A 3rd or later earns the standard bench.
+const FIRST_MISS_BENCH_DAYS: i32 = 1;
+const SECOND_MISS_BENCH_DAYS: i32 = 7;
 
 /// Statuses an on-chain cancel by dipper ends.
 const CANCEL_BY_REQUESTER_FROM: &[IndexingAgreementStatus] = &[
@@ -783,29 +807,61 @@ impl PgRegistry {
             .collect())
     }
 
-    /// Get declined `CanceledByIndexer`/`Expired`/`Rejected` indexers, and those whose agreement
-    /// dipper ended `AbandonedByIndexer`, grouped by deployment (deployment id -> indexer ids).
-    /// Each rejection reason gets its own exclusion window, as does an expiry that never had an
-    /// offer transaction.
-    pub async fn get_declined_indexers_by_deployment(
-        &self,
-        default_lookback_days: i32,
-        price_lookback_days: i32,
-        transient_lookback_minutes: i32,
-        uncertain_lookback_days: i32,
-    ) -> Result<HashMap<DeploymentId, Vec<IndexerId>>, Error> {
-        use crate::rejection_reason::{
-            AGREEMENT_EXPIRED, CAPACITY_EXCEEDED, DEADLINE_EXPIRED, INDEXER_UNAVAILABLE,
-            INVALID_SIGNATURE, PRICE_TOO_LOW, REPLAY_DETECTED, SENDER_NOT_TRUSTED,
-            SUBGRAPH_MANIFEST_UNAVAILABLE, UNEXPECTED_SERVICE_PROVIDER, UNSPECIFIED,
-            UNSUPPORTED_METADATA_VERSION,
-        };
-
-        let rows: Vec<(PgDeploymentId, Vec<PgIndexerId>)> = sqlx::query_as(
-            r#"
-            SELECT
-                deployment_id,
-                array_agg(DISTINCT indexer_id) as indexer_ids
+    /// The query behind [`Self::get_declined_indexers_by_deployment`], kept beside it so its
+    /// placeholders sit near the binds that fill them; the method's doc says what each window is
+    /// for.
+    const DECLINED_INDEXERS_SQL: &str = r#"
+            -- Misses count towards a bench for 2 standard benches, so 1 from months ago doesn't
+            -- lengthen the bench for a fresh one.
+            WITH missed AS (
+                SELECT deployment_id, indexer_id, created_at, updated_at,
+                       CAST(terms->>'deadline' AS bigint) AS deadline
+                FROM dipper_reg_indexing_agreements
+                WHERE status = $2 AND offer_tx_hash IS NOT NULL AND rejection_reason IS NULL
+                  AND updated_at >= timezone('UTC', now()) - make_interval(days => 2 * $5)
+            ),
+            -- accepted_at is chain seconds; read it the way updated_at is written, through
+            -- timezone('UTC', ...), so the 2 compare like for like. Only acceptances after the
+            -- oldest counted miss can matter, so older ones are left out to keep this small.
+            accepted AS (
+                SELECT deployment_id, indexer_id, accepted_at,
+                       timezone('UTC', to_timestamp(accepted_at)) AS at
+                FROM dipper_reg_indexing_agreements
+                WHERE accepted_at >= EXTRACT(EPOCH FROM now() - make_interval(days => 2 * $5 + 1))
+            ),
+            -- The misses on each subgraph since the indexer last accepted an offer there.
+            streaks AS (
+                SELECT m.deployment_id, m.indexer_id, count(*) AS misses,
+                       max(m.updated_at) AS last_miss, max(m.deadline) AS last_deadline
+                FROM missed m
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM accepted a
+                    WHERE a.deployment_id = m.deployment_id
+                      AND a.indexer_id = m.indexer_id
+                      AND a.at > m.created_at
+                )
+                GROUP BY m.deployment_id, m.indexer_id
+            ),
+            benched_for_missing AS (
+                SELECT s.deployment_id, s.indexer_id
+                FROM streaks s
+                WHERE (s.misses = 1
+                       AND s.last_miss >= timezone('UTC', now()) - make_interval(days => LEAST($21, $5))
+                       -- Only a 1st-miss bench lifts on an acceptance elsewhere, or accepting
+                       -- other subgraphs would wipe every longer bench on this one. Both times
+                       -- are chain seconds, and dipper marks a miss only a grace after its
+                       -- deadline, so the deadline is when the indexer missed it.
+                       AND NOT EXISTS (
+                           SELECT 1 FROM accepted a
+                           WHERE a.indexer_id = s.indexer_id AND a.accepted_at > s.last_deadline
+                       ))
+                   OR (s.misses = 2
+                       AND s.last_miss >= timezone('UTC', now()) - make_interval(days => LEAST($22, $5)))
+                   OR (s.misses >= 3
+                       AND s.last_miss >= timezone('UTC', now()) - make_interval(days => $5))
+            ),
+            declined AS (
+            SELECT deployment_id, indexer_id
             FROM dipper_reg_indexing_agreements
             WHERE status IN ($1, $2, $3, $20)
               AND (
@@ -835,36 +891,73 @@ impl PgRegistry {
                 (status = $2 AND offer_tx_hash IS NULL AND rejection_reason IS NULL
                  AND updated_at >= timezone('UTC', now()) - make_interval(mins => $7))
                 OR
-                -- All other rejections/expirations/cancellations: standard lookback
+                -- All other rejections/expirations/cancellations: standard lookback. A missed
+                -- offer, an expiry with no reason, is benched by benched_for_missing instead.
                 (COALESCE(rejection_reason, '') NOT IN ($6, $8, $9, $10, $11, $12, $13, $14, $15, $16, $18, $19)
-                 AND NOT (status = $2 AND offer_tx_hash IS NULL AND rejection_reason IS NULL)
+                 AND NOT (status = $2 AND rejection_reason IS NULL)
                  AND updated_at >= timezone('UTC', now()) - make_interval(days => $5))
               )
+            )
+            SELECT deployment_id, array_agg(DISTINCT indexer_id) AS indexer_ids
+            FROM (
+                SELECT deployment_id, indexer_id FROM declined
+                UNION ALL
+                SELECT deployment_id, indexer_id FROM benched_for_missing
+            ) benched
             GROUP BY deployment_id
-            "#,
-        )
-        .bind(IndexingAgreementStatus::CanceledByIndexer) // $1
-        .bind(IndexingAgreementStatus::Expired) // $2
-        .bind(IndexingAgreementStatus::Rejected) // $3
-        .bind(price_lookback_days) // $4
-        .bind(default_lookback_days) // $5
-        .bind(PRICE_TOO_LOW) // $6
-        .bind(transient_lookback_minutes) // $7
-        .bind(DEADLINE_EXPIRED) // $8
-        .bind(SUBGRAPH_MANIFEST_UNAVAILABLE) // $9
-        .bind(UNEXPECTED_SERVICE_PROVIDER) // $10
-        .bind(AGREEMENT_EXPIRED) // $11
-        .bind(UNSUPPORTED_METADATA_VERSION) // $12
-        .bind(CAPACITY_EXCEEDED) // $13
-        .bind(INDEXER_UNAVAILABLE) // $14
-        .bind(INVALID_SIGNATURE) // $15
-        .bind(REPLAY_DETECTED) // $16
-        .bind(uncertain_lookback_days) // $17
-        .bind(SENDER_NOT_TRUSTED) // $18
-        .bind(UNSPECIFIED) // $19
-        .bind(IndexingAgreementStatus::AbandonedByIndexer) // $20
-        .fetch_all(&self.pool)
-        .await?;
+            "#;
+
+    /// Get declined `CanceledByIndexer`/`Expired`/`Rejected` indexers, and those whose agreement
+    /// dipper ended `AbandonedByIndexer`, grouped by deployment (deployment id -> indexer ids).
+    /// Each rejection reason gets its own exclusion window, as does an expiry that never had an
+    /// offer transaction.
+    ///
+    /// An offer that landed on chain and expired with no reason given is a missed offer: the
+    /// indexer had one to accept and didn't. Its bench grows with the misses in a row on that
+    /// subgraph since the indexer last accepted there: 1 day, then 7 days, then
+    /// `default_lookback_days`, and never longer than that standard bench. A 1st miss is often a
+    /// blip on the indexer's side, so its bench also lifts once the indexer accepts any offer
+    /// after it.
+    pub async fn get_declined_indexers_by_deployment(
+        &self,
+        default_lookback_days: i32,
+        price_lookback_days: i32,
+        transient_lookback_minutes: i32,
+        uncertain_lookback_days: i32,
+    ) -> Result<HashMap<DeploymentId, Vec<IndexerId>>, Error> {
+        use crate::rejection_reason::{
+            AGREEMENT_EXPIRED, CAPACITY_EXCEEDED, DEADLINE_EXPIRED, INDEXER_UNAVAILABLE,
+            INVALID_SIGNATURE, PRICE_TOO_LOW, REPLAY_DETECTED, SENDER_NOT_TRUSTED,
+            SUBGRAPH_MANIFEST_UNAVAILABLE, UNEXPECTED_SERVICE_PROVIDER, UNSPECIFIED,
+            UNSUPPORTED_METADATA_VERSION,
+        };
+
+        let rows: Vec<(PgDeploymentId, Vec<PgIndexerId>)> =
+            sqlx::query_as(Self::DECLINED_INDEXERS_SQL)
+                .bind(IndexingAgreementStatus::CanceledByIndexer) // $1
+                .bind(IndexingAgreementStatus::Expired) // $2
+                .bind(IndexingAgreementStatus::Rejected) // $3
+                .bind(price_lookback_days) // $4
+                .bind(default_lookback_days) // $5
+                .bind(PRICE_TOO_LOW) // $6
+                .bind(transient_lookback_minutes) // $7
+                .bind(DEADLINE_EXPIRED) // $8
+                .bind(SUBGRAPH_MANIFEST_UNAVAILABLE) // $9
+                .bind(UNEXPECTED_SERVICE_PROVIDER) // $10
+                .bind(AGREEMENT_EXPIRED) // $11
+                .bind(UNSUPPORTED_METADATA_VERSION) // $12
+                .bind(CAPACITY_EXCEEDED) // $13
+                .bind(INDEXER_UNAVAILABLE) // $14
+                .bind(INVALID_SIGNATURE) // $15
+                .bind(REPLAY_DETECTED) // $16
+                .bind(uncertain_lookback_days) // $17
+                .bind(SENDER_NOT_TRUSTED) // $18
+                .bind(UNSPECIFIED) // $19
+                .bind(IndexingAgreementStatus::AbandonedByIndexer) // $20
+                .bind(FIRST_MISS_BENCH_DAYS) // $21
+                .bind(SECOND_MISS_BENCH_DAYS) // $22
+                .fetch_all(&self.pool)
+                .await?;
 
         Ok(rows
             .into_iter()
@@ -899,6 +992,72 @@ impl PgRegistry {
         .await?;
 
         Ok(rows.into_iter().map(|(id,)| id.0).collect())
+    }
+
+    /// Indexers that, since their last on-chain acceptance, missed an offer made after an earlier
+    /// missed offer had already expired: 2 rounds unanswered, counting misses that ended in the
+    /// last 24 hours. Each gets 1 test offer once `test_interval_minutes` pass with none made.
+    pub async fn get_indexers_to_withhold_offers_from(
+        &self,
+        test_interval_minutes: i32,
+    ) -> Result<WithheldIndexers, Error> {
+        let rows: Vec<(PgIndexerId,)> = sqlx::query_as(
+            r#"
+            WITH missed AS (
+                -- An expiry with an offer transaction and no rejection is an offer the
+                -- indexer had on-chain and let lapse.
+                SELECT m.indexer_id, m.created_at, m.updated_at
+                FROM dipper_reg_indexing_agreements m
+                WHERE m.status = $1
+                  AND m.offer_tx_hash IS NOT NULL
+                  AND m.rejection_reason IS NULL
+                  AND m.updated_at >= timezone('UTC', now()) - make_interval(hours => $3)
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM dipper_reg_indexing_agreements a
+                      WHERE a.indexer_id = m.indexer_id
+                        AND a.accepted_at IS NOT NULL
+                        AND timezone('UTC', to_timestamp(a.accepted_at)) >= m.created_at
+                  )
+            )
+            SELECT missed.indexer_id
+            FROM missed
+            GROUP BY missed.indexer_id
+            HAVING MAX(missed.created_at) >= MIN(missed.updated_at)
+               AND EXISTS (
+                   SELECT 1
+                   FROM dipper_reg_indexing_agreements o
+                   WHERE o.indexer_id = missed.indexer_id
+                     AND o.created_at >= timezone('UTC', now()) - make_interval(mins => $2)
+               )
+            "#,
+        )
+        .bind(IndexingAgreementStatus::Expired)
+        .bind(test_interval_minutes)
+        .bind(NON_ACCEPTING_LOOKBACK_HOURS)
+        .fetch_all(&self.pool)
+        .await?;
+
+        // The second branch takes in every miss counted above, even one made before the window.
+        let (offered,): (i64,) = sqlx::query_as(
+            r#"
+            SELECT COUNT(DISTINCT indexer_id)
+            FROM dipper_reg_indexing_agreements
+            WHERE offer_tx_hash IS NOT NULL
+              AND (created_at >= timezone('UTC', now()) - make_interval(hours => $2)
+                   OR (status = $1
+                       AND updated_at >= timezone('UTC', now()) - make_interval(hours => $2)))
+            "#,
+        )
+        .bind(IndexingAgreementStatus::Expired)
+        .bind(NON_ACCEPTING_LOOKBACK_HOURS)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(WithheldIndexers {
+            indexers: rows.into_iter().map(|(id,)| id.0).collect(),
+            offered,
+        })
     }
 
     pub async fn get_indexing_agreements_by_indexing_request_id(
@@ -1693,12 +1852,9 @@ impl PgRegistry {
 
     /// Get open indexing requests eligible for reassessment.
     ///
-    /// Returns requests that are in the `OPEN` status and were created at least
-    /// `min_age_seconds` ago. Results are ordered by `updated_at` ascending to
-    /// prioritize requests that haven't been reassessed recently.
-    ///
-    /// If `batch_size` is greater than 0, limits the number of results.
-    /// If `batch_size` is 0 or negative, returns all matching requests.
+    /// Returns `OPEN` requests created at least `min_age_seconds` ago, least recently changed
+    /// first (a target or status change; reassessing doesn't count). If `batch_size` is greater
+    /// than 0, limits the number of results; otherwise returns them all.
     pub async fn get_open_indexing_requests_for_reassessment(
         &self,
         min_age_seconds: i64,
@@ -1724,6 +1880,80 @@ impl PgRegistry {
         )
         .bind(IndexingRequestStatus::Open)
         .bind(min_age_seconds)
+        .bind(batch_size)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Open requests still short of indexers on a deployment where dipper finished cancelling an
+    /// agreement within the last `since_seconds`. That frees its indexer to be picked again; one
+    /// the indexer ended itself stays declined, so it doesn't count.
+    pub async fn get_short_requests_on_deployments_with_ended_agreements(
+        &self,
+        since_seconds: i64,
+        batch_size: i64,
+    ) -> Result<Vec<IndexingRequest>, Error> {
+        sqlx::query_as(
+            r#"
+            SELECT
+                r.id,
+                r.created_at,
+                r.updated_at,
+                r.status,
+                r.requested_by,
+                r.deployment_id,
+                r.deployment_chain_id,
+                r.num_candidates
+            FROM dipper_reg_indexing_requests r
+            WHERE r.status = $1
+              AND r.shortfall_active
+              AND EXISTS (
+                SELECT 1
+                FROM dipper_reg_indexing_agreements a
+                WHERE a.deployment_id = r.deployment_id
+                  AND a.status = $2
+                  AND a.updated_at >= timezone('UTC', now()) - ($3 * interval '1 second')
+              )
+            ORDER BY r.updated_at ASC
+            LIMIT $4
+            "#,
+        )
+        .bind(IndexingRequestStatus::Open)
+        .bind(IndexingAgreementStatus::CanceledByRequester)
+        .bind(since_seconds)
+        .bind(batch_size)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Open requests whose last reassessment left them short of indexers, whatever their age,
+    /// least recently changed first. If `batch_size` is greater than 0, limits the number of
+    /// results; otherwise returns them all.
+    pub async fn get_short_open_indexing_requests(
+        &self,
+        batch_size: i64,
+    ) -> Result<Vec<IndexingRequest>, Error> {
+        sqlx::query_as(
+            r#"
+            SELECT
+                id,
+                created_at,
+                updated_at,
+                status,
+                requested_by,
+                deployment_id,
+                deployment_chain_id,
+                num_candidates
+            FROM dipper_reg_indexing_requests
+            WHERE status = $1
+              AND shortfall_active
+            ORDER BY updated_at ASC
+            LIMIT CASE WHEN $2 > 0 THEN $2 ELSE NULL END
+            "#,
+        )
+        .bind(IndexingRequestStatus::Open)
         .bind(batch_size)
         .fetch_all(&self.pool)
         .await
@@ -2179,21 +2409,135 @@ impl PgRegistry {
     // Indexer denylist operations
     // =========================================================================
 
-    /// Get all active (non-expired) denied indexer IDs.
-    ///
-    /// Entries with an expiration date in the past are excluded.
+    /// Get all active (non-expired) denied indexer IDs: the operator denylist's, and those the DIPs
+    /// info watcher blocks for missing their DIPs info too long.
     pub async fn get_indexer_denylist(&self) -> Result<Vec<IndexerId>, Error> {
         let rows: Vec<(PgIndexerId,)> = sqlx::query_as(
             r#"
             SELECT indexer_id
             FROM dipper_indexer_denylist
             WHERE expires_at IS NULL OR expires_at > timezone('UTC', now())
+            UNION
+            SELECT indexer_id
+            FROM dipper_indexer_dips_info_missing
+            WHERE blocked_until > timezone('UTC', now())
             "#,
         )
         .fetch_all(&self.pool)
         .await?;
 
         Ok(rows.into_iter().map(|(id,)| id.0).collect())
+    }
+
+    // =========================================================================
+    // DIPs info watcher operations
+    // =========================================================================
+
+    /// Get every indexer holding at least 1 `AcceptedOnChain` agreement, each once.
+    pub async fn get_indexers_with_accepted_agreements(&self) -> Result<Vec<IndexerId>, Error> {
+        let rows: Vec<(PgIndexerId,)> = sqlx::query_as(
+            r#"
+            SELECT DISTINCT indexer_id
+            FROM dipper_reg_indexing_agreements
+            WHERE status = $1
+            "#,
+        )
+        .bind(IndexingAgreementStatus::AcceptedOnChain)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(|(id,)| id.0).collect())
+    }
+
+    /// Record 1 cycle of DIPs info checks: add `added_secs` to the time each of `missing` has
+    /// gone without a readable answer, and forget every other indexer, so a readable answer, or
+    /// no longer being checked, starts its count again from 0.
+    pub async fn record_dips_info_checks(
+        &self,
+        missing: &[IndexerId],
+        added_secs: i64,
+    ) -> Result<DipsInfoChecks, Error> {
+        let pg_missing: Vec<PgIndexerId> = missing.iter().map(|id| PgIndexerId(*id)).collect();
+        let mut tx = self.pool.begin().await?;
+
+        let cleared: Vec<(PgIndexerId, i64)> = sqlx::query_as(
+            r#"
+            DELETE FROM dipper_indexer_dips_info_missing
+            WHERE NOT (indexer_id = ANY($1))
+            RETURNING indexer_id, missing_secs
+            "#,
+        )
+        .bind(&pg_missing[..])
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let still_missing: Vec<(PgIndexerId, i64)> = sqlx::query_as(
+            r#"
+            INSERT INTO dipper_indexer_dips_info_missing (indexer_id, missing_secs)
+            SELECT indexer_id, $2 FROM unnest($1::bytea[]) AS t(indexer_id)
+            ON CONFLICT (indexer_id) DO UPDATE SET
+                missing_secs = dipper_indexer_dips_info_missing.missing_secs
+                    + EXCLUDED.missing_secs,
+                updated_at = timezone('UTC', now())
+            RETURNING indexer_id, missing_secs
+            "#,
+        )
+        .bind(&pg_missing[..])
+        .bind(added_secs)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        Ok(DipsInfoChecks {
+            missing: still_missing.into_iter().map(|(id, s)| (id.0, s)).collect(),
+            cleared: cleared.into_iter().map(|(id, s)| (id.0, s)).collect(),
+        })
+    }
+
+    /// Get the indexers the DIPs info watcher blocks now.
+    pub async fn get_dips_info_blocks(&self) -> Result<Vec<IndexerId>, Error> {
+        let rows: Vec<(PgIndexerId,)> = sqlx::query_as(
+            r#"
+            SELECT indexer_id
+            FROM dipper_indexer_dips_info_missing
+            WHERE blocked_until > timezone('UTC', now())
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(|(id,)| id.0).collect())
+    }
+
+    /// Block each of `indexer_ids`, still missing its DIPs info, for `for_secs` from the database's
+    /// clock, returning those blocked for the 1st time since it went missing. A readable answer
+    /// removes the indexer's row, and with it the block.
+    pub async fn block_missing_dips_info(
+        &self,
+        indexer_ids: &[IndexerId],
+        for_secs: i64,
+    ) -> Result<Vec<IndexerId>, Error> {
+        let pg_ids: Vec<PgIndexerId> = indexer_ids.iter().map(|id| PgIndexerId(*id)).collect();
+        let rows: Vec<(PgIndexerId, bool)> = sqlx::query_as(
+            r#"
+            UPDATE dipper_indexer_dips_info_missing AS t
+            SET blocked_until = timezone('UTC', now()) + $2::bigint * interval '1 second'
+            FROM dipper_indexer_dips_info_missing AS was
+            WHERE t.indexer_id = was.indexer_id AND t.indexer_id = ANY($1)
+            RETURNING t.indexer_id, was.blocked_until IS NULL
+            "#,
+        )
+        .bind(&pg_ids[..])
+        .bind(for_secs)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .filter(|(_, newly)| *newly)
+            .map(|(id, _)| id.0)
+            .collect())
     }
 
     // =========================================================================

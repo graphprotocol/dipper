@@ -17,8 +17,40 @@ use thegraph_core::alloy::{
 };
 use url::Url;
 
-/// The maximum number of candidates to select.
+/// How many indexers a request gets when it doesn't say. Despite the name, it is a default,
+/// not a limit; [`MAX_NUM_CANDIDATES`] is the limit.
 pub const DEFAULT_MAX_CANDIDATES: usize = 3;
+
+/// The most indexers one indexing request may ask for. Each is paid separately, so this keeps a
+/// mistyped count from becoming an agreement with every indexer IISA can find.
+pub const MAX_NUM_CANDIDATES: usize = 100;
+
+// A default above the limit would make every request that leaves the count out fail.
+const _: () = assert!(DEFAULT_MAX_CANDIDATES <= MAX_NUM_CANDIDATES);
+
+/// How an endpoint is named in logs and errors. Hosted RPC and gateway endpoints can carry their
+/// API key in the path or the query, so naming one by host says which it was without the key.
+pub fn endpoint_name(url: &Url) -> String {
+    match (url.host_str(), url.port()) {
+        (Some(host), Some(port)) => format!("{host}:{port}"),
+        (Some(host), None) => host.to_string(),
+        (None, _) => "unnamed endpoint".to_string(),
+    }
+}
+
+fn debug_endpoint(url: &Url, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.write_str(&endpoint_name(url))
+}
+
+#[expect(
+    clippy::ptr_arg,
+    reason = "custom_debug passes the field itself, a &Vec"
+)]
+fn debug_endpoints(urls: &Vec<Url>, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_list()
+        .entries(urls.iter().map(endpoint_name))
+        .finish()
+}
 
 /// Load the configuration from a JSON file.
 pub fn load_from_file(path: &Path) -> Result<Config, Error> {
@@ -70,6 +102,9 @@ pub struct Config {
     /// The liveness checker service configuration (detects silent agreement abandonment)
     #[serde(default)]
     pub liveness_checker: Option<LivenessCheckerConfig>,
+    /// The DIPs info watcher configuration (alerts on agreement holders missing DIPs info)
+    #[serde(default)]
+    pub dips_info_watcher: Option<DipsInfoWatcherConfig>,
     /// The escrow reconciler service configuration (runs only when this section is present)
     #[serde(default)]
     pub escrow_reconciler: Option<EscrowReconcilerConfig>,
@@ -172,6 +207,7 @@ fn default_ipfs_url() -> Url {
 #[serde(default, deny_unknown_fields)]
 pub struct AlertsConfig {
     /// The Slack incoming-webhook URL to post alerts to. Without one, none are sent.
+    #[serde_as(as = "Option<serde_with::DisplayFromStr>")]
     pub slack_webhook_url: Option<Hidden<Url>>,
     /// The `event` tags of the log lines to alert on. Leave it out to alert on the defaults,
     /// which grow as alerts are added; a list given here replaces them.
@@ -200,9 +236,14 @@ impl Default for AlertsConfig {
                 "rpc_blocks_refused",
                 "nonce_gap_fill_failed",
                 "chain_listener_changes_skipped",
+                "chain_listener_fetch_failing",
                 "stale_agreement_uncancellable",
                 "liveness_abandonment_paused",
                 "studio_request_chain_refused",
+                "iisa_request_rejected",
+                "dips_info_missing",
+                "dips_info_checks_paused",
+                "dips_info_missing_denylisted",
             ]
             .map(str::to_owned)
             .to_vec(),
@@ -394,7 +435,7 @@ pub struct ReassignmentConfig {
     )]
     pub run_at_utc_hour: u8,
 
-    /// Maximum number of requests to process per cycle (default: 100, 0 = unlimited)
+    /// Most requests 1 top-up queues (default: 100, 0 = unlimited); the daily pass queues them all
     #[serde(default = "default_reassignment_batch_size")]
     pub batch_size: i64,
 
@@ -402,6 +443,12 @@ pub struct ReassignmentConfig {
     #[serde_as(as = "serde_with::DurationSeconds<u64>")]
     #[serde(default = "default_reassignment_min_age")]
     pub min_request_age: Duration,
+
+    /// Seconds between top-ups of requests left short of indexers, whatever their age, when an
+    /// indexer that could take an offer is free (default: 3600s, 0 = off)
+    #[serde_as(as = "serde_with::DurationSeconds<u64>")]
+    #[serde(default = "default_reassignment_top_up_interval")]
+    pub top_up_interval: Duration,
 }
 
 fn default_reassignment_enabled() -> bool {
@@ -434,6 +481,10 @@ fn default_reassignment_min_age() -> Duration {
     Duration::from_secs(86400)
 }
 
+fn default_reassignment_top_up_interval() -> Duration {
+    Duration::from_secs(3600)
+}
+
 impl Default for ReassignmentConfig {
     fn default() -> Self {
         Self {
@@ -442,6 +493,7 @@ impl Default for ReassignmentConfig {
             run_at_utc_hour: default_reassignment_run_at_utc_hour(),
             batch_size: default_reassignment_batch_size(),
             min_request_age: default_reassignment_min_age(),
+            top_up_interval: default_reassignment_top_up_interval(),
         }
     }
 }
@@ -690,13 +742,142 @@ impl Default for LivenessCheckerConfig {
     }
 }
 
+/// Configuration for the DIPs info watcher, which alerts on, then blocks, an indexer holding an
+/// accepted agreement that goes too long without a readable answer from its `/dips/info`.
+#[serde_as]
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DipsInfoWatcherConfig {
+    /// Whether the DIPs info watcher is enabled (default: false).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Interval between checks in seconds (default: 300s / 5 min).
+    #[serde_as(as = "serde_with::DurationSeconds<u64>")]
+    #[serde(default = "default_dips_info_watcher_interval")]
+    pub interval: Duration,
+
+    /// Hours an indexer may go without a readable answer before the `dips_info_missing`
+    /// alert (default: 24).
+    #[serde(default = "default_dips_info_watcher_alert_after_hours")]
+    pub alert_after_hours: u32,
+
+    /// Hours an indexer may go without a readable answer before dipper blocks it, so IISA drops it
+    /// and its agreements are replaced; must be above `alert_after_hours` (default: 48).
+    #[serde(default = "default_dips_info_watcher_denylist_after_hours")]
+    pub denylist_after_hours: u32,
+
+    /// Timeout per `/dips/info` request in seconds (default: 10s).
+    #[serde_as(as = "serde_with::DurationSeconds<u64>")]
+    #[serde(default = "default_dips_info_watcher_request_timeout")]
+    pub request_timeout: Duration,
+
+    /// Most indexers asked at once (default: 16).
+    #[serde(default = "default_dips_info_watcher_max_concurrent_requests")]
+    pub max_concurrent_requests: usize,
+
+    /// Share of the indexers checked in a cycle that, giving no readable answer at once, pauses
+    /// counting missing time, since so many points to a fault on dipper's side or a release that
+    /// changed the endpoint (default: 0.5).
+    #[serde(default = "default_liveness_checker_unreachable_trip_fraction")]
+    pub unreachable_trip_fraction: f64,
+
+    /// Fewest indexers checked in a cycle for that share to count (default: 3).
+    #[serde(default = "default_liveness_checker_unreachable_trip_min_indexers")]
+    pub unreachable_trip_min_indexers: usize,
+}
+
+fn default_dips_info_watcher_interval() -> Duration {
+    Duration::from_secs(300)
+}
+
+fn default_dips_info_watcher_alert_after_hours() -> u32 {
+    24
+}
+
+fn default_dips_info_watcher_denylist_after_hours() -> u32 {
+    48
+}
+
+fn default_dips_info_watcher_request_timeout() -> Duration {
+    Duration::from_secs(10)
+}
+
+fn default_dips_info_watcher_max_concurrent_requests() -> usize {
+    16
+}
+
+impl DipsInfoWatcherConfig {
+    /// Reject settings the watcher can't run with. A disabled watcher uses none of them, so only
+    /// an enabled one is checked.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.interval.is_zero() || self.interval > Duration::from_secs(24 * 3600) {
+            return Err(format!(
+                "interval ({}s) must be above 0 and at most 1 day",
+                self.interval.as_secs()
+            ));
+        }
+        if self.request_timeout.is_zero() {
+            return Err("request_timeout must be above 0".to_string());
+        }
+        if self.alert_after_hours == 0 {
+            return Err("alert_after_hours must be above 0".to_string());
+        }
+        if self.denylist_after_hours <= self.alert_after_hours {
+            return Err(format!(
+                "denylist_after_hours ({}) must be above alert_after_hours ({}), so an alert comes \
+                 before the block",
+                self.denylist_after_hours, self.alert_after_hours
+            ));
+        }
+        if self.max_concurrent_requests == 0 {
+            return Err("max_concurrent_requests must be above 0".to_string());
+        }
+        let fraction = self.unreachable_trip_fraction;
+        if fraction.is_nan() || fraction <= 0.0 || fraction > 1.0 {
+            return Err(format!(
+                "unreachable_trip_fraction ({fraction}) must be above 0 and at most 1"
+            ));
+        }
+        Ok(())
+    }
+
+    /// How long an indexer may go without a readable answer before it is alerted on.
+    pub fn alert_after(&self) -> Duration {
+        Duration::from_secs(u64::from(self.alert_after_hours) * 3600)
+    }
+
+    /// How long an indexer may go without a readable answer before dipper blocks it.
+    pub fn denylist_after(&self) -> Duration {
+        Duration::from_secs(u64::from(self.denylist_after_hours) * 3600)
+    }
+}
+
+impl Default for DipsInfoWatcherConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval: default_dips_info_watcher_interval(),
+            alert_after_hours: default_dips_info_watcher_alert_after_hours(),
+            denylist_after_hours: default_dips_info_watcher_denylist_after_hours(),
+            request_timeout: default_dips_info_watcher_request_timeout(),
+            max_concurrent_requests: default_dips_info_watcher_max_concurrent_requests(),
+            unreachable_trip_fraction: default_liveness_checker_unreachable_trip_fraction(),
+            unreachable_trip_min_indexers: default_liveness_checker_unreachable_trip_min_indexers(),
+        }
+    }
+}
+
 /// Configuration for the on-chain event listener service.
 ///
 /// This service monitors the SubgraphService contract for `IndexingAgreementAccepted`
 /// and `IndexingAgreementCanceled` events via a subgraph. When a `Rejected` agreement
 /// is accepted on-chain, it triggers automatic cancellation via `cancelIndexingAgreementByPayer`.
 #[serde_as]
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(custom_debug::CustomDebug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChainListenerConfig {
     /// Whether the chain listener service is enabled (default: false)
@@ -709,12 +890,13 @@ pub struct ChainListenerConfig {
     ///
     /// This should point to a subgraph that indexes the SubgraphService contract's
     /// IndexingAgreementAccepted and IndexingAgreementCanceled events.
+    #[debug(with = debug_endpoint)]
     #[serde_as(as = "serde_with::DisplayFromStr")]
     pub subgraph_endpoint: Url,
 
     /// API key for subgraph authentication (optional for local/test subgraphs).
     #[serde(default)]
-    pub subgraph_api_key: Option<String>,
+    pub subgraph_api_key: Option<Hidden<String>>,
 
     /// Chain ID for state tracking (default: 42161 for Arbitrum One)
     #[serde(default = "default_chain_id")]
@@ -743,18 +925,15 @@ pub struct ChainListenerConfig {
     #[serde(default = "default_chain_listener_reorg_buffer_blocks")]
     pub reorg_buffer_blocks: u32,
 
-    /// How far ahead of the host's wall clock the subgraph's reported
-    /// chain timestamp may sit before the response is rejected as
-    /// corrupt. Default 60s covers typical NTP drift; widen if the
-    /// host clock is known to lag.
+    /// How far ahead of the host's wall clock the subgraph's chain timestamp may sit before
+    /// the response is rejected as corrupt (default 60s, for typical NTP drift). If the host
+    /// clock lags, widen this along with `chain_ts_drift_tolerance_secs`.
     #[serde(default = "default_chain_listener_wall_clock_skew_tolerance_secs")]
     pub wall_clock_skew_tolerance_secs: u64,
 
-    /// How much faster than wall-clock the persisted chain timestamp
-    /// may advance per poll before the listener caps the advance.
-    /// Chain time legitimately moves at ~1s per wall second; the
-    /// tolerance covers poll-cadence jitter and subgraph-side rounding.
-    /// Widen for environments with choppy poll cadence.
+    /// How far ahead of the host's wall clock the persisted chain timestamp,
+    /// which drives agreement expiry, may be set. If the host clock lags the
+    /// chain, widen this along with `wall_clock_skew_tolerance_secs`.
     #[serde(default = "default_chain_listener_chain_ts_drift_tolerance_secs")]
     pub chain_ts_drift_tolerance_secs: u64,
 
@@ -765,7 +944,7 @@ pub struct ChainListenerConfig {
     ///
     /// When true:
     ///   * the subgraph timestamp skew check is skipped
-    ///   * the per-poll chain timestamp drift cap is skipped
+    ///   * the chain timestamp drift cap is skipped
     ///   * agreement deadlines are computed from chain time instead
     ///     of wall time, so freshly created agreements do not appear
     ///     born-expired against an advanced chain
@@ -823,7 +1002,7 @@ fn default_max_gas_price_gwei() -> u64 {
 /// `cancelIndexingAgreementByPayer` on the SubgraphService contract.
 /// It supports multiple RPC providers with automatic failover and retry.
 #[serde_as]
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(custom_debug::CustomDebug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChainClientConfig {
     /// Whether the chain client is enabled (default: false). Required in practice: dipper
@@ -836,6 +1015,8 @@ pub struct ChainClientConfig {
     ///
     /// At least one provider is required when enabled. Providers are tried in order,
     /// rotating to the next on persistent failures.
+    #[debug(with = debug_endpoints)]
+    #[serde_as(as = "Vec<serde_with::DisplayFromStr>")]
     pub providers: Vec<Url>,
 
     /// Request timeout per RPC call in seconds (default: 10s). Every call here is a small one,
@@ -965,14 +1146,22 @@ pub struct DipsAgreementConfig {
     #[serde(default = "default_max_grt_per_30_days")]
     pub max_grt_per_30_days: BTreeMap<String, f64>,
 
-    /// Maximum GRT per billion entities per 30 days.
+    /// Maximum GRT per 30 days Dipper will pay on a chain with no entry in
+    /// `max_grt_per_30_days`, so every chain has a base-price ceiling.
+    #[serde(default = "default_fallback_max_grt_per_30_days")]
+    pub fallback_max_grt_per_30_days: f64,
+
+    /// Maximum GRT per billion entities per 30 days Dipper will pay, on every chain.
+    ///
+    /// Sent to IISA, which excludes indexers advertising a higher per-entity price.
     #[serde(default = "default_max_grt_per_billion_entities_per_30_days")]
     pub max_grt_per_billion_entities_per_30_days: f64,
 
     /// Number of days to look back for declined indexers (standard exclusion). Covers
-    /// CanceledByIndexer, AbandonedByIndexer, expiries whose offer reached the chain, and
-    /// structurally persistent rejections (UNSUPPORTED_NETWORK, MANIFEST_TOO_LARGE). Default: 30
-    /// days.
+    /// CanceledByIndexer, AbandonedByIndexer and structurally persistent rejections
+    /// (UNSUPPORTED_NETWORK, MANIFEST_TOO_LARGE). An offer that reached the chain and expired
+    /// benches for 1 day, then 7 days for a 2nd miss in a row, then this; none longer than this,
+    /// so 0 turns them off too. Default: 30 days.
     #[serde(default = "default_declined_indexer_lookback_days")]
     pub declined_indexer_lookback_days: i32,
 
@@ -1002,6 +1191,11 @@ pub struct DipsAgreementConfig {
     /// to a proposal (status `Unresponsive`). Default: 1 day.
     #[serde(default = "default_unresponsive_indexer_lookback_days")]
     pub unresponsive_indexer_lookback_days: i32,
+
+    /// Minutes between test offers to an indexer that let 2 rounds of offers lapse since it last
+    /// accepted one; it gets no other offer until it accepts again. Default: 60.
+    #[serde(default = "default_non_accepting_test_interval_minutes")]
+    pub non_accepting_test_interval_minutes: i32,
 
     /// Fraction of the DIPs-accepting pool that must be unresponsive before the
     /// breaker trips and suppresses the network-wide exclusion. Default 0.50.
@@ -1050,6 +1244,45 @@ impl DipsAgreementConfig {
             return Err(
                 "recurring_agreement_manager must be set to a non-zero address".to_string(),
             );
+        }
+        // Every offer's on-chain payment limit comes from this, so 0, a negative or NaN would offer
+        // indexers nothing and infinity would lift the limit; refuse to start instead.
+        let agreement_cap = self.max_agreement_grt_per_30_days;
+        if !(agreement_cap.is_finite() && agreement_cap > 0.0) {
+            return Err(format!(
+                "max_agreement_grt_per_30_days ({agreement_cap}) must be a positive number"
+            ));
+        }
+        // IISA drops every indexer priced above this per entity, so a cap of 0 shuts out every
+        // priced indexer, and a negative or non-finite one makes IISA reject the request or
+        // ignore the cap; refuse to start instead.
+        let entity_ceiling = self.max_grt_per_billion_entities_per_30_days;
+        if !(entity_ceiling.is_finite() && entity_ceiling > 0.0) {
+            return Err(format!(
+                "max_grt_per_billion_entities_per_30_days ({entity_ceiling}) must be a positive number"
+            ));
+        }
+        // A chain's cap of 0 excludes every priced indexer there, and IISA refuses a negative
+        // one, which dipper takes for an outage and retries forever; refuse to start instead.
+        for (chain, cap) in &self.max_grt_per_30_days {
+            if !(cap.is_finite() && *cap > 0.0) {
+                return Err(format!(
+                    "max_grt_per_30_days for chain {chain} ({cap}) must be a positive number"
+                ));
+            }
+        }
+        let fallback = self.fallback_max_grt_per_30_days;
+        if !(fallback.is_finite() && fallback > 0.0) {
+            return Err(format!(
+                "fallback_max_grt_per_30_days ({fallback}) must be a positive number"
+            ));
+        }
+        // A test offer due at once means an indexer that stopped accepting is never held back.
+        if self.non_accepting_test_interval_minutes <= 0 {
+            return Err(format!(
+                "non_accepting_test_interval_minutes ({}) must be positive",
+                self.non_accepting_test_interval_minutes
+            ));
         }
         if self.mass_unresponsive_reset_fraction >= self.mass_unresponsive_trip_fraction {
             return Err(format!(
@@ -1122,10 +1355,9 @@ fn default_deadline_seconds() -> u64 {
 /// indexer-rs published minimum on a given chain.
 ///
 /// **Scope**: only the chains in the initial DIPs rollout set are
-/// listed here. Other chains carry no default filter — an indexer
-/// can offer any base price on them and still pass selection.
-/// Operators who want filter coverage on additional chains must
-/// add explicit entries to `max_grt_per_30_days` in their config.
+/// listed here. Other chains get `fallback_max_grt_per_30_days`;
+/// operators can give one its own ceiling with an explicit entry in
+/// `max_grt_per_30_days`.
 ///
 /// Synced from <https://github.com/graphprotocol/indexer-rs/blob/mb9/dips-signalling-endpoint/crates/config/maximal-config-example.toml#L201-L210>
 /// (the rollout-trimmed `[dips.min_grt_per_30_days]` section).
@@ -1154,6 +1386,15 @@ fn default_max_grt_per_30_days() -> BTreeMap<String, f64> {
         .iter()
         .map(|(name, min)| ((*name).to_string(), min * PAYMENT_CEILING_MULTIPLIER))
         .collect()
+}
+
+/// Default ceiling for chains outside the rollout set: the highest of the default chain
+/// ceilings, whatever `max_grt_per_30_days` an operator configures.
+fn default_fallback_max_grt_per_30_days() -> f64 {
+    INDEXER_RS_MIN_GRT_PER_30_DAYS
+        .iter()
+        .map(|(_, min)| min * PAYMENT_CEILING_MULTIPLIER)
+        .fold(0.0, f64::max)
 }
 
 fn default_max_grt_per_billion_entities_per_30_days() -> f64 {
@@ -1188,6 +1429,10 @@ fn default_uncertain_rejection_lookback_days() -> i32 {
 
 fn default_unresponsive_indexer_lookback_days() -> i32 {
     1
+}
+
+fn default_non_accepting_test_interval_minutes() -> i32 {
+    60
 }
 
 fn default_mass_unresponsive_trip_fraction() -> f64 {
@@ -1272,7 +1517,7 @@ pub struct IndexerUrlsConfig {
     /// The indexing-payments subgraph query endpoint used to look up
     /// registered indexer URLs. Same form as `chain_listener.subgraph_endpoint`:
     /// a full query URL, gateway-served or self-hosted.
-    #[debug(with = std::fmt::Display::fmt)]
+    #[debug(with = debug_endpoint)]
     #[serde_as(as = "serde_with::DisplayFromStr")]
     pub subgraph_endpoint: Url,
 
@@ -1328,6 +1573,8 @@ pub struct IndexingAgreementConfig {
     pub deadline_seconds: u64,
     /// Payment ceiling per chain (GRT per 30 days).
     pub max_grt_per_30_days: BTreeMap<String, f64>,
+    /// Payment ceiling (GRT per 30 days) for a chain with no entry in `max_grt_per_30_days`.
+    pub fallback_max_grt_per_30_days: f64,
     /// Payment ceiling for entity pricing (GRT per billion entities per 30 days).
     pub max_grt_per_billion_entities_per_30_days: f64,
     /// Number of days to look back for declined indexers (standard exclusion).
@@ -1340,6 +1587,8 @@ pub struct IndexingAgreementConfig {
     pub uncertain_rejection_lookback_days: i32,
     /// Number of days to skip an unresponsive indexer across all deployments.
     pub unresponsive_indexer_lookback_days: i32,
+    /// Minutes between test offers to an indexer that stopped accepting offers.
+    pub non_accepting_test_interval_minutes: i32,
     /// Breaker trip fraction (see `DipsAgreementConfig`).
     pub mass_unresponsive_trip_fraction: f64,
     /// Breaker reset fraction.
@@ -1359,24 +1608,28 @@ pub struct IndexingAgreementConfig {
 #[cfg(test)]
 impl IndexingAgreementConfig {
     /// Addresses and limits all set to 0, with permissive breaker and cache settings, for tests
-    /// to adjust the fields they care about.
+    /// to adjust the fields they care about. The agreement, fallback and per-entity price caps
+    /// keep their defaults, since dipper refuses to start with any of them at 0.
     pub fn for_tests() -> Self {
         Self {
             data_service: Address::ZERO,
             recurring_collector: Address::ZERO,
             recurring_agreement_manager: Address::ZERO,
-            max_agreement_grt_per_30_days: 0.0,
+            max_agreement_grt_per_30_days: default_max_agreement_grt_per_30_days(),
             max_seconds_per_collection: 0,
             min_seconds_per_collection: 0,
             duration_seconds: 0,
             deadline_seconds: 0,
             max_grt_per_30_days: BTreeMap::new(),
-            max_grt_per_billion_entities_per_30_days: 0.0,
+            fallback_max_grt_per_30_days: default_fallback_max_grt_per_30_days(),
+            max_grt_per_billion_entities_per_30_days:
+                default_max_grt_per_billion_entities_per_30_days(),
             declined_indexer_lookback_days: 0,
             price_rejection_lookback_days: 0,
             transient_rejection_lookback_minutes: 0,
             uncertain_rejection_lookback_days: 0,
             unresponsive_indexer_lookback_days: 0,
+            non_accepting_test_interval_minutes: default_non_accepting_test_interval_minutes(),
             mass_unresponsive_trip_fraction: 0.5,
             mass_unresponsive_reset_fraction: 0.25,
             dips_accepting_snapshot_max_age_hours: 48,
@@ -1429,8 +1682,12 @@ impl IndexingAgreementConfig {
         self.deadline_seconds
     }
 
-    pub fn max_grt_per_30_days(&self) -> &BTreeMap<String, f64> {
-        &self.max_grt_per_30_days
+    /// The base-price ceiling for a chain: its own entry, or the fallback when it has none.
+    pub fn max_grt_per_30_days_for(&self, chain: &str) -> f64 {
+        self.max_grt_per_30_days
+            .get(chain)
+            .copied()
+            .unwrap_or(self.fallback_max_grt_per_30_days)
     }
 
     pub fn max_grt_per_billion_entities_per_30_days(&self) -> f64 {
@@ -1455,6 +1712,10 @@ impl IndexingAgreementConfig {
 
     pub fn unresponsive_indexer_lookback_days(&self) -> i32 {
         self.unresponsive_indexer_lookback_days
+    }
+
+    pub fn non_accepting_test_interval_minutes(&self) -> i32 {
+        self.non_accepting_test_interval_minutes
     }
 
     pub fn mass_unresponsive_trip_fraction(&self) -> f64 {
@@ -1499,6 +1760,7 @@ impl From<DipsAgreementConfig>
             duration_seconds: value.duration_seconds.unwrap_or(u64::MAX),
             deadline_seconds: value.deadline_seconds,
             max_grt_per_30_days: value.max_grt_per_30_days,
+            fallback_max_grt_per_30_days: value.fallback_max_grt_per_30_days,
             max_grt_per_billion_entities_per_30_days: value
                 .max_grt_per_billion_entities_per_30_days,
             declined_indexer_lookback_days: value.declined_indexer_lookback_days,
@@ -1506,6 +1768,7 @@ impl From<DipsAgreementConfig>
             transient_rejection_lookback_minutes: value.transient_rejection_lookback_minutes,
             uncertain_rejection_lookback_days: value.uncertain_rejection_lookback_days,
             unresponsive_indexer_lookback_days: value.unresponsive_indexer_lookback_days,
+            non_accepting_test_interval_minutes: value.non_accepting_test_interval_minutes,
             mass_unresponsive_trip_fraction: value.mass_unresponsive_trip_fraction,
             mass_unresponsive_reset_fraction: value.mass_unresponsive_reset_fraction,
             dips_accepting_snapshot_max_age_hours: value.dips_accepting_snapshot_max_age_hours,
@@ -1872,6 +2135,126 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_an_unusable_agreement_cap() {
+        let mut conf: DipsAgreementConfig = serde_json::from_str(
+            r#"{
+                "data_service": "0x1111111111111111111111111111111111111111",
+                "recurring_collector": "0x2222222222222222222222222222222222222222",
+                "recurring_agreement_manager": "0x3333333333333333333333333333333333333333",
+                "min_seconds_per_collection": 60,
+                "max_seconds_per_collection": 3600,
+                "pricing_table": {}
+            }"#,
+        )
+        .expect("deserialization");
+        for cap in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            conf.max_agreement_grt_per_30_days = cap;
+            let err = conf.validate().expect_err(&format!("{cap}"));
+            assert!(err.contains("max_agreement_grt_per_30_days"), "{err}");
+        }
+        for cap in [0.01, 20_000.0] {
+            conf.max_agreement_grt_per_30_days = cap;
+            assert!(conf.validate().is_ok(), "{cap}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_an_unusable_per_entity_ceiling() {
+        let mut conf: DipsAgreementConfig = serde_json::from_str(
+            r#"{
+                "data_service": "0x1111111111111111111111111111111111111111",
+                "recurring_collector": "0x2222222222222222222222222222222222222222",
+                "recurring_agreement_manager": "0x3333333333333333333333333333333333333333",
+                "min_seconds_per_collection": 60,
+                "max_seconds_per_collection": 3600,
+                "pricing_table": {}
+            }"#,
+        )
+        .expect("deserialization");
+        for ceiling in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            conf.max_grt_per_billion_entities_per_30_days = ceiling;
+            assert!(conf.validate().is_err(), "{ceiling}");
+        }
+        for ceiling in [0.01, 2000.0] {
+            conf.max_grt_per_billion_entities_per_30_days = ceiling;
+            assert!(conf.validate().is_ok(), "{ceiling}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_an_unusable_per_chain_ceiling() {
+        let mut conf: DipsAgreementConfig = serde_json::from_str(
+            r#"{
+                "data_service": "0x1111111111111111111111111111111111111111",
+                "recurring_collector": "0x2222222222222222222222222222222222222222",
+                "recurring_agreement_manager": "0x3333333333333333333333333333333333333333",
+                "min_seconds_per_collection": 60,
+                "max_seconds_per_collection": 3600,
+                "pricing_table": {}
+            }"#,
+        )
+        .expect("deserialization");
+        for ceiling in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            conf.max_grt_per_30_days
+                .insert("arbitrum-one".to_string(), ceiling);
+            let err = conf.validate().expect_err(&format!("{ceiling}"));
+            assert!(err.contains("arbitrum-one"), "{err}");
+            assert!(err.contains(&format!("({ceiling})")), "{err}");
+        }
+        for ceiling in [0.01, 4500.0] {
+            conf.max_grt_per_30_days
+                .insert("arbitrum-one".to_string(), ceiling);
+            assert!(conf.validate().is_ok(), "{ceiling}");
+        }
+    }
+
+    #[test]
+    fn caps_a_chain_without_its_own_ceiling_at_the_fallback() {
+        let conf: DipsAgreementConfig = serde_json::from_str(
+            r#"{
+                "data_service": "0x1111111111111111111111111111111111111111",
+                "recurring_collector": "0x2222222222222222222222222222222222222222",
+                "recurring_agreement_manager": "0x3333333333333333333333333333333333333333",
+                "min_seconds_per_collection": 60,
+                "max_seconds_per_collection": 3600,
+                "pricing_table": {},
+                "max_grt_per_30_days": {"mainnet": 450}
+            }"#,
+        )
+        .expect("deserialization");
+        // Unset, the fallback is the highest default chain ceiling (arbitrum-one's).
+        assert_eq!(conf.fallback_max_grt_per_30_days, 4500.0);
+        let (agreement_conf, _) =
+            <(Arc<IndexingAgreementConfig>, Arc<BTreeMap<ChainId, _>>)>::from(conf);
+        assert_eq!(agreement_conf.max_grt_per_30_days_for("mainnet"), 450.0);
+        assert_eq!(agreement_conf.max_grt_per_30_days_for("gnosis"), 4500.0);
+    }
+
+    #[test]
+    fn validate_rejects_a_fallback_ceiling_that_is_not_a_positive_number() {
+        let mut conf: DipsAgreementConfig = serde_json::from_str(
+            r#"{
+                "data_service": "0x1111111111111111111111111111111111111111",
+                "recurring_collector": "0x2222222222222222222222222222222222222222",
+                "recurring_agreement_manager": "0x3333333333333333333333333333333333333333",
+                "min_seconds_per_collection": 60,
+                "max_seconds_per_collection": 3600,
+                "pricing_table": {}
+            }"#,
+        )
+        .expect("deserialization");
+        for ceiling in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            conf.fallback_max_grt_per_30_days = ceiling;
+            let err = conf.validate().expect_err(&format!("{ceiling}"));
+            assert!(err.contains("fallback_max_grt_per_30_days"), "{err}");
+        }
+        for ceiling in [0.01, 4500.0] {
+            conf.fallback_max_grt_per_30_days = ceiling;
+            assert!(conf.validate().is_ok(), "{ceiling}");
+        }
+    }
+
+    #[test]
     fn validate_rejects_a_collection_window_the_contract_would_refuse() {
         // The RecurringCollector requires max - min >= 600; an offer built from
         // a narrower window reverts at gas estimation on every attempt, so the
@@ -1934,6 +2317,71 @@ mod tests {
         assert!(
             disabled.validate().is_ok(),
             "a disabled checker uses no share"
+        );
+    }
+
+    #[test]
+    fn dips_info_watcher_defaults_alert_after_a_day() {
+        let conf: DipsInfoWatcherConfig =
+            serde_json::from_str(r#"{"enabled": true}"#).expect("deserialization");
+
+        assert!(conf.validate().is_ok());
+        assert_eq!(conf.alert_after(), Duration::from_secs(24 * 3600));
+        assert_eq!(conf.denylist_after(), Duration::from_secs(48 * 3600));
+        assert_eq!(conf.interval, Duration::from_secs(300));
+        assert!(
+            !DipsInfoWatcherConfig::default().enabled,
+            "off until configured"
+        );
+    }
+
+    #[test]
+    fn dips_info_watcher_validate_rejects_settings_it_cannot_run_with() {
+        let enabled = DipsInfoWatcherConfig {
+            enabled: true,
+            ..DipsInfoWatcherConfig::default()
+        };
+        for bad in [
+            DipsInfoWatcherConfig {
+                interval: Duration::ZERO,
+                ..enabled.clone()
+            },
+            DipsInfoWatcherConfig {
+                interval: Duration::from_secs(24 * 3600 + 1),
+                ..enabled.clone()
+            },
+            DipsInfoWatcherConfig {
+                request_timeout: Duration::ZERO,
+                ..enabled.clone()
+            },
+            DipsInfoWatcherConfig {
+                alert_after_hours: 0,
+                ..enabled.clone()
+            },
+            DipsInfoWatcherConfig {
+                alert_after_hours: 48,
+                denylist_after_hours: 48,
+                ..enabled.clone()
+            },
+            DipsInfoWatcherConfig {
+                max_concurrent_requests: 0,
+                ..enabled.clone()
+            },
+            DipsInfoWatcherConfig {
+                unreachable_trip_fraction: f64::NAN,
+                ..enabled.clone()
+            },
+        ] {
+            assert!(bad.validate().is_err(), "{bad:?}");
+        }
+        let disabled = DipsInfoWatcherConfig {
+            enabled: false,
+            alert_after_hours: 0,
+            ..enabled
+        };
+        assert!(
+            disabled.validate().is_ok(),
+            "a disabled watcher uses none of it"
         );
     }
 
@@ -2019,6 +2467,7 @@ mod tests {
             Some(100),
             "max_in_flight_offers_total should default to 100"
         );
+        assert_eq!(config.non_accepting_test_interval_minutes, 60);
 
         // Test the From conversion - None should map to u64::MAX
         let (agreement_config, _) = <(
@@ -2040,6 +2489,31 @@ mod tests {
             Some(100),
             "total cap should survive the From conversion"
         );
+        assert_eq!(agreement_config.non_accepting_test_interval_minutes(), 60);
+    }
+
+    /// With no time between test offers, an indexer that stopped accepting would never be held
+    /// back at all.
+    #[test]
+    fn validate_rejects_a_test_offer_interval_that_is_not_positive() {
+        let mut conf: DipsAgreementConfig = serde_json::from_str(
+            r#"{
+                "data_service": "0x1111111111111111111111111111111111111111",
+                "recurring_collector": "0x2222222222222222222222222222222222222222",
+                "recurring_agreement_manager": "0x3333333333333333333333333333333333333333",
+                "min_seconds_per_collection": 60,
+                "max_seconds_per_collection": 3600,
+                "pricing_table": {}
+            }"#,
+        )
+        .expect("deserialization");
+        for minutes in [0, -1] {
+            conf.non_accepting_test_interval_minutes = minutes;
+            let err = conf.validate().expect_err(&format!("{minutes}"));
+            assert!(err.contains("non_accepting_test_interval_minutes"), "{err}");
+        }
+        conf.non_accepting_test_interval_minutes = 1;
+        assert!(conf.validate().is_ok());
     }
 
     #[test]
@@ -2487,6 +2961,55 @@ mod tests {
     }
 
     #[test]
+    fn the_config_dump_names_endpoints_by_host_and_hides_the_subgraph_key() {
+        let gateway = "https://gateway.example.com/api/url-key/subgraphs/id/x";
+        let listener = serde_json::from_value::<ChainListenerConfig>(serde_json::json!({
+            "enabled": true,
+            "subgraph_endpoint": gateway,
+            "subgraph_api_key": "header-key",
+        }))
+        .expect("chain listener config");
+        let indexer_urls = serde_json::from_value::<IndexerUrlsConfig>(serde_json::json!({
+            "subgraph_endpoint": gateway,
+            "update_interval": 60,
+        }))
+        .expect("indexer URLs config");
+        let chain_client = serde_json::from_value::<ChainClientConfig>(serde_json::json!({
+            "enabled": true,
+            "providers": ["https://rpc.example.com/v2/rpc-key"],
+        }))
+        .expect("chain client config");
+
+        let dumped = format!("{listener:?} {indexer_urls:?} {chain_client:?}");
+
+        for secret in ["url-key", "header-key", "rpc-key"] {
+            assert!(!dumped.contains(secret), "{secret} in {dumped}");
+        }
+        assert!(dumped.contains("gateway.example.com"), "{dumped}");
+        assert!(dumped.contains("rpc.example.com"), "{dumped}");
+    }
+
+    #[test]
+    fn a_malformed_secret_url_is_refused_without_repeating_it() {
+        let chain_client = serde_json::from_value::<ChainClientConfig>(serde_json::json!({
+            "enabled": true,
+            "providers": ["rpc.example.com/v2/rpc-key"],
+        }))
+        .expect_err("a provider without a scheme is refused");
+        let alerts = serde_json::from_value::<AlertsConfig>(serde_json::json!({
+            "slack_webhook_url": "hooks.slack.com/services/T/B/webhook-secret",
+        }))
+        .expect_err("a webhook without a scheme is refused");
+
+        let refused = format!("{chain_client} {alerts}");
+
+        assert!(refused.contains("relative URL without a base"), "{refused}");
+        for secret in ["rpc-key", "webhook-secret"] {
+            assert!(!refused.contains(secret), "{secret} in {refused}");
+        }
+    }
+
+    #[test]
     fn names_the_default_events_a_configured_list_leaves_out() {
         let alerts = serde_json::from_str::<AlertsConfig>(
             r#"{"events": ["rpc_blocks_refused", "some_other_event"]}"#,
@@ -2546,6 +3069,7 @@ mod tests {
         assert_rejects::<ExpirationConfig>("expiration");
         assert_rejects::<EscrowReconcilerConfig>("escrow_reconciler");
         assert_rejects::<LivenessCheckerConfig>("liveness_checker");
+        assert_rejects::<DipsInfoWatcherConfig>("dips_info_watcher");
         assert_rejects::<IndexerClientConfig>("indexer_client");
         assert_rejects::<EventStreamingConfig>("event_streaming_config");
     }

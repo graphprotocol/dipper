@@ -121,6 +121,11 @@ pub async fn main() -> anyhow::Result<()> {
     if let Err(err) = conf.request_chain_check.validate() {
         anyhow::bail!("invalid request chain check config: {err}");
     }
+    if let Some(watcher_conf) = &conf.dips_info_watcher
+        && let Err(err) = watcher_conf.validate()
+    {
+        anyhow::bail!("invalid DIPs info watcher config: {err}");
+    }
 
     // TODO: Decouple the config file format from the internal representation
     let (agreement_conf, pricing_table) = conf.dips.into();
@@ -131,6 +136,7 @@ pub async fn main() -> anyhow::Result<()> {
     let liveness_agreement_conf = agreement_conf.clone();
     let escrow_reconciler_agreement_conf = agreement_conf.clone();
     let cancel_retry_agreement_conf = agreement_conf.clone();
+    let reassignment_agreement_conf = agreement_conf.clone();
 
     // Canonical chain id and RecurringCollector address, read once and shared by the
     // admin signer, the gRPC proposal signer, and the on-chain chain client so their
@@ -427,6 +433,7 @@ pub async fn main() -> anyhow::Result<()> {
             network::service::entity_count_cache::Ctx {
                 cache: entity_count_cache.clone(),
                 endpoint: cl_conf.subgraph_endpoint.clone(),
+                api_key: cl_conf.subgraph_api_key.clone().map(|key| key.into_inner()),
                 // Entity counts change slowly (once per collection epoch).
                 // Refresh hourly to balance freshness and query cost.
                 interval: std::time::Duration::from_secs(3600),
@@ -446,6 +453,12 @@ pub async fn main() -> anyhow::Result<()> {
 
     //- Worker liveness watermark, shared with the health endpoint below.
     let worker_liveness = health::Liveness::new();
+
+    // IISA's DIPs-accepting set per chain, shared by reassessments and the reassignment top-up.
+    let dips_accepting_cache = worker::DipsAcceptingCache::new(std::time::Duration::from_secs(
+        agreement_conf.dips_accepting_cache_ttl_seconds(),
+    ));
+    let reassignment_networks = (networks_registry.clone(), additional_networks.clone());
 
     //- The worker service
     let (worker_handle, worker_service) = {
@@ -485,9 +498,6 @@ pub async fn main() -> anyhow::Result<()> {
         // A single global reassess lock, shared across all worker loops.
         let reassess_lock = Arc::new(tokio::sync::Mutex::new(()));
         let unresponsive_breaker = Arc::new(worker::UnresponsiveBreaker::new());
-        let dips_accepting_cache = worker::DipsAcceptingCache::new(std::time::Duration::from_secs(
-            agreement_conf.dips_accepting_cache_ttl_seconds(),
-        ));
         let ctx = worker::Ctx {
             queue,
             signer: signer.clone(),
@@ -512,7 +522,7 @@ pub async fn main() -> anyhow::Result<()> {
             liveness: worker_liveness.clone(),
             reassess_lock,
             unresponsive_breaker,
-            dips_accepting_cache,
+            dips_accepting_cache: dips_accepting_cache.clone(),
             concurrency: conf.worker_concurrency,
             subgraph_indexing_agreements_events_emitter:
                 subgraph_indexing_agreements_events_emitter.clone(),
@@ -524,10 +534,16 @@ pub async fn main() -> anyhow::Result<()> {
     //- The reassignment service (optional, enabled by config)
     let reassignment_handle = match conf.reassignment {
         Some(ref reassignment_conf) if reassignment_conf.enabled => {
+            let (networks_registry, additional_networks) = reassignment_networks;
             let ctx = network::service::reassignment::Ctx {
                 registry: registry.clone(),
                 worker_queue: worker_handle.queue().clone(),
                 config: reassignment_conf.clone(),
+                iisa: iisa_client.clone(),
+                dips_accepting_cache,
+                agreement_conf: reassignment_agreement_conf,
+                networks_registry,
+                additional_networks,
             };
             let (handle, service) = network::service::reassignment::new(ctx);
             Some((handle, service))
@@ -562,7 +578,10 @@ pub async fn main() -> anyhow::Result<()> {
             // Create the subgraph event source
             let event_source_config = network::service::chain_events::SubgraphEventSourceConfig {
                 endpoint: chain_listener_conf.subgraph_endpoint.clone(),
-                api_key: chain_listener_conf.subgraph_api_key.clone(),
+                api_key: chain_listener_conf
+                    .subgraph_api_key
+                    .clone()
+                    .map(|key| key.into_inner()),
                 payer_address: listener_payer_address,
                 request_timeout: chain_listener_conf.request_timeout,
                 max_retries: chain_listener_conf.max_retries,
@@ -612,6 +631,20 @@ pub async fn main() -> anyhow::Result<()> {
             };
             let (handle, service) = network::service::liveness_checker::new(ctx);
             Some((handle, service))
+        }
+        _ => None,
+    };
+
+    //- The DIPs info watcher (optional, enabled by config)
+    // Alerts on, then blocks, agreement holders whose /dips/info stays unreadable
+    let dips_info_watcher_handle = match conf.dips_info_watcher {
+        Some(ref watcher_conf) if watcher_conf.enabled => {
+            let ctx = network::service::dips_info_watcher::Ctx {
+                registry: registry.clone(),
+                network: network_provider.clone(),
+                config: watcher_conf.clone(),
+            };
+            Some(network::service::dips_info_watcher::new(ctx))
         }
         _ => None,
     };
@@ -757,6 +790,15 @@ pub async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Spawn the DIPs info watcher if enabled
+    let dips_info_watcher_stop_handle = if let Some((handle, service)) = dips_info_watcher_handle {
+        let task_handle = task_tree.spawn(service);
+        tracing::debug!(task_id=%task_handle.id(), "DIPs info watcher started");
+        Some(handle)
+    } else {
+        None
+    };
+
     // Spawn the chain listener service if enabled
     let chain_listener_stop_handle = if let Some((handle, service)) = chain_listener_handle {
         let task_handle = task_tree.spawn(service);
@@ -852,6 +894,10 @@ pub async fn main() -> anyhow::Result<()> {
         // Stop liveness checker service before worker (it depends on worker queue)
         if let Some(handle) = liveness_checker_stop_handle {
             all_stopped &= stop_service("Liveness checker", handle.stop()).await;
+        }
+
+        if let Some(handle) = dips_info_watcher_stop_handle {
+            all_stopped &= stop_service("DIPs info watcher", handle.stop()).await;
         }
 
         // Stop chain listener service before worker (it depends on worker queue)

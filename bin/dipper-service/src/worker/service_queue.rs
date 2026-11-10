@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use async_trait::async_trait;
 use dipper_core::ids::{IndexingAgreementId, IndexingRequestId};
 use thegraph_core::{DeploymentId, alloy::primitives::ChainId};
@@ -32,6 +34,12 @@ pub trait WorkerQueue {
         num_candidates: usize,
         priority: JobPriority,
     ) -> anyhow::Result<JobId>;
+
+    /// The requests a reassessment job is queued, waiting to retry or running for.
+    /// Default: none, so mocks need not override.
+    async fn queued_reassessments(&self) -> anyhow::Result<HashSet<IndexingRequestId>> {
+        Ok(HashSet::new())
+    }
 
     /// Check on-chain an agreement dipper rejected or cancelled that was accepted anyway, and
     /// move it back into `Cancelling` if it is live, recording `accept`.
@@ -124,6 +132,19 @@ where
             .await
     }
 
+    async fn queued_reassessments(&self) -> anyhow::Result<HashSet<IndexingRequestId>> {
+        Ok(self
+            .queue
+            .unfinished()
+            .await?
+            .into_iter()
+            .filter_map(|msg| match msg {
+                Message::ReassessIndexingRequest(job) => Some(job.indexing_request_id),
+                _ => None,
+            })
+            .collect())
+    }
+
     async fn cancel_rejected_agreement_on_chain(
         &self,
         agreement_id: IndexingAgreementId,
@@ -180,6 +201,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingQueue {
         pushes: Mutex<Vec<Option<u32>>>,
+        unfinished: Vec<Message>,
     }
 
     struct NeverNotifies;
@@ -214,9 +236,50 @@ mod tests {
             Ok(None)
         }
 
+        async fn unfinished(&self) -> anyhow::Result<Vec<Message>> {
+            Ok(self
+                .unfinished
+                .iter()
+                .map(|msg| serde_json::from_value(serde_json::to_value(msg).unwrap()).unwrap())
+                .collect())
+        }
+
         async fn subscribe(&self) -> anyhow::Result<Self::Listener> {
             anyhow::bail!("these tests never subscribe")
         }
+    }
+
+    /// Only reassessment jobs count, whatever else is waiting in the queue.
+    #[tokio::test]
+    async fn lists_the_requests_a_reassessment_is_queued_for() {
+        let deployment = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
+        let request = IndexingRequestId::new();
+        let other_request = IndexingRequestId::new();
+        let queue = WorkerQueueHandle::new(
+            RecordingQueue {
+                unfinished: vec![
+                    Message::ReassessIndexingRequest(ReassessIndexingRequest {
+                        indexing_request_id: request,
+                        deployment_id: deployment,
+                        deployment_chain_id: 421_614,
+                        num_candidates: 3,
+                    }),
+                    Message::SubmitOffer(SubmitOffer {
+                        agreement_id: IndexingAgreementId::from_bytes([0; 16]),
+                        indexing_request_id: other_request,
+                        indexer_url: "https://indexer.example.com".parse().unwrap(),
+                        deployment_id: deployment,
+                        deployment_chain_id: 421_614,
+                    }),
+                ],
+                ..RecordingQueue::default()
+            },
+            4,
+        );
+
+        let queued = queue.queued_reassessments().await.unwrap();
+
+        assert_eq!(queued, HashSet::from([request]));
     }
 
     fn handle(max_retries: u32) -> WorkerQueueHandle<RecordingQueue> {

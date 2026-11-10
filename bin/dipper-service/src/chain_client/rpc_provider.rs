@@ -17,7 +17,7 @@ use thegraph_core::alloy::{
 };
 use url::Url;
 
-use crate::chain_client::ChainClientError;
+use crate::{chain_client::ChainClientError, config::endpoint_name};
 
 /// Pull a `ChainClientError` back out of a `TransportError` if a closure
 /// boxed it in via `TransportErrorKind::custom` (see `build_and_send_call`).
@@ -28,16 +28,6 @@ fn extract_chain_client_error(err: TransportError) -> Option<ChainClientError> {
             boxed.downcast::<ChainClientError>().ok().map(|b| *b)
         }
         _ => None,
-    }
-}
-
-/// How an endpoint is named in logs and errors. Hosted RPC endpoints carry their API key in
-/// the path or the query, so naming one by host says which endpoint it was without the key.
-fn endpoint_name(url: &Url) -> String {
-    match (url.host_str(), url.port()) {
-        (Some(host), Some(port)) => format!("{host}:{port}"),
-        (Some(host), None) => host.to_string(),
-        (None, _) => "unnamed endpoint".to_string(),
     }
 }
 
@@ -286,9 +276,13 @@ impl RpcProviderPool {
             reasons.push(format!("{endpoint}: {reason}"));
             providers_tried += 1;
 
-            // Structured errors reach us boxed in through `TransportErrorKind::custom`, which
-            // is how gas estimation hands back a contract rejection. Keep the first one.
-            named_refusal = named_refusal.or_else(|| extract_chain_client_error(endpoint_error));
+            // Gas estimation hands back a contract rejection boxed in through
+            // `TransportErrorKind::custom`; keep the first. Its other errors can name the URL, so
+            // they go in the summary above, which leaves the URL out.
+            named_refusal = named_refusal.or_else(|| {
+                extract_chain_client_error(endpoint_error)
+                    .filter(|err| matches!(err, ChainClientError::ContractRevert { .. }))
+            });
 
             // Check if we've tried all providers
             if providers_tried >= self.providers.len() {
@@ -665,6 +659,37 @@ mod tests {
         assert!(
             !reason.contains("super-secret-key"),
             "the API key must not appear in the failure: {reason}"
+        );
+    }
+
+    /// A gas estimate that can't reach the endpoint fails with the HTTP client's error, which
+    /// names the URL, so what the pool hands back must hide the key.
+    #[tokio::test]
+    async fn a_failed_gas_estimate_hides_the_api_key() {
+        let keyed: Url = "http://127.0.0.1:1/v2/super-secret-key"
+            .parse()
+            .expect("keyed endpoint URL");
+        let pool = RpcProviderPool::new(vec![keyed], Duration::from_secs(5), 0).expect("pool");
+        let estimator = crate::chain_client::gas::GasEstimator::new(1.5, 21_000, 100_000);
+        let tx = thegraph_core::alloy::rpc::types::TransactionRequest::default();
+
+        let err = pool
+            .execute("estimate_gas", |provider| {
+                let (estimator, tx) = (estimator.clone(), tx.clone());
+                async move {
+                    estimator
+                        .estimate(&provider, &tx)
+                        .await
+                        .map_err(TransportErrorKind::custom)
+                }
+            })
+            .await
+            .expect_err("nothing is listening, so the estimate fails")
+            .to_string();
+
+        assert!(
+            !err.contains("super-secret-key"),
+            "the API key must not appear in the failure: {err}"
         );
     }
 

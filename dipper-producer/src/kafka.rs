@@ -5,9 +5,11 @@
 mod connection;
 mod consumer;
 mod producer;
+mod reconnect;
 
 pub use connection::ConnectionError;
 pub use consumer::{ConsumerError, KafkaConsumer, KafkaConsumerConfig};
 pub use producer::{Error, KafkaConfig, KafkaProducer};
+pub use reconnect::Reconnecting;
 // Re-exported so callers name fetch positions without depending on rskafka.
 pub use rskafka::client::partition::OffsetAt;

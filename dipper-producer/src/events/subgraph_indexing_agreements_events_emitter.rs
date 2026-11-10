@@ -1,6 +1,7 @@
 //! Subgraph Indexing Agreement event emitter to Kafka topic utilities
 
 use std::{
+    future::Future,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -17,7 +18,7 @@ use tokio::{
 };
 
 use crate::{
-    kafka::{KafkaConfig, KafkaProducer},
+    kafka::{self, KafkaConfig, KafkaProducer, Reconnecting},
     proto,
 };
 
@@ -141,9 +142,6 @@ pub trait SubgraphIndexingAgreementEventsProducer: Send + Sync {
     async fn flush(&self) {}
 }
 
-/// A broker handle that may be absent while (re)connecting.
-type SharedProducer = Arc<Mutex<Option<Arc<KafkaProducer>>>>;
-
 /// Kafka producer wrapper for Subgraph Indexing agreements lifecycle events.
 ///
 /// `streaming == None` means emission is disabled by configuration -- durable
@@ -159,7 +157,7 @@ pub struct SubgraphIndexingAgreementsEventsEmitter {
 /// State for an emitter with event streaming enabled.
 struct Streaming {
     /// Current broker handle. `None` while (re)connecting.
-    producer: SharedProducer,
+    producer: Reconnecting<KafkaProducer>,
     /// Bounded channel for the best-effort diagnostic tier.
     queue: mpsc::Sender<QueuedSubgraphIndexingAgreementEvent>,
     /// Cumulative diagnostic events dropped (queue full, or the broker was
@@ -179,22 +177,21 @@ impl SubgraphIndexingAgreementsEventsEmitter {
         Self { streaming: None }
     }
 
-    /// Creates a streaming producer. The broker is connected in the background
-    /// (retrying if unreachable at startup), so this never blocks and never comes
-    /// up permanently disabled on a transient broker outage.
+    /// Creates a streaming producer. The broker is connected in the background, retrying while
+    /// unreachable and connecting again when sends keep failing, so this never blocks and never
+    /// stays disabled after a broker outage or a change of brokers.
     pub fn enabled(config: KafkaConfig, capacity: usize) -> Self {
-        let producer: SharedProducer = Arc::new(Mutex::new(None));
         let dropped = Arc::new(AtomicU64::new(0));
         let shutdown = Arc::new(Notify::new());
         let (tx, mut rx) = mpsc::channel::<QueuedSubgraphIndexingAgreementEvent>(capacity);
 
-        // Connect (retrying) and swap the handle in. rskafka reconnects internally
-        // once connected, so this task only bridges an unreachable-at-startup
-        // broker, then exits.
-        Self::spawn_connect_task(config, producer.clone());
+        let producer = Reconnecting::spawn("lifecycle events", move || {
+            let config = config.clone();
+            async move { KafkaProducer::new(&config).await }
+        });
 
         // Drain diagnostic events through the current producer, holding each one
-        // until the broker connects (the bounded queue is the backpressure). On
+        // until the brokers take it (the bounded queue is the backpressure). On
         // shutdown, flush what is buffered.
         let drain_handle = {
             let producer = producer.clone();
@@ -205,14 +202,19 @@ impl SubgraphIndexingAgreementsEventsEmitter {
                     tokio::select! {
                         maybe = rx.recv() => match maybe {
                             Some(event) => {
-                                match Self::wait_for_producer(&producer, &shutdown).await {
-                                    Some(handle) => {
-                                        let (event_type, key, envelope) = Self::prepare_event(event);
-                                        Self::send_event(&handle, event_type, &key, envelope).await;
-                                    }
-                                    // Shutdown fired while still disconnected: drop the
-                                    // held event and the rest, keeping the counter honest.
-                                    None => {
+                                let (event_type, key, envelope) = Self::prepare_event(event);
+                                let Some(buf) = Self::encode(event_type, &envelope) else {
+                                    continue;
+                                };
+                                let (key_ref, buf_ref) = (key.as_str(), buf.as_slice());
+                                let send = move |client: Arc<KafkaProducer>| async move {
+                                    client.send(key_ref, buf_ref).await
+                                };
+                                match deliver(&producer, &shutdown, event_type, &key, send).await {
+                                    Delivery::Sent | Delivery::Refused => {}
+                                    // Shutdown fired while the brokers were unreachable: drop
+                                    // the held event and the rest, keeping the counter honest.
+                                    Delivery::Shutdown => {
                                         let mut dropped_now: u64 = 1;
                                         while rx.try_recv().is_ok() {
                                             dropped_now += 1;
@@ -223,7 +225,7 @@ impl SubgraphIndexingAgreementsEventsEmitter {
                                         tracing::warn!(
                                             dropped_now,
                                             dropped_total = total,
-                                            "event broker never connected; dropping buffered diagnostic events on shutdown"
+                                            "event broker unreachable at shutdown; dropping buffered diagnostic events"
                                         );
                                         break;
                                     }
@@ -253,78 +255,15 @@ impl SubgraphIndexingAgreementsEventsEmitter {
         }
     }
 
-    /// Retry `KafkaProducer::new` with capped backoff until it connects, then swap
-    /// the handle in and exit. Logs the first failure and then periodically so an
-    /// operator without dashboards still sees that emission is off.
-    fn spawn_connect_task(config: KafkaConfig, producer: SharedProducer) {
-        tokio::spawn(async move {
-            const MAX_BACKOFF_SECS: u64 = 30;
-            const WARN_EVERY: u32 = 5;
-            let mut attempt: u32 = 0;
-            loop {
-                match KafkaProducer::new(&config).await {
-                    Ok(client) => {
-                        // Recover from poisoning rather than panic: the guarded
-                        // handle is always valid, so a prior panic elsewhere must
-                        // not take down the connect task.
-                        *producer.lock().unwrap_or_else(|e| e.into_inner()) =
-                            Some(Arc::new(client));
-                        tracing::info!("Subgraph Indexing Agreement event broker connected");
-                        return;
-                    }
-                    Err(err) => {
-                        attempt = attempt.saturating_add(1);
-                        if attempt == 1 || attempt.is_multiple_of(WARN_EVERY) {
-                            tracing::warn!(
-                                attempt,
-                                error = %err,
-                                "event broker unreachable; lifecycle events are NOT being sent -- retrying"
-                            );
-                        }
-                        let backoff = MAX_BACKOFF_SECS.min(2u64.saturating_pow(attempt.min(5)));
-                        tokio::time::sleep(Duration::from_secs(backoff)).await;
-                    }
-                }
-            }
-        });
-    }
-
-    /// Read the current broker handle, recovering from a poisoned lock rather
-    /// than panicking (the guarded `Option` is always valid).
-    fn current_producer(
-        producer: &Mutex<Option<Arc<KafkaProducer>>>,
-    ) -> Option<Arc<KafkaProducer>> {
-        producer.lock().unwrap_or_else(|e| e.into_inner()).clone()
-    }
-
-    /// Wait until the broker handle is available, checking every 250ms. Returns
-    /// `None` if shutdown is signalled first, so the caller can stop waiting on a
-    /// broker that may never come up.
-    async fn wait_for_producer(
-        producer: &Mutex<Option<Arc<KafkaProducer>>>,
-        shutdown: &Notify,
-    ) -> Option<Arc<KafkaProducer>> {
-        const POLL: Duration = Duration::from_millis(250);
-        loop {
-            if let Some(handle) = Self::current_producer(producer) {
-                return Some(handle);
-            }
-            tokio::select! {
-                _ = tokio::time::sleep(POLL) => {}
-                _ = shutdown.notified() => return None,
-            }
-        }
-    }
-
     /// Send one diagnostic event through the current producer, or drop it (with a
     /// counter) if the broker is not connected. Only used by the shutdown flush,
     /// which must not wait for a connect.
     async fn drain_one(
-        producer: &Mutex<Option<Arc<KafkaProducer>>>,
+        producer: &Reconnecting<KafkaProducer>,
         dropped: &AtomicU64,
         event: QueuedSubgraphIndexingAgreementEvent,
     ) {
-        let Some(handle) = Self::current_producer(producer) else {
+        let Some(handle) = producer.current() else {
             let total = dropped.fetch_add(1, Ordering::Relaxed) + 1;
             tracing::warn!(
                 dropped_total = total,
@@ -335,7 +274,7 @@ impl SubgraphIndexingAgreementsEventsEmitter {
         let (event_type, key, envelope) = Self::prepare_event(event);
         // `send_event` already bounds the produce attempt via `KafkaProducer`'s
         // internal produce timeout, so no additional timeout is layered here.
-        Self::send_event(&handle, event_type, &key, envelope).await;
+        Self::send_event(producer, &handle, event_type, &key, envelope).await;
     }
 }
 
@@ -448,7 +387,7 @@ impl SubgraphIndexingAgreementsEventsEmitter {
         let Some(streaming) = &self.streaming else {
             return Ok(());
         };
-        let Some(producer) = Self::current_producer(&streaming.producer) else {
+        let Some(producer) = streaming.producer.current() else {
             return Err(EmitError::Send(
                 "event broker not connected; will retry".to_string(),
             ));
@@ -466,11 +405,9 @@ impl SubgraphIndexingAgreementsEventsEmitter {
             .encode(&mut buf)
             .map_err(|e| EmitError::Send(format!("encode failed: {e}")))?;
 
-        producer
-            .send(&key, &buf)
-            .await
-            .map_err(|e| EmitError::Send(e.to_string()))?;
-        Ok(())
+        let result = producer.send(&key, &buf).await;
+        report(&streaming.producer, &producer, &result);
+        result.map_err(|e| EmitError::Send(e.to_string()))
     }
 
     fn enqueue(
@@ -548,28 +485,43 @@ impl SubgraphIndexingAgreementsEventsEmitter {
     ///
     /// Errors are logged, but do not fail as it is a best-effort
     async fn send_event(
+        conn: &Reconnecting<KafkaProducer>,
         producer: &Arc<KafkaProducer>,
         event_type: SubgraphIndexingAgreementEventType,
         key: &str,
         event: proto::SubgraphIndexingAgreementEvent,
     ) {
-        let mut buf = Vec::with_capacity(event.encoded_len());
-        if let Err(e) = event.encode(&mut buf) {
-            tracing::error!(
-                event_type = %event_type,
-                error = %e,
-                "failed to encode Subgraph Indexing Agreement event"
-            );
+        let Some(buf) = Self::encode(event_type, &event) else {
             return;
-        }
-
-        if let Err(e) = producer.send(key, &buf).await {
+        };
+        let result = producer.send(key, &buf).await;
+        report(conn, producer, &result);
+        if let Err(e) = result {
             tracing::warn!(
                 event_type = %event_type,
                 key,
                 error = %e,
                 "failed to send Subgraph Indexing Agreement event to producer (event dropped)"
             );
+        }
+    }
+
+    /// Encodes an event for the wire, logging the event type if it can't be encoded.
+    fn encode(
+        event_type: SubgraphIndexingAgreementEventType,
+        event: &proto::SubgraphIndexingAgreementEvent,
+    ) -> Option<Vec<u8>> {
+        let mut buf = Vec::with_capacity(event.encoded_len());
+        match event.encode(&mut buf) {
+            Ok(()) => Some(buf),
+            Err(e) => {
+                tracing::error!(
+                    event_type = %event_type,
+                    error = %e,
+                    "failed to encode Subgraph Indexing Agreement event"
+                );
+                None
+            }
         }
     }
 
@@ -587,6 +539,103 @@ impl SubgraphIndexingAgreementsEventsEmitter {
             subgraph_deployment_qm_hash: metadata.subgraph_deployment_qm_hash.to_string(),
             the_graph_network: metadata.the_graph_network.to_string(),
             payload: Some(payload),
+        }
+    }
+}
+
+/// What became of a diagnostic event handed to [`deliver`].
+enum Delivery {
+    Sent,
+    /// The brokers received the event and refused it, so it is dropped.
+    Refused,
+    /// Shutdown fired before the event could be sent.
+    Shutdown,
+}
+
+/// Pause before resending an event the brokers didn't get, so fast failures don't spin.
+const RESEND_PAUSE: Duration = Duration::from_secs(1);
+
+/// Sends a diagnostic event, resending it while the brokers are unreachable. Each such failure is
+/// reported to `conn`, which rebuilds the client once they have gone on for a minute, so the event
+/// goes out once the cluster's current brokers are found.
+async fn deliver<T, S, Fut>(
+    conn: &Reconnecting<T>,
+    shutdown: &Notify,
+    event_type: SubgraphIndexingAgreementEventType,
+    key: &str,
+    send: S,
+) -> Delivery
+where
+    T: Send + Sync + 'static,
+    S: Fn(Arc<T>) -> Fut,
+    Fut: Future<Output = Result<(), kafka::Error>>,
+{
+    let mut attempt: u32 = 0;
+    loop {
+        let Some(client) = wait_for_client(conn, shutdown).await else {
+            return Delivery::Shutdown;
+        };
+        let result = send(client.clone()).await;
+        report(conn, &client, &result);
+        match result {
+            Ok(()) => return Delivery::Sent,
+            Err(e) if e.is_unreachable() => {
+                attempt = attempt.saturating_add(1);
+                tracing::warn!(
+                    event_type = %event_type,
+                    key,
+                    attempt,
+                    error = %e,
+                    "event broker unreachable; holding the event to resend"
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(RESEND_PAUSE) => {}
+                    _ = shutdown.notified() => return Delivery::Shutdown,
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    event_type = %event_type,
+                    key,
+                    error = %e,
+                    "event broker refused the Subgraph Indexing Agreement event (event dropped)"
+                );
+                return Delivery::Refused;
+            }
+        }
+    }
+}
+
+/// Tells `conn` whether a send through `client` reached the brokers. Every send goes through here,
+/// so none is left out of the count that decides when to reconnect.
+fn report<T: Send + Sync + 'static>(
+    conn: &Reconnecting<T>,
+    client: &Arc<T>,
+    result: &Result<(), kafka::Error>,
+) {
+    match result {
+        Ok(()) => conn.report_success(),
+        Err(e) if e.is_unreachable() => {
+            conn.report_unreachable(client);
+        }
+        Err(_) => {}
+    }
+}
+
+/// Waits until a client is available, checking every 250ms. Returns `None` if shutdown is
+/// signalled first, so the caller can stop waiting on brokers that may never come up.
+async fn wait_for_client<T: Send + Sync + 'static>(
+    conn: &Reconnecting<T>,
+    shutdown: &Notify,
+) -> Option<Arc<T>> {
+    const POLL: Duration = Duration::from_millis(250);
+    loop {
+        if let Some(client) = conn.current() {
+            return Some(client);
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(POLL) => {}
+            _ = shutdown.notified() => return None,
         }
     }
 }
@@ -686,6 +735,8 @@ impl std::fmt::Display for SubgraphIndexingAgreementEventType {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicU32;
+
     use proto::subgraph_indexing_agreement_event::Payload;
 
     use super::*;
@@ -784,6 +835,95 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), emitter.flush())
             .await
             .expect("flush must not wait for a broker that never connects");
+    }
+
+    /// Stands in for the producer, numbered by the connect attempt that made it.
+    struct FakeClient(u32);
+
+    /// Clients connected through a [`Reconnecting`], counting the connects.
+    fn fake_clients() -> (Arc<AtomicU32>, Reconnecting<FakeClient>) {
+        let connects = Arc::new(AtomicU32::new(0));
+        let counted = connects.clone();
+        let conn = Reconnecting::spawn("test", move || {
+            let n = counted.fetch_add(1, Ordering::Relaxed) + 1;
+            std::future::ready(Ok::<_, String>(FakeClient(n)))
+        });
+        (connects, conn)
+    }
+
+    async fn connected(conn: &Reconnecting<FakeClient>) {
+        while conn.current().is_none() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_event_the_brokers_never_got_is_resent_through_a_new_client() {
+        let (connects, conn) = fake_clients();
+        let sent_by = Mutex::new(None);
+        let sent_by_ref = &sent_by;
+
+        // Client 1 dials brokers that are gone, as after a cluster replaces every broker.
+        let delivery = deliver(
+            &conn,
+            &Notify::new(),
+            SubgraphIndexingAgreementEventType::Proposed,
+            "key",
+            move |client: Arc<FakeClient>| async move {
+                if client.0 == 1 {
+                    return Err(kafka::Error::Timeout);
+                }
+                *sent_by_ref.lock().unwrap() = Some(client.0);
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(matches!(delivery, Delivery::Sent));
+        assert_eq!(*sent_by.lock().unwrap(), Some(2));
+        assert_eq!(connects.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_event_the_brokers_refused_is_dropped_without_resending() {
+        let (connects, conn) = fake_clients();
+        let attempts = AtomicU32::new(0);
+        let attempts_ref = &attempts;
+
+        let delivery = deliver(
+            &conn,
+            &Notify::new(),
+            SubgraphIndexingAgreementEventType::Proposed,
+            "key",
+            move |_client: Arc<FakeClient>| async move {
+                attempts_ref.fetch_add(1, Ordering::Relaxed);
+                Err(kafka::Error::refused())
+            },
+        )
+        .await;
+
+        assert!(matches!(delivery, Delivery::Refused));
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(connects.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_stops_resending_an_event_the_brokers_never_got() {
+        let (_, conn) = fake_clients();
+        connected(&conn).await;
+        let shutdown = Notify::new();
+        shutdown.notify_one();
+
+        let delivery = deliver(
+            &conn,
+            &shutdown,
+            SubgraphIndexingAgreementEventType::Proposed,
+            "key",
+            |_client: Arc<FakeClient>| async { Err(kafka::Error::Timeout) },
+        )
+        .await;
+
+        assert!(matches!(delivery, Delivery::Shutdown));
     }
 
     fn metadata() -> EventMetadata {

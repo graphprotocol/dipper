@@ -27,10 +27,12 @@ pub struct SelectionContext {
     /// Mapped to `blocklist` in the IISA request.
     pub indexer_denylist: Vec<IndexerId>,
 
-    /// For each deployment, indexers that have recently declined agreements.
+    /// For each deployment, indexers to offer no new agreement for now: those that recently
+    /// declined or missed an offer on the deployment's chain, and those whose agreement on the
+    /// deployment dipper is still cancelling.
     ///
-    /// Used to avoid re-offering agreements to indexers that recently declined.
-    /// Key: Deployment ID, Value: List of indexer IDs that declined.
+    /// Unlike the denylist, IISA leaves an indexer already in the group in place.
+    /// Key: Deployment ID, Value: those indexers' IDs.
     pub declined_indexers: HashMap<DeploymentId, Vec<IndexerId>>,
 
     /// Chain ID of the deployment (e.g., "arbitrum-one").
@@ -44,6 +46,11 @@ pub struct SelectionContext {
     /// Indexers with advertised prices above this ceiling are excluded from selection.
     pub max_grt_per_30_days: Option<f64>,
 
+    /// Maximum GRT per billion entities per 30 days (per-entity payment ceiling).
+    ///
+    /// Indexers with an advertised per-entity price above this ceiling are excluded.
+    pub max_grt_per_billion_entities_per_30_days: Option<f64>,
+
     /// Expected DIPs fees per indexer in GRT per 30 days.
     ///
     /// Derived from the base rate (`tokens_per_second`) in accepted agreement vouchers,
@@ -53,6 +60,16 @@ pub struct SelectionContext {
     pub optimistic_dips_fees: HashMap<IndexerId, f64>,
 }
 
+/// The most Dipper will pay, so IISA can drop indexers asking more. Named fields keep
+/// the 2 prices, which are in different units, from being swapped. `None` skips one.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PriceCeilings {
+    /// Base price for the chain, in GRT per 30 days.
+    pub max_grt_per_30_days: Option<f64>,
+    /// Per-entity price, in GRT per billion entities per 30 days.
+    pub max_grt_per_billion_entities_per_30_days: Option<f64>,
+}
+
 /// An indexer selected by IISA with its advertised pricing.
 #[derive(Debug, Clone)]
 pub struct SelectedIndexer {
@@ -60,7 +77,7 @@ pub struct SelectedIndexer {
     /// Minimum GRT per 30 days the indexer charges for this chain.
     /// `None` if the indexer has no advertised price (legacy indexer).
     pub min_grt_per_30_days: Option<f64>,
-    /// Minimum GRT per million entities per 30 days.
+    /// Minimum GRT per billion entities per 30 days.
     pub min_grt_per_billion_entities_per_30_days: Option<f64>,
 }
 
@@ -84,6 +101,12 @@ pub enum SelectionError {
     /// An error occurred while sending a request to the IISA service.
     #[error("IISA service is not available")]
     IisaServiceUnavailable,
+
+    /// IISA answered with a status that resending the same request won't change
+    /// (in practice a 4xx), usually bad config, a rotated token or a version
+    /// mismatch mid-rollout. `body` is IISA's response, cut short if long.
+    #[error("IISA rejected the request with HTTP {status}: {body}")]
+    IisaRejected { status: u16, body: String },
 
     /// An error occurred during the selection process.
     #[error(transparent)]
@@ -115,12 +138,11 @@ pub trait CandidateSelection {
         context: &SelectionContext,
     ) -> Result<Vec<SelectedIndexer>, SelectionError>;
 
-    /// Fetch the indexers that currently accept DIPs on `chain` (stricter than
-    /// "IISA scores it"). `chain` is a required chain *name*; `max_grt_per_30_days`
-    /// optionally caps the set to indexers priced at or under that ceiling.
+    /// Fetch the indexers that currently accept DIPs on `chain`, a required chain *name*
+    /// (stricter than "IISA scores it"), capped to those priced at or under `ceilings`.
     async fn dips_accepting_indexers(
         &self,
         chain: &str,
-        max_grt_per_30_days: Option<f64>,
+        ceilings: PriceCeilings,
     ) -> Result<DipsAcceptingSnapshot, SelectionError>;
 }

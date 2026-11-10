@@ -1,6 +1,6 @@
 //! Shared utilities for gathering IISA selection context.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use dipper_iisa::SelectionContext;
 use thegraph_core::{DeploymentId, IndexerId, alloy::primitives::ChainId};
@@ -9,6 +9,7 @@ use crate::{
     network::service::entity_count_cache::EntityCountCache,
     registry::{
         AgreementRegistry, IndexerDenylistRegistry, IndexingAgreement, IndexingAgreementStatus,
+        WithheldIndexers,
     },
     worker::result::{JobError, JobResult},
 };
@@ -19,12 +20,16 @@ const SECONDS_PER_28_DAYS: f64 = 86400.0 * 28.0;
 /// 1 GRT = 10^18 wei.
 const WEI_PER_GRT: f64 = 1e18;
 
+/// Fewest indexers held back at once that can point at a fault on dipper's side.
+const MIN_WITHHELD_FOR_DIPPER_FAULT: usize = 2;
+
 /// Gather load balancing context for IISA selection.
 ///
 /// This function queries the registry to build context about:
 /// - Which indexers already have active agreements for this deployment
 /// - What pending agreements exist across all deployments
 /// - Which indexers have recently declined agreements (within lookback windows)
+/// - Which indexers have stopped accepting offers, and get none until their test offer is due
 /// - Which indexers are on the denylist and should be excluded entirely
 /// - Optimistic DIPs fees from accepted agreement vouchers, enriched with
 ///   entity counts from the shared cache when available
@@ -37,6 +42,7 @@ pub async fn gather_selection_context<R>(
     transient_rejection_lookback_minutes: i32,
     uncertain_rejection_lookback_days: i32,
     unresponsive_indexer_lookback_days: i32,
+    non_accepting_test_interval_minutes: i32,
     deployment_chain_id: ChainId,
     entity_count_cache: &EntityCountCache,
 ) -> JobResult<(SelectionContext, Vec<IndexerId>)>
@@ -89,6 +95,26 @@ where
         .into_iter()
         .filter(|id| !already_denied.contains(id))
         .collect();
+
+    // Sent as declined, not denylisted: IISA would drop a denylisted group member, cancelling an
+    // agreement it may still serve, when it has only stopped taking new ones.
+    let withheld = registry
+        .get_indexers_to_withhold_offers_from(non_accepting_test_interval_minutes)
+        .await
+        .map_err(|err| JobError::Fatal(err.into()))?;
+    let withheld: Vec<IndexerId> = withheld_unless_dipper_fault(withheld)
+        .into_iter()
+        .filter(|id| !already_denied.contains(id))
+        .collect();
+    if !withheld.is_empty() {
+        tracing::debug!(
+            deployment_id = %deployment_id,
+            withheld = withheld.len(),
+            indexers = ?withheld,
+            "withholding new offers from indexers that have stopped accepting them"
+        );
+        add_declined(&mut declined_indexers, *deployment_id, &withheld);
+    }
 
     // Compute optimistic DIPs fees from active agreements, enriched with
     // entity counts from the shared cache when available.
@@ -190,23 +216,76 @@ fn exclude_cancelling_indexers(
         .filter(|a| a.status == IndexingAgreementStatus::Cancelling)
         .map(|a| a.indexer.id)
         .collect::<Vec<_>>();
-    if cancelling.is_empty() {
+    add_declined(declined, deployment_id, &cancelling);
+}
+
+/// The indexers to hold back from new offers, or none when at least half of those offered to in
+/// the last 24 hours (and at least 2) would be: that many at once points at a fault on dipper's
+/// side, such as a short escrow or a stalled chain reader, rather than at the indexers.
+pub(crate) fn withheld_unless_dipper_fault(withheld: WithheldIndexers) -> Vec<IndexerId> {
+    let count = withheld.indexers.len();
+    if count >= MIN_WITHHELD_FOR_DIPPER_FAULT && count.saturating_mul(2) >= withheld.offered {
+        tracing::warn!(
+            withheld = count,
+            offered = withheld.offered,
+            "at least half of the indexers offered to in the last 24 hours look like they stopped \
+             accepting, which points at dipper; holding back none of them"
+        );
+        return Vec::new();
+    }
+    withheld.indexers
+}
+
+/// Add `indexers` to the deployment's declined list, each once, adding no entry for none.
+pub(crate) fn add_declined(
+    declined: &mut HashMap<DeploymentId, Vec<IndexerId>>,
+    deployment_id: DeploymentId,
+    indexers: &[IndexerId],
+) {
+    if indexers.is_empty() {
         return;
     }
     let excluded = declined.entry(deployment_id).or_default();
-    for indexer in cancelling {
-        if !excluded.contains(&indexer) {
-            excluded.push(indexer);
+    for indexer in indexers {
+        if !excluded.contains(indexer) {
+            excluded.push(*indexer);
         }
     }
 }
 
 /// Check if an agreement status represents an active agreement.
-fn is_active_agreement(status: &IndexingAgreementStatus) -> bool {
+pub(crate) fn is_active_agreement(status: &IndexingAgreementStatus) -> bool {
     matches!(
         status,
         IndexingAgreementStatus::Created | IndexingAgreementStatus::AcceptedOnChain
     )
+}
+
+/// The indexers in IISA's DIPs `pool` that dipper's records leave free for a new offer on
+/// `deployment_id`, in pool order: none holding or cancelling an agreement there, declined there,
+/// denylisted, unresponsive or holding a slot. IISA's own scoring may still pass one over.
+pub(crate) fn offerable_indexers(
+    pool: &[IndexerId],
+    deployment_id: DeploymentId,
+    agreements: &[IndexingAgreement],
+    declined: &HashMap<DeploymentId, Vec<IndexerId>>,
+    denylist: &[IndexerId],
+    unresponsive: &[IndexerId],
+    held: &[IndexerId],
+) -> Vec<IndexerId> {
+    let mut excluded: HashSet<IndexerId> = agreements
+        .iter()
+        .filter(|a| {
+            is_active_agreement(&a.status) || a.status == IndexingAgreementStatus::Cancelling
+        })
+        .map(|a| a.indexer.id)
+        .collect();
+    excluded.extend(declined.get(&deployment_id).into_iter().flatten());
+    excluded.extend(denylist.iter().chain(unresponsive).chain(held));
+    pool.iter()
+        .copied()
+        .filter(|id| !excluded.contains(id))
+        .collect()
 }
 
 #[cfg(test)]
@@ -218,6 +297,69 @@ mod tests {
         format!("0x{}", hex_digit.to_string().repeat(40))
             .parse()
             .unwrap()
+    }
+
+    fn on(indexer_id: IndexerId, status: IndexingAgreementStatus) -> IndexingAgreement {
+        let mut a = agreement(status, None);
+        a.indexer.id = indexer_id;
+        a
+    }
+
+    #[test]
+    fn offerable_indexers_leave_out_every_indexer_a_reassessment_would_rule_out() {
+        let deployment: DeploymentId = "QmTXzATwNfgGVukV1fX2T6xw9f6LAYRVWpsdXyRWzUR2H9"
+            .parse()
+            .unwrap();
+        let other: DeploymentId = "QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv"
+            .parse()
+            .unwrap();
+        let pool: Vec<IndexerId> = "abcdef123".chars().map(indexer).collect();
+        let agreements = [
+            on(indexer('a'), IndexingAgreementStatus::AcceptedOnChain),
+            on(indexer('b'), IndexingAgreementStatus::Created),
+            on(indexer('c'), IndexingAgreementStatus::Cancelling),
+            // Ended agreements don't keep their indexer from a new offer.
+            on(indexer('3'), IndexingAgreementStatus::CanceledByRequester),
+        ];
+        let declined = HashMap::from([
+            (deployment, vec![indexer('d')]),
+            (other, vec![indexer('2')]),
+        ]);
+
+        let offerable = offerable_indexers(
+            &pool,
+            deployment,
+            &agreements,
+            &declined,
+            &[indexer('e')],
+            &[indexer('f')],
+            &[indexer('1')],
+        );
+
+        assert_eq!(offerable, vec![indexer('2'), indexer('3')]);
+    }
+
+    #[test]
+    fn no_indexer_is_offerable_when_every_pool_member_already_holds_the_deployment() {
+        let deployment: DeploymentId = "QmTXzATwNfgGVukV1fX2T6xw9f6LAYRVWpsdXyRWzUR2H9"
+            .parse()
+            .unwrap();
+        let agreements = [
+            on(indexer('a'), IndexingAgreementStatus::AcceptedOnChain),
+            on(indexer('b'), IndexingAgreementStatus::AcceptedOnChain),
+        ];
+
+        let offerable = offerable_indexers(
+            &[indexer('a'), indexer('b')],
+            deployment,
+            &agreements,
+            &HashMap::new(),
+            &[],
+            &[],
+            &[],
+        );
+
+        assert!(offerable.is_empty(), "{offerable:?}");
     }
 
     #[test]
@@ -251,6 +393,23 @@ mod tests {
         let accepted = agreement(IndexingAgreementStatus::AcceptedOnChain, None);
         exclude_cancelling_indexers(&mut none_declined, deployment, &[accepted]);
         assert!(none_declined.is_empty());
+    }
+
+    #[test]
+    fn holds_back_no_one_once_half_of_those_offered_to_would_be_held_back() {
+        let held_back = |count: usize, offered: usize| {
+            withheld_unless_dipper_fault(WithheldIndexers {
+                indexers: "abcdef".chars().take(count).map(indexer).collect(),
+                offered,
+            })
+            .len()
+        };
+
+        assert_eq!(held_back(2, 4), 0, "half");
+        assert_eq!(held_back(3, 4), 0, "over half");
+        assert_eq!(held_back(2, 5), 2, "under half");
+        assert_eq!(held_back(1, 1), 1, "1 is never enough to point at dipper");
+        assert_eq!(held_back(0, 0), 0, "none");
     }
 
     #[test]

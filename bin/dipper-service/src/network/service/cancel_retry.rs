@@ -18,7 +18,7 @@ use crate::{
         AgreementRegistry, CancelKind, CancellingAgreement, IndexingAgreement,
         IndexingAgreementStatus, IndexingRequestRegistry,
     },
-    worker::service::WorkerQueue,
+    worker::service::{JobPriority, WorkerQueue},
 };
 
 /// Failed cancels before dipper alerts an operator and retries the agreement only hourly, so a
@@ -31,6 +31,18 @@ const BATCH_SIZE: i64 = 50;
 
 /// How often agreements still being cancelled get their cancel retried.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(300);
+
+/// How far back a sweep looks for agreements that ended: 2 sweeps, so one that ended just
+/// after the last sweep read the database is still seen.
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "twice a 300s interval is far below i64::MAX"
+)]
+const FREED_WINDOW_SECS: i64 = 2 * SWEEP_INTERVAL.as_secs() as i64;
+
+/// Short requests a sweep queues at most. Queueing is cheap and the window is only 2 sweeps
+/// long, so this is large enough that a burst of ended cancels doesn't leave any out.
+const FREED_BATCH_SIZE: i64 = 500;
 
 /// Time a sweep may take before leaving the rest to the next one, as each cancel can wait up
 /// to 15 s to be mined.
@@ -109,6 +121,7 @@ where
                 () = async {
                     retry_cancelling_agreements(&registry, &chain_client, &agreement_conf).await;
                     replace_ended_abandoned(&registry, &worker_queue).await;
+                    reassess_freed_requests(&registry, &worker_queue).await;
                 } => {},
             }
         }
@@ -144,6 +157,58 @@ where
             QUEUE_TIMEOUT,
         )
         .await;
+    }
+}
+
+/// Queue a reassessment of each open request still short of indexers on a deployment where an
+/// agreement just ended, whatever ended it: the indexer that agreement held can be picked again,
+/// and nothing else re-checks the request before the daily reassignment.
+async fn reassess_freed_requests<R, W>(registry: &R, worker_queue: &W)
+where
+    R: IndexingRequestRegistry + Sync,
+    W: WorkerQueue + Sync,
+{
+    let listed = tokio::time::timeout(
+        DB_TIMEOUT,
+        registry.get_short_requests_on_deployments_with_ended_agreements(
+            FREED_WINDOW_SECS,
+            FREED_BATCH_SIZE,
+        ),
+    )
+    .await;
+    let listed = listed
+        .map_err(anyhow::Error::from)
+        .and_then(|requests| requests.map_err(anyhow::Error::from));
+    let requests = match listed {
+        Ok(requests) => requests,
+        Err(err) => {
+            tracing::warn!(error = %err, "Failed to list short requests that ended cancels may fill");
+            return;
+        }
+    };
+    for request in &requests {
+        let queued = tokio::time::timeout(
+            QUEUE_TIMEOUT,
+            worker_queue.reassess_indexing_request(
+                request.id,
+                request.deployment_id,
+                request.deployment_chain_id,
+                request.num_candidates,
+                // Background: filling a short request yields to interactive work.
+                JobPriority::Background,
+            ),
+        )
+        .await;
+        if let Err(err) = queued
+            .map_err(anyhow::Error::from)
+            .and_then(|pushed| pushed)
+        {
+            tracing::warn!(
+                indexing_request_id = %request.id,
+                error = %err,
+                "Failed to queue a short request's reassessment; the next sweep retries it"
+            );
+        }
     }
 }
 
@@ -476,6 +541,8 @@ mod tests {
         writes: Mutex<Vec<&'static str>>,
         /// Ended agreements awaiting replacement, until noted as replaced.
         awaiting_replacement: Vec<IndexingAgreement>,
+        /// Short open requests on deployments where an agreement just ended.
+        short_requests: Vec<crate::registry::IndexingRequest>,
         replacements_noted: Mutex<Vec<IndexingAgreementId>>,
     }
 
@@ -751,6 +818,13 @@ mod tests {
         ) -> crate::registry::Result<Vec<crate::registry::IndexingRequest>> {
             unimplemented!()
         }
+        async fn get_short_requests_on_deployments_with_ended_agreements(
+            &self,
+            _since_seconds: i64,
+            _batch_size: i64,
+        ) -> crate::registry::Result<Vec<crate::registry::IndexingRequest>> {
+            Ok(self.short_requests.clone())
+        }
     }
 
     /// Records the requests it is asked to reassess.
@@ -844,6 +918,33 @@ mod tests {
             vec![ended.indexing_request_id],
             "queued once, then noted as replaced"
         );
+    }
+
+    /// A request left short while its indexers finished cancelling an earlier agreement is
+    /// reassessed once one has ended, since nothing else re-checks it before the daily sweep.
+    #[tokio::test]
+    async fn reassesses_a_short_request_once_an_agreement_on_its_deployment_ends() {
+        let short = crate::registry::IndexingRequest {
+            id: IndexingRequestId::new(),
+            created_at: time::OffsetDateTime::now_utc(),
+            updated_at: time::OffsetDateTime::now_utc(),
+            status: crate::registry::IndexingRequestStatus::Open,
+            requested_by: Address::ZERO,
+            deployment_id: thegraph_core::deployment_id!(
+                "QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv"
+            ),
+            deployment_chain_id: 421614,
+            num_candidates: 2,
+        };
+        let registry = MockRegistry {
+            short_requests: vec![short.clone()],
+            ..MockRegistry::default()
+        };
+        let queue = MockQueue::default();
+
+        reassess_freed_requests(&registry, &queue).await;
+
+        assert_eq!(*queue.0.lock().unwrap(), vec![short.id]);
     }
 
     #[tokio::test]

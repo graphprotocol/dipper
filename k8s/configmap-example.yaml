@@ -40,7 +40,9 @@ data:
           "base-sepolia": 150,
           "sepolia": 50
         },
-        "max_grt_per_billion_entities_per_30_days": 2000
+        "fallback_max_grt_per_30_days": 4500,
+        "max_grt_per_billion_entities_per_30_days": 2000,
+        "non_accepting_test_interval_minutes": 60
       },
       "admin_rpc": {
         "listen_addr": "0.0.0.0:8545",
@@ -78,7 +80,8 @@ data:
         "interval": 86400,
         "run_at_utc_hour": 10,
         "batch_size": 100,
-        "min_request_age": 86400
+        "min_request_age": 86400,
+        "top_up_interval": 3600
       },
       "expiration": {
         "enabled": true,
@@ -99,6 +102,16 @@ data:
         "max_tolerance_days": 4,
         "request_timeout": 10,
         "batch_size": 500,
+        "unreachable_trip_fraction": 0.5,
+        "unreachable_trip_min_indexers": 3
+      },
+      "dips_info_watcher": {
+        "enabled": true,
+        "interval": 300,
+        "alert_after_hours": 24,
+        "denylist_after_hours": 48,
+        "request_timeout": 10,
+        "max_concurrent_requests": 16,
         "unreachable_trip_fraction": 0.5,
         "unreachable_trip_min_indexers": 3
       },

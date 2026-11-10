@@ -49,17 +49,32 @@ pub trait IndexingRequestRegistry {
 
     /// Get open indexing requests eligible for reassessment.
     ///
-    /// Returns requests that are in the `OPEN` status and were created at least
-    /// `min_age_seconds` ago. Results are ordered by `updated_at` ascending to
-    /// prioritize requests that haven't been reassessed recently.
-    ///
-    /// If `batch_size` is greater than 0, limits the number of results.
-    /// If `batch_size` is 0 or negative, returns all matching requests.
+    /// Returns `OPEN` requests created at least `min_age_seconds` ago, least recently changed
+    /// first (a target or status change; reassessing doesn't count). If `batch_size` is greater
+    /// than 0, limits the number of results; otherwise returns them all.
     async fn get_open_indexing_requests_for_reassessment(
         &self,
         min_age_seconds: i64,
         batch_size: i64,
     ) -> RegistryResult<Vec<IndexingRequest>>;
+
+    /// Open requests still short of indexers on a deployment where dipper finished cancelling an
+    /// agreement within the last `since_seconds`, whose freed indexer could now fill them.
+    async fn get_short_requests_on_deployments_with_ended_agreements(
+        &self,
+        since_seconds: i64,
+        batch_size: i64,
+    ) -> RegistryResult<Vec<IndexingRequest>>;
+
+    /// Open requests whose last reassessment left them short of indexers, whatever their age,
+    /// least recently changed first, at most `batch_size` (all when it is 0 or less).
+    /// Default: none, so mocks need not override.
+    async fn get_short_open_indexing_requests(
+        &self,
+        _batch_size: i64,
+    ) -> RegistryResult<Vec<IndexingRequest>> {
+        Ok(Vec::new())
+    }
 
     /// Atomically set the request's coverage-shortfall latch, returning whether
     /// the value actually changed (a single guarded UPDATE, so the transition is

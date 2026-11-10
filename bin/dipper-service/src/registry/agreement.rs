@@ -116,6 +116,14 @@ pub struct PendingExpiredEvent {
     pub request_expired_at: u64,
 }
 
+/// The indexers that stopped accepting offers, and how many indexers had an offer on-chain in
+/// the same 24 hours, to tell that apart from a fault on dipper's side.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WithheldIndexers {
+    pub indexers: Vec<IndexerId>,
+    pub offered: usize,
+}
+
 #[async_trait]
 pub trait AgreementRegistry {
     /// Get agreement by ID.
@@ -192,6 +200,13 @@ pub trait AgreementRegistry {
         lookback_days: i32,
         chain_id: ChainId,
     ) -> RegistryResult<Vec<IndexerId>>;
+
+    /// Get indexers that let 2 rounds of offers lapse since they last accepted one, within the last
+    /// 24 hours, leaving out any with no offer in the last `test_interval_minutes`: due a test.
+    async fn get_indexers_to_withhold_offers_from(
+        &self,
+        test_interval_minutes: i32,
+    ) -> RegistryResult<WithheldIndexers>;
 
     /// Get all agreements by associated indexing request ID.
     async fn get_indexing_agreements_by_indexing_request_id(

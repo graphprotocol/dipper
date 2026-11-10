@@ -1,12 +1,12 @@
 #![cfg(feature = "fake")]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use dipper_core::ids::{IndexingAgreementId, IndexingRequestId};
 use dipper_pgregistry::{
     CancelKind, EndCorrection, Error, IndexingAgreementStatus, IndexingAgreementTerms,
     IndexingRequestStatus, NewAgreementParams, PgRegistry, ReconciliationAudit, ReconciliationItem,
-    RecordedEnd,
+    RecordedEnd, WithheldIndexers,
 };
 use fake::{Fake, Faker};
 use pgtemp::PgTempDB;
@@ -68,6 +68,28 @@ async fn set_indexing_target_candidates_inserts_when_no_open_row_exists() {
         outcome,
         dipper_pgregistry::IndexingRequestSetTargetOutcome::Inserted { .. }
     ));
+}
+
+#[tokio::test]
+async fn set_indexing_target_candidates_refuses_a_negative_count() {
+    //* Given
+    let requested_by = FakeAlloy.fake();
+    let deployment_id = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
+    let deployment_chain_id = Faker.fake::<ChainId>();
+
+    let (db, _temp_db) = temp_registry_db().await;
+    let registry = PgRegistry::new(db);
+
+    //* When
+    let result = registry
+        .set_indexing_target_candidates(requested_by, deployment_id, deployment_chain_id, -1)
+        .await;
+
+    //* Then
+    assert!(
+        result.is_err(),
+        "a negative count must not be stored: {result:?}"
+    );
 }
 
 #[tokio::test]
@@ -518,6 +540,112 @@ async fn get_indexing_agreements_by_indexing_request_id() {
         }),
         "Expected all agreements to be in CREATED or ACCEPTED_ON_CHAIN state"
     );
+}
+
+/// Apply `sql` to the fixture, then count the short requests the cancel sweep would reassess.
+#[expect(
+    clippy::expect_used,
+    reason = "a test helper: a failed step should fail the test that called it"
+)]
+async fn short_requests_after(db: &Pool<Postgres>, registry: &PgRegistry, sql: &str) -> usize {
+    run_fixture(db, sql)
+        .await
+        .expect("Failed to apply the change");
+    registry
+        .get_short_requests_on_deployments_with_ended_agreements(600, 10)
+        .await
+        .expect("Failed to query")
+        .len()
+}
+
+/// Only an open, short request is found, and only once dipper has just finished cancelling an
+/// agreement on its deployment.
+#[tokio::test]
+async fn finds_short_requests_on_deployments_with_recently_ended_agreements() {
+    //* Given
+    let (db, _temp_db) = temp_registry_db().await;
+    run_fixture(&db, include_str!("fixtures/0002_indexing_agreements.sql"))
+        .await
+        .expect("Failed to run fixture");
+    let registry = PgRegistry::new(db.clone());
+    let ended_long_ago = "UPDATE dipper_reg_indexing_requests SET shortfall_active = true; \
+         UPDATE dipper_reg_indexing_agreements \
+         SET status = 3, updated_at = timezone('UTC', now()) - interval '1 hour';";
+
+    //* When
+    let long_ago = short_requests_after(&db, &registry, ended_long_ago).await;
+    let just_ended = short_requests_after(
+        &db,
+        &registry,
+        "UPDATE dipper_reg_indexing_agreements SET updated_at = timezone('UTC', now());",
+    )
+    .await;
+    let not_short = short_requests_after(
+        &db,
+        &registry,
+        "UPDATE dipper_reg_indexing_requests SET shortfall_active = false;",
+    )
+    .await;
+    let ended_by_indexer = short_requests_after(
+        &db,
+        &registry,
+        "UPDATE dipper_reg_indexing_requests SET shortfall_active = true; \
+         UPDATE dipper_reg_indexing_agreements SET status = 4;",
+    )
+    .await;
+    let request_cancelled = short_requests_after(
+        &db,
+        &registry,
+        "UPDATE dipper_reg_indexing_agreements SET status = 3; \
+         UPDATE dipper_reg_indexing_requests SET status = 1;",
+    )
+    .await;
+
+    //* Then
+    assert_eq!(long_ago, 0, "a cancel that ended long ago");
+    assert_eq!(just_ended, 1, "a cancel that just ended");
+    assert_eq!(not_short, 0, "a request that isn't short");
+    assert_eq!(ended_by_indexer, 0, "an agreement the indexer ended");
+    assert_eq!(request_cancelled, 0, "a cancelled request");
+}
+
+/// Every open request flagged short is listed, however new, and nothing else is.
+#[tokio::test]
+async fn lists_open_requests_flagged_short_whatever_their_age() {
+    //* Given
+    let (db, _temp_db) = temp_registry_db().await;
+    run_fixture(&db, include_str!("fixtures/0002_indexing_agreements.sql"))
+        .await
+        .expect("Failed to run fixture");
+    let registry = PgRegistry::new(db.clone());
+    let short_after = |sql: &'static str| {
+        let (db, registry) = (db.clone(), &registry);
+        async move {
+            run_fixture(&db, sql)
+                .await
+                .expect("Failed to apply the change");
+            registry
+                .get_short_open_indexing_requests(10)
+                .await
+                .expect("Failed to query")
+                .len()
+        }
+    };
+
+    //* When
+    let not_short =
+        short_after("UPDATE dipper_reg_indexing_requests SET shortfall_active = false;").await;
+    let short_and_new = short_after(
+        "UPDATE dipper_reg_indexing_requests \
+         SET shortfall_active = true, created_at = timezone('UTC', now());",
+    )
+    .await;
+    let short_but_closed = short_after("UPDATE dipper_reg_indexing_requests SET status = 1;").await;
+
+    //* Then
+    assert_eq!(not_short, 0, "a request that isn't short");
+    assert_eq!(short_and_new, 1, "a short request made just now");
+    assert_eq!(short_but_closed, 0, "a closed request");
 }
 
 #[tokio::test]
@@ -1110,6 +1238,266 @@ async fn get_unresponsive_indexers_is_scoped_to_chain() {
         other_chain.is_empty(),
         "an indexer unresponsive on another chain is not returned"
     );
+}
+
+// =============================================================================
+// get_indexers_to_withhold_offers_from tests
+// =============================================================================
+
+/// The indexer whose offers these tests record. Fixture 0003 has none for it.
+const QUIET_INDEXER: IndexerId = indexer_id!("4444444444444444444444444444444444444444");
+
+/// Load fixture 0003 with its agreements retired 2 days ago, so none of its indexers is held back
+/// or counted as offered to.
+#[expect(
+    clippy::expect_used,
+    reason = "test setup; a failure should stop the test"
+)]
+async fn registry_with_retired_fixture() -> (Pool<Postgres>, PgTempDB) {
+    let (db, temp_db) = temp_registry_db().await;
+    run_fixture(
+        &db,
+        include_str!("fixtures/0003_multi_indexer_agreements.sql"),
+    )
+    .await
+    .expect("Failed to run fixture");
+    run_fixture(
+        &db,
+        "UPDATE dipper_reg_indexing_agreements SET status = 3, \
+         created_at = timezone('UTC', now()) - interval '2 days', \
+         updated_at = timezone('UTC', now()) - interval '2 days';",
+    )
+    .await
+    .expect("Failed to retire the fixture's agreements");
+    (db, temp_db)
+}
+
+/// Record an offer to [`QUIET_INDEXER`]; see [`record_offer_to`].
+async fn record_offer(
+    db: &Pool<Postgres>,
+    status: IndexingAgreementStatus,
+    made_mins_ago: i32,
+    changed_mins_ago: i32,
+    accepted_mins_ago: Option<i32>,
+) -> Vec<u8> {
+    record_offer_to(
+        db,
+        QUIET_INDEXER,
+        status,
+        made_mins_ago,
+        changed_mins_ago,
+        accepted_mins_ago,
+    )
+    .await
+}
+
+/// Record an offer to `indexer` with an offer transaction, made `made_mins_ago` and last changed
+/// `changed_mins_ago`, accepted on-chain `accepted_mins_ago` if given. Copies the rest from a
+/// fixture row and returns the new row's id.
+#[expect(
+    clippy::expect_used,
+    reason = "test setup; a failure should stop the test"
+)]
+async fn record_offer_to(
+    db: &Pool<Postgres>,
+    indexer: IndexerId,
+    status: IndexingAgreementStatus,
+    made_mins_ago: i32,
+    changed_mins_ago: i32,
+    accepted_mins_ago: Option<i32>,
+) -> Vec<u8> {
+    let (id,): (Vec<u8>,) = sqlx::query_as(
+        r#"
+        INSERT INTO dipper_reg_indexing_agreements
+            (id, nonce_uuid, created_at, updated_at, status, indexing_request_id, deployment_id,
+             indexer_id, indexer_url, terms, offer_tx_hash, accepted_at)
+        SELECT
+            decode(replace(gen_random_uuid()::text, '-', ''), 'hex'),
+            gen_random_uuid(),
+            timezone('UTC', now()) - make_interval(mins => $1),
+            timezone('UTC', now()) - make_interval(mins => $2),
+            $3,
+            indexing_request_id,
+            deployment_id,
+            $4,
+            indexer_url,
+            terms,
+            offer_tx_hash,
+            (EXTRACT(EPOCH FROM now()) - $5::int * 60)::bigint
+        FROM dipper_reg_indexing_agreements
+        WHERE id = '\xcc000000000000000000000000000001'::bytea
+        RETURNING id
+        "#,
+    )
+    .bind(made_mins_ago)
+    .bind(changed_mins_ago)
+    .bind(status)
+    .bind(indexer.as_slice())
+    .bind(accepted_mins_ago)
+    .fetch_one(db)
+    .await
+    .expect("Failed to record the offer");
+    id
+}
+
+/// Those held back with a 60-minute test interval, and the count of indexers offered to.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper; a failure should stop the test"
+)]
+async fn withheld(db: &Pool<Postgres>) -> WithheldIndexers {
+    PgRegistry::new(db.clone())
+        .get_indexers_to_withhold_offers_from(60)
+        .await
+        .expect("Failed to get the indexers to withhold offers from")
+}
+
+/// The indexers held back with a 60-minute test interval.
+async fn held_back(db: &Pool<Postgres>) -> Vec<IndexerId> {
+    withheld(db).await.indexers
+}
+
+/// A round of offers that all expire before the next is made is what a brief agent restart
+/// costs, so it isn't enough to hold the indexer back.
+#[tokio::test]
+async fn missing_1_round_of_offers_does_not_hold_an_indexer_back() {
+    //* Given
+    let (db, _temp_db) = registry_with_retired_fixture().await;
+    for made in [17, 16, 15] {
+        record_offer(&db, IndexingAgreementStatus::Expired, made, 1, None).await;
+    }
+
+    //* When
+    let held = held_back(&db).await;
+
+    //* Then
+    assert!(held.is_empty(), "{held:?}");
+}
+
+#[tokio::test]
+async fn an_indexer_that_missed_2_rounds_is_held_back() {
+    //* Given
+    let (db, _temp_db) = registry_with_retired_fixture().await;
+    record_offer(&db, IndexingAgreementStatus::Expired, 35, 20, None).await;
+    // Made after the first round had expired, and missed as well.
+    record_offer(&db, IndexingAgreementStatus::Expired, 18, 2, None).await;
+
+    //* When
+    let held = held_back(&db).await;
+
+    //* Then
+    assert_eq!(held, vec![QUIET_INDEXER]);
+}
+
+/// Without an offer in the last 60 minutes the indexer's test is due, so it is let through until
+/// that test offer is made.
+#[tokio::test]
+async fn an_indexer_held_back_gets_a_test_offer_after_60_minutes_with_none() {
+    //* Given
+    let (db, _temp_db) = registry_with_retired_fixture().await;
+    record_offer(&db, IndexingAgreementStatus::Expired, 150, 135, None).await;
+    record_offer(&db, IndexingAgreementStatus::Expired, 130, 115, None).await;
+
+    //* When
+    let test_due = held_back(&db).await;
+    record_offer(&db, IndexingAgreementStatus::Created, 1, 1, None).await;
+    let test_made = held_back(&db).await;
+
+    //* Then
+    assert!(test_due.is_empty(), "{test_due:?}");
+    assert_eq!(test_made, vec![QUIET_INDEXER]);
+}
+
+/// Only misses from the last 24 hours count. A held-back indexer's missed test offers keep its
+/// record fresh, so this only lets go of one nobody has offered anything for a day.
+#[tokio::test]
+async fn missed_offers_that_ended_over_24_hours_ago_do_not_hold_an_indexer_back() {
+    //* Given
+    let (db, _temp_db) = registry_with_retired_fixture().await;
+    record_offer(&db, IndexingAgreementStatus::Expired, 1_560, 1_545, None).await;
+    record_offer(&db, IndexingAgreementStatus::Expired, 1_540, 1_525, None).await;
+    record_offer(&db, IndexingAgreementStatus::Created, 1, 1, None).await;
+
+    //* When
+    let held = held_back(&db).await;
+
+    //* Then
+    assert!(held.is_empty(), "{held:?}");
+}
+
+/// The count a caller weighs those held back against: every indexer with an offer on-chain in the
+/// last 24 hours, whether still open, missed or accepted, including a miss made just before that.
+#[tokio::test]
+async fn counts_every_indexer_offered_to_in_the_last_24_hours() {
+    //* Given
+    let (db, _temp_db) = registry_with_retired_fixture().await;
+    record_offer(&db, IndexingAgreementStatus::Expired, 35, 20, None).await;
+    record_offer(&db, IndexingAgreementStatus::Expired, 18, 2, None).await;
+    let open = indexer_id!("5555555555555555555555555555555555555555");
+    record_offer_to(&db, open, IndexingAgreementStatus::Created, 5, 5, None).await;
+    let missed_at_the_edge = indexer_id!("6666666666666666666666666666666666666666");
+    record_offer_to(
+        &db,
+        missed_at_the_edge,
+        IndexingAgreementStatus::Expired,
+        1_450,
+        1_430,
+        None,
+    )
+    .await;
+    let long_ago = indexer_id!("7777777777777777777777777777777777777777");
+    record_offer_to(
+        &db,
+        long_ago,
+        IndexingAgreementStatus::Expired,
+        3_000,
+        2_985,
+        None,
+    )
+    .await;
+
+    //* When
+    let withheld = withheld(&db).await;
+
+    //* Then
+    assert_eq!(withheld.indexers, vec![QUIET_INDEXER]);
+    assert_eq!(withheld.offered, 3);
+}
+
+#[tokio::test]
+async fn an_acceptance_after_the_missed_offers_lets_the_indexer_back_in() {
+    //* Given
+    let (db, _temp_db) = registry_with_retired_fixture().await;
+    let accepted = record_offer(
+        &db,
+        IndexingAgreementStatus::AcceptedOnChain,
+        50,
+        40,
+        Some(40),
+    )
+    .await;
+    record_offer(&db, IndexingAgreementStatus::Expired, 35, 20, None).await;
+    record_offer(&db, IndexingAgreementStatus::Expired, 18, 2, None).await;
+
+    //* When
+    let accepted_before = held_back(&db).await;
+    sqlx::query(
+        "UPDATE dipper_reg_indexing_agreements \
+         SET accepted_at = EXTRACT(EPOCH FROM now())::bigint - 60 WHERE id = $1",
+    )
+    .bind(accepted)
+    .execute(&db)
+    .await
+    .expect("Failed to move the acceptance");
+    let accepted_after = held_back(&db).await;
+
+    //* Then
+    assert_eq!(
+        accepted_before,
+        vec![QUIET_INDEXER],
+        "an acceptance before the misses"
+    );
+    assert!(accepted_after.is_empty(), "{accepted_after:?}");
 }
 
 // =============================================================================
@@ -1707,6 +2095,198 @@ async fn get_open_indexing_requests_for_reassessment_zero_batch_returns_all() {
 
     //* Then
     assert_eq!(requests.len(), 3, "Expected all 3 eligible requests");
+}
+
+// =============================================================================
+// DIPs info watcher DB operation tests
+// =============================================================================
+
+#[tokio::test]
+async fn get_indexers_with_accepted_agreements_lists_each_holder_once() {
+    //* Given
+    let (db, _temp_db) = temp_registry_db().await;
+    run_fixture(
+        &db,
+        include_str!("fixtures/0003_multi_indexer_agreements.sql"),
+    )
+    .await
+    .expect("Failed to run fixture");
+    // Indexer 0x1111 holds 2 accepted agreements and indexer 0x2222 holds 1; indexer 0x3333's
+    // only agreement expired.
+    run_fixture(
+        &db,
+        r#"
+        UPDATE dipper_reg_indexing_agreements SET status = 6
+        WHERE id IN ('\xaa000000000000000000000000000001'::bytea,
+                     '\xbb000000000000000000000000000001'::bytea);
+        "#,
+    )
+    .await
+    .expect("Failed to set up accepted agreements");
+    let registry = PgRegistry::new(db);
+
+    //* When
+    let indexers: HashSet<IndexerId> = registry
+        .get_indexers_with_accepted_agreements()
+        .await
+        .expect("Failed to get indexers with accepted agreements")
+        .into_iter()
+        .collect();
+
+    //* Then
+    assert_eq!(
+        indexers,
+        HashSet::from([
+            indexer_id!("1111111111111111111111111111111111111111"),
+            indexer_id!("2222222222222222222222222222222222222222"),
+        ])
+    );
+}
+
+#[tokio::test]
+async fn record_dips_info_checks_adds_up_missing_time_until_an_indexer_answers() {
+    //* Given
+    let (db, _temp_db) = temp_registry_db().await;
+    let registry = PgRegistry::new(db);
+    let indexer_a = indexer_id!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let indexer_b = indexer_id!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+    //* When
+    registry
+        .record_dips_info_checks(&[indexer_a, indexer_b], 300)
+        .await
+        .expect("Failed to record first cycle");
+    let second = registry
+        .record_dips_info_checks(&[indexer_a, indexer_b], 600)
+        .await
+        .expect("Failed to record second cycle");
+    let third = registry
+        .record_dips_info_checks(&[indexer_a], 300)
+        .await
+        .expect("Failed to record third cycle");
+
+    //* Then
+    assert_eq!(second.missing.get(&indexer_a), Some(&900));
+    assert_eq!(second.missing.get(&indexer_b), Some(&900));
+    assert!(second.cleared.is_empty());
+    assert_eq!(third.missing, HashMap::from([(indexer_a, 1200)]));
+    assert_eq!(
+        third.cleared,
+        HashMap::from([(indexer_b, 900)]),
+        "indexer B answered, so its count is forgotten"
+    );
+}
+
+#[tokio::test]
+async fn record_dips_info_checks_with_no_indexer_missing_forgets_them_all() {
+    //* Given
+    let (db, _temp_db) = temp_registry_db().await;
+    let registry = PgRegistry::new(db);
+    let indexer_a = indexer_id!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    registry
+        .record_dips_info_checks(&[indexer_a], 300)
+        .await
+        .expect("Failed to record first cycle");
+
+    //* When
+    let checks = registry
+        .record_dips_info_checks(&[], 300)
+        .await
+        .expect("Failed to record second cycle");
+    let after = registry
+        .record_dips_info_checks(&[indexer_a], 0)
+        .await
+        .expect("Failed to record third cycle");
+
+    //* Then
+    assert!(checks.missing.is_empty());
+    assert_eq!(checks.cleared, HashMap::from([(indexer_a, 300)]));
+    assert_eq!(
+        after.missing,
+        HashMap::from([(indexer_a, 0)]),
+        "a forgotten indexer starts again from 0"
+    );
+}
+
+#[tokio::test]
+async fn a_dips_info_block_denies_an_indexer_until_it_lapses_or_the_indexer_answers() {
+    //* Given
+    let (db, _temp_db) = temp_registry_db().await;
+    let registry = PgRegistry::new(db);
+    let blocked = indexer_id!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let lapsed = indexer_id!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    let answered = indexer_id!("cccccccccccccccccccccccccccccccccccccccc");
+    registry
+        .record_dips_info_checks(&[blocked, lapsed, answered], 48 * 3600)
+        .await
+        .expect("Failed to record missing DIPs info");
+
+    //* When
+    let first = registry
+        .block_missing_dips_info(&[blocked, answered], 900)
+        .await
+        .expect("Failed to block");
+    let renewed = registry
+        .block_missing_dips_info(&[blocked], 1200)
+        .await
+        .expect("Failed to renew the block");
+    registry
+        .block_missing_dips_info(&[lapsed], 0)
+        .await
+        .expect("Failed to set a block already over");
+    let while_missing = registry
+        .get_indexer_denylist()
+        .await
+        .expect("Failed to get the denylist");
+    let blocks = registry
+        .get_dips_info_blocks()
+        .await
+        .expect("Failed to get the blocks");
+    registry
+        .record_dips_info_checks(&[blocked, lapsed], 300)
+        .await
+        .expect("Failed to record the answer");
+    let after_answer = registry
+        .get_indexer_denylist()
+        .await
+        .expect("Failed to get the denylist");
+    let lapsed_renewed = registry
+        .block_missing_dips_info(&[lapsed], 900)
+        .await
+        .expect("Failed to renew a lapsed block");
+    let unknown = registry
+        .block_missing_dips_info(&[answered], 900)
+        .await
+        .expect("Failed to block an indexer with no missing row");
+
+    //* Then
+    assert_eq!(
+        first.into_iter().collect::<HashSet<_>>(),
+        HashSet::from([blocked, answered])
+    );
+    assert!(renewed.is_empty(), "renewing a block isn't a new one");
+    assert_eq!(
+        while_missing.into_iter().collect::<HashSet<_>>(),
+        HashSet::from([blocked, answered]),
+        "a block already over denies nobody"
+    );
+    assert_eq!(
+        blocks.into_iter().collect::<HashSet<_>>(),
+        HashSet::from([blocked, answered])
+    );
+    assert_eq!(
+        after_answer,
+        vec![blocked],
+        "answering removes the row and its block"
+    );
+    assert!(
+        lapsed_renewed.is_empty(),
+        "renewing a lapsed block isn't a new one either"
+    );
+    assert!(
+        unknown.is_empty(),
+        "only an indexer still missing its DIPs info is blocked"
+    );
 }
 
 // =============================================================================
@@ -2381,9 +2961,9 @@ async fn get_declined_indexers_expiry_without_offer_tx_excluded_after_5_minutes(
 }
 
 /// The mirror case: the offer did land, so the indexer had one on chain and let the window
-/// close, which is their decision and does earn the standard bench.
+/// close, which is their decision and earns a missed-offer bench (1 day for a 1st miss).
 #[tokio::test]
-async fn get_declined_indexers_expiry_with_offer_tx_included_within_30_days() {
+async fn get_declined_indexers_expiry_with_offer_tx_benches_the_indexer() {
     //* Given
     let (db, _temp_db) = temp_registry_db().await;
     run_fixture(
@@ -2438,6 +3018,253 @@ async fn get_declined_indexers_expiry_with_offer_tx_included_within_30_days() {
     assert!(
         declined.contains(&indexer_a),
         "an expiry after the offer landed should still bench the indexer, got {declined:?}"
+    );
+}
+
+/// A registry holding only the agreements a missed-offer test adds: the fixture's rows are moved
+/// out of every bench, and serve only as the template new rows copy their terms from.
+#[expect(
+    clippy::expect_used,
+    reason = "a test helper: a failed step should fail the test that called it"
+)]
+async fn missed_offer_registry() -> (PgRegistry, Pool<Postgres>, PgTempDB) {
+    let (db, temp_db) = temp_registry_db().await;
+    run_fixture(
+        &db,
+        include_str!("fixtures/0003_multi_indexer_agreements.sql"),
+    )
+    .await
+    .expect("Failed to run fixture");
+    sqlx::query("UPDATE dipper_reg_indexing_agreements SET status = 3")
+        .execute(&db)
+        .await
+        .expect("Failed to retire the fixture agreements");
+    (PgRegistry::new(db.clone()), db, temp_db)
+}
+
+/// Indexer A, whose benches the missed-offer tests check.
+const MISS_INDEXER: &str = "1111111111111111111111111111111111111111";
+/// The subgraph the missed offers are for, and another one indexer A takes offers on.
+const MISS_DEPLOYMENT: &str = "QmAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA1a";
+const OTHER_DEPLOYMENT: &str = "QmBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB2b";
+
+/// Add an offer to indexer A on `deployment`, made 10 minutes before it was last updated
+/// `minutes_ago`, with its deadline 5 minutes before that update, as dipper marks an offer expired
+/// a grace after its deadline. A missed offer is one that landed on chain and expired with no
+/// reason given.
+async fn add_missed_offer(db: &Pool<Postgres>, n: u8, deployment: &str, minutes_ago: i32) {
+    add_offer(db, n, deployment, 5, minutes_ago, None).await;
+}
+
+/// Add an offer to indexer A on `deployment` that it accepted on chain `minutes_ago`. It is
+/// cancelled now, so it holds no active slot and benches no one.
+async fn add_accepted_offer(db: &Pool<Postgres>, n: u8, deployment: &str, minutes_ago: i32) {
+    add_offer(db, n, deployment, 3, minutes_ago, Some(minutes_ago)).await;
+}
+
+/// The id of the `n`th offer a missed-offer test adds.
+fn offer_id(n: u8) -> Vec<u8> {
+    let mut id = vec![0xdd; 16];
+    id[15] = n;
+    id
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "a test helper: a failed step should fail the test that called it"
+)]
+async fn add_offer(
+    db: &Pool<Postgres>,
+    n: u8,
+    deployment: &str,
+    status: i32,
+    minutes_ago: i32,
+    accepted_minutes_ago: Option<i32>,
+) {
+    sqlx::query(
+        r#"
+        INSERT INTO dipper_reg_indexing_agreements
+            (id, nonce_uuid, created_at, updated_at, status, indexing_request_id, deployment_id,
+             indexer_id, indexer_url, terms, offer_tx_hash, accepted_at)
+        SELECT $1, gen_random_uuid(),
+               timezone('UTC', now()) - make_interval(mins => $4 + 10),
+               timezone('UTC', now()) - make_interval(mins => $4),
+               $3, indexing_request_id, $2, decode($5, 'hex'), indexer_url,
+               jsonb_set(terms::jsonb, '{deadline}',
+                         to_jsonb(extract(epoch FROM now() - make_interval(mins => $4 + 5))::bigint))::json,
+               decode(repeat('11', 32), 'hex'),
+               CASE WHEN $6::int IS NULL THEN NULL
+                    ELSE extract(epoch FROM now() - make_interval(mins => $6::int))::bigint END
+        FROM dipper_reg_indexing_agreements
+        WHERE id = '\xaa000000000000000000000000000001'::bytea
+        "#,
+    )
+    .bind(offer_id(n))
+    .bind(deployment)
+    .bind(status)
+    .bind(minutes_ago)
+    .bind(MISS_INDEXER)
+    .bind(accepted_minutes_ago)
+    .execute(db)
+    .await
+    .expect("Failed to add offer");
+}
+
+/// Whether indexer A is benched on the missed-offer subgraph, with a 30-day standard bench.
+#[expect(
+    clippy::expect_used,
+    reason = "a test helper: a failed step should fail the test that called it"
+)]
+async fn benched_on_missed_subgraph(registry: &PgRegistry) -> bool {
+    let deployment: DeploymentId = MISS_DEPLOYMENT.parse().expect("valid deployment id");
+    let indexer: IndexerId = indexer_id!("1111111111111111111111111111111111111111");
+    registry
+        .get_declined_indexers_by_deployment(30, 1, 5, 1)
+        .await
+        .expect("Failed to get declined indexers")
+        .get(&deployment)
+        .is_some_and(|indexers| indexers.contains(&indexer))
+}
+
+const HOUR: i32 = 60;
+const DAY: i32 = 24 * HOUR;
+
+/// 1 missed offer is often a blip on the indexer's side, so it benches for 1 day, not 30.
+#[tokio::test]
+async fn a_first_missed_offer_benches_the_indexer_for_a_day() {
+    let (registry, db, _temp_db) = missed_offer_registry().await;
+    add_missed_offer(&db, 1, MISS_DEPLOYMENT, 23 * HOUR).await;
+    assert!(
+        benched_on_missed_subgraph(&registry).await,
+        "benched within the day"
+    );
+
+    sqlx::query(
+        "UPDATE dipper_reg_indexing_agreements SET updated_at = updated_at - interval '2 hours' \
+         WHERE id = $1",
+    )
+    .bind(offer_id(1))
+    .execute(&db)
+    .await
+    .expect("Failed to age the miss");
+    assert!(
+        !benched_on_missed_subgraph(&registry).await,
+        "free once the day is over"
+    );
+}
+
+/// A 2nd miss in a row on the same subgraph benches for 7 days.
+#[tokio::test]
+async fn a_second_missed_offer_in_a_row_benches_the_indexer_for_7_days() {
+    let (registry, db, _temp_db) = missed_offer_registry().await;
+    add_missed_offer(&db, 1, MISS_DEPLOYMENT, 10 * DAY).await;
+    add_missed_offer(&db, 2, MISS_DEPLOYMENT, 6 * DAY).await;
+    assert!(
+        benched_on_missed_subgraph(&registry).await,
+        "benched within 7 days"
+    );
+
+    let (registry, db, _temp_db) = missed_offer_registry().await;
+    add_missed_offer(&db, 1, MISS_DEPLOYMENT, 10 * DAY).await;
+    add_missed_offer(&db, 2, MISS_DEPLOYMENT, 8 * DAY).await;
+    assert!(
+        !benched_on_missed_subgraph(&registry).await,
+        "free after 7 days"
+    );
+}
+
+/// A 3rd miss in a row benches for the standard 30 days.
+#[tokio::test]
+async fn a_third_missed_offer_in_a_row_benches_the_indexer_for_30_days() {
+    let (registry, db, _temp_db) = missed_offer_registry().await;
+    add_missed_offer(&db, 1, MISS_DEPLOYMENT, 40 * DAY).await;
+    add_missed_offer(&db, 2, MISS_DEPLOYMENT, 35 * DAY).await;
+    add_missed_offer(&db, 3, MISS_DEPLOYMENT, 29 * DAY).await;
+    assert!(
+        benched_on_missed_subgraph(&registry).await,
+        "benched within 30 days"
+    );
+
+    let (registry, db, _temp_db) = missed_offer_registry().await;
+    add_missed_offer(&db, 1, MISS_DEPLOYMENT, 40 * DAY).await;
+    add_missed_offer(&db, 2, MISS_DEPLOYMENT, 35 * DAY).await;
+    add_missed_offer(&db, 3, MISS_DEPLOYMENT, 31 * DAY).await;
+    assert!(
+        !benched_on_missed_subgraph(&registry).await,
+        "free after 30 days"
+    );
+}
+
+/// Accepting an offer on the subgraph wipes the misses before it, so the next miss is a 1st.
+#[tokio::test]
+async fn accepting_on_the_subgraph_starts_the_misses_again() {
+    let (registry, db, _temp_db) = missed_offer_registry().await;
+    add_missed_offer(&db, 1, MISS_DEPLOYMENT, 20 * DAY).await;
+    add_missed_offer(&db, 2, MISS_DEPLOYMENT, 15 * DAY).await;
+    add_accepted_offer(&db, 3, MISS_DEPLOYMENT, 10 * DAY).await;
+    add_missed_offer(&db, 4, MISS_DEPLOYMENT, 2 * DAY).await;
+    assert!(
+        !benched_on_missed_subgraph(&registry).await,
+        "a miss after an acceptance is a 1st miss, whose day has passed"
+    );
+}
+
+/// Accepting any offer after a 1st miss shows the blip is over, so that bench comes off.
+#[tokio::test]
+async fn a_first_miss_bench_lifts_once_the_indexer_accepts_elsewhere() {
+    let (registry, db, _temp_db) = missed_offer_registry().await;
+    add_missed_offer(&db, 1, MISS_DEPLOYMENT, HOUR).await;
+    add_accepted_offer(&db, 2, OTHER_DEPLOYMENT, 2 * HOUR).await;
+    assert!(
+        benched_on_missed_subgraph(&registry).await,
+        "an acceptance before the miss says nothing about recovery"
+    );
+
+    add_accepted_offer(&db, 3, OTHER_DEPLOYMENT, 30).await;
+    assert!(
+        !benched_on_missed_subgraph(&registry).await,
+        "an acceptance after the miss lifts the 1st-miss bench"
+    );
+}
+
+/// An indexer that recovers in the gap between the deadline and dipper marking the offer expired
+/// has still recovered after missing it, so the 1st-miss bench lifts.
+#[tokio::test]
+async fn a_first_miss_bench_lifts_on_an_acceptance_before_dipper_marks_the_miss() {
+    let (registry, db, _temp_db) = missed_offer_registry().await;
+    add_missed_offer(&db, 1, MISS_DEPLOYMENT, HOUR).await;
+    add_accepted_offer(&db, 2, OTHER_DEPLOYMENT, HOUR + 2).await;
+    assert!(
+        !benched_on_missed_subgraph(&registry).await,
+        "accepted after the deadline, though before the miss was marked"
+    );
+}
+
+/// Misses from long ago don't count towards the next one, so a fresh miss after months without
+/// an offer on the subgraph is a 1st miss again.
+#[tokio::test]
+async fn misses_from_long_ago_do_not_lengthen_a_new_bench() {
+    let (registry, db, _temp_db) = missed_offer_registry().await;
+    add_missed_offer(&db, 1, MISS_DEPLOYMENT, 90 * DAY).await;
+    add_missed_offer(&db, 2, MISS_DEPLOYMENT, 80 * DAY).await;
+    add_missed_offer(&db, 3, MISS_DEPLOYMENT, 2 * DAY).await;
+    assert!(
+        !benched_on_missed_subgraph(&registry).await,
+        "the old misses are past counting, so this 1st miss's day is over"
+    );
+}
+
+/// Only a 1st-miss bench lifts early. Otherwise an indexer could reset its longer benches on 1
+/// subgraph forever by accepting offers on others.
+#[tokio::test]
+async fn a_second_miss_bench_holds_when_the_indexer_accepts_elsewhere() {
+    let (registry, db, _temp_db) = missed_offer_registry().await;
+    add_missed_offer(&db, 1, MISS_DEPLOYMENT, 2 * DAY).await;
+    add_missed_offer(&db, 2, MISS_DEPLOYMENT, HOUR).await;
+    add_accepted_offer(&db, 3, OTHER_DEPLOYMENT, 30).await;
+    assert!(
+        benched_on_missed_subgraph(&registry).await,
+        "the 7-day bench holds"
     );
 }
 

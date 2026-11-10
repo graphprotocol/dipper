@@ -206,6 +206,39 @@ pub enum Error {
     InvalidPartitionCount,
 }
 
+impl Error {
+    /// Whether a send failed to reach the brokers, so a resend through a new client can help; a broker
+    /// that refused it or answered unreadably would do the same again. rskafka retries connection
+    /// failures with no deadline, so an unreachable cluster mostly shows as a timeout.
+    pub fn is_unreachable(&self) -> bool {
+        use rskafka::client::error::{Error as Rskafka, RequestError};
+        match self {
+            Self::Timeout => true,
+            Self::Send(e) => matches!(
+                e,
+                Rskafka::Connection(_)
+                    | Rskafka::Timeout
+                    | Rskafka::RetryFailed(_)
+                    | Rskafka::Request(RequestError::IO(_) | RequestError::Poisoned(_))
+            ),
+            _ => false,
+        }
+    }
+
+    /// A send the broker received and refused.
+    #[cfg(test)]
+    pub(crate) fn refused() -> Self {
+        use rskafka::client::error::{Error as Rskafka, ProtocolError, RequestContext};
+        Self::Send(Rskafka::ServerError {
+            protocol_error: ProtocolError::MessageTooLarge,
+            error_message: None,
+            request: RequestContext::Topic("test".to_string()),
+            response: None,
+            is_virtual: false,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,6 +265,20 @@ mod tests {
             KafkaProducer::new(&config).await,
             Err(Error::InvalidPartitionCount)
         ));
+    }
+
+    #[test]
+    fn only_failures_to_reach_the_brokers_count_as_unreachable() {
+        use rskafka::client::error::{Error as Rskafka, RequestError};
+        assert!(Error::Timeout.is_unreachable());
+        assert!(Error::Send(Rskafka::Timeout).is_unreachable());
+        let reset = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        assert!(Error::Send(Rskafka::Request(RequestError::IO(reset))).is_unreachable());
+
+        // A broker that refuses a send, or answers in a way the client can't read, does it again.
+        assert!(!Error::refused().is_unreachable());
+        assert!(!Error::Send(Rskafka::InvalidResponse("bad".to_string())).is_unreachable());
+        assert!(!Error::InvalidPartitionCount.is_unreachable());
     }
 
     // -------- Test helpers --------

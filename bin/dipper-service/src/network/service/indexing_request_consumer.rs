@@ -998,6 +998,14 @@ mod tests {
         ) -> RegistryResult<Vec<IndexingRequestRecord>> {
             unimplemented!()
         }
+
+        async fn get_short_requests_on_deployments_with_ended_agreements(
+            &self,
+            _since_seconds: i64,
+            _batch_size: i64,
+        ) -> RegistryResult<Vec<IndexingRequestRecord>> {
+            unimplemented!()
+        }
     }
 
     /// A worker queue that records reassessment jobs, optionally failing the

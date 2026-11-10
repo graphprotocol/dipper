@@ -5,7 +5,7 @@ use std::{
 };
 
 use dipper_core::{ids::IndexingRequestId, time::now_secs};
-use dipper_iisa::{CandidateSelection, SelectedIndexer, SelectionError};
+use dipper_iisa::{CandidateSelection, PriceCeilings, SelectedIndexer, SelectionError};
 use dipper_producer::{events::SubgraphIndexingAgreementEventsProducer, proto};
 use graph_networks_registry::NetworksRegistry;
 use jsonrpsee::core::Serialize;
@@ -29,7 +29,7 @@ use crate::{
     registry::{
         AgreementRegistry, IndexerDenylistRegistry, IndexingAgreementStatus,
         IndexingAgreementTerms, IndexingAgreementTermsMetadata, IndexingRequestRegistry,
-        NewAgreementParams, PendingCancellationRegistry,
+        IndexingRequestStatus, NewAgreementParams, PendingCancellationRegistry,
     },
     signing::eip712::Eip712Signer,
     worker::{
@@ -93,7 +93,8 @@ pub struct Message {
     pub deployment_id: DeploymentId,
     /// The chain ID of the subgraph deployment
     pub deployment_chain_id: ChainId,
-    /// The desired group size (how many indexers should be assigned)
+    /// The request's target when this job was queued. The job reads the current target instead;
+    /// this stays so a worker running an older release can still read and run the job.
     pub num_candidates: usize,
 }
 
@@ -111,7 +112,7 @@ pub async fn handle<R, W, I, T>(
         indexing_request_id,
         deployment_id,
         deployment_chain_id,
-        num_candidates,
+        num_candidates: _,
     }: &Message,
 ) -> JobResult<()>
 where
@@ -131,6 +132,25 @@ where
     let _reassess_guard = match ctx.reassess_lock.try_lock() {
         Ok(guard) => guard,
         Err(_) => return Err(JobError::Deferred(Duration::from_secs(1))),
+    };
+
+    // Use the request's target as it stands now, not when this job was queued: a burst of target
+    // changes queues a job each, and only the latest should take effect. Cancelled means zero.
+    let num_candidates = match ctx
+        .registry
+        .get_indexing_request_by_id(indexing_request_id)
+        .await
+        .map_err(|err| JobError::Fatal(err.into()))?
+    {
+        Some(request) if request.status == IndexingRequestStatus::Open => request.num_candidates,
+        Some(_) => 0,
+        None => {
+            tracing::warn!(
+                indexing_request_id = %indexing_request_id,
+                "Reassessing an indexing request that doesn't exist; nothing to do"
+            );
+            return Ok(());
+        }
     };
 
     // Get current active agreements for this indexing request. Fetched once here
@@ -196,6 +216,7 @@ where
         ctx.agreement_conf.transient_rejection_lookback_minutes(),
         ctx.agreement_conf.uncertain_rejection_lookback_days(),
         ctx.agreement_conf.unresponsive_indexer_lookback_days(),
+        ctx.agreement_conf.non_accepting_test_interval_minutes(),
         *deployment_chain_id,
         &ctx.entity_count_cache,
     )
@@ -218,11 +239,13 @@ where
 
     // Cap the breaker's pool to indexers dipper could actually pay on this chain, so
     // the denominator matches the indexers the unresponsive numerator is drawn from.
-    let max_grt_per_30_days = ctx
-        .agreement_conf
-        .max_grt_per_30_days()
-        .get(&chain_name)
-        .copied();
+    let ceilings = PriceCeilings {
+        max_grt_per_30_days: Some(ctx.agreement_conf.max_grt_per_30_days_for(&chain_name)),
+        max_grt_per_billion_entities_per_30_days: Some(
+            ctx.agreement_conf
+                .max_grt_per_billion_entities_per_30_days(),
+        ),
+    };
 
     // Per-chain mass-unresponsive breaker: when a large fraction of this chain's
     // DIPs-accepting pool is unresponsive at once it's a dipper-side outage, so
@@ -230,7 +253,7 @@ where
     if !unresponsive.is_empty() {
         let snapshot = ctx
             .dips_accepting_cache
-            .get_or_fetch(&ctx.iisa, &chain_name, max_grt_per_30_days)
+            .get_or_fetch(&ctx.iisa, &chain_name, ceilings)
             .await;
         let suppress = ctx.unresponsive_breaker.evaluate(
             &chain_name,
@@ -247,12 +270,21 @@ where
                 "unresponsive breaker tripped; skipping this chain's unresponsive exclusion"
             );
         } else {
-            context.indexer_denylist.extend(unresponsive);
+            // Sent as declined, which only stops new offers. IISA drops a group member on the
+            // denylist, which would cancel an agreement it still serves.
+            let declined = context.declined_indexers.entry(*deployment_id).or_default();
+            for indexer in unresponsive {
+                if !declined.contains(&indexer) {
+                    declined.push(indexer);
+                }
+            }
         }
     }
 
     context.chain_id = Some(chain_name.clone());
-    context.max_grt_per_30_days = max_grt_per_30_days;
+    context.max_grt_per_30_days = ceilings.max_grt_per_30_days;
+    context.max_grt_per_billion_entities_per_30_days =
+        ceilings.max_grt_per_billion_entities_per_30_days;
 
     // Select the target group of indexers via IISA. If IISA is unreachable
     // we retry with exponential backoff rather than falling back to a
@@ -262,7 +294,7 @@ where
     // stall new requests until IISA recovers — see README "IISA dependency".
     let target_selected: Vec<SelectedIndexer> = match ctx
         .iisa
-        .select_indexers(*deployment_id, *num_candidates, &context)
+        .select_indexers(*deployment_id, num_candidates, &context)
         .await
     {
         Ok(indexers) => indexers,
@@ -276,13 +308,45 @@ where
                 Duration::from_secs(60),
             ));
         }
+        // Retried like an outage, not dropped: a rejection is usually fixed by a
+        // deploy (bad config, a rotated token, a version mismatch mid-rollout).
+        Err(err @ SelectionError::IisaRejected { .. }) => {
+            tracing::warn!(
+                event = "iisa_request_rejected",
+                indexing_request_id=%indexing_request_id,
+                error=%err,
+                "IISA rejected the selection request for reassessment, will retry"
+            );
+            return Err(JobError::Retryable(err.into(), Duration::from_secs(60)));
+        }
         Err(SelectionError::Error(e)) => return Err(JobError::Fatal(e)),
     };
 
-    // Build lookup maps: ID set for diffing, and pricing for new agreements
     let target_ids: HashSet<IndexerId> = target_selected.iter().map(|s| s.id).collect();
-    let target_pricing: HashMap<IndexerId, &SelectedIndexer> =
-        target_selected.iter().map(|s| (s.id, s)).collect();
+
+    // What dipper would offer each new pick. A pick it can't offer to takes no slot, and the
+    // old agreement it would have replaced stays, as for a withheld offer.
+    let fallback_prices = ctx.chain_price.get(deployment_chain_id);
+    let mut offers: HashMap<IndexerId, NewOffer> = HashMap::new();
+    let mut unofferable = 0u32;
+    for pick in target_selected
+        .iter()
+        .filter(|s| !current_ids.contains(&s.id) && !held.contains(&s.id))
+    {
+        match new_offer(
+            &ctx.network,
+            pick,
+            &ceilings,
+            fallback_prices,
+            deployment_chain_id,
+            indexing_request_id,
+        ) {
+            Some(offer) => {
+                offers.insert(pick.id, offer);
+            }
+            None => unofferable += 1,
+        }
+    }
 
     // Compute the diff. New offers fill only what the agreements kept and the held slots leave
     // of the target, in IISA's order, and never for an indexer holding a slot.
@@ -293,7 +357,7 @@ where
     let to_add: HashSet<&IndexerId> = target_selected
         .iter()
         .map(|s| &s.id)
-        .filter(|id| !current_ids.contains(*id) && !held.contains(*id))
+        .filter(|id| offers.contains_key(*id))
         .take(room)
         .collect();
 
@@ -301,7 +365,8 @@ where
     // "everyone is declined" apart from "we're already synced" without
     // cross-referencing IISA logs. `requested_num_candidates` vs
     // `iisa_returned_count` is the key diagnostic — a shortfall means
-    // IISA filtered candidates out (typically the declined/denylist sets).
+    // IISA filtered candidates out (typically the declined/denylist sets),
+    // and `unofferable_count` counts the picks dipper could not offer to.
     tracing::info!(
         indexing_request_id=%indexing_request_id,
         deployment_id=%deployment_id,
@@ -311,11 +376,13 @@ where
         current_active_count = current_ids.len(),
         to_add_count = to_add.len(),
         to_cancel_count = to_cancel.len(),
+        unofferable_count = unofferable,
         "reassessment diff computed"
     );
 
-    // Coverage-shortfall signal (transition-based). IISA returning fewer
-    // candidates than requested means the request cannot be fully covered. We
+    // Coverage-shortfall signal (transition-based). Fewer picks dipper can offer
+    // to than requested, because IISA returned fewer or some of its picks have no
+    // usable price or URL, means the request cannot be fully covered. We
     // fire `n_indexers_unavailable` ONCE, on the transition INTO shortfall, and
     // clear the latch on recovery -- so it covers the zero-available and
     // coverage-drop cases (which produce an empty diff and would otherwise be
@@ -323,7 +390,8 @@ where
     // persistently short request. The atomic latch update makes this retry-safe:
     // a re-run after a later failure sees the latch already set and does not
     // re-emit.
-    let in_shortfall = target_selected.len() < *num_candidates;
+    let offerable_picks = target_selected.len() - unofferable as usize;
+    let in_shortfall = offerable_picks < num_candidates;
     let shortfall_changed = ctx
         .registry
         .set_indexing_request_shortfall_active(indexing_request_id, in_shortfall)
@@ -342,8 +410,8 @@ where
                 *deployment_id,
                 ctx.signer.chain_id(),
                 proto::SubgraphIndexingAgreementNIndexersUnavailable {
-                    agreements_requested: *num_candidates as i32,
-                    candidates_returned: target_selected.len() as i32,
+                    agreements_requested: num_candidates as i32,
+                    candidates_returned: offerable_picks as i32,
                 },
             );
     }
@@ -403,8 +471,6 @@ where
         )
     };
 
-    let fallback_prices = ctx.chain_price.get(deployment_chain_id);
-
     // --- Add new agreements FIRST ---
     // We add before cancelling to prevent under-allocation. Old agreements
     // stay active until the chain_listener confirms the replacement is
@@ -434,43 +500,16 @@ where
     // 0x addresses of the indexers we successfully sent proposals to this cycle,
     // for the `proposed` lifecycle event emitted after the loop.
     let mut proposed_candidates: Vec<String> = vec![];
-    let mut add_failures = 0u32;
+    let mut add_failures = unofferable;
     let mut _pending_recorded = 0u32;
     for indexer_id in &capped_to_add {
-        let candidate = match ctx.network.get_indexer_by_id(indexer_id) {
-            Some(indexer) => indexer,
-            None => {
-                tracing::warn!(
-                    indexing_request_id=%indexing_request_id,
-                    indexer_id=%indexer_id,
-                    "IISA selected indexer not found in network topology, skipping"
-                );
-                continue;
-            }
-        };
-
-        // Use per-indexer pricing from IISA when available, otherwise fall back
-        // to the static pricing_table config
-        let selected = target_pricing
-            .get(indexer_id)
-            .expect("ID from to_add must exist in target_pricing");
-        let (tokens_per_second, tokens_per_entity_per_second) =
-            match super::selection_helpers::resolve_pricing(
-                selected,
-                fallback_prices,
-                deployment_chain_id,
-            ) {
-                Some(prices) => prices,
-                None => {
-                    tracing::warn!(
-                        indexing_request_id=%indexing_request_id,
-                        indexer_id=%indexer_id,
-                        "No pricing available, skipping indexer"
-                    );
-                    add_failures += 1;
-                    continue;
-                }
-            };
+        let NewOffer {
+            indexer: candidate,
+            tokens_per_second,
+            tokens_per_entity_per_second,
+        } = offers
+            .remove(indexer_id)
+            .expect("ID from to_add must have an offer");
 
         let terms_metadata = IndexingAgreementTermsMetadata {
             tokens_per_second,
@@ -726,6 +765,53 @@ where
     Ok(())
 }
 
+/// An indexer dipper can offer an agreement to, and the prices it would offer.
+struct NewOffer {
+    indexer: crate::network::provider::Indexer,
+    tokens_per_second: U256,
+    tokens_per_entity_per_second: U256,
+}
+
+/// The offer dipper would make to an IISA pick, or `None` (logged) when the pick isn't in the
+/// network topology or has no usable price: IISA's within `ceilings`, else the pricing_table.
+fn new_offer(
+    network: &NetworkProviderService,
+    pick: &SelectedIndexer,
+    ceilings: &PriceCeilings,
+    fallback_prices: Option<&IndexingAgreementChainPrices>,
+    deployment_chain_id: &ChainId,
+    indexing_request_id: &IndexingRequestId,
+) -> Option<NewOffer> {
+    let Some(indexer) = network.get_indexer_by_id(&pick.id) else {
+        tracing::warn!(
+            indexing_request_id=%indexing_request_id,
+            indexer_id=%pick.id,
+            "IISA selected indexer not found in network topology, skipping"
+        );
+        return None;
+    };
+    let Some((tokens_per_second, tokens_per_entity_per_second)) =
+        super::selection_helpers::resolve_pricing(
+            pick,
+            ceilings,
+            fallback_prices,
+            deployment_chain_id,
+        )
+    else {
+        tracing::warn!(
+            indexing_request_id=%indexing_request_id,
+            indexer_id=%pick.id,
+            "No usable pricing, skipping indexer"
+        );
+        return None;
+    };
+    Some(NewOffer {
+        indexer,
+        tokens_per_second,
+        tokens_per_entity_per_second,
+    })
+}
+
 /// Compute the EIP-712 terms hash persisted for the protocol-managed cancel
 /// path, reusing the proposal signer's RCA-to-sol conversion and signing-hash so
 /// the value matches the hash dipper signs over.
@@ -837,13 +923,15 @@ mod lifecycle_event_tests {
     //! emitted (and with which payloads), and that no others fire.
 
     use std::{
-        collections::HashMap,
+        collections::{BTreeMap, HashMap, HashSet},
         sync::{Arc, Mutex},
     };
 
     use async_trait::async_trait;
     use dipper_core::ids::{IndexingAgreementId, IndexingRequestId};
-    use dipper_iisa::{CandidateSelection, SelectedIndexer, SelectionContext, SelectionError};
+    use dipper_iisa::{
+        CandidateSelection, PriceCeilings, SelectedIndexer, SelectionContext, SelectionError,
+    };
     use dipper_rpc::indexer::indexer_client::sol::RecurringCollectionAgreement;
     use thegraph_core::{
         DeploymentId, IndexerId,
@@ -855,10 +943,10 @@ mod lifecycle_event_tests {
     use time::OffsetDateTime;
     use url::Url;
 
-    use super::{Ctx, Message, handle};
+    use super::{Ctx, JobError, JobResult, Message, handle};
     use crate::{
         chain_client::{AgreementOnChain, ChainClient, ChainClientError},
-        config::IndexingAgreementConfig,
+        config::{IndexingAgreementChainPrices, IndexingAgreementConfig},
         network::{
             provider::NetworkProviderService,
             service::{
@@ -869,8 +957,9 @@ mod lifecycle_event_tests {
         registry::{
             AgreementFeeRate, Indexer, IndexerDenylistRegistry, IndexingAgreement,
             IndexingAgreementStatus, IndexingAgreementTerms, IndexingAgreementTermsMetadata,
-            IndexingRequest, IndexingRequestRegistry, NewAgreementParams, PendingCancellation,
-            PendingCancellationRegistry, Result as RegistryResult, SetTargetOutcome,
+            IndexingRequest, IndexingRequestRegistry, IndexingRequestStatus, NewAgreementParams,
+            PendingCancellation, PendingCancellationRegistry, Result as RegistryResult,
+            SetTargetOutcome, WithheldIndexers,
         },
         signing::eip712::Eip712Signer,
         test_support::{CapturedEvent, CapturingEventsProducer},
@@ -895,9 +984,18 @@ mod lifecycle_event_tests {
 
     // ---- Mock: IISA candidate selection -------------------------------------
 
-    /// Returns a fixed list of [`SelectedIndexer`], at most as many as asked for.
+    /// Returns a fixed list of [`SelectedIndexer`], at most as many as asked for, and
+    /// records every selection context and DIPs-accepting price ceiling it receives.
+    #[derive(Default)]
     struct MockIisa {
         selected: Vec<SelectedIndexer>,
+        /// When set, selection is refused with this HTTP status and response body.
+        rejects_with: Option<(u16, &'static str)>,
+        contexts: Arc<Mutex<Vec<SelectionContext>>>,
+        dips_ceilings: Arc<Mutex<Vec<PriceCeilings>>>,
+        /// The chain's DIPs-accepting pool, reported as just computed. Empty reports no
+        /// scores loaded, which leaves the unresponsive breaker inactive.
+        dips_pool: Vec<IndexerId>,
     }
 
     #[async_trait]
@@ -906,19 +1004,32 @@ mod lifecycle_event_tests {
             &self,
             _deployment_id: DeploymentId,
             num_candidates: usize,
-            _context: &SelectionContext,
+            context: &SelectionContext,
         ) -> std::result::Result<Vec<SelectedIndexer>, SelectionError> {
+            self.contexts.lock().unwrap().push(context.clone());
+            if let Some((status, body)) = self.rejects_with {
+                return Err(SelectionError::IisaRejected {
+                    status,
+                    body: body.to_string(),
+                });
+            }
             Ok(self.selected.iter().take(num_candidates).cloned().collect())
         }
 
         async fn dips_accepting_indexers(
             &self,
             _chain: &str,
-            _max_grt_per_30_days: Option<f64>,
+            ceilings: PriceCeilings,
         ) -> std::result::Result<dipper_iisa::DipsAcceptingSnapshot, SelectionError> {
+            self.dips_ceilings.lock().unwrap().push(ceilings);
+            let computed_at = (!self.dips_pool.is_empty()).then(|| {
+                time::OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap()
+            });
             Ok(dipper_iisa::DipsAcceptingSnapshot {
-                computed_at: None,
-                indexers: Vec::new(),
+                computed_at,
+                indexers: self.dips_pool.clone(),
             })
         }
     }
@@ -1074,6 +1185,13 @@ mod lifecycle_event_tests {
         marked_cancelling: Arc<Mutex<Vec<IndexingAgreementId>>>,
         /// Indexers holding a slot with an agreement they stopped serving.
         held: Vec<IndexerId>,
+        /// Indexers reported as recently unresponsive, which wakes the breaker.
+        unresponsive: Vec<IndexerId>,
+        /// Indexers reported as having stopped accepting offers, and how many were offered to.
+        withheld: Vec<IndexerId>,
+        offered: usize,
+        /// The stored request the job reads its target from.
+        request: Option<IndexingRequest>,
     }
 
     #[async_trait]
@@ -1092,9 +1210,9 @@ mod lifecycle_event_tests {
         }
         async fn get_indexing_request_by_id(
             &self,
-            _id: &IndexingRequestId,
+            id: &IndexingRequestId,
         ) -> RegistryResult<Option<IndexingRequest>> {
-            unimplemented!()
+            Ok(self.request.clone().filter(|request| request.id == *id))
         }
         async fn get_indexing_requests_by_deployment_id(
             &self,
@@ -1107,6 +1225,13 @@ mod lifecycle_event_tests {
             _min_age_seconds: i64,
             _batch_size: i64,
         ) -> RegistryResult<Vec<IndexingRequest>> {
+            unimplemented!()
+        }
+        async fn get_short_requests_on_deployments_with_ended_agreements(
+            &self,
+            _since_seconds: i64,
+            _batch_size: i64,
+        ) -> crate::registry::Result<Vec<crate::registry::IndexingRequest>> {
             unimplemented!()
         }
         async fn set_indexing_request_shortfall_active(
@@ -1185,7 +1310,16 @@ mod lifecycle_event_tests {
             _lookback_days: i32,
             _chain_id: ChainId,
         ) -> RegistryResult<Vec<IndexerId>> {
-            Ok(Vec::new())
+            Ok(self.unresponsive.clone())
+        }
+        async fn get_indexers_to_withhold_offers_from(
+            &self,
+            _test_interval_minutes: i32,
+        ) -> RegistryResult<WithheldIndexers> {
+            Ok(WithheldIndexers {
+                indexers: self.withheld.clone(),
+                offered: self.offered,
+            })
         }
         async fn count_created_agreements_by_indexer(
             &self,
@@ -1301,6 +1435,11 @@ mod lifecycle_event_tests {
             price_rejection_lookback_days: 1,
             transient_rejection_lookback_minutes: 30,
             uncertain_rejection_lookback_days: 1,
+            max_grt_per_30_days: std::collections::BTreeMap::from([(
+                "test-chain".to_string(),
+                450.0,
+            )]),
+            max_grt_per_billion_entities_per_30_days: 2000.0,
             ..IndexingAgreementConfig::for_tests()
         }
     }
@@ -1368,13 +1507,105 @@ mod lifecycle_event_tests {
         }
     }
 
-    fn test_message(num_candidates: usize) -> Message {
+    /// The job queued for `request`, carrying the count it had then, as callers queue it.
+    fn test_message(request: &IndexingRequest) -> Message {
         Message {
-            indexing_request_id: IndexingRequestId::new(),
+            indexing_request_id: request.id,
+            deployment_id: deployment(),
+            deployment_chain_id: TEST_DEPLOYMENT_CHAIN_ID,
+            num_candidates: request.num_candidates,
+        }
+    }
+
+    /// A stored request wanting `num_candidates` indexers, or a cancelled one for 0, since
+    /// cancelling is how a request's target reaches zero.
+    fn stored_request(num_candidates: usize) -> IndexingRequest {
+        IndexingRequest {
+            id: IndexingRequestId::new(),
+            created_at: OffsetDateTime::now_utc(),
+            updated_at: OffsetDateTime::now_utc(),
+            status: if num_candidates == 0 {
+                IndexingRequestStatus::Canceled
+            } else {
+                IndexingRequestStatus::Open
+            },
+            requested_by: Address::ZERO,
             deployment_id: deployment(),
             deployment_chain_id: TEST_DEPLOYMENT_CHAIN_ID,
             num_candidates,
         }
+    }
+
+    /// Run the handler for a request whose stored target is `num_candidates`.
+    async fn run(
+        mut ctx: Ctx<MockRegistry, MockQueue, MockIisa, MockChainClient>,
+        num_candidates: usize,
+    ) -> JobResult<()> {
+        let request = stored_request(num_candidates);
+        let message = test_message(&request);
+        ctx.registry.request = Some(request);
+        handle(ctx, &message).await
+    }
+
+    /// A context whose IISA picks `picked`, with `picked` reachable, plus the queue it offers on.
+    fn ctx_picking(
+        picked: IndexerId,
+    ) -> (
+        Ctx<MockRegistry, MockQueue, MockIisa, MockChainClient>,
+        MockQueue,
+    ) {
+        let mut snapshot = indexer_urls::Snapshot::new();
+        snapshot.insert(picked, url_of(picked));
+        let queue = MockQueue::default();
+        let ctx = build_ctx(
+            MockRegistry::default(),
+            MockIisa {
+                selected: vec![selected(picked)],
+                ..Default::default()
+            },
+            queue.clone(),
+            MockChainClient::default(),
+            CapturingEventsProducer::new(),
+            snapshot,
+        );
+        (ctx, queue)
+    }
+
+    /// A job queued while its request wanted indexers but run after the request was cancelled
+    /// makes no offers, so a burst of target changes settles on the last one.
+    #[tokio::test]
+    async fn a_job_for_a_request_since_cancelled_makes_no_offers() {
+        let (mut ctx, queue) = ctx_picking(indexer_id(0x81));
+        let mut request = stored_request(2);
+        let queued_while_open = test_message(&request);
+        request.status = IndexingRequestStatus::Canceled;
+        ctx.registry.request = Some(request);
+
+        handle(ctx, &queued_while_open).await.expect("handler ok");
+
+        assert!(queue.proposals.lock().unwrap().is_empty());
+    }
+
+    /// The same job for a request that is still open makes its offer, which shows the test above
+    /// passes because the request was cancelled, not because nothing could be offered.
+    #[tokio::test]
+    async fn a_job_for_an_open_request_makes_its_offers() {
+        let (ctx, queue) = ctx_picking(indexer_id(0x81));
+
+        run(ctx, 1).await.expect("handler ok");
+
+        assert_eq!(queue.proposals.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_job_for_a_missing_request_does_nothing() {
+        let (ctx, queue) = ctx_picking(indexer_id(0x81));
+
+        handle(ctx, &test_message(&stored_request(1)))
+            .await
+            .expect("handler ok");
+
+        assert!(queue.proposals.lock().unwrap().is_empty());
     }
 
     /// Build an active agreement for `indexer` in the given status.
@@ -1427,6 +1658,486 @@ mod lifecycle_event_tests {
         }
     }
 
+    // ---- Scenario 0: price ceilings reach IISA ------------------------------
+
+    #[tokio::test]
+    async fn sends_per_entity_price_ceiling_to_iisa() {
+        let iisa = MockIisa::default();
+        let contexts = Arc::clone(&iisa.contexts);
+        let ctx = build_ctx(
+            MockRegistry::default(),
+            iisa,
+            MockQueue::default(),
+            MockChainClient::default(),
+            CapturingEventsProducer::new(),
+            indexer_urls::Snapshot::new(),
+        );
+
+        run(ctx, 1).await.expect("handler ok");
+
+        let contexts = contexts.lock().unwrap();
+        assert_eq!(contexts.len(), 1, "IISA asked once: {contexts:?}");
+        assert_eq!(
+            contexts[0].max_grt_per_billion_entities_per_30_days,
+            Some(2000.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn sends_the_fallback_base_price_ceiling_for_a_chain_without_its_own() {
+        let iisa = MockIisa::default();
+        let contexts = Arc::clone(&iisa.contexts);
+        let mut ctx = build_ctx(
+            MockRegistry::default(),
+            iisa,
+            MockQueue::default(),
+            MockChainClient::default(),
+            CapturingEventsProducer::new(),
+            indexer_urls::Snapshot::new(),
+        );
+        ctx.agreement_conf = Arc::new(IndexingAgreementConfig {
+            max_grt_per_30_days: std::collections::BTreeMap::from([(
+                "other-chain".to_string(),
+                450.0,
+            )]),
+            fallback_max_grt_per_30_days: 900.0,
+            ..test_agreement_conf()
+        });
+
+        run(ctx, 1).await.expect("handler ok");
+
+        let contexts = contexts.lock().unwrap();
+        assert_eq!(contexts.len(), 1, "IISA asked once: {contexts:?}");
+        assert_eq!(contexts[0].max_grt_per_30_days, Some(900.0));
+    }
+
+    #[tokio::test]
+    async fn sends_both_price_ceilings_to_the_breaker_pool_lookup() {
+        // The breaker's pool must be priced like selection, so its lookup carries
+        // the same 2 ceilings. An unresponsive indexer wakes the breaker.
+        let iisa = MockIisa::default();
+        let dips_ceilings = Arc::clone(&iisa.dips_ceilings);
+        let ctx = build_ctx(
+            MockRegistry {
+                unresponsive: vec![indexer_id(0x31)],
+                ..Default::default()
+            },
+            iisa,
+            MockQueue::default(),
+            MockChainClient::default(),
+            CapturingEventsProducer::new(),
+            indexer_urls::Snapshot::new(),
+        );
+
+        run(ctx, 1).await.expect("handler ok");
+
+        assert_eq!(
+            *dips_ceilings.lock().unwrap(),
+            vec![PriceCeilings {
+                max_grt_per_30_days: Some(450.0),
+                max_grt_per_billion_entities_per_30_days: Some(2000.0),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn sends_indexers_that_missed_an_offer_as_declined_not_denylisted() {
+        // IISA drops a group member on the denylist, which cancels its agreement here, so a
+        // missed offer only stops new offers, for members and outsiders alike.
+        let member = indexer_id(0x40);
+        let outsider = indexer_id(0x41);
+        let iisa = MockIisa::default();
+        let contexts = Arc::clone(&iisa.contexts);
+        let ctx = build_ctx(
+            MockRegistry {
+                active_agreements: vec![agreement(
+                    member,
+                    IndexingAgreementStatus::AcceptedOnChain,
+                )],
+                unresponsive: vec![member, outsider],
+                ..Default::default()
+            },
+            iisa,
+            MockQueue::default(),
+            MockChainClient::default(),
+            CapturingEventsProducer::new(),
+            indexer_urls::Snapshot::new(),
+        );
+
+        run(ctx, 1).await.expect("handler ok");
+
+        let contexts = contexts.lock().unwrap();
+        assert_eq!(contexts.len(), 1, "IISA asked once: {contexts:?}");
+        assert_eq!(contexts[0].existing_indexers, vec![member]);
+        assert!(contexts[0].indexer_denylist.is_empty());
+        let declined: Vec<_> = contexts[0].declined_indexers.values().flatten().collect();
+        assert_eq!(declined, vec![&member, &outsider]);
+    }
+
+    #[tokio::test]
+    async fn sends_indexers_that_stopped_accepting_offers_as_declined_not_denylisted() {
+        // A member that stopped accepting new offers may still serve the agreement it holds, which
+        // a denylisting would cancel, so it and an outsider are only kept from new offers.
+        let member = indexer_id(0x60);
+        let outsider = indexer_id(0x61);
+        let iisa = MockIisa::default();
+        let contexts = Arc::clone(&iisa.contexts);
+        let ctx = build_ctx(
+            MockRegistry {
+                active_agreements: vec![agreement(
+                    member,
+                    IndexingAgreementStatus::AcceptedOnChain,
+                )],
+                withheld: vec![member, outsider],
+                offered: 10,
+                ..Default::default()
+            },
+            iisa,
+            MockQueue::default(),
+            MockChainClient::default(),
+            CapturingEventsProducer::new(),
+            indexer_urls::Snapshot::new(),
+        );
+
+        run(ctx, 1).await.expect("handler ok");
+
+        let contexts = contexts.lock().unwrap();
+        assert_eq!(contexts.len(), 1, "IISA asked once: {contexts:?}");
+        assert_eq!(contexts[0].existing_indexers, vec![member]);
+        assert!(contexts[0].indexer_denylist.is_empty());
+        let declined: Vec<_> = contexts[0].declined_indexers.values().flatten().collect();
+        assert_eq!(declined, vec![&member, &outsider]);
+    }
+
+    #[tokio::test]
+    async fn holds_back_no_one_when_half_of_those_offered_to_stopped_accepting() {
+        // That many at once points at dipper, such as a short escrow or a stalled chain reader.
+        let iisa = MockIisa::default();
+        let contexts = Arc::clone(&iisa.contexts);
+        let ctx = build_ctx(
+            MockRegistry {
+                withheld: vec![indexer_id(0x62), indexer_id(0x63)],
+                offered: 4,
+                ..Default::default()
+            },
+            iisa,
+            MockQueue::default(),
+            MockChainClient::default(),
+            CapturingEventsProducer::new(),
+            indexer_urls::Snapshot::new(),
+        );
+
+        run(ctx, 1).await.expect("handler ok");
+
+        let contexts = contexts.lock().unwrap();
+        assert_eq!(contexts.len(), 1, "IISA asked once: {contexts:?}");
+        assert!(contexts[0].indexer_denylist.is_empty());
+        let declined: Vec<_> = contexts[0].declined_indexers.values().flatten().collect();
+        assert!(declined.is_empty(), "{declined:?}");
+    }
+
+    #[tokio::test]
+    async fn holds_back_no_unresponsive_indexer_while_the_breaker_is_tripped() {
+        // 2 of the chain's 3 DIPs-accepting indexers stopped replying at once, which points at
+        // dipper rather than at them, so neither is held back from new offers.
+        let unresponsive = vec![indexer_id(0x50), indexer_id(0x51)];
+        let iisa = MockIisa {
+            dips_pool: vec![indexer_id(0x50), indexer_id(0x51), indexer_id(0x52)],
+            ..Default::default()
+        };
+        let contexts = Arc::clone(&iisa.contexts);
+        let ctx = build_ctx(
+            MockRegistry {
+                unresponsive,
+                ..Default::default()
+            },
+            iisa,
+            MockQueue::default(),
+            MockChainClient::default(),
+            CapturingEventsProducer::new(),
+            indexer_urls::Snapshot::new(),
+        );
+
+        run(ctx, 1).await.expect("handler ok");
+
+        let contexts = contexts.lock().unwrap();
+        assert_eq!(contexts.len(), 1, "IISA asked once: {contexts:?}");
+        assert!(contexts[0].indexer_denylist.is_empty());
+        let declined: Vec<_> = contexts[0].declined_indexers.values().flatten().collect();
+        assert!(declined.is_empty(), "{declined:?}");
+    }
+
+    #[tokio::test]
+    async fn retries_a_rejected_selection_after_60_seconds_and_says_it_was_rejected() {
+        // A rejection is usually fixed by a deploy, so the job must stay queued
+        // (a fatal error would drop it) and the log must not blame an outage.
+        let ctx = build_ctx(
+            MockRegistry::default(),
+            MockIisa {
+                rejects_with: Some((422, r#"{"detail":"num_candidates must be positive"}"#)),
+                ..Default::default()
+            },
+            MockQueue::default(),
+            MockChainClient::default(),
+            CapturingEventsProducer::new(),
+            indexer_urls::Snapshot::new(),
+        );
+
+        let mut result = None;
+        let logs = crate::test_support::logged(async {
+            result = Some(run(ctx, 1).await);
+        })
+        .await;
+
+        match result.unwrap() {
+            Err(JobError::Retryable(err, delay)) => {
+                assert_eq!(delay, std::time::Duration::from_secs(60));
+                assert!(
+                    matches!(
+                        err.downcast_ref::<SelectionError>(),
+                        Some(SelectionError::IisaRejected { status: 422, .. })
+                    ),
+                    "not a rejection: {err:?}"
+                );
+            }
+            other => panic!("expected a 60-second retry, got {other:?}"),
+        }
+        assert!(
+            logs.contains("IISA rejected the selection request"),
+            "{logs}"
+        );
+        assert!(logs.contains("num_candidates must be positive"), "{logs}");
+        assert!(logs.contains("iisa_request_rejected"), "{logs}");
+        assert!(!logs.contains("unavailable"), "{logs}");
+    }
+
+    // ---- Scenario 0b: dipper checks IISA's prices against its own caps ------
+
+    fn priced(id: IndexerId, base: f64, per_entity: f64) -> SelectedIndexer {
+        SelectedIndexer {
+            id,
+            min_grt_per_30_days: Some(base),
+            min_grt_per_billion_entities_per_30_days: Some(per_entity),
+        }
+    }
+
+    fn url_of(id: IndexerId) -> Url {
+        Url::parse(&format!("https://{id}.example")).unwrap()
+    }
+
+    /// Reassess a request for every indexer IISA returns, each at its own URL, with
+    /// `fallback` as the chain's pricing_table entry. Returns the URLs offered and the logs.
+    async fn offers_and_logs(
+        selected: Vec<SelectedIndexer>,
+        fallback: Option<IndexingAgreementChainPrices>,
+    ) -> (HashSet<Url>, String) {
+        let mut snapshot = indexer_urls::Snapshot::new();
+        for indexer in &selected {
+            snapshot.insert(indexer.id, url_of(indexer.id));
+        }
+        let request = stored_request(selected.len());
+        let message = test_message(&request);
+        let queue = MockQueue::default();
+        let mut ctx = build_ctx(
+            MockRegistry::default(),
+            MockIisa {
+                selected,
+                ..Default::default()
+            },
+            queue.clone(),
+            MockChainClient::default(),
+            CapturingEventsProducer::new(),
+            snapshot,
+        );
+        ctx.registry.request = Some(request);
+        if let Some(prices) = fallback {
+            ctx.chain_price = Arc::new(BTreeMap::from([(TEST_DEPLOYMENT_CHAIN_ID, prices)]));
+        }
+
+        let logs = crate::test_support::logged(async {
+            handle(ctx, &message).await.expect("handler ok");
+        })
+        .await;
+        let offered = queue.proposals.lock().unwrap().iter().cloned().collect();
+        (offered, logs)
+    }
+
+    /// The log line that names `id`, which must also name every text in `expected`.
+    fn assert_logged(logs: &str, id: IndexerId, expected: &[&str]) {
+        let id = id.to_string();
+        let line = logs
+            .lines()
+            .find(|line| line.contains(&id))
+            .unwrap_or_else(|| panic!("nothing logged for {id}: {logs}"));
+        for text in expected {
+            assert!(line.contains(text), "{text} missing from: {line}");
+        }
+    }
+
+    #[tokio::test]
+    async fn skips_an_indexer_iisa_prices_above_a_cap() {
+        // An older, rolled-back or faulty IISA may not drop these. The test caps are
+        // 450 GRT per 30 days and 2,000 GRT per billion entities, and a price equal to one passes.
+        let within = indexer_id(0x41);
+        let base_over = indexer_id(0x42);
+        let entity_over = indexer_id(0x43);
+
+        let (offered, logs) = offers_and_logs(
+            vec![
+                priced(within, 450.0, 2000.0),
+                priced(base_over, 450.5, 1.0),
+                priced(entity_over, 100.0, 2000.5),
+            ],
+            None,
+        )
+        .await;
+
+        assert_eq!(offered, HashSet::from([url_of(within)]), "{logs}");
+        assert_logged(&logs, base_over, &["WARN", "450.5", "Some(450.0)"]);
+        assert_logged(&logs, entity_over, &["WARN", "2000.5", "Some(2000.0)"]);
+        assert!(logs.contains("add_failures=2"), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn skips_an_indexer_iisa_prices_below_zero_or_not_as_a_number() {
+        // Turned into wei as they stand, these prices would become offers at 0 GRT.
+        let within = indexer_id(0x51);
+        let refused = [
+            priced(indexer_id(0x52), -1.0, 1.0),
+            priced(indexer_id(0x53), f64::NAN, 1.0),
+            priced(indexer_id(0x54), 100.0, -1.0),
+            priced(indexer_id(0x55), 100.0, f64::NAN),
+        ];
+        let mut selected = vec![priced(within, 100.0, 1.0)];
+        selected.extend(refused.iter().cloned());
+
+        let (offered, logs) = offers_and_logs(selected, None).await;
+
+        assert_eq!(offered, HashSet::from([url_of(within)]), "{logs}");
+        for (indexer, price) in refused.iter().zip(["-1", "NaN", "-1", "NaN"]) {
+            assert_logged(&logs, indexer.id, &["WARN", price]);
+        }
+        assert!(logs.contains("add_failures=4"), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn offers_a_pricing_table_price_without_checking_it_against_the_caps() {
+        // The pricing_table is dipper's own config, used for an indexer IISA has no price for.
+        let unpriced = SelectedIndexer {
+            id: indexer_id(0x61),
+            min_grt_per_30_days: None,
+            min_grt_per_billion_entities_per_30_days: None,
+        };
+        // 1 GRT a second, far above the 450 GRT per 30 days cap.
+        let fallback = IndexingAgreementChainPrices {
+            tokens_per_second: U256::from(10u128.pow(18)),
+            tokens_per_entity_per_second: U256::ZERO,
+        };
+
+        let (offered, logs) = offers_and_logs(vec![unpriced.clone()], Some(fallback)).await;
+
+        assert_eq!(offered, HashSet::from([url_of(unpriced.id)]), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn keeps_the_agreement_an_offer_dipper_cannot_make_would_have_replaced() {
+        // IISA swaps `leaving` for an indexer dipper can't offer to. With nothing taking its
+        // place, cancelling `leaving` would leave the request 1 agreement short.
+        let unpriced = SelectedIndexer {
+            min_grt_per_30_days: None,
+            min_grt_per_billion_entities_per_30_days: None,
+            ..selected(indexer_id(0x73))
+        };
+        let cases = [
+            (
+                "over the per-entity cap",
+                priced(indexer_id(0x73), 100.0, 2000.5),
+                true,
+            ),
+            (
+                "not in the network topology",
+                selected(indexer_id(0x73)),
+                false,
+            ),
+            ("without any price", unpriced, true),
+        ];
+        for (case, replacement, in_topology) in cases {
+            let staying = indexer_id(0x71);
+            let mut snapshot = indexer_urls::Snapshot::new();
+            if in_topology {
+                snapshot.insert(replacement.id, url_of(replacement.id));
+            }
+            let registry = MockRegistry {
+                active_agreements: vec![
+                    agreement(staying, IndexingAgreementStatus::AcceptedOnChain),
+                    agreement(indexer_id(0x72), IndexingAgreementStatus::AcceptedOnChain),
+                ],
+                ..Default::default()
+            };
+            let cancelling = Arc::clone(&registry.marked_cancelling);
+            let cancelled = Arc::clone(&registry.marked_cancelled);
+            let queue = MockQueue::default();
+            let chain = MockChainClient::default();
+            let ctx = build_ctx(
+                registry,
+                MockIisa {
+                    selected: vec![selected(staying), replacement],
+                    ..Default::default()
+                },
+                queue.clone(),
+                chain.clone(),
+                CapturingEventsProducer::new(),
+                snapshot,
+            );
+
+            run(ctx, 2).await.expect("handler ok");
+
+            assert!(queue.proposals.lock().unwrap().is_empty(), "{case}");
+            assert!(chain.cancelled.lock().unwrap().is_empty(), "{case}");
+            assert!(cancelling.lock().unwrap().is_empty(), "{case}");
+            assert!(cancelled.lock().unwrap().is_empty(), "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn signals_a_shortfall_when_dipper_cannot_offer_to_every_iisa_pick() {
+        // IISA returns as many as asked for, but 1 is priced over a cap, so the request can only
+        // be part covered while IISA keeps picking it.
+        let within = indexer_id(0x81);
+        let refused = indexer_id(0x82);
+        let mut snapshot = indexer_urls::Snapshot::new();
+        snapshot.insert(within, url_of(within));
+        snapshot.insert(refused, url_of(refused));
+        let events = CapturingEventsProducer::new();
+        let queue = MockQueue::default();
+        let ctx = build_ctx(
+            MockRegistry::default(),
+            MockIisa {
+                selected: vec![selected(within), priced(refused, 100.0, 2000.5)],
+                ..Default::default()
+            },
+            queue.clone(),
+            MockChainClient::default(),
+            events.clone(),
+            snapshot,
+        );
+
+        run(ctx, 2).await.expect("handler ok");
+
+        let captured = events.events();
+        let unavailable: Vec<_> = captured
+            .iter()
+            .filter_map(|e| match e {
+                CapturedEvent::NIndexersUnavailable { event, .. } => Some(event),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(unavailable.len(), 1, "{captured:?}");
+        assert_eq!(unavailable[0].agreements_requested, 2);
+        assert_eq!(unavailable[0].candidates_returned, 1);
+        assert_eq!(*queue.proposals.lock().unwrap(), vec![url_of(within)]);
+    }
+
     // ---- Scenario 1: n_indexers_unavailable ---------------------------------
 
     #[tokio::test]
@@ -1444,6 +2155,7 @@ mod lifecycle_event_tests {
             MockRegistry::default(),
             MockIisa {
                 selected: vec![selected(new_idx)],
+                ..Default::default()
             },
             MockQueue::default(),
             MockChainClient::default(),
@@ -1451,7 +2163,7 @@ mod lifecycle_event_tests {
             snapshot,
         );
 
-        handle(ctx, &test_message(3)).await.expect("handler ok");
+        run(ctx, 3).await.expect("handler ok");
 
         let captured = events.events();
         let unavailable: Vec<_> = captured
@@ -1497,6 +2209,7 @@ mod lifecycle_event_tests {
             },
             MockIisa {
                 selected: vec![selected(new_idx)],
+                ..Default::default()
             },
             MockQueue::default(),
             MockChainClient::default(),
@@ -1507,7 +2220,7 @@ mod lifecycle_event_tests {
         ctx.chain_listener_chain_id = Some(1337);
 
         // Request 3, IISA returns 1: enters shortfall. The clock read then fails.
-        let result = handle(ctx, &test_message(3)).await;
+        let result = run(ctx, 3).await;
 
         assert!(
             result.is_err(),
@@ -1542,11 +2255,16 @@ mod lifecycle_event_tests {
             marked_cancelled: Arc::default(),
             marked_cancelling: Arc::default(),
             held: Vec::new(),
+            unresponsive: Vec::new(),
+            withheld: Vec::new(),
+            offered: 0,
+            request: None,
         };
         let ctx = build_ctx(
             registry,
             MockIisa {
                 selected: vec![selected(idx)],
+                ..Default::default()
             },
             MockQueue::default(),
             MockChainClient::default(),
@@ -1556,7 +2274,7 @@ mod lifecycle_event_tests {
 
         // Request 3, IISA returns 1: still short, synced (empty diff). The latch is
         // already set, so no re-emit.
-        handle(ctx, &test_message(3)).await.expect("handler ok");
+        run(ctx, 3).await.expect("handler ok");
 
         assert!(
             events.events().is_empty(),
@@ -1581,11 +2299,16 @@ mod lifecycle_event_tests {
             marked_cancelled: Arc::default(),
             marked_cancelling: Arc::default(),
             held: Vec::new(),
+            unresponsive: Vec::new(),
+            withheld: Vec::new(),
+            offered: 0,
+            request: None,
         };
         let ctx = build_ctx(
             registry,
             MockIisa {
                 selected: vec![selected(idx)],
+                ..Default::default()
             },
             MockQueue::default(),
             MockChainClient::default(),
@@ -1593,7 +2316,7 @@ mod lifecycle_event_tests {
             indexer_urls::Snapshot::new(),
         );
 
-        handle(ctx, &test_message(1)).await.expect("handler ok");
+        run(ctx, 1).await.expect("handler ok");
 
         assert!(
             events.events().is_empty(),
@@ -1610,15 +2333,18 @@ mod lifecycle_event_tests {
         // entering shortfall regardless of the empty diff.
         let events = CapturingEventsProducer::new();
         let ctx = build_ctx(
-            MockRegistry::default(),       // no current agreements, latch false
-            MockIisa { selected: vec![] }, // zero available
+            MockRegistry::default(), // no current agreements, latch false
+            MockIisa {
+                selected: vec![],
+                ..Default::default()
+            }, // zero available
             MockQueue::default(),
             MockChainClient::default(),
             events.clone(),
             indexer_urls::Snapshot::new(),
         );
 
-        handle(ctx, &test_message(3)).await.expect("handler ok");
+        run(ctx, 3).await.expect("handler ok");
 
         let captured = events.events();
         let unavailable: Vec<_> = captured
@@ -1656,6 +2382,7 @@ mod lifecycle_event_tests {
             },
             MockIisa {
                 selected: candidates.iter().copied().map(selected).collect(),
+                ..Default::default()
             },
             queue.clone(),
             MockChainClient::default(),
@@ -1663,7 +2390,7 @@ mod lifecycle_event_tests {
             snapshot,
         );
 
-        handle(ctx, &test_message(3)).await.expect("handler ok");
+        run(ctx, 3).await.expect("handler ok");
 
         let proposed: std::collections::HashSet<Url> =
             queue.proposals.lock().unwrap().iter().cloned().collect();
@@ -1690,6 +2417,7 @@ mod lifecycle_event_tests {
             registry,
             MockIisa {
                 selected: vec![selected(healthy)],
+                ..Default::default()
             },
             queue.clone(),
             chain_client.clone(),
@@ -1697,7 +2425,7 @@ mod lifecycle_event_tests {
             indexer_urls::Snapshot::new(),
         );
 
-        handle(ctx, &test_message(1)).await.expect("handler ok");
+        run(ctx, 1).await.expect("handler ok");
 
         assert!(chain_client.cancelled.lock().unwrap().is_empty());
         assert!(marked_cancelling.lock().unwrap().is_empty());
@@ -1721,17 +2449,24 @@ mod lifecycle_event_tests {
             marked_cancelled: Arc::default(),
             marked_cancelling: Arc::default(),
             held: Vec::new(),
+            unresponsive: Vec::new(),
+            withheld: Vec::new(),
+            offered: 0,
+            request: None,
         };
         let ctx = build_ctx(
             registry,
-            MockIisa { selected: vec![] }, // IISA returns nothing -> coverage drops
+            MockIisa {
+                selected: vec![],
+                ..Default::default()
+            }, // IISA returns nothing -> coverage drops
             MockQueue::default(),
             MockChainClient::default(),
             events.clone(),
             indexer_urls::Snapshot::new(),
         );
 
-        handle(ctx, &test_message(3)).await.expect("handler ok");
+        run(ctx, 3).await.expect("handler ok");
 
         let unavailable = events
             .events()
@@ -1777,11 +2512,16 @@ mod lifecycle_event_tests {
             marked_cancelled: Arc::default(),
             marked_cancelling: Arc::default(),
             held: Vec::new(),
+            unresponsive: Vec::new(),
+            withheld: Vec::new(),
+            offered: 0,
+            request: None,
         };
         let ctx = build_ctx(
             registry,
             MockIisa {
                 selected: vec![selected(new_idx)],
+                ..Default::default()
             },
             queue.clone(),
             MockChainClient::default(),
@@ -1790,7 +2530,7 @@ mod lifecycle_event_tests {
         );
 
         // Request size 1 == returned 1, so no shortfall event.
-        handle(ctx, &test_message(1)).await.expect("handler ok");
+        run(ctx, 1).await.expect("handler ok");
 
         let captured = events.events();
         let proposed: Vec<_> = captured
@@ -1843,11 +2583,16 @@ mod lifecycle_event_tests {
             marked_cancelled: Arc::default(),
             marked_cancelling: Arc::default(),
             held: Vec::new(),
+            unresponsive: Vec::new(),
+            withheld: Vec::new(),
+            offered: 0,
+            request: None,
         };
         let ctx = build_ctx(
             registry,
             MockIisa {
                 selected: vec![selected(new_idx)],
+                ..Default::default()
             },
             MockQueue::default(),
             MockChainClient::default(),
@@ -1855,7 +2600,7 @@ mod lifecycle_event_tests {
             snapshot,
         );
 
-        handle(ctx, &test_message(1)).await.expect("handler ok");
+        run(ctx, 1).await.expect("handler ok");
 
         let captured = events.events();
         assert_eq!(
@@ -1880,7 +2625,10 @@ mod lifecycle_event_tests {
                 active_agreements: vec![leaving.clone()],
                 ..MockRegistry::default()
             },
-            MockIisa { selected: vec![] },
+            MockIisa {
+                selected: vec![],
+                ..Default::default()
+            },
             MockQueue::default(),
             MockChainClient::default(),
             CapturingEventsProducer::new(),
@@ -1899,7 +2647,7 @@ mod lifecycle_event_tests {
         let chain = ctx.chain_client.clone();
         let cancelled = ctx.registry.marked_cancelled.clone();
 
-        let result = handle(ctx, &test_message(0)).await;
+        let result = run(ctx, 0).await;
 
         assert!(result.is_ok(), "got {result:?}");
         assert_eq!(
@@ -1919,7 +2667,7 @@ mod lifecycle_event_tests {
         let chain = ctx.chain_client.clone();
         let marked = ctx.registry.marked_cancelling.clone();
 
-        let result = handle(ctx, &test_message(0)).await;
+        let result = run(ctx, 0).await;
 
         assert!(result.is_ok(), "got {result:?}");
         assert!(chain.cancelled.lock().unwrap().is_empty());
@@ -1932,7 +2680,7 @@ mod lifecycle_event_tests {
         let chain = ctx.chain_client.clone();
         let cancelled = ctx.registry.marked_cancelled.clone();
 
-        let result = handle(ctx, &test_message(0)).await;
+        let result = run(ctx, 0).await;
 
         assert!(result.is_ok(), "got {result:?}");
         assert_eq!(*chain.marked_at_cancel.lock().unwrap(), vec![true]);
@@ -1952,7 +2700,7 @@ mod lifecycle_event_tests {
             let cancelling = ctx.registry.marked_cancelling.clone();
             let cancelled = ctx.registry.marked_cancelled.clone();
 
-            let result = handle(ctx, &test_message(0)).await;
+            let result = run(ctx, 0).await;
 
             assert!(result.is_ok(), "got {result:?}");
             assert_eq!(*cancelling.lock().unwrap(), vec![leaving.id]);
@@ -1976,17 +2724,24 @@ mod lifecycle_event_tests {
             marked_cancelled: Arc::default(),
             marked_cancelling: Arc::default(),
             held: Vec::new(),
+            unresponsive: Vec::new(),
+            withheld: Vec::new(),
+            offered: 0,
+            request: None,
         };
         let ctx = build_ctx(
             registry,
-            MockIisa { selected: vec![] },
+            MockIisa {
+                selected: vec![],
+                ..Default::default()
+            },
             MockQueue::default(),
             chain_client.clone(),
             CapturingEventsProducer::new(),
             indexer_urls::Snapshot::new(),
         );
 
-        handle(ctx, &test_message(0)).await.expect("handler ok");
+        run(ctx, 0).await.expect("handler ok");
 
         assert_eq!(*chain_client.cancelled.lock().unwrap(), vec![leaving_id]);
     }

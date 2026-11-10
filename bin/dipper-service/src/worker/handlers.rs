@@ -13,6 +13,10 @@ pub use reassess_indexing_request::{
     Ctx as ReassessIndexingRequestCtx, Message as ReassessIndexingRequest,
     handle as reassess_indexing_request,
 };
+pub(crate) use selection_context::{
+    add_declined, is_active_agreement, offerable_indexers, withheld_unless_dipper_fault,
+};
+pub(crate) use selection_helpers::resolve_chain_name;
 pub use send_indexing_agreement_proposal::{
     Ctx as SendIndexingAgreementProposalCtx, Message as SendIndexingAgreementProposal,
     handle as send_indexing_agreement_proposal,

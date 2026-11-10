@@ -142,6 +142,12 @@ pub enum ChainEventError {
     /// Permanent error - should not be retried
     #[error("permanent error: {0}")]
     Permanent(String),
+
+    /// The endpoint refused the query for exceeding its rate limit. Not retried
+    /// within the poll, since each retry would spend more of the same limit; the
+    /// listener tries again on a later poll.
+    #[error("rate limited: {0}")]
+    RateLimited(String),
 }
 
 impl ChainEventError {
@@ -354,13 +360,22 @@ impl SubgraphEventSource {
             request = request.bearer_auth(api_key);
         }
 
+        // The HTTP client names the URL in a failed request, and a gateway URL can carry the key.
         let response = request.send().await.map_err(|e| {
+            let e = e.without_url();
             if e.is_timeout() || e.is_connect() {
                 ChainEventError::Transient(format!("Network error: {}", e))
             } else {
                 ChainEventError::Permanent(format!("Request error: {}", e))
             }
         })?;
+
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(ChainEventError::RateLimited(format!(
+                "HTTP error: {}",
+                response.status()
+            )));
+        }
 
         if response.status().is_server_error() {
             return Err(ChainEventError::Transient(format!(
@@ -387,19 +402,23 @@ impl SubgraphEventSource {
             message: String,
         }
 
-        let graphql_response: GraphQLResponse<T> = response
-            .json()
-            .await
-            .map_err(|e| ChainEventError::Permanent(format!("Failed to parse response: {}", e)))?;
+        let graphql_response: GraphQLResponse<T> = response.json().await.map_err(|e| {
+            ChainEventError::Permanent(format!("Failed to parse response: {}", e.without_url()))
+        })?;
 
         if let Some(errors) = graphql_response.errors {
             let messages: Vec<_> = errors.iter().map(|e| e.message.as_str()).collect();
+            if messages.iter().any(|m| m.contains("rate limit")) {
+                return Err(ChainEventError::RateLimited(format!(
+                    "GraphQL errors: {:?}",
+                    messages
+                )));
+            }
             // Check for transient-looking errors
-            if messages.iter().any(|m| {
-                m.contains("timeout")
-                    || m.contains("rate limit")
-                    || m.contains("temporarily unavailable")
-            }) {
+            if messages
+                .iter()
+                .any(|m| m.contains("timeout") || m.contains("temporarily unavailable"))
+            {
                 return Err(ChainEventError::Transient(format!(
                     "GraphQL errors: {:?}",
                     messages
@@ -862,6 +881,11 @@ pub mod mock {
         pub fn set_page_size(&self, page_size: Option<usize>) {
             *self.page_size.lock().unwrap() = page_size;
         }
+
+        /// Fail the next query with `error`.
+        pub fn set_error(&self, error: ChainEventError) {
+            *self.error.lock().unwrap() = Some(error);
+        }
     }
 
     impl Default for MockEventSource {
@@ -1109,6 +1133,89 @@ mod tests {
     fn test_chain_event_error_is_transient() {
         assert!(ChainEventError::Transient("test".into()).is_transient());
         assert!(!ChainEventError::Permanent("test".into()).is_transient());
+        assert!(!ChainEventError::RateLimited("test".into()).is_transient());
+    }
+
+    fn event_source_at(endpoint: Url, max_retries: u32) -> SubgraphEventSource {
+        SubgraphEventSource::new(SubgraphEventSourceConfig {
+            endpoint,
+            api_key: None,
+            payer_address: Address::ZERO,
+            request_timeout: Duration::from_secs(5),
+            max_retries,
+            wall_clock_skew_tolerance_secs: 60,
+            bypass_chain_clock_defenses: false,
+        })
+    }
+
+    fn event_source_for(server: &wiremock::MockServer) -> SubgraphEventSource {
+        event_source_at(server.uri().parse().unwrap(), 3)
+    }
+
+    /// Mounts `response` for every query, failing the test on drop unless exactly 1 arrived.
+    async fn expect_single_query(
+        server: &wiremock::MockServer,
+        response: wiremock::ResponseTemplate,
+    ) {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(response)
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    async fn query_meta(
+        source: &SubgraphEventSource,
+    ) -> Result<serde_json::Value, ChainEventError> {
+        source
+            .query_with_retry("{ _meta { block { number } } }", serde_json::json!({}))
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_http_429_is_rate_limited_and_not_retried() {
+        let server = wiremock::MockServer::start().await;
+        expect_single_query(&server, wiremock::ResponseTemplate::new(429)).await;
+
+        let err = query_meta(&event_source_for(&server))
+            .await
+            .expect_err("a 429 must fail the query");
+
+        assert!(
+            matches!(err, ChainEventError::RateLimited(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_connection_error_leaves_the_url_out() {
+        let source = event_source_at(crate::test_support::refused_url_with_key("secret-key"), 0);
+
+        let err = query_meta(&source)
+            .await
+            .expect_err("a refused connection must fail the query");
+
+        assert!(!err.to_string().contains("secret-key"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_graphql_rate_limit_error_is_rate_limited_and_not_retried() {
+        let server = wiremock::MockServer::start().await;
+        let body = serde_json::json!({ "errors": [{ "message": "rate limit exceeded" }] });
+        expect_single_query(
+            &server,
+            wiremock::ResponseTemplate::new(200).set_body_json(body),
+        )
+        .await;
+
+        let err = query_meta(&event_source_for(&server))
+            .await
+            .expect_err("a rate limit error must fail the query");
+
+        assert!(
+            matches!(err, ChainEventError::RateLimited(_)),
+            "got {err:?}"
+        );
     }
 
     #[test]

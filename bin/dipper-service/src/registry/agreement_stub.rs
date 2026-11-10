@@ -11,7 +11,7 @@ use super::{
     agreement::{
         AgreementFeeRate, AgreementRegistry, CancelKind, CancellingAgreement, IndexingAgreement,
         NewAgreementParams, PendingAcceptedEvent, PendingExpiredEvent, PendingTerminatedEvent,
-        ReconciliationItem, ReconciliationOutcome,
+        ReconciliationItem, ReconciliationOutcome, WithheldIndexers,
     },
     result::Result,
 };
@@ -80,6 +80,14 @@ pub trait StubAgreementRegistry: Send + Sync {
         _chain_id: ChainId,
     ) -> Result<Vec<IndexerId>> {
         unimplemented!("get_unresponsive_indexers")
+    }
+
+    // Selection and the top-up both ask, so most mocks would otherwise need it.
+    async fn get_indexers_to_withhold_offers_from(
+        &self,
+        _test_interval_minutes: i32,
+    ) -> Result<WithheldIndexers> {
+        Ok(WithheldIndexers::default())
     }
 
     async fn get_indexing_agreements_by_indexing_request_id(
@@ -421,6 +429,14 @@ impl<T: StubAgreementRegistry> AgreementRegistry for T {
         chain_id: ChainId,
     ) -> Result<Vec<IndexerId>> {
         StubAgreementRegistry::get_unresponsive_indexers(self, lookback_days, chain_id).await
+    }
+
+    async fn get_indexers_to_withhold_offers_from(
+        &self,
+        test_interval_minutes: i32,
+    ) -> Result<WithheldIndexers> {
+        StubAgreementRegistry::get_indexers_to_withhold_offers_from(self, test_interval_minutes)
+            .await
     }
 
     async fn get_indexing_agreements_by_indexing_request_id(

@@ -1,5 +1,98 @@
 # Changelog
 
+## [0.2.10](https://github.com/graphprotocol/dipper/compare/v0.2.9...v0.2.10) (2026-11-10)
+
+
+### Fixed
+
+* reconnect to Kafka after the brokers are replaced ([#794](https://github.com/graphprotocol/dipper/issues/794)) ([571cc9f](https://github.com/graphprotocol/dipper/commit/571cc9f8f6ce7de98f3e5637a9ec3f4e3eb2437a))
+
+
+### Documentation
+
+* ask fixes to remove the cause of a failure ([#793](https://github.com/graphprotocol/dipper/issues/793)) ([f365f06](https://github.com/graphprotocol/dipper/commit/f365f064e6ac4c3e8638910738af5e43e98a1369))
+
+## [0.2.9](https://github.com/graphprotocol/dipper/compare/v0.2.8...v0.2.9) (2026-11-09)
+
+
+### Added
+
+* hold offers back from indexers that stopped accepting ([#791](https://github.com/graphprotocol/dipper/issues/791)) ([cfad912](https://github.com/graphprotocol/dipper/commit/cfad9123d6ed426e66c408ddf9f0f3027e2e9033))
+
+
+### Fixed
+
+* **registry:** bench missed offers for 1, 7, then 30 days ([#790](https://github.com/graphprotocol/dipper/issues/790)) ([2969c54](https://github.com/graphprotocol/dipper/commit/2969c54184ec01fe9329a9487272f39d819284cf))
+
+## [0.2.8](https://github.com/graphprotocol/dipper/compare/v0.2.7...v0.2.8) (2026-11-06)
+
+
+### Added
+
+* **reassignment:** retry subgraphs below target every hour ([#786](https://github.com/graphprotocol/dipper/issues/786)) ([cd02dd9](https://github.com/graphprotocol/dipper/commit/cd02dd93073454abfc316b06e65af4b40aae430c))
+
+
+### Fixed
+
+* reassess requests from their latest indexer count ([#782](https://github.com/graphprotocol/dipper/issues/782)) ([732bb65](https://github.com/graphprotocol/dipper/commit/732bb655dd5e2b14a0b61ccf21a6c343c7b1831f))
+* **reassignment:** reassess every open request daily ([#788](https://github.com/graphprotocol/dipper/issues/788)) ([f9af831](https://github.com/graphprotocol/dipper/commit/f9af831d25d1681451f83788de842710bc679549))
+* **reassignment:** skip requests with a reassessment queued ([#787](https://github.com/graphprotocol/dipper/issues/787)) ([ba12c70](https://github.com/graphprotocol/dipper/commit/ba12c7021927217ab8955213668469df89d1ac1f))
+* refuse indexer counts above 100 instead of wrapping them ([#780](https://github.com/graphprotocol/dipper/issues/780)) ([99b8507](https://github.com/graphprotocol/dipper/commit/99b8507bc627cf53133074df12148d67e9fa5db6))
+* retry short requests once their indexers finish cancelling ([#783](https://github.com/graphprotocol/dipper/issues/783)) ([666e33b](https://github.com/graphprotocol/dipper/commit/666e33b65e73f3851854f02369b0cd7693adeb9f))
+
+## [0.2.7](https://github.com/graphprotocol/dipper/compare/v0.2.6...v0.2.7) (2026-11-04)
+
+
+### Fixed
+
+* let the expiry clock catch up at once after a restart ([#778](https://github.com/graphprotocol/dipper/issues/778)) ([68ab0aa](https://github.com/graphprotocol/dipper/commit/68ab0aa87b039ccb5bd700c7e4e3a0db6551278b))
+
+## [0.2.6](https://github.com/graphprotocol/dipper/compare/v0.2.5...v0.2.6) (2026-11-04)
+
+
+### Added
+
+* alert once when subgraph fetches keep failing ([#774](https://github.com/graphprotocol/dipper/issues/774)) ([3d85587](https://github.com/graphprotocol/dipper/commit/3d85587d1e9b61f7b30af041e2ae94b53cb01da6))
+
+
+### Fixed
+
+* keep subgraph and RPC API keys out of dipper's logs ([#777](https://github.com/graphprotocol/dipper/issues/777)) ([d9e6565](https://github.com/graphprotocol/dipper/commit/d9e6565f9d9f5de1f514754cae7a6d7a5dedfa6f))
+* **listener:** log subgraph rate limits as such, without quick retries ([#772](https://github.com/graphprotocol/dipper/issues/772)) ([f2e928e](https://github.com/graphprotocol/dipper/commit/f2e928e776bacc0d4589f2e48f6165b0e9d2be52))
+* **network:** report the HTTP status when a subgraph poller is refused ([#773](https://github.com/graphprotocol/dipper/issues/773)) ([c532b84](https://github.com/graphprotocol/dipper/commit/c532b8462d54161df16882f13e2c00c6554d89b1))
+
+## [0.2.5](https://github.com/graphprotocol/dipper/compare/v0.2.4...v0.2.5) (2026-11-03)
+
+
+### Added
+
+* alert when an agreement holder's DIPs info stays down ([#767](https://github.com/graphprotocol/dipper/issues/767)) ([0ad4808](https://github.com/graphprotocol/dipper/commit/0ad4808fb05e4ca8641795db188ee88b7b79e6d5))
+* deny an indexer whose DIPs info stays down for 48 hours ([#768](https://github.com/graphprotocol/dipper/issues/768)) ([4aed6b7](https://github.com/graphprotocol/dipper/commit/4aed6b707515f5ce76fc55666537ee9ed374e3ba))
+
+
+### CI/CD
+
+* trust the Postgres repo with a signed-by key, not apt-key ([#769](https://github.com/graphprotocol/dipper/issues/769)) ([24a8b50](https://github.com/graphprotocol/dipper/commit/24a8b50909864222bacbf10dad803b7464fe2a34))
+
+## [0.2.4](https://github.com/graphprotocol/dipper/compare/v0.2.3...v0.2.4) (2026-10-27)
+
+
+### Fixed
+
+* cap the base price on chains without their own ceiling ([#763](https://github.com/graphprotocol/dipper/issues/763)) ([dd721a8](https://github.com/graphprotocol/dipper/commit/dd721a869ac04c36d83860b13abf3e5acce34c81))
+* **config:** refuse to start with an unusable chain price cap ([#760](https://github.com/graphprotocol/dipper/issues/760)) ([dd404b2](https://github.com/graphprotocol/dipper/commit/dd404b21e6d51ff66d7352641b7c4269ee8c839d))
+* **iisa:** report IISA refusing a request apart from an outage ([#761](https://github.com/graphprotocol/dipper/issues/761)) ([4847399](https://github.com/graphprotocol/dipper/commit/4847399daf92d94c5179ebdeda016a981919c443))
+* **pricing:** never offer above the caps dipper sends to IISA ([#762](https://github.com/graphprotocol/dipper/issues/762)) ([d38379e](https://github.com/graphprotocol/dipper/commit/d38379e2a7f9975449c75e356ffdc3c35ed0aa21))
+* **pricing:** send the per-entity price ceiling to IISA ([#759](https://github.com/graphprotocol/dipper/issues/759)) ([0d39bdd](https://github.com/graphprotocol/dipper/commit/0d39bdd726bd381d9de0e99be6bd6d53f826802b))
+* send indexers that missed an offer as declined ([#764](https://github.com/graphprotocol/dipper/issues/764)) ([caec2ac](https://github.com/graphprotocol/dipper/commit/caec2ac3d43e5e2d61e601731c9e4f7533697ff4))
+
+## [0.2.3](https://github.com/graphprotocol/dipper/compare/v0.2.2...v0.2.3) (2026-10-13)
+
+
+### Fixed
+
+* stop log-capture tests missing lines when run in parallel ([#756](https://github.com/graphprotocol/dipper/issues/756)) ([c591658](https://github.com/graphprotocol/dipper/commit/c591658df8ff557a31e7fa77ba39720c1cf056ec))
+
 ## [0.2.2](https://github.com/graphprotocol/dipper/compare/v0.2.1...v0.2.2) (2026-10-12)
 
 
