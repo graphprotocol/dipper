@@ -206,6 +206,12 @@ pub enum Error {
     InvalidPartitionCount,
 }
 
+impl super::reconnect::CallError for Error {
+    fn is_unreachable(&self) -> bool {
+        Error::is_unreachable(self)
+    }
+}
+
 impl Error {
     /// Whether a send failed to reach the brokers, so a resend through a new client can help; a broker
     /// that refused it or answered unreadably would do the same again. rskafka retries connection

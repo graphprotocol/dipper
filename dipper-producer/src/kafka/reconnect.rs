@@ -26,9 +26,15 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Failed connect attempts between repeated warnings, after the first.
 const WARN_EVERY: u32 = 5;
 
-/// A client connected in the background and rebuilt once sends have failed to reach the brokers for
-/// [`RECONNECT_AFTER`]. Callers report each attempt with `report_success` or `report_unreachable`;
-/// `current` returns `None` while the client is being (re)built.
+/// What a failed call through the client says about the client.
+pub trait CallError {
+    /// The call never reached the brokers, so a new client might succeed where this one can't.
+    fn is_unreachable(&self) -> bool;
+}
+
+/// A client connected in the background and rebuilt once calls have failed to reach the brokers for
+/// [`RECONNECT_AFTER`]. Callers run calls through [`call`](Self::call), or report each outcome with
+/// [`report`](Self::report); `current` returns `None` while the client is being (re)built.
 pub struct Reconnecting<T> {
     shared: Arc<Shared<T>>,
 }
@@ -164,6 +170,31 @@ impl<T: Send + Sync + 'static> Reconnecting<T> {
         self.shared.lock().client.clone()
     }
 
+    /// Runs `call` on the client, waiting while one is being connected, and reports the outcome.
+    pub async fn call<R, E, F, Fut>(&self, call: F) -> Result<R, E>
+    where
+        E: CallError,
+        F: FnOnce(Arc<T>) -> Fut,
+        Fut: Future<Output = Result<R, E>>,
+    {
+        let client = self.connected().await;
+        let result = call(Arc::clone(&client)).await;
+        self.report(&client, &result);
+        result
+    }
+
+    /// Records what a call through `client` showed: a success clears the outage, and a failure to
+    /// reach the brokers counts toward a rebuild. A refusal from a broker counts as neither.
+    pub fn report<R, E: CallError>(&self, client: &Arc<T>, result: &Result<R, E>) {
+        match result {
+            Ok(_) => self.report_success(),
+            Err(e) if e.is_unreachable() => {
+                self.report_unreachable(client);
+            }
+            Err(_) => {}
+        }
+    }
+
     /// Records that a request through the current client reached the brokers.
     pub fn report_success(&self) {
         self.shared.lock().failing_since = None;
@@ -272,6 +303,56 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         panic!("no new client was handed out");
+    }
+
+    /// A call's error, saying whether it reached the brokers.
+    #[derive(Debug)]
+    struct Failure {
+        unreachable: bool,
+    }
+
+    impl CallError for Failure {
+        fn is_unreachable(&self) -> bool {
+            self.unreachable
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn calls_go_through_a_new_client_once_the_old_one_keeps_failing() {
+        let (attempts, connect) = connector(0);
+        let conn = Reconnecting::spawn("test", connect);
+        // Client 1 can't reach the brokers; any later client can.
+        let call = || {
+            conn.call(|client: Arc<Client>| async move {
+                if client.0 == 1 {
+                    Err(Failure { unreachable: true })
+                } else {
+                    Ok(client.0)
+                }
+            })
+        };
+
+        assert!(call().await.is_err());
+        tokio::time::sleep(RECONNECT_AFTER).await;
+        assert!(call().await.is_err(), "this failure drops client 1");
+
+        assert_eq!(call().await.unwrap(), 2);
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_call_the_brokers_answered_keeps_the_client() {
+        let (attempts, connect) = connector(0);
+        let conn = Reconnecting::spawn("test", connect);
+        let refused =
+            || conn.call(|_: Arc<Client>| async { Err::<(), _>(Failure { unreachable: false }) });
+
+        assert!(refused().await.is_err());
+        tokio::time::sleep(RECONNECT_AFTER).await;
+        assert!(refused().await.is_err());
+
+        assert_eq!(conn.current().as_deref(), Some(&Client(1)));
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test(start_paused = true)]

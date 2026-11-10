@@ -253,6 +253,12 @@ pub enum ConsumerError {
     Timeout,
 }
 
+impl super::reconnect::CallError for ConsumerError {
+    fn is_unreachable(&self) -> bool {
+        ConsumerError::is_unreachable(self)
+    }
+}
+
 impl ConsumerError {
     /// Whether a call failed to reach the brokers, so a new client might succeed where this one
     /// can't.
