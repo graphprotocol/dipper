@@ -274,7 +274,7 @@ impl SubgraphIndexingAgreementsEventsEmitter {
         let (event_type, key, envelope) = Self::prepare_event(event);
         // `send_event` already bounds the produce attempt via `KafkaProducer`'s
         // internal produce timeout, so no additional timeout is layered here.
-        Self::send_event(&handle, event_type, &key, envelope).await;
+        Self::send_event(producer, &handle, event_type, &key, envelope).await;
     }
 }
 
@@ -405,18 +405,9 @@ impl SubgraphIndexingAgreementsEventsEmitter {
             .encode(&mut buf)
             .map_err(|e| EmitError::Send(format!("encode failed: {e}")))?;
 
-        match producer.send(&key, &buf).await {
-            Ok(()) => {
-                streaming.producer.report_success();
-                Ok(())
-            }
-            Err(e) => {
-                if e.is_unreachable() {
-                    streaming.producer.report_unreachable(&producer);
-                }
-                Err(EmitError::Send(e.to_string()))
-            }
-        }
+        let result = producer.send(&key, &buf).await;
+        report(&streaming.producer, &producer, &result);
+        result.map_err(|e| EmitError::Send(e.to_string()))
     }
 
     fn enqueue(
@@ -494,6 +485,7 @@ impl SubgraphIndexingAgreementsEventsEmitter {
     ///
     /// Errors are logged, but do not fail as it is a best-effort
     async fn send_event(
+        conn: &Reconnecting<KafkaProducer>,
         producer: &Arc<KafkaProducer>,
         event_type: SubgraphIndexingAgreementEventType,
         key: &str,
@@ -502,7 +494,9 @@ impl SubgraphIndexingAgreementsEventsEmitter {
         let Some(buf) = Self::encode(event_type, &event) else {
             return;
         };
-        if let Err(e) = producer.send(key, &buf).await {
+        let result = producer.send(key, &buf).await;
+        report(conn, producer, &result);
+        if let Err(e) = result {
             tracing::warn!(
                 event_type = %event_type,
                 key,
@@ -581,14 +575,12 @@ where
         let Some(client) = wait_for_client(conn, shutdown).await else {
             return Delivery::Shutdown;
         };
-        match send(client.clone()).await {
-            Ok(()) => {
-                conn.report_success();
-                return Delivery::Sent;
-            }
+        let result = send(client.clone()).await;
+        report(conn, &client, &result);
+        match result {
+            Ok(()) => return Delivery::Sent,
             Err(e) if e.is_unreachable() => {
                 attempt = attempt.saturating_add(1);
-                conn.report_unreachable(&client);
                 tracing::warn!(
                     event_type = %event_type,
                     key,
@@ -611,6 +603,22 @@ where
                 return Delivery::Refused;
             }
         }
+    }
+}
+
+/// Tells `conn` whether a send through `client` reached the brokers. Every send goes through here,
+/// so none is left out of the count that decides when to reconnect.
+fn report<T: Send + Sync + 'static>(
+    conn: &Reconnecting<T>,
+    client: &Arc<T>,
+    result: &Result<(), kafka::Error>,
+) {
+    match result {
+        Ok(()) => conn.report_success(),
+        Err(e) if e.is_unreachable() => {
+            conn.report_unreachable(client);
+        }
+        Err(_) => {}
     }
 }
 
