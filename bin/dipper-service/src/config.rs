@@ -42,6 +42,13 @@ fn debug_endpoint(url: &Url, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Resul
     f.write_str(&endpoint_name(url))
 }
 
+fn debug_optional_endpoint(url: &Option<Url>, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match url {
+        Some(url) => debug_endpoint(url, f),
+        None => f.write_str("None"),
+    }
+}
+
 #[expect(
     clippy::ptr_arg,
     reason = "custom_debug passes the field itself, a &Vec"
@@ -137,6 +144,133 @@ pub struct Config {
     #[serde(default)]
     pub alerts: AlertsConfig,
 }
+
+/// How loudly startup reports a background service that will not run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OffNoticeLevel {
+    /// An opt-in service that was left out, which is normal.
+    Debug,
+    /// A service its own config section turns off.
+    Info,
+    /// A service whose absence leaves dipper without a safeguard, with nothing in the config to
+    /// show that anyone chose to give it up.
+    Warn,
+}
+
+/// A background service that will not run, as startup reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceOff {
+    /// The config section that controls the service.
+    pub section: &'static str,
+    /// How loudly to report it.
+    pub level: OffNoticeLevel,
+    /// What being off means, and how to turn it on where the section is missing.
+    pub message: String,
+}
+
+impl Config {
+    /// Refuses a config that leaves the chain listener out without saying so. Without the listener
+    /// an accepted offer looks unanswered, so it may only be off when the config says so.
+    pub fn validate_chain_listener(&self) -> Result<(), String> {
+        match &self.chain_listener {
+            None => Err(format!(
+                "the config has no chain_listener section, and without the chain listener dipper \
+                 never learns that an indexer accepted or cancelled an agreement on-chain. Add \
+                 {RUN_CHAIN_LISTENER} to run it, or {SKIP_CHAIN_LISTENER} to run without it"
+            )),
+            Some(listener) if listener.enabled && listener.subgraph_endpoint.is_none() => {
+                Err(format!(
+                    "chain_listener.subgraph_endpoint is missing: the listener reads agreement \
+                     events from that subgraph, so give its URL, or replace the section with \
+                     {SKIP_CHAIN_LISTENER} to run without the listener"
+                ))
+            }
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// The background services that will not run, for startup to report.
+    pub fn background_services_off(&self) -> Vec<ServiceOff> {
+        let mut off = Vec::new();
+        if self.chain_listener.as_ref().is_some_and(|c| !c.enabled) {
+            off.push(ServiceOff {
+                section: "chain_listener",
+                level: OffNoticeLevel::Warn,
+                message: "chain_listener is turned off in its config section: dipper will not \
+                          learn that indexers accepted or cancelled agreements on-chain, so an \
+                          accepted offer stays pending and is never expired either, since expiry \
+                          runs on the chain time the listener records; the entity counts used in \
+                          fee estimates are not fetched"
+                    .to_string(),
+            });
+        }
+        // Each service that is off without a section to say so, and so with no sign anyone chose
+        // it, is a warning, except the escrow reconciler, which is documented as opt-in.
+        let services = [
+            (
+                "expiration",
+                self.expiration.as_ref().map(|c| c.enabled),
+                OffNoticeLevel::Warn,
+                "offers no indexer accepts by their deadline are never marked expired, so their \
+                 requests get no replacement indexers",
+            ),
+            (
+                "reassignment",
+                self.reassignment.as_ref().map(|c| c.enabled),
+                OffNoticeLevel::Warn,
+                "requests left short of indexers are not topped up, and the daily reassessment of \
+                 open requests does not run",
+            ),
+            (
+                "liveness_checker",
+                self.liveness_checker.as_ref().map(|c| c.enabled),
+                OffNoticeLevel::Warn,
+                "agreements whose indexer stops indexing are not cancelled or replaced",
+            ),
+            (
+                "dips_info_watcher",
+                self.dips_info_watcher.as_ref().map(|c| c.enabled),
+                OffNoticeLevel::Warn,
+                "indexers holding agreements whose DIPs info endpoint stops answering are neither \
+                 alerted on nor blocked",
+            ),
+            (
+                "escrow_reconciler",
+                self.escrow_reconciler.as_ref().map(|c| c.enabled),
+                OffNoticeLevel::Debug,
+                "escrow the agreement manager holds for ended agreements is not reclaimed",
+            ),
+        ];
+        for (section, enabled, level_when_missing, consequence) in services {
+            match enabled {
+                Some(true) => {}
+                Some(false) => off.push(ServiceOff {
+                    section,
+                    level: OffNoticeLevel::Info,
+                    message: format!(
+                        "{section} is turned off in its config section: {consequence}"
+                    ),
+                }),
+                None => off.push(ServiceOff {
+                    section,
+                    level: level_when_missing,
+                    message: format!(
+                        "{section} is off because the config has no {section} section: \
+                         {consequence}; add the section with \"enabled\": true to run it"
+                    ),
+                }),
+            }
+        }
+        off
+    }
+}
+
+/// What to add to the config to run the chain listener.
+const RUN_CHAIN_LISTENER: &str =
+    r#""chain_listener": {"subgraph_endpoint": "<URL of the indexing-payments subgraph>"}"#;
+
+/// What to add to the config to run without the chain listener.
+const SKIP_CHAIN_LISTENER: &str = r#""chain_listener": {"enabled": false}"#;
 
 /// Alerts for the log lines an operator has to act on, picked out by their `event` tag and
 /// posted to Slack, at most once per event in each throttle window.
@@ -817,19 +951,17 @@ impl Default for DipsInfoWatcherConfig {
 #[derive(custom_debug::CustomDebug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChainListenerConfig {
-    /// Whether the chain listener service is enabled (default: false)
-    ///
-    /// Disabled by default since it requires subgraph configuration.
+    /// Whether the chain listener runs (default: true). Only `false` turns it off, since without
+    /// it dipper never learns that an indexer accepted or cancelled an agreement.
     #[serde(default = "default_chain_listener_enabled")]
     pub enabled: bool,
 
-    /// The subgraph endpoint URL for querying indexing agreement events.
-    ///
-    /// This should point to a subgraph that indexes the SubgraphService contract's
-    /// IndexingAgreementAccepted and IndexingAgreementCanceled events.
-    #[debug(with = debug_endpoint)]
-    #[serde_as(as = "serde_with::DisplayFromStr")]
-    pub subgraph_endpoint: Url,
+    /// The subgraph that indexes the SubgraphService's agreement events. Required while the
+    /// listener runs; a section that only switches the listener off can leave it out.
+    #[debug(with = debug_optional_endpoint)]
+    #[serde(default)]
+    #[serde_as(as = "Option<serde_with::DisplayFromStr>")]
+    pub subgraph_endpoint: Option<Url>,
 
     /// API key for subgraph authentication (optional for local/test subgraphs).
     #[serde(default)]
@@ -893,8 +1025,19 @@ pub struct ChainListenerConfig {
     pub bypass_chain_clock_defenses: bool,
 }
 
+impl ChainListenerConfig {
+    /// The subgraph endpoint to poll when the listener is to run, or `None` when it is off.
+    pub fn running_endpoint(&self) -> Option<&Url> {
+        if self.enabled {
+            self.subgraph_endpoint.as_ref()
+        } else {
+            None
+        }
+    }
+}
+
 fn default_chain_listener_enabled() -> bool {
-    false
+    true
 }
 
 fn default_chain_id() -> u64 {
@@ -2682,6 +2825,176 @@ mod tests {
             .map(|line| format!("{}\n", line.strip_prefix("    ").unwrap_or(line)))
             .collect();
         serde_json::from_str(&json).expect("config.json is JSON")
+    }
+
+    /// The example as a whole config after `edit`, with the placeholders that are not valid values
+    /// (the contracts not yet deployed and the signing key) filled in.
+    fn example_config_edited(edit: impl FnOnce(&mut serde_json::Value)) -> Config {
+        let mut config = example_config();
+        config["dips"]["recurring_collector"] = "0x2222222222222222222222222222222222222222".into();
+        config["dips"]["recurring_agreement_manager"] =
+            "0x3333333333333333333333333333333333333333".into();
+        config["signer"]["secret_key"] =
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".into();
+        edit(&mut config);
+        serde_json::from_value(config).expect("the edited example is a valid config")
+    }
+
+    fn remove_sections(config: &mut serde_json::Value, sections: &[&str]) {
+        let config = config.as_object_mut().expect("the config is an object");
+        for section in sections {
+            config.remove(*section);
+        }
+    }
+
+    fn services_off(config: &Config) -> Vec<(&'static str, OffNoticeLevel)> {
+        config
+            .background_services_off()
+            .into_iter()
+            .map(|off| (off.section, off.level))
+            .collect()
+    }
+
+    #[test]
+    fn the_example_config_loads_and_runs_every_safety_service() {
+        let config = example_config_edited(|_| {});
+
+        assert!(config.validate_chain_listener().is_ok());
+        let listener = config.chain_listener.as_ref().expect("the example has one");
+        assert!(listener.running_endpoint().is_some(), "the listener runs");
+        assert_eq!(
+            services_off(&config),
+            [
+                ("liveness_checker", OffNoticeLevel::Info),
+                ("escrow_reconciler", OffNoticeLevel::Debug),
+            ],
+            "a deployment copied from the example starts with no warning about a service left off"
+        );
+    }
+
+    /// Without the listener dipper never learns an offer was accepted, so leaving the section out
+    /// must stop startup rather than run with it silently off.
+    #[test]
+    fn a_config_without_a_chain_listener_section_is_refused() {
+        let config = example_config_edited(|config| remove_sections(config, &["chain_listener"]));
+
+        let err = config
+            .validate_chain_listener()
+            .expect_err("a config with no chain_listener section must be refused");
+
+        assert!(err.contains("no chain_listener section"), "{err}");
+        assert!(
+            err.contains(r#""chain_listener": {"subgraph_endpoint": "#),
+            "the error says what to add to run it: {err}"
+        );
+        assert!(
+            err.contains(r#""chain_listener": {"enabled": false}"#),
+            "the error says what to add to run without it: {err}"
+        );
+    }
+
+    #[test]
+    fn a_chain_listener_section_that_leaves_out_enabled_runs_the_listener() {
+        let config = example_config_edited(|config| {
+            remove_sections(&mut config["chain_listener"], &["enabled"]);
+        });
+
+        assert!(config.validate_chain_listener().is_ok());
+        let listener = config
+            .chain_listener
+            .as_ref()
+            .expect("the section is there");
+        assert!(listener.running_endpoint().is_some(), "the listener runs");
+        assert!(
+            services_off(&config)
+                .iter()
+                .all(|(section, _)| *section != "chain_listener"),
+            "a running listener is not reported as off"
+        );
+    }
+
+    #[test]
+    fn a_chain_listener_switched_off_explicitly_is_accepted_and_reported() {
+        let config = example_config_edited(|config| {
+            config["chain_listener"] = serde_json::json!({"enabled": false});
+        });
+
+        assert!(
+            config.validate_chain_listener().is_ok(),
+            "switching the listener off needs no subgraph endpoint"
+        );
+        let listener = config
+            .chain_listener
+            .as_ref()
+            .expect("the section is there");
+        assert!(
+            listener.running_endpoint().is_none(),
+            "the listener does not run"
+        );
+        let reported: Vec<_> = config
+            .background_services_off()
+            .into_iter()
+            .filter(|off| off.section == "chain_listener")
+            .collect();
+        assert_eq!(reported.len(), 1, "{reported:?}");
+        assert_eq!(reported[0].level, OffNoticeLevel::Warn);
+        assert!(
+            reported[0].message.contains("accepted or cancelled"),
+            "the warning says what being off means: {}",
+            reported[0].message
+        );
+    }
+
+    #[test]
+    fn a_running_chain_listener_needs_a_subgraph_endpoint() {
+        let config = example_config_edited(|config| {
+            config["chain_listener"] = serde_json::json!({"enabled": true});
+        });
+
+        let err = config
+            .validate_chain_listener()
+            .expect_err("a listener with nothing to poll must be refused");
+
+        assert!(err.contains("subgraph_endpoint"), "{err}");
+    }
+
+    #[test]
+    fn startup_reports_each_background_service_that_is_off() {
+        const SECTIONS: [&str; 5] = [
+            "expiration",
+            "reassignment",
+            "liveness_checker",
+            "dips_info_watcher",
+            "escrow_reconciler",
+        ];
+        let missing = example_config_edited(|config| remove_sections(config, &SECTIONS));
+        let turned_off = example_config_edited(|config| {
+            for section in SECTIONS {
+                config[section] = serde_json::json!({"enabled": false});
+            }
+        });
+
+        assert_eq!(
+            services_off(&missing),
+            [
+                ("expiration", OffNoticeLevel::Warn),
+                ("reassignment", OffNoticeLevel::Warn),
+                ("liveness_checker", OffNoticeLevel::Warn),
+                ("dips_info_watcher", OffNoticeLevel::Warn),
+                ("escrow_reconciler", OffNoticeLevel::Debug),
+            ]
+        );
+        for off in missing.background_services_off() {
+            assert!(
+                off.message.contains(r#""enabled": true"#),
+                "a missing section's notice says how to turn the service on: {}",
+                off.message
+            );
+        }
+        assert_eq!(
+            services_off(&turned_off),
+            SECTIONS.map(|section| (section, OffNoticeLevel::Info))
+        );
     }
 
     #[test]

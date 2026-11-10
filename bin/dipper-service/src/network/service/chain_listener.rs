@@ -238,7 +238,10 @@ where
     let service = async move {
         tracing::info!(
             poll_interval_secs = config.poll_interval.as_secs(),
-            endpoint = %crate::config::endpoint_name(&config.subgraph_endpoint),
+            endpoint = %config
+                .subgraph_endpoint
+                .as_ref()
+                .map_or_else(|| "none".to_string(), crate::config::endpoint_name),
             "chain listener service started"
         );
 
@@ -4027,7 +4030,7 @@ mod tests {
 
         let config = crate::config::ChainListenerConfig {
             enabled: true,
-            subgraph_endpoint: "http://localhost:8000/subgraphs/name/test".parse().unwrap(),
+            subgraph_endpoint: Some("http://localhost:8000/subgraphs/name/test".parse().unwrap()),
             subgraph_api_key: None,
             chain_id: 1337,
             poll_interval: Duration::from_millis(50),
@@ -4114,7 +4117,7 @@ mod tests {
 
         let config = crate::config::ChainListenerConfig {
             enabled: true,
-            subgraph_endpoint: "http://localhost:8000/subgraphs/name/test".parse().unwrap(),
+            subgraph_endpoint: Some("http://localhost:8000/subgraphs/name/test".parse().unwrap()),
             subgraph_api_key: None,
             chain_id: 1337,
             poll_interval: Duration::from_millis(20),
@@ -4195,7 +4198,7 @@ mod tests {
 
         let config = crate::config::ChainListenerConfig {
             enabled: true,
-            subgraph_endpoint: "http://localhost:8000/subgraphs/name/test".parse().unwrap(),
+            subgraph_endpoint: Some("http://localhost:8000/subgraphs/name/test".parse().unwrap()),
             subgraph_api_key: None,
             chain_id: 1337,
             poll_interval: Duration::from_millis(20),
@@ -4890,7 +4893,7 @@ mod tests {
 
         let config = crate::config::ChainListenerConfig {
             enabled: true,
-            subgraph_endpoint: "http://localhost:8000/subgraphs/name/test".parse().unwrap(),
+            subgraph_endpoint: Some("http://localhost:8000/subgraphs/name/test".parse().unwrap()),
             subgraph_api_key: None,
             chain_id: 1337,
             poll_interval: Duration::from_millis(50),
