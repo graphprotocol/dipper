@@ -131,7 +131,7 @@ pub async fn fetch_snapshot(
             } else {
                 tracing::warn!(
                     indexer = %entry.id,
-                    url = %entry.url,
+                    url = %url_for_log(&entry.url),
                     "skipping indexer with unparseable id or invalid URL"
                 );
             }
@@ -143,6 +143,21 @@ pub async fn fetch_snapshot(
     }
 
     Ok(snapshot)
+}
+
+/// The most characters of a registered URL that are logged.
+const MAX_LOGGED_URL_CHARS: usize = 200;
+
+/// A registered URL in a form that is safe to log. The indexer wrote it on-chain, so it is quoted
+/// with its control characters escaped, so a line break in it can't start a fake log line, and
+/// cut short, so a huge one can't flood the log on every refresh.
+fn url_for_log(raw: &str) -> String {
+    let shown: String = raw.chars().take(MAX_LOGGED_URL_CHARS).collect();
+    if shown.len() < raw.len() {
+        format!("{shown:?}...")
+    } else {
+        format!("{shown:?}")
+    }
 }
 
 /// Parse a single indexer entry into an ID and validated URL.
@@ -310,6 +325,51 @@ mod tests {
         assert!(parse_indexer_entry(&entry(INDEXER, "httpsx://indexer.example.com")).is_none());
         // No host
         assert!(parse_indexer_entry(&entry(INDEXER, "http://")).is_none());
+    }
+
+    /// Answer every query with 1 registered indexer whose URL is `url`, and return what dipper
+    /// logs while reading it.
+    async fn logged_reading_url(url: &str) -> String {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data": {"indexers": [{"id": INDEXER, "url": url}]}
+                })),
+            )
+            .mount(&server)
+            .await;
+        let endpoint: Url = server.uri().parse().unwrap();
+        crate::test_support::logged(async {
+            let snapshot = fetch_snapshot(&reqwest::Client::new(), &endpoint, None)
+                .await
+                .unwrap();
+            assert!(snapshot.is_empty(), "the URL is not one dipper can use");
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_line_break_in_a_registered_url_cannot_start_a_fake_log_line() {
+        //* Given a registered URL holding a line break, then text made to look like a log line
+        let forged = "2026-11-10T00:00:00.000000Z ERROR dipper_service: funds are lost";
+
+        //* When
+        let logs = logged_reading_url(&format!("not a url\n{forged}")).await;
+
+        //* Then the forged text stays inside the line that reports the indexer
+        assert!(logs.contains("skipping indexer"), "{logs}");
+        assert!(!logs.lines().any(|line| line.starts_with(forged)), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn a_huge_registered_url_is_cut_short_in_the_log() {
+        //* When
+        let logs = logged_reading_url(&"x".repeat(100_000)).await;
+
+        //* Then
+        assert!(logs.contains("skipping indexer"), "{logs:.300}");
+        assert!(logs.len() < 1_000, "logged {} bytes", logs.len());
     }
 
     #[test]
