@@ -187,7 +187,7 @@ impl<T: Send + Sync + 'static> Reconnecting<T> {
     /// reach the brokers counts toward a rebuild. A refusal from a broker counts as neither.
     pub fn report<R, E: CallError>(&self, client: &Arc<T>, result: &Result<R, E>) {
         match result {
-            Ok(_) => self.report_success(),
+            Ok(_) => self.report_success(client),
             Err(e) if e.is_unreachable() => {
                 self.report_unreachable(client);
             }
@@ -195,9 +195,17 @@ impl<T: Send + Sync + 'static> Reconnecting<T> {
         }
     }
 
-    /// Records that a request through the current client reached the brokers.
-    pub fn report_success(&self) {
-        self.shared.lock().failing_since = None;
+    /// Records that a request through `client` reached the brokers, unless another client has
+    /// replaced it since, so a late success on an old client can't hide an outage on the new one.
+    fn report_success(&self, client: &Arc<T>) {
+        let mut state = self.shared.lock();
+        if state
+            .client
+            .as_ref()
+            .is_some_and(|c| Arc::ptr_eq(c, client))
+        {
+            state.failing_since = None;
+        }
     }
 
     /// Records that a request through `client` couldn't reach the brokers; once sends have failed for
@@ -341,6 +349,27 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_success_through_a_replaced_client_leaves_the_outage_running() {
+        let (_, connect) = connector(0);
+        let conn = Reconnecting::spawn("test", connect);
+        let first = next_client(&conn, None).await;
+        conn.report_unreachable(&first);
+        tokio::time::sleep(RECONNECT_AFTER).await;
+        assert!(conn.report_unreachable(&first));
+        let second = next_client(&conn, Some(&first)).await;
+
+        conn.report_unreachable(&second);
+        tokio::time::sleep(RECONNECT_AFTER).await;
+        // A call still in flight on the first client finishes well.
+        conn.report(&first, &Ok::<(), Failure>(()));
+
+        assert!(
+            conn.report_unreachable(&second),
+            "the second client's outage still counts"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_call_the_brokers_answered_keeps_the_client() {
         let (attempts, connect) = connector(0);
         let conn = Reconnecting::spawn("test", connect);
@@ -475,7 +504,7 @@ mod tests {
 
         conn.report_unreachable(&client);
         tokio::time::sleep(RECONNECT_AFTER - Duration::from_secs(1)).await;
-        conn.report_success();
+        conn.report(&client, &Ok::<(), Failure>(()));
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert!(!conn.report_unreachable(&client));
 

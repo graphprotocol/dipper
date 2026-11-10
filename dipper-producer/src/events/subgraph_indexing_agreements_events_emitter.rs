@@ -613,13 +613,7 @@ fn report<T: Send + Sync + 'static>(
     client: &Arc<T>,
     result: &Result<(), kafka::Error>,
 ) {
-    match result {
-        Ok(()) => conn.report_success(),
-        Err(e) if e.is_unreachable() => {
-            conn.report_unreachable(client);
-        }
-        Err(_) => {}
-    }
+    conn.report(client, result);
 }
 
 /// Waits until a client is available, checking every 250ms. Returns `None` if shutdown is

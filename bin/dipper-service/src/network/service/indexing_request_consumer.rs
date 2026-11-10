@@ -522,13 +522,7 @@ where
         _ = shutdown_rx.changed() => return None,
         result = call(Arc::clone(&client)) => result,
     };
-    match &result {
-        Ok(_) => consumer.report_success(),
-        Err(err) if err.is_unreachable() => {
-            consumer.report_unreachable(&client);
-        }
-        Err(_) => {}
-    }
+    consumer.report(&client, &result);
     Some(result)
 }
 
