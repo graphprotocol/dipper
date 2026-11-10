@@ -38,9 +38,14 @@ impl AddressRule {
         self == Self::Any || is_public(ip)
     }
 
-    /// Refuse `url` if its host is written as an address this rule doesn't allow. A host written
-    /// as a name passes here: it is judged by what it resolves to, when dipper connects.
+    /// Refuse `url` if it is not http or https, or its host is written as an address this rule
+    /// doesn't allow. A host written as a name passes: it is judged as dipper connects.
     pub fn check_url(self, url: &Url) -> Result<(), Refused> {
+        // For any other scheme the URL parser keeps an address in the host as a name, so it can't
+        // be judged here, yet a connector would still reach it directly. Neither rule allows it.
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(Refused::Scheme(url.scheme().to_string()));
+        }
         let ip = match url.host() {
             Some(Host::Ipv4(ip)) => IpAddr::V4(ip),
             Some(Host::Ipv6(ip)) => IpAddr::V6(ip),
@@ -112,9 +117,13 @@ impl reqwest::dns::Resolve for Resolver {
     }
 }
 
-/// Dipper's refusal to connect to an address that is not public.
+/// Dipper's refusal to connect to an indexer, at an address that is not public or by a URL it
+/// can't judge.
 #[derive(Debug, thiserror::Error)]
 pub enum Refused {
+    /// A URL whose scheme is not http or https.
+    #[error("refused a {0} URL: dipper calls indexers only over http or https")]
+    Scheme(String),
     /// A host written as an address that is not public.
     #[error("refused {0}: not a public address")]
     Address(IpAddr),
@@ -372,6 +381,32 @@ mod tests {
             let expected = refused.map(|ip| format!("refused {ip}: not a public address"));
             assert_eq!(refusal, expected, "{url}");
             assert!(AddressRule::Any.check_url(&url).is_ok(), "{url}");
+        }
+    }
+
+    #[test]
+    fn a_url_that_is_not_http_or_https_is_refused_whatever_the_switch() {
+        // For these schemes the URL parser keeps `10.0.0.5` as a name, not an address.
+        for url in [
+            "grpc://10.0.0.5:7602/",
+            "ftp://8.8.8.8/",
+            "grpc://indexer.example.com/",
+        ] {
+            let url: Url = url.parse().unwrap();
+            let scheme = url.scheme().to_string();
+            for rule in [AddressRule::PublicOnly, AddressRule::Any] {
+                let refusal = rule
+                    .check_url(&url)
+                    .err()
+                    .map(|refused| refused.to_string());
+                assert_eq!(
+                    refusal,
+                    Some(format!(
+                        "refused a {scheme} URL: dipper calls indexers only over http or https"
+                    )),
+                    "{url} under {rule:?}"
+                );
+            }
         }
     }
 
