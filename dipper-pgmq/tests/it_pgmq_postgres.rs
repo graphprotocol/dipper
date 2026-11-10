@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use dipper_pgmq::{JobBuilder, JobGuard, JobPriority, PgQueue, RetryOutcome};
+use dipper_pgmq::{JobBuilder, JobGuard, JobPriority, PgQueue, Popped, RetryOutcome};
 use fake::{Dummy, Fake, Faker};
 use pgtemp::PgTempDB;
 use sqlx::{Pool, Postgres};
@@ -994,5 +994,114 @@ async fn future_interactive_does_not_preempt_eligible_background() {
     assert!(
         second.is_none(),
         "the future interactive job must stay gated until its scheduled_for"
+    );
+}
+
+/// A stored job this release can't read, such as 1 of a type a rollback removed, and a readable
+/// job queued after it.
+async fn unreadable_job_ahead_of_a_good_one(
+    queue: &PgQueue,
+) -> anyhow::Result<(dipper_pgmq::JobId, serde_json::Value, dipper_pgmq::JobId)> {
+    let unreadable = serde_json::json!({"type": "RemovedJobType", "request": 7});
+    let unreadable_id = queue.push(unreadable.clone()).await?;
+    let good_id = queue.push(Faker.fake::<TestMsg>()).await?;
+    Ok((unreadable_id, unreadable, good_id))
+}
+
+/// The status and stored form of a job.
+async fn stored_job(
+    db: &Pool<Postgres>,
+    id: dipper_pgmq::JobId,
+) -> anyhow::Result<(i32, serde_json::Value)> {
+    let (status, descriptor): (i32, sqlx::types::Json<serde_json::Value>) =
+        sqlx::query_as("SELECT status, descriptor FROM pgmq_queue WHERE id = $1")
+            .bind(id)
+            .fetch_one(db)
+            .await?;
+    Ok((status, descriptor.0))
+}
+
+/// A stored job that can't be read used to fail every pop and stay first in line for ever. It is
+/// now handed back once as unreadable, marked failed for good with its stored form kept for an
+/// operator, and the job behind it is delivered next.
+#[tokio::test]
+async fn an_unreadable_job_is_failed_for_good_and_the_next_job_delivered() {
+    //* Given
+    let (db, _temp_db) = temp_pgmq_db().await;
+    let queue = PgQueue::new(db.clone());
+    let (unreadable_id, unreadable, good_id) = unreadable_job_ahead_of_a_good_one(&queue)
+        .await
+        .expect("Failed to push the jobs");
+
+    //* When
+    let first = queue
+        .take_next::<TestMsg>()
+        .await
+        .expect("an unreadable job is not a database error")
+        .expect("expected the unreadable job");
+    let second = queue
+        .take_next::<TestMsg>()
+        .await
+        .expect("Failed to take")
+        .expect("expected the good job");
+
+    //* Then
+    let Popped::Unreadable(first) = first else {
+        panic!("the unreadable job must be reported as unreadable");
+    };
+    assert_eq!(first.id, unreadable_id);
+    assert!(first.error.to_string().contains("data"), "{}", first.error);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&first.stored).expect("stored JSON"),
+        unreadable
+    );
+    let Popped::Job(second) = second else {
+        panic!("the good job must be delivered");
+    };
+    assert_eq!(second.id(), &good_id);
+    second
+        .remove()
+        .await
+        .expect("Failed to remove the good job");
+
+    assert_eq!(
+        stored_job(&db, unreadable_id)
+            .await
+            .expect("Failed to read the job row"),
+        (1, unreadable),
+        "the unreadable job ends failed (status = 1) with its stored JSON intact"
+    );
+    let next = queue.take_next::<TestMsg>().await.expect("Failed to take");
+    assert!(
+        next.is_none(),
+        "a job failed for good is not handed out again"
+    );
+}
+
+/// `pop` gets past an unreadable job the same way, delivering the job behind it.
+#[tokio::test]
+async fn pop_delivers_the_job_behind_an_unreadable_one() {
+    //* Given
+    let (db, _temp_db) = temp_pgmq_db().await;
+    let queue = PgQueue::new(db.clone());
+    let (unreadable_id, unreadable, good_id) = unreadable_job_ahead_of_a_good_one(&queue)
+        .await
+        .expect("Failed to push the jobs");
+
+    //* When
+    let job: JobGuard<TestMsg> = queue
+        .pop()
+        .await
+        .expect("an unreadable job is not a database error")
+        .expect("expected the good job");
+
+    //* Then
+    assert_eq!(job.id(), &good_id);
+    job.remove().await.expect("Failed to remove the good job");
+    assert_eq!(
+        stored_job(&db, unreadable_id)
+            .await
+            .expect("Failed to read the job row"),
+        (1, unreadable)
     );
 }

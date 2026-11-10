@@ -7,6 +7,7 @@ edition = "2024"
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 sqlx = { workspace = true, features = ["runtime-tokio"] }
 time.workspace = true
 tokio.workspace = true
@@ -15,7 +16,6 @@ uuid = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
 fake.workspace = true
-serde_json.workspace = true
 pgtemp = "0.6.0"
 tokio = { workspace = true, features = ["macros", "test-util"] }
 

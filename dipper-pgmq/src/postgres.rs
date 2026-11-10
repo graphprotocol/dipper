@@ -96,11 +96,11 @@ where
     Ok(id)
 }
 
-/// Pop a job from the queue
-pub async fn pop<'q, E, T>(executor: E) -> anyhow::Result<Option<PgJob<T>>>
+/// Pop a job from the queue. Its descriptor comes back as stored, so a job this release can't
+/// read is still taken off the head of the queue rather than failing the pop.
+pub async fn pop<'q, E>(executor: E) -> anyhow::Result<Option<PgJob<serde_json::Value>>>
 where
     E: sqlx::Executor<'q, Database = Postgres>,
-    T: for<'de> serde::Deserialize<'de> + Send + Unpin + 'static,
 {
     // MATERIALIZED is required for correctness, not perf: without it Postgres
     // re-runs the `FOR UPDATE SKIP LOCKED LIMIT 1` subquery per outer row and
@@ -156,6 +156,22 @@ where
     sqlx::query("DELETE FROM pgmq_queue")
         .execute(executor)
         .await?;
+    Ok(())
+}
+
+/// Mark a job that can't be read as failed for good, leaving its descriptor as stored so an
+/// operator can look at it.
+pub async fn mark_as_unreadable<'q, E>(executor: E, id: &JobId) -> anyhow::Result<()>
+where
+    E: sqlx::Executor<'q, Database = Postgres>,
+{
+    sqlx::query(
+        "UPDATE pgmq_queue SET status = $2, updated_at = timezone('UTC', now()) WHERE id = $1",
+    )
+    .bind(id)
+    .bind(PgJobStatus::Failed)
+    .execute(executor)
+    .await?;
     Ok(())
 }
 

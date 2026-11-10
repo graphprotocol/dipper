@@ -78,29 +78,64 @@ impl PgQueue {
         }
     }
 
-    /// Pulls a job from the queue
+    /// Pulls the next job this release can read from the queue. Each job ahead of it that can't
+    /// be read is taken off the queue first, as [`Self::take_next`] does, and logged as an error.
+    pub async fn pop<T>(&self) -> anyhow::Result<Option<JobGuard<'_, T>>>
+    where
+        T: for<'de> serde::Deserialize<'de> + Send + Unpin + 'static,
+    {
+        loop {
+            match self.take_next().await? {
+                Some(Popped::Job(job)) => return Ok(Some(job)),
+                Some(Popped::Unreadable(job)) => tracing::error!(
+                    job_id = %job.id,
+                    error = %job.error,
+                    stored = %job.stored_excerpt(),
+                    "Took a job that can't be read off the queue; it is kept as failed"
+                ),
+                None => return Ok(None),
+            }
+        }
+    }
+
+    /// Takes the job at the head of the queue. A stored job that can't be read as `T`, such as
+    /// 1 queued by a release whose job types differ, is marked failed for good with its stored
+    /// form kept, and handed back as [`Popped::Unreadable`], so it can't hold up the jobs behind
+    /// it. A database error is returned as an error, leaving the queue as it was.
     #[expect(
         clippy::cast_sign_loss,
         reason = "predates this lint; fix when next touched"
     )]
-    pub async fn pop<T>(&self) -> anyhow::Result<Option<JobGuard<'_, T>>>
+    pub async fn take_next<T>(&self) -> anyhow::Result<Option<Popped<'_, T>>>
     where
         T: for<'de> serde::Deserialize<'de> + Send + Unpin + 'static,
     {
         let mut tx = self.pool.begin().await?;
 
-        let res = postgres::pop(tx.as_mut()).await?.map(|job| {
-            let job = JobInner {
-                id: job.id,
-                created_at: job.created_at,
-                updated_at: job.updated_at,
-                desc: job.descriptor.0,
-                max_attempts: job.max_attempts as u32,
-                failed_attempts: job.attempt_count as u32,
-            };
-            JobGuard::new(tx, job)
-        });
-        Ok(res)
+        let Some(job) = postgres::pop(tx.as_mut()).await? else {
+            return Ok(None);
+        };
+        let desc = match T::deserialize(&job.descriptor.0) {
+            Ok(desc) => desc,
+            Err(error) => {
+                postgres::mark_as_unreadable(tx.as_mut(), &job.id).await?;
+                tx.commit().await?;
+                return Ok(Some(Popped::Unreadable(UnreadableJob {
+                    id: job.id,
+                    error,
+                    stored: job.descriptor.0.to_string(),
+                })));
+            }
+        };
+        let job = JobInner {
+            id: job.id,
+            created_at: job.created_at,
+            updated_at: job.updated_at,
+            desc,
+            max_attempts: job.max_attempts as u32,
+            failed_attempts: job.attempt_count as u32,
+        };
+        Ok(Some(Popped::Job(JobGuard::new(tx, job))))
     }
 
     /// Subscribes to the `pgmq_jobs_available` channel
@@ -116,6 +151,43 @@ impl PgQueue {
     /// Clears the queue
     pub async fn clear(&self) -> anyhow::Result<()> {
         postgres::clear(&self.pool).await
+    }
+}
+
+/// What taking the job at the head of the queue found.
+pub enum Popped<'c, T> {
+    /// A job to run.
+    Job(JobGuard<'c, T>),
+    /// A stored job that can't be read, now marked failed for good.
+    Unreadable(UnreadableJob),
+}
+
+/// A stored job that couldn't be read, kept in the queue as failed for good.
+#[derive(Debug)]
+pub struct UnreadableJob {
+    /// The job's id.
+    pub id: JobId,
+    /// Why it couldn't be read.
+    pub error: serde_json::Error,
+    /// The job as stored.
+    pub stored: String,
+}
+
+/// Most characters of a stored job a log line carries; the full form stays in the queue.
+const STORED_EXCERPT_CHARS: usize = 1_000;
+
+impl UnreadableJob {
+    /// The stored job, cut to a length a log line or an alert can carry.
+    pub fn stored_excerpt(&self) -> std::borrow::Cow<'_, str> {
+        match self.stored.char_indices().nth(STORED_EXCERPT_CHARS) {
+            None => self.stored.as_str().into(),
+            Some((cut, _)) => format!(
+                "{}... (cut; {} characters in all)",
+                &self.stored[..cut],
+                self.stored.chars().count()
+            )
+            .into(),
+        }
     }
 }
 
@@ -172,5 +244,40 @@ where
 {
     fn from(desc: T) -> Self {
         Self::new(desc)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{JobId, STORED_EXCERPT_CHARS, UnreadableJob};
+
+    fn unreadable(stored: String) -> UnreadableJob {
+        UnreadableJob {
+            id: JobId::default(),
+            error: serde_json::from_str::<u8>("\"x\"").unwrap_err(),
+            stored,
+        }
+    }
+
+    /// A short stored job is logged whole; a long one is cut, on a character boundary, with a note
+    /// of how long it was, so it can't swamp a log line or an alert.
+    #[test]
+    fn a_stored_job_is_cut_to_a_length_a_log_line_can_carry() {
+        let short = "{\"type\":\"RemovedJobType\"}".to_string();
+        assert_eq!(unreadable(short.clone()).stored_excerpt(), short);
+
+        let long = "é".repeat(STORED_EXCERPT_CHARS + 5);
+        let excerpt = unreadable(long).stored_excerpt().into_owned();
+        assert!(
+            excerpt.starts_with(&"é".repeat(STORED_EXCERPT_CHARS)),
+            "{excerpt}"
+        );
+        assert!(
+            excerpt.ends_with(&format!(
+                "... (cut; {} characters in all)",
+                STORED_EXCERPT_CHARS + 5
+            )),
+            "{excerpt}"
+        );
     }
 }

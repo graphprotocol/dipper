@@ -719,7 +719,7 @@ async fn retry_job(job: impl FinishedJob, err: &anyhow::Error, base_delay: Durat
 
 /// The `event` tag on the error logged for a job that will never run again, so an operator is
 /// alerted to work left undone.
-const JOB_FAILED_EVENT: &str = "job_failed_permanently";
+pub(super) const JOB_FAILED_EVENT: &str = "job_failed_permanently";
 
 /// A job whose run failed, as its failure is logged.
 struct FailedJob {
