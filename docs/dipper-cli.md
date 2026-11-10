@@ -16,6 +16,7 @@ The Dipper Admin CLI supports multiple authentication mechanisms to securely man
 >    - Use environment-specific vaults (development, staging, production)
 >    - Regularly audit vault access permissions
 >    - Implement the principle of least privilege for key access
+>    - Use a different signing key for each dipper. A request is signed for the chain a dipper serves, so 2 dippers on the same chain that allow the same key would each accept a request sent to the other
 >
 > 2. **Secret Management**
 >    - Never commit actual signing keys to version control

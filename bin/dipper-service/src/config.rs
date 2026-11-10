@@ -1419,6 +1419,10 @@ pub struct AdminRpcConfig {
     pub listen_addr: std::net::SocketAddr,
 
     /// Authorized gateway operator addresses (e.g., Graph Studio).
+    ///
+    /// Allow each address on only 1 dipper per chain. A request is signed for the chain a dipper
+    /// serves, not for the dipper, so a second dipper on that chain allowing the same address
+    /// would accept a request that was sent to the first.
     #[serde_as(as = "serde_with::SetLastValueWins<_>")]
     pub gateway_operator_allowlist: BTreeSet<Address>,
 }
