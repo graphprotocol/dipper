@@ -1,0 +1,33 @@
+name: osv-scanner
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [ 'main' ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+# Only reads the code: findings go to the job log rather than the repository's security tab,
+# which would need write access to security events.
+permissions:
+  contents: read
+
+jobs:
+  # Fails when Cargo.lock holds a crate with a known vulnerability that osv-scanner.toml does not
+  # ignore, and also when the scan itself fails, so a broken scan never passes as a clean one.
+  scan-dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
+        with:
+          persist-credentials: false
+
+      - name: Scan dependencies against the OSV database
+        uses: google/osv-scanner-action/osv-scanner-action@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
+        with:
+          scan-args: |-
+            --config=osv-scanner.toml
+            --recursive
+            ./
