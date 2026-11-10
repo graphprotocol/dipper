@@ -46,7 +46,7 @@ All environment variables used by the CLI are prefixed with `DIPS_`. The main co
 - `DIPS_IPFS_URL`: The IPFS API that subgraph manifests are read from (defaults to `https://ipfs.thegraph.com`)
 - `DIPS_PROTOCOL_CHAIN_ID`: The chain the DIPs contracts are on (42161 for Arbitrum One, 421614 for Arbitrum Sepolia). `indexings set-target-candidates` needs it, or `--protocol-chain-id`, because each request is signed for the dipper on that chain
 
-A dipper answers 403 to a request signed for another chain, and 401 to one signed more than 5 minutes from its own clock, so keep the clock of the machine running the CLI in sync. It answers 409 to a request signed no later than one it already accepted for the same deployment and chain, which is what a second request in the same second gets: send it again.
+A dipper answers 403 to a request signed for another chain, and 401 to one signed more than 5 minutes before its own clock or more than 30 seconds ahead of it, so keep the clock of the machine running the CLI in sync. It answers 409 to a request signed no later than one it already accepted for the same deployment and chain, which is what a second request in the same second gets: send it again.
 
 A command-line flag takes precedence over the matching environment variable. Environment variables can be used to avoid repeating common configuration:
 

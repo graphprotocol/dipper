@@ -25,10 +25,14 @@ use crate::{
     worker::service::{JobPriority, WorkerQueue},
 };
 
-/// How far a request's `signed_at` may be from this server's clock, in either direction. Long
-/// enough for a slow connection and for clocks that disagree a little, and short enough that a
-/// request someone recorded is soon no use to them.
-const MAX_SIGNED_AT_DISTANCE_SECS: u64 = 300;
+/// How long after it was signed a request is still accepted. Long enough for a slow connection,
+/// and short enough that a request someone recorded is soon no use to them.
+const MAX_SIGNED_AT_AGE_SECS: u64 = 300;
+
+/// How far ahead of this server's clock a request may be dated, for clocks that disagree a
+/// little. Kept small because the newest signing time accepted blocks every request signed
+/// before it: a request dated far ahead would lock its operator out until that time came.
+const MAX_SIGNED_AT_AHEAD_SECS: u64 = 30;
 
 /// The substate for the [`IndexingRequestsRpc`] handler
 ///
@@ -133,7 +137,20 @@ where
         } = req.into_message();
 
         let now = (self.clock)();
-        if now.abs_diff(signed_at) > MAX_SIGNED_AT_DISTANCE_SECS {
+        let refusal = if now.saturating_sub(signed_at) > MAX_SIGNED_AT_AGE_SECS {
+            Some(format!(
+                "more than {MAX_SIGNED_AT_AGE_SECS} seconds before this server's clock ({now}); \
+                 sign and send it again"
+            ))
+        } else if signed_at.saturating_sub(now) > MAX_SIGNED_AT_AHEAD_SECS {
+            Some(format!(
+                "more than {MAX_SIGNED_AT_AHEAD_SECS} seconds ahead of this server's clock \
+                 ({now}); check the clock of the machine that signed it"
+            ))
+        } else {
+            None
+        };
+        if let Some(refusal) = refusal {
             tracing::warn!(
                 %requested_by,
                 signed_at,
@@ -142,11 +159,7 @@ where
             );
             return Err(ErrorObject::owned(
                 401,
-                format!(
-                    "the request was signed at {signed_at}, more than \
-                     {MAX_SIGNED_AT_DISTANCE_SECS} seconds from this server's clock ({now}); \
-                     sign and send it again"
-                ),
+                format!("the request was signed at {signed_at}, {refusal}"),
                 None::<()>,
             ));
         }
@@ -874,6 +887,38 @@ mod tests {
         assert_eq!(accepted_counts(&server), vec![3, 0]);
     }
 
+    /// A request dated well ahead of the server's clock is refused. Accepted, it would become
+    /// the newest signing time and block its operator's correctly dated requests until then.
+    #[tokio::test]
+    async fn a_request_dated_well_ahead_does_not_block_later_ones() {
+        let deployment = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
+        let signer = PrivateKeySigner::random();
+        let sign = |signed_at| {
+            signed_for(
+                SIGNER_CHAIN_ID,
+                &signer,
+                deployment,
+                DEPLOYMENT_CHAIN_ID,
+                Some(3),
+                signed_at,
+            )
+        };
+        let (server, _events) = server(
+            signer.address(),
+            SetTargetOutcome::Inserted {
+                id: IndexingRequestId::new(),
+            },
+        );
+        let from_a_fast_clock = server.set_indexing_target_candidates(sign(NOW + 200)).await;
+
+        let result = server.set_indexing_target_candidates(sign(NOW)).await;
+
+        let err = from_a_fast_clock.expect_err("a request dated 200 seconds ahead is refused");
+        assert_eq!(err.code(), 401, "{err:?}");
+        assert!(result.is_ok(), "handler returned an error: {result:?}");
+        assert_eq!(accepted_counts(&server), vec![3]);
+    }
+
     /// The same request is refused the second time it arrives.
     #[tokio::test]
     async fn a_request_sent_twice_is_refused_the_second_time() {
@@ -945,8 +990,8 @@ mod tests {
     #[tokio::test]
     async fn a_request_signed_too_far_from_now_is_refused() {
         let deployment = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
-        let too_old = NOW - MAX_SIGNED_AT_DISTANCE_SECS - 1;
-        let too_far_ahead = NOW + MAX_SIGNED_AT_DISTANCE_SECS + 1;
+        let too_old = NOW - MAX_SIGNED_AT_AGE_SECS - 1;
+        let too_far_ahead = NOW + MAX_SIGNED_AT_AHEAD_SECS + 1;
         for signed_at in [too_old, too_far_ahead, 0] {
             let signer = PrivateKeySigner::random();
             let request = signed_for(
@@ -981,8 +1026,8 @@ mod tests {
     #[tokio::test]
     async fn a_request_signed_at_the_limit_is_accepted() {
         let deployment = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
-        let oldest = NOW - MAX_SIGNED_AT_DISTANCE_SECS;
-        let furthest_ahead = NOW + MAX_SIGNED_AT_DISTANCE_SECS;
+        let oldest = NOW - MAX_SIGNED_AT_AGE_SECS;
+        let furthest_ahead = NOW + MAX_SIGNED_AT_AHEAD_SECS;
         for signed_at in [oldest, furthest_ahead] {
             let signer = PrivateKeySigner::random();
             let request = signed_for(
