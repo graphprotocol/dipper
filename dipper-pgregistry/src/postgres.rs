@@ -49,6 +49,14 @@ pub struct ChainListenerStateRow {
     pub last_processed_block_timestamp: Option<u64>,
 }
 
+/// An on-chain change to an agreement the chain listener set aside after it kept failing to apply:
+/// the agreement, and the block the change was seen at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetAsideChange {
+    pub agreement_id: IndexingAgreementId,
+    pub block: u64,
+}
+
 /// Which party cancelled an agreement, for the atomic reconciliation
 /// transition written by `apply_reconciliation`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2658,6 +2666,77 @@ impl PgRegistry {
         .bind(last_processed_block as i64)
         .bind(last_processed_id)
         .bind(last_processed_block_timestamp.map(|t| t as i64))
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Record `changes` as set aside by the chain listener, to be tried again. An agreement
+    /// already recorded keeps when it was first set aside and the later of the 2 blocks.
+    pub async fn record_set_aside_changes(&self, changes: &[SetAsideChange]) -> Result<(), Error> {
+        let agreement_ids: Vec<IndexingAgreementId> =
+            changes.iter().map(|change| change.agreement_id).collect();
+        // Only a broken subgraph reports a block the column can't hold; the largest it can hold
+        // still waits for a state at least as recent.
+        let blocks: Vec<i64> = changes
+            .iter()
+            .map(|change| i64::try_from(change.block).unwrap_or(i64::MAX))
+            .collect();
+        sqlx::query(
+            r#"
+            INSERT INTO dipper_chain_listener_set_aside_changes (agreement_id, change_block)
+            SELECT agreement_id, max(change_block)
+            FROM unnest($1::bytea[], $2::bigint[]) AS t(agreement_id, change_block)
+            GROUP BY agreement_id
+            ON CONFLICT (agreement_id) DO UPDATE SET
+                change_block = GREATEST(
+                    dipper_chain_listener_set_aside_changes.change_block,
+                    EXCLUDED.change_block
+                )
+            "#,
+        )
+        .bind(&agreement_ids[..])
+        .bind(&blocks[..])
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get every change the chain listener set aside, the longest set aside first.
+    pub async fn get_set_aside_changes(&self) -> Result<Vec<SetAsideChange>, Error> {
+        let rows: Vec<(IndexingAgreementId, i64)> = sqlx::query_as(
+            r#"
+            SELECT agreement_id, change_block
+            FROM dipper_chain_listener_set_aside_changes
+            ORDER BY set_aside_at, agreement_id
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(agreement_id, block)| SetAsideChange {
+                agreement_id,
+                block: block.max(0).unsigned_abs(),
+            })
+            .collect())
+    }
+
+    /// Remove the set-aside changes to `agreement_ids`, once they applied or had nothing to apply.
+    pub async fn delete_set_aside_changes(
+        &self,
+        agreement_ids: &[IndexingAgreementId],
+    ) -> Result<(), Error> {
+        sqlx::query(
+            r#"
+            DELETE FROM dipper_chain_listener_set_aside_changes
+            WHERE agreement_id = ANY($1)
+            "#,
+        )
+        .bind(agreement_ids)
         .execute(&self.pool)
         .await?;
 

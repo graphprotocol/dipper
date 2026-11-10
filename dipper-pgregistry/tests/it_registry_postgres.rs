@@ -6,7 +6,7 @@ use dipper_core::ids::{IndexingAgreementId, IndexingRequestId};
 use dipper_pgregistry::{
     CancelKind, EndCorrection, Error, IndexingAgreementStatus, IndexingAgreementTerms,
     IndexingRequestStatus, NewAgreementParams, PgRegistry, ReconciliationAudit, ReconciliationItem,
-    RecordedEnd, WithheldIndexers,
+    RecordedEnd, SetAsideChange, WithheldIndexers,
 };
 use fake::{Fake, Faker};
 use pgtemp::PgTempDB;
@@ -1832,6 +1832,123 @@ async fn update_chain_listener_state_upserts_existing() {
         Some(1700001000),
         "Timestamp should be updated"
     );
+}
+
+#[tokio::test]
+async fn set_aside_changes_are_listed_longest_set_aside_first_until_deleted() {
+    //* Given
+    let (db, _temp_db) = temp_registry_db().await;
+    let registry = PgRegistry::new(db);
+    let early = IndexingAgreementId::from_bytes([0xbb; 16]);
+    let later = IndexingAgreementId::from_bytes([0xaa; 16]);
+    let last = IndexingAgreementId::from_bytes([0xcc; 16]);
+    registry
+        .record_set_aside_changes(&[SetAsideChange {
+            agreement_id: early,
+            block: 10,
+        }])
+        .await
+        .expect("Failed to record the first change");
+    registry
+        .record_set_aside_changes(&[
+            SetAsideChange {
+                agreement_id: later,
+                block: 20,
+            },
+            SetAsideChange {
+                agreement_id: last,
+                block: 30,
+            },
+        ])
+        .await
+        .expect("Failed to record the later changes");
+
+    //* When
+    let listed = registry
+        .get_set_aside_changes()
+        .await
+        .expect("Failed to list set-aside changes");
+    registry
+        .delete_set_aside_changes(&[early, last])
+        .await
+        .expect("Failed to delete set-aside changes");
+    let after = registry
+        .get_set_aside_changes()
+        .await
+        .expect("Failed to list set-aside changes");
+
+    //* Then
+    assert_eq!(
+        listed,
+        vec![
+            SetAsideChange {
+                agreement_id: early,
+                block: 10,
+            },
+            SetAsideChange {
+                agreement_id: later,
+                block: 20,
+            },
+            SetAsideChange {
+                agreement_id: last,
+                block: 30,
+            },
+        ],
+        "the first set aside comes first, though its id sorts after the next"
+    );
+    assert_eq!(
+        after,
+        vec![SetAsideChange {
+            agreement_id: later,
+            block: 20,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn a_change_set_aside_again_keeps_the_later_block() {
+    //* Given
+    let (db, _temp_db) = temp_registry_db().await;
+    let registry = PgRegistry::new(db);
+    let agreement_id = IndexingAgreementId::from_bytes([0xaa; 16]);
+    let change_at = |block| SetAsideChange {
+        agreement_id,
+        block,
+    };
+    registry
+        .record_set_aside_changes(&[change_at(20)])
+        .await
+        .expect("Failed to record the change");
+
+    //* When
+    registry
+        .record_set_aside_changes(&[change_at(10)])
+        .await
+        .expect("Failed to record an earlier block");
+    let after_earlier = registry
+        .get_set_aside_changes()
+        .await
+        .expect("Failed to list set-aside changes");
+    registry
+        .record_set_aside_changes(&[change_at(30), change_at(40)])
+        .await
+        .expect("Failed to record later blocks");
+    let after_later = registry
+        .get_set_aside_changes()
+        .await
+        .expect("Failed to list set-aside changes");
+    registry
+        .record_set_aside_changes(&[])
+        .await
+        .expect("Recording nothing should not error");
+    registry
+        .delete_set_aside_changes(&[])
+        .await
+        .expect("Deleting nothing should not error");
+
+    //* Then
+    assert_eq!(after_earlier, vec![change_at(20)]);
+    assert_eq!(after_later, vec![change_at(40)]);
 }
 
 // =============================================================================

@@ -6,6 +6,7 @@ mod indexer_denylist;
 mod indexing_request;
 mod pending_cancellation;
 mod result;
+mod set_aside_change;
 
 use async_trait::async_trait;
 use dipper_core::ids::{IndexingAgreementId, IndexingRequestId};
@@ -36,6 +37,7 @@ pub use self::{
     },
     pending_cancellation::{PendingCancellation, PendingCancellationRegistry},
     result::{Error, Result},
+    set_aside_change::{SetAsideChange, SetAsideChangeRegistry},
 };
 
 impl From<NewAgreementParams> for dipper_pgregistry::NewAgreementParams {
@@ -991,6 +993,44 @@ impl PendingCancellationRegistry for RegistryProvider {
     ) -> RegistryResult<Vec<IndexingAgreementId>> {
         self.inner
             .list_executable_pending_cancellations(limit)
+            .await
+            .map_err(Into::into)
+    }
+}
+
+#[async_trait]
+impl SetAsideChangeRegistry for RegistryProvider {
+    async fn record_set_aside_changes(&self, changes: &[SetAsideChange]) -> RegistryResult<()> {
+        let pg_changes: Vec<dipper_pgregistry::SetAsideChange> = changes
+            .iter()
+            .map(|change| dipper_pgregistry::SetAsideChange {
+                agreement_id: change.agreement_id,
+                block: change.block,
+            })
+            .collect();
+        self.inner
+            .record_set_aside_changes(&pg_changes)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn get_set_aside_changes(&self) -> RegistryResult<Vec<SetAsideChange>> {
+        let rows = self.inner.get_set_aside_changes().await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| SetAsideChange {
+                agreement_id: row.agreement_id,
+                block: row.block,
+            })
+            .collect())
+    }
+
+    async fn delete_set_aside_changes(
+        &self,
+        agreement_ids: &[IndexingAgreementId],
+    ) -> RegistryResult<()> {
+        self.inner
+            .delete_set_aside_changes(agreement_ids)
             .await
             .map_err(Into::into)
     }

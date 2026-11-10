@@ -210,6 +210,17 @@ pub trait ChainEventSource: Send + Sync {
         since: &Cursor,
         pinned_block: Option<u64>,
     ) -> Result<ChangedAgreementsResult, ChainEventError>;
+
+    /// Fetch the current state of each of `agreement_ids`, read at the subgraph's latest block,
+    /// with the same payer filter as [`Self::get_changed_agreements`]. The chain listener uses it
+    /// to try again the changes it set aside.
+    ///
+    /// An agreement the subgraph has no readable state for is left out. A response naming an
+    /// agreement not asked for, or naming one twice, fails as transient.
+    async fn get_agreement_snapshots(
+        &self,
+        agreement_ids: &[IndexingAgreementId],
+    ) -> Result<Vec<AgreementStateSnapshot>, ChainEventError>;
 }
 
 /// Configuration for the subgraph event source.
@@ -251,6 +262,13 @@ struct ChangedAgreementsResponse {
     indexing_agreements: Vec<IndexingAgreementEntity>,
     #[serde(rename = "_meta")]
     meta: SubgraphMeta,
+}
+
+/// GraphQL response wrapping the `indexingAgreements` list read by id.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgreementSnapshotsResponse {
+    indexing_agreements: Vec<IndexingAgreementEntity>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -648,6 +666,75 @@ impl ChainEventSource for SubgraphEventSource {
             cursor,
         })
     }
+
+    async fn get_agreement_snapshots(
+        &self,
+        agreement_ids: &[IndexingAgreementId],
+    ) -> Result<Vec<AgreementStateSnapshot>, ChainEventError> {
+        let query = format!(
+            r#"
+            query AgreementSnapshots($payer: Bytes!, $ids: [Bytes!]!) {{
+                indexingAgreements(
+                    where: {{ payer: $payer, id_in: $ids }}
+                    first: {SUBGRAPH_PAGE_SIZE}
+                ) {{
+                    id
+                    indexer
+                    state
+                    canceledBy
+                    lastStateChangeBlock
+                    acceptedAt
+                    acceptedAtTx
+                    canceledAt
+                    canceledAtTx
+                }}
+            }}
+            "#
+        );
+
+        let mut snapshots = Vec::with_capacity(agreement_ids.len());
+        // The query returns at most a page of rows, so it asks for at most a page of ids at once.
+        for ids in agreement_ids.chunks(SUBGRAPH_PAGE_SIZE) {
+            let variables = serde_json::json!({
+                "payer": format!("{:#x}", self.config.payer_address),
+                "ids": ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            });
+            let response: AgreementSnapshotsResponse =
+                self.query_with_retry(&query, variables).await?;
+            snapshots.extend(snapshots_asked_for(ids, &response.indexing_agreements)?);
+        }
+        Ok(snapshots)
+    }
+}
+
+/// Parse the entities read for `asked_for`, leaving out any that are malformed. A response naming
+/// an agreement not asked for, or naming one twice, is rejected: the subgraph isn't trusted, and
+/// the listener would apply whatever state it returned.
+fn snapshots_asked_for(
+    asked_for: &[IndexingAgreementId],
+    entities: &[IndexingAgreementEntity],
+) -> Result<Vec<AgreementStateSnapshot>, ChainEventError> {
+    let mut unseen: std::collections::HashSet<IndexingAgreementId> =
+        asked_for.iter().copied().collect();
+    let mut snapshots = Vec::with_capacity(entities.len());
+    for entity in entities {
+        // The listener warns, at a bounded rate, about each agreement left without a state.
+        let Some(snapshot) = parse_snapshot(entity) else {
+            tracing::debug!(
+                entity_id = %entity.id,
+                "Leaving out a malformed IndexingAgreement entity read by id"
+            );
+            continue;
+        };
+        if !unseen.remove(&snapshot.agreement_id) {
+            return Err(ChainEventError::Transient(format!(
+                "subgraph returned agreement {} that was not asked for, or more than once",
+                snapshot.agreement_id
+            )));
+        }
+        snapshots.push(snapshot);
+    }
+    Ok(snapshots)
 }
 
 /// Reject a response whose `_meta.block.number` does not match the
@@ -967,6 +1054,28 @@ pub mod mock {
                 cursor,
             })
         }
+
+        async fn get_agreement_snapshots(
+            &self,
+            agreement_ids: &[IndexingAgreementId],
+        ) -> Result<Vec<AgreementStateSnapshot>, ChainEventError> {
+            // The subgraph keeps 1 entity per agreement, so only the latest snapshot of each.
+            let mut latest: std::collections::HashMap<IndexingAgreementId, AgreementStateSnapshot> =
+                std::collections::HashMap::new();
+            for snapshot in self.snapshots.lock().unwrap().iter() {
+                if !agreement_ids.contains(&snapshot.agreement_id) {
+                    continue;
+                }
+                match latest.get(&snapshot.agreement_id) {
+                    Some(kept)
+                        if kept.last_state_change_block >= snapshot.last_state_change_block => {}
+                    _ => {
+                        latest.insert(snapshot.agreement_id, snapshot.clone());
+                    }
+                }
+            }
+            Ok(latest.into_values().collect())
+        }
     }
 }
 
@@ -1215,6 +1324,126 @@ mod tests {
         assert!(
             matches!(err, ChainEventError::RateLimited(_)),
             "got {err:?}"
+        );
+    }
+
+    /// The JSON the subgraph sends for [`valid_entity`], under `id`.
+    fn entity_json(id: IndexingAgreementId) -> serde_json::Value {
+        let entity = valid_entity();
+        serde_json::json!({
+            "id": id.to_string(),
+            "indexer": entity.indexer,
+            "state": entity.state,
+            "canceledBy": entity.canceled_by,
+            "lastStateChangeBlock": entity.last_state_change_block,
+            "acceptedAt": entity.accepted_at,
+            "acceptedAtTx": entity.accepted_at_tx,
+            "canceledAt": entity.canceled_at,
+            "canceledAtTx": entity.canceled_at_tx,
+        })
+    }
+
+    fn agreements_response(entities: Vec<serde_json::Value>) -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(200)
+            .set_body_json(serde_json::json!({ "data": { "indexingAgreements": entities } }))
+    }
+
+    /// Reading agreements by id asks for those ids of the payer, and parses what comes back as a
+    /// page does, leaving out a malformed entity.
+    #[tokio::test]
+    async fn test_get_agreement_snapshots_reads_the_payers_agreements_by_id() {
+        let server = wiremock::MockServer::start().await;
+        let read = IndexingAgreementId::from_bytes([1; 16]);
+        let malformed = IndexingAgreementId::from_bytes([2; 16]);
+        let mut malformed_entity = entity_json(malformed);
+        malformed_entity["state"] = serde_json::json!("Garbage");
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_string_contains(
+                "where: { payer: $payer, id_in: $ids }",
+            ))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "variables": {
+                    "payer": "0x0000000000000000000000000000000000000000",
+                    "ids": [read.to_string(), malformed.to_string()],
+                }
+            })))
+            .respond_with(agreements_response(vec![
+                entity_json(read),
+                malformed_entity,
+            ]))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let snapshots = event_source_for(&server)
+            .get_agreement_snapshots(&[read, malformed])
+            .await
+            .expect("the read succeeds");
+
+        assert_eq!(snapshots.len(), 1, "{snapshots:?}");
+        let snapshot = &snapshots[0];
+        assert_eq!(snapshot.agreement_id, read);
+        assert_eq!(snapshot.state, AgreementState::Accepted);
+        assert_eq!(snapshot.last_state_change_block, 150);
+        assert_eq!(snapshot.accepted_at, 1_700_000_001);
+        assert_eq!(snapshot.canceled_by, Address::ZERO);
+    }
+
+    /// The subgraph isn't trusted: a state for an agreement not asked for, or for 1 twice, fails
+    /// the read rather than being applied.
+    #[tokio::test]
+    async fn test_get_agreement_snapshots_rejects_agreements_not_asked_for() {
+        let asked = IndexingAgreementId::from_bytes([1; 16]);
+        let other = IndexingAgreementId::from_bytes([3; 16]);
+        for returned in [vec![other], vec![asked, asked]] {
+            let server = wiremock::MockServer::start().await;
+            expect_single_query(
+                &server,
+                agreements_response(returned.iter().map(|id| entity_json(*id)).collect()),
+            )
+            .await;
+
+            let err = event_source_for(&server)
+                .get_agreement_snapshots(&[asked])
+                .await
+                .expect_err("the read fails");
+
+            assert!(err.is_transient(), "{returned:?}: {err:?}");
+        }
+    }
+
+    /// The query returns at most a page of rows, so more ids than that take more than 1 query,
+    /// and none take none.
+    #[tokio::test]
+    async fn test_get_agreement_snapshots_asks_for_at_most_a_page_of_ids_at_once() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(agreements_response(vec![]))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let source = event_source_for(&server);
+        let ids: Vec<IndexingAgreementId> = (0..=SUBGRAPH_PAGE_SIZE)
+            .map(|n| {
+                let mut bytes = [0u8; 16];
+                bytes[..8].copy_from_slice(&(n as u64).to_be_bytes());
+                IndexingAgreementId::from_bytes(bytes)
+            })
+            .collect();
+
+        assert!(
+            source
+                .get_agreement_snapshots(&[])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            source
+                .get_agreement_snapshots(&ids)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 
