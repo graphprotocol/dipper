@@ -25,17 +25,22 @@ id = "RUSTSEC-2023-0071"
 reason = "rsa is only reachable through sqlx's MySQL driver. Dipper uses Postgres and does not build it."
 
 # Built, with no fixed release dipper can take until the libraries that pull them in move on.
+# These 3 are real flaws in code dipper runs, so each entry lapses on the date given and the
+# scan fails again until someone reads it afresh and either removes it or moves the date.
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0387"
+ignoreUntil = 2027-02-11
 reason = "Timing leaks in crypto-bigint, fixed only in 0.7.6. Dipper builds 0.5.5 under k256, the secp256k1 library alloy signs with, which uses it to add, subtract, negate and range-check secret values while signing and does its own multiplication and inversion. The fixes were made to 0.7 code; nobody has shown whether 0.5.5 leaks in the operations k256 uses, and no constant-time check has been run on it. Goes when alloy moves to k256 0.14."
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0258"
+ignoreUntil = 2027-02-11
 reason = "h2 0.3 comes in under reqwest 0.11, which the networks registry client uses to fetch the registry at startup, and under the IPFS client in indexer-rs, which dipper never calls. That reqwest is built without the feature that negotiates HTTP/2 over TLS, so the registry fetch uses HTTP/1.1 and does not reach h2. No 0.3 release is fixed. Dipper's other HTTP/2 traffic uses h2 0.4, which is updated past the fix."
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0253"
+ignoreUntil = 2027-02-11
 reason = "lru 0.16 backs alloy's provider caches. Only a key whose drop code panics can trigger it, and those keys are block numbers and hashes. Only 0.18 is fixed, which needs a new alloy release."
 
 # Notices that a crate is no longer maintained: no known flaw, but no fixes to come either.
