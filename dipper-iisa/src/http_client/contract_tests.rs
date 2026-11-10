@@ -56,9 +56,46 @@ fn resolved<'a>(schema: &'a Value, api: &'a Value) -> &'a Value {
     }
 }
 
+/// The keywords of IISA's schema these checks act on.
+const CHECKED: [&str; 9] = [
+    "type",
+    "anyOf",
+    "$ref",
+    "items",
+    "properties",
+    "additionalProperties",
+    "required",
+    "minimum",
+    "minLength",
+];
+
+/// The keywords that only describe, which no value can break.
+const DESCRIPTIVE: [&str; 3] = ["title", "description", "default"];
+
+/// Stops a check that would otherwise pass a value by ignoring part of IISA's schema it does not
+/// understand, such as `oneOf`, `pattern` or a list of types.
+fn understood(schema: &Value, at: &str) {
+    let Some(keywords) = schema.as_object() else {
+        panic!("{at}: these checks do not understand IISA's schema {schema}");
+    };
+    for keyword in keywords.keys() {
+        assert!(
+            CHECKED.contains(&keyword.as_str()) || DESCRIPTIVE.contains(&keyword.as_str()),
+            "{at}: IISA's schema uses `{keyword}`, which these checks do not understand; teach \
+             `misfit` and `example` what it means before trusting them: {schema}"
+        );
+    }
+    assert!(
+        schema.get("type").is_none_or(Value::is_string),
+        "{at}: IISA's schema gives a list of types, which these checks do not understand: {schema}"
+    );
+}
+
 /// Why `value` does not fit `schema`, or `None` when it does. `at` names it in the message.
 fn misfit(value: &Value, schema: &Value, api: &Value, at: &str) -> Option<String> {
+    understood(schema, at);
     let schema = resolved(schema, api);
+    understood(schema, at);
     if let Some(alternatives) = schema["anyOf"].as_array() {
         let misfits: Vec<_> = alternatives
             .iter()
@@ -81,7 +118,32 @@ fn misfit(value: &Value, schema: &Value, api: &Value, at: &str) -> Option<String
         }
         None => true,
     };
-    (!fits).then(|| format!("{at} is {value} where IISA expects {}", schema["type"]))
+    if !fits {
+        return Some(format!(
+            "{at} is {value} where IISA expects {}",
+            schema["type"]
+        ));
+    }
+    bound_misfit(value, schema, at)
+}
+
+/// Why `value` is outside the least value or length IISA's schema sets, if it is.
+fn bound_misfit(value: &Value, schema: &Value, at: &str) -> Option<String> {
+    if let (Some(number), Some(minimum)) = (value.as_f64(), schema["minimum"].as_f64())
+        && number < minimum
+    {
+        return Some(format!(
+            "{at} is {value}, below IISA's minimum of {minimum}"
+        ));
+    }
+    if let (Some(text), Some(least)) = (value.as_str(), schema["minLength"].as_u64())
+        && (text.chars().count() as u64) < least
+    {
+        return Some(format!(
+            "{at} is {value}, shorter than the {least} characters IISA needs"
+        ));
+    }
+    None
 }
 
 fn array_misfit(value: &Value, schema: &Value, api: &Value, at: &str) -> Option<String> {
@@ -100,6 +162,13 @@ fn object_misfit(value: &Value, schema: &Value, api: &Value, at: &str) -> Option
     let Some(fields) = value.as_object() else {
         return Some(format!("{at} is {value} where IISA expects an object"));
     };
+    let required = schema["required"].as_array().into_iter().flatten();
+    if let Some(name) = required
+        .filter_map(Value::as_str)
+        .find(|name| !fields.contains_key(*name))
+    {
+        return Some(format!("{at} leaves out `{name}`, which IISA requires"));
+    }
     fields.iter().find_map(|(name, field)| {
         let at = format!("{at}.{name}");
         let named = schema["properties"].get(name);
@@ -117,18 +186,29 @@ fn object_misfit(value: &Value, schema: &Value, api: &Value, at: &str) -> Option
 
 /// A value for every field `schema` describes, as a reply that leaves nothing out.
 fn example(schema: &Value, api: &Value) -> Value {
+    understood(schema, "an example reply");
     let schema = resolved(schema, api);
+    understood(schema, "an example reply");
     if let Some(alternatives) = schema["anyOf"].as_array() {
         let not_null = alternatives
             .iter()
             .find(|alternative| alternative["type"] != "null");
         return not_null.map_or(Value::Null, |alternative| example(alternative, api));
     }
+    let least = schema["minimum"].as_f64().unwrap_or(f64::MIN);
+    let least_length = schema["minLength"].as_u64().unwrap_or(0);
     match schema["type"].as_str() {
-        Some("string") => json!("0x00000000000000000000000000000000000000aa"),
-        Some("number") => json!(1.5),
-        Some("integer") => json!(1),
+        Some("string") => {
+            let mut text = "0x00000000000000000000000000000000000000aa".to_string();
+            while (text.chars().count() as u64) < least_length {
+                text.push('a');
+            }
+            json!(text)
+        }
+        Some("number") => json!(least.max(1.5)),
+        Some("integer") => json!(schema["minimum"].as_i64().unwrap_or(1).max(1)),
         Some("boolean") => json!(true),
+        Some("null") => Value::Null,
         Some("array") => json!([example(&schema["items"], api)]),
         Some("object") => match schema["properties"].as_object() {
             Some(properties) => properties
@@ -137,7 +217,8 @@ fn example(schema: &Value, api: &Value) -> Value {
                 .collect(),
             None => json!({ "key": example(&schema["additionalProperties"], api) }),
         },
-        _ => Value::Null,
+        None => Value::Null,
+        Some(other) => panic!("these checks cannot build a value of IISA's type {other}"),
     }
 }
 
@@ -538,33 +619,36 @@ async fn every_field_dipper_sends_is_in_the_request_schema_with_a_compatible_typ
     );
 }
 
-/// Every field IISA requires in a request to /select-indexers is in every request dipper sends,
-/// however little dipper knows: a request missing 1 is refused.
+/// However little dipper knows, every request it sends to /select-indexers has each field IISA
+/// requires, with a value IISA takes: a request IISA would refuse is not sent at all.
 #[test]
-fn every_field_the_request_schema_requires_is_always_sent() {
+fn every_request_dipper_can_send_has_what_the_schema_requires() {
     let api = api();
-    let required: BTreeSet<String> = component(&api, "SelectionRequest")["required"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|name| name.as_str().map(str::to_string))
-        .collect();
-    let without_chain = SelectionRequest::new(deployment(), 1, &SelectionContext::default());
-    let with_chain = SelectionContext {
-        chain_id: Some("arbitrum-one".to_string()),
+    let operation = &api["paths"]["/select-indexers"]["post"];
+    let schema = &operation["requestBody"]["content"]["application/json"]["schema"];
+    let with_chain = |chain_id: Option<&str>| SelectionContext {
+        chain_id: chain_id.map(str::to_string),
         ..SelectionContext::default()
     };
-    let with_chain = SelectionRequest::new(deployment(), 1, &with_chain)
-        .expect("a request with the deployment's chain is sent");
+    let contexts = [
+        with_chain(None),
+        with_chain(Some("")),
+        with_chain(Some("arbitrum-one")),
+    ];
+    let requests: Vec<_> = contexts
+        .iter()
+        .filter_map(|context| SelectionRequest::new(deployment(), 1, context).ok())
+        .collect();
+    assert!(
+        !requests.is_empty(),
+        "a request with the deployment's chain is sent"
+    );
 
-    for request in without_chain.into_iter().chain([with_chain]) {
-        let sent = keys(&serde_json::to_value(request).expect("the request is JSON"));
-        let missing: Vec<_> = required.difference(&sent).collect();
-        assert!(
-            missing.is_empty(),
-            "IISA requires {missing:?} in a request to /select-indexers, which dipper can leave \
-             out. {IF_IISA_CHANGED}"
-        );
+    for request in requests {
+        let body = serde_json::to_value(request).expect("the request is JSON");
+        if let Some(misfit) = misfit(&body, schema, &api, "SelectionRequest") {
+            panic!("{misfit}, in a request dipper can send. {IF_IISA_CHANGED}");
+        }
     }
 }
 

@@ -104,16 +104,18 @@ struct SelectionRequest {
 
 impl SelectionRequest {
     /// The request for `num_candidates` indexers for `deployment_id`, given what dipper knows.
-    /// Without the deployment's chain there is no request IISA would take, so none is made.
+    /// Without the deployment's chain, missing or empty, there is no request IISA would take, so
+    /// none is made.
     fn new(
         deployment_id: DeploymentId,
         num_candidates: usize,
         context: &SelectionContext,
     ) -> Result<Self, SelectionError> {
-        let Some(chain_id) = context.chain_id.clone() else {
+        let chain_id = context.chain_id.clone().filter(|chain| !chain.is_empty());
+        let Some(chain_id) = chain_id else {
             return Err(SelectionError::Error(anyhow::anyhow!(
                 "cannot ask IISA to select indexers for {deployment_id} without the chain it is \
-                 on: IISA refuses a request with no chain_id"
+                 on: IISA refuses a request with a missing or empty chain_id"
             )));
         };
         Ok(Self {
@@ -627,12 +629,19 @@ mod tests {
             .parse()
             .unwrap();
 
-        let err = client
-            .select_indexers(deployment_id, 2, &SelectionContext::default())
-            .await
-            .expect_err("a selection without a chain is refused");
+        for chain_id in [None, Some(String::new())] {
+            let context = SelectionContext {
+                chain_id,
+                ..SelectionContext::default()
+            };
 
-        assert!(err.to_string().contains("chain"), "{err}");
+            let err = client
+                .select_indexers(deployment_id, 2, &context)
+                .await
+                .expect_err("a selection without a chain is refused");
+
+            assert!(err.to_string().contains("chain"), "{err}");
+        }
     }
 
     #[test]
