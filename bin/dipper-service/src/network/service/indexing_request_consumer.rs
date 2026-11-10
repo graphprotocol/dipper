@@ -138,11 +138,15 @@ where
         );
         // rskafka never goes back to the bootstrap addresses while it knows any broker, so after
         // the cluster replaces its brokers this rebuilds the client from them.
+        // `connect` enforces its own deadline, so the rebuild allows a little longer and that
+        // deadline's error is the one logged.
         let kafka = ctx.config.kafka.clone();
-        let consumer = Reconnecting::with_client("indexing requests", first, move || {
-            let kafka = kafka.clone();
-            async move { KafkaConsumer::connect(&kafka).await }
-        });
+        let connect_timeout = Duration::from_secs(kafka.connect_timeout_secs.saturating_add(5));
+        let consumer =
+            Reconnecting::with_client("indexing requests", first, connect_timeout, move || {
+                let kafka = kafka.clone();
+                async move { KafkaConsumer::connect(&kafka).await }
+            });
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut tasks: JoinSet<()> = JoinSet::new();

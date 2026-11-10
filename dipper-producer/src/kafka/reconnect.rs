@@ -19,10 +19,6 @@ pub const RECONNECT_AFTER: Duration = Duration::from_secs(60);
 /// The longest wait between attempts to connect.
 const MAX_CONNECT_BACKOFF_SECS: u64 = 30;
 
-/// How long 1 attempt to connect may take. rskafka retries an unreachable bootstrap address with no
-/// deadline, so an attempt without a limit could hang with no retry and no warning.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// Failed connect attempts between repeated warnings, after the first.
 const WARN_EVERY: u32 = 5;
 
@@ -85,27 +81,39 @@ impl<T> Shared<T> {
 impl<T: Send + Sync + 'static> Reconnecting<T> {
     /// Starts connecting in the background with `connect`, retrying with capped backoff until it
     /// succeeds, and connects again each time the client is dropped. `name` labels the log lines.
-    pub fn spawn<F, Fut, E>(name: &'static str, connect: F) -> Self
+    /// Each attempt is abandoned after `connect_timeout`, since rskafka retries an unreachable
+    /// bootstrap address with no deadline; give a connect with its own deadline a little longer.
+    pub fn spawn<F, Fut, E>(name: &'static str, connect_timeout: Duration, connect: F) -> Self
     where
         F: Fn() -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<T, E>> + Send,
         E: Display + Send,
     {
-        Self::start(name, None, connect)
+        Self::start(name, None, connect_timeout, connect)
     }
 
     /// Like [`spawn`](Self::spawn), starting from a client the caller already connected, so the
     /// caller decides what a failed first connect means; `connect` is used only for rebuilds.
-    pub fn with_client<F, Fut, E>(name: &'static str, client: T, connect: F) -> Self
+    pub fn with_client<F, Fut, E>(
+        name: &'static str,
+        client: T,
+        connect_timeout: Duration,
+        connect: F,
+    ) -> Self
     where
         F: Fn() -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<T, E>> + Send,
         E: Display + Send,
     {
-        Self::start(name, Some(client), connect)
+        Self::start(name, Some(client), connect_timeout, connect)
     }
 
-    fn start<F, Fut, E>(name: &'static str, client: Option<T>, connect: F) -> Self
+    fn start<F, Fut, E>(
+        name: &'static str,
+        client: Option<T>,
+        connect_timeout: Duration,
+        connect: F,
+    ) -> Self
     where
         F: Fn() -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<T, E>> + Send,
@@ -126,7 +134,7 @@ impl<T: Send + Sync + 'static> Reconnecting<T> {
             loop {
                 if !connected {
                     let client = tokio::select! {
-                        client = connect_with_retry(name, &connect) => client,
+                        client = connect_with_retry(name, connect_timeout, &connect) => client,
                         _ = signals.closed.notified() => return,
                     };
                     let Some(shared) = task.upgrade() else {
@@ -243,7 +251,11 @@ impl<T: Send + Sync + 'static> Reconnecting<T> {
 /// Calls `connect` until it succeeds, waiting 2, 4, 8, 16 and then 30 seconds between attempts.
 /// Warns on the first failure and every [`WARN_EVERY`] after it, so an operator without
 /// dashboards still sees that the client is down.
-async fn connect_with_retry<T, F, Fut, E>(name: &'static str, connect: &F) -> T
+async fn connect_with_retry<T, F, Fut, E>(
+    name: &'static str,
+    connect_timeout: Duration,
+    connect: &F,
+) -> T
 where
     F: Fn() -> Fut,
     Fut: Future<Output = Result<T, E>>,
@@ -251,10 +263,10 @@ where
 {
     let mut attempt: u32 = 0;
     loop {
-        let error = match tokio::time::timeout(CONNECT_TIMEOUT, connect()).await {
+        let error = match tokio::time::timeout(connect_timeout, connect()).await {
             Ok(Ok(client)) => return client,
             Ok(Err(err)) => err.to_string(),
-            Err(_) => format!("timed out after {}s", CONNECT_TIMEOUT.as_secs()),
+            Err(_) => format!("timed out after {}s", connect_timeout.as_secs()),
         };
         attempt = attempt.saturating_add(1);
         if attempt == 1 || attempt.is_multiple_of(WARN_EVERY) {
@@ -275,6 +287,8 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::*;
+
+    const TIMEOUT: Duration = Duration::from_secs(30);
 
     /// A stand-in client, numbered by the connect attempt that made it.
     #[derive(Debug, PartialEq)]
@@ -328,7 +342,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn calls_go_through_a_new_client_once_the_old_one_keeps_failing() {
         let (attempts, connect) = connector(0);
-        let conn = Reconnecting::spawn("test", connect);
+        let conn = Reconnecting::spawn("test", TIMEOUT, connect);
         // Client 1 can't reach the brokers; any later client can.
         let call = || {
             conn.call(|client: Arc<Client>| async move {
@@ -351,7 +365,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_success_through_a_replaced_client_leaves_the_outage_running() {
         let (_, connect) = connector(0);
-        let conn = Reconnecting::spawn("test", connect);
+        let conn = Reconnecting::spawn("test", TIMEOUT, connect);
         let first = next_client(&conn, None).await;
         conn.report_unreachable(&first);
         tokio::time::sleep(RECONNECT_AFTER).await;
@@ -372,7 +386,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_call_the_brokers_answered_keeps_the_client() {
         let (attempts, connect) = connector(0);
-        let conn = Reconnecting::spawn("test", connect);
+        let conn = Reconnecting::spawn("test", TIMEOUT, connect);
         let refused =
             || conn.call(|_: Arc<Client>| async { Err::<(), _>(Failure { unreachable: false }) });
 
@@ -387,7 +401,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn keeps_trying_until_the_first_connect_succeeds() {
         let (attempts, connect) = connector(2);
-        let conn = Reconnecting::spawn("test", connect);
+        let conn = Reconnecting::spawn("test", TIMEOUT, connect);
 
         let client = next_client(&conn, None).await;
 
@@ -398,7 +412,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn hands_out_a_client_connected_by_the_caller_without_connecting() {
         let (attempts, connect) = connector(0);
-        let conn = Reconnecting::with_client("test", Client(0), connect);
+        let conn = Reconnecting::with_client("test", Client(0), TIMEOUT, connect);
 
         assert_eq!(conn.current().as_deref(), Some(&Client(0)));
         tokio::time::sleep(Duration::from_secs(60)).await;
@@ -414,7 +428,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn waits_for_a_client_while_one_is_connected() {
         let (_, connect) = connector(2);
-        let conn = Reconnecting::spawn("test", connect);
+        let conn = Reconnecting::spawn("test", TIMEOUT, connect);
 
         let waited = tokio::time::timeout(Duration::from_secs(60), conn.connected()).await;
 
@@ -426,7 +440,7 @@ mod tests {
         let (_, connect) = connector(0);
         let held = Arc::new(());
         let marker = held.clone();
-        let conn = Reconnecting::spawn("test", move || {
+        let conn = Reconnecting::spawn("test", TIMEOUT, move || {
             let _keep = &marker;
             connect()
         });
@@ -440,10 +454,35 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn gives_a_rebuild_as_long_as_the_caller_allows() {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let counted = attempts.clone();
+        let conn =
+            Reconnecting::with_client("test", Client(0), Duration::from_secs(60), move || {
+                let n = counted.fetch_add(1, Ordering::Relaxed) + 1;
+                async move {
+                    tokio::time::sleep(Duration::from_secs(45)).await;
+                    Ok::<_, String>(Client(n))
+                }
+            });
+        let first = conn.current().unwrap();
+        conn.report_unreachable(&first);
+        tokio::time::sleep(RECONNECT_AFTER).await;
+        assert!(conn.report_unreachable(&first));
+
+        assert_eq!(
+            *conn.connected().await,
+            Client(1),
+            "the first slow attempt succeeded"
+        );
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn gives_up_on_a_connect_attempt_that_never_finishes() {
         let attempts = Arc::new(AtomicU32::new(0));
         let counted = attempts.clone();
-        let conn = Reconnecting::spawn("test", move || {
+        let conn = Reconnecting::spawn("test", TIMEOUT, move || {
             let n = counted.fetch_add(1, Ordering::Relaxed) + 1;
             async move {
                 if n == 1 {
@@ -461,7 +500,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn connects_again_once_sends_keep_failing_to_reach_the_brokers() {
         let (attempts, connect) = connector(0);
-        let conn = Reconnecting::spawn("test", connect);
+        let conn = Reconnecting::spawn("test", TIMEOUT, connect);
         let first = next_client(&conn, None).await;
 
         assert!(!conn.report_unreachable(&first));
@@ -484,7 +523,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn sends_failing_together_in_one_stall_keep_the_client() {
         let (attempts, connect) = connector(0);
-        let conn = Reconnecting::spawn("test", connect);
+        let conn = Reconnecting::spawn("test", TIMEOUT, connect);
         let client = next_client(&conn, None).await;
 
         // Several sends waiting on the same slow broker time out at once.
@@ -499,7 +538,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_success_starts_the_clock_again() {
         let (attempts, connect) = connector(0);
-        let conn = Reconnecting::spawn("test", connect);
+        let conn = Reconnecting::spawn("test", TIMEOUT, connect);
         let client = next_client(&conn, None).await;
 
         conn.report_unreachable(&client);
@@ -516,7 +555,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn failures_on_a_replaced_client_are_ignored() {
         let (attempts, connect) = connector(0);
-        let conn = Reconnecting::spawn("test", connect);
+        let conn = Reconnecting::spawn("test", TIMEOUT, connect);
         let first = next_client(&conn, None).await;
         conn.report_unreachable(&first);
         tokio::time::sleep(RECONNECT_AFTER).await;

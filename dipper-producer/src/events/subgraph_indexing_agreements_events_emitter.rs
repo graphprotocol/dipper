@@ -185,7 +185,10 @@ impl SubgraphIndexingAgreementsEventsEmitter {
         let shutdown = Arc::new(Notify::new());
         let (tx, mut rx) = mpsc::channel::<QueuedSubgraphIndexingAgreementEvent>(capacity);
 
-        let producer = Reconnecting::spawn("lifecycle events", move || {
+        // `KafkaProducer::new` enforces its own deadline, so each attempt allows a little longer
+        // and that deadline's error is the one logged.
+        let connect_timeout = Duration::from_secs(config.connect_timeout_secs.saturating_add(5));
+        let producer = Reconnecting::spawn("lifecycle events", connect_timeout, move || {
             let config = config.clone();
             async move { KafkaProducer::new(&config).await }
         });
@@ -838,7 +841,7 @@ mod tests {
     fn fake_clients() -> (Arc<AtomicU32>, Reconnecting<FakeClient>) {
         let connects = Arc::new(AtomicU32::new(0));
         let counted = connects.clone();
-        let conn = Reconnecting::spawn("test", move || {
+        let conn = Reconnecting::spawn("test", Duration::from_secs(30), move || {
             let n = counted.fetch_add(1, Ordering::Relaxed) + 1;
             std::future::ready(Ok::<_, String>(FakeClient(n)))
         });
