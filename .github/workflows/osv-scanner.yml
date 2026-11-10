@@ -16,7 +16,8 @@ permissions:
 
 jobs:
   # Fails when Cargo.lock holds a crate with a known vulnerability that osv-scanner.toml does not
-  # ignore, and also when the scan itself fails, so a broken scan never passes as a clean one.
+  # ignore, and also when the scan itself fails or finds no lock file to read, so a broken scan
+  # never passes as a clean one.
   scan-dependencies:
     runs-on: ubuntu-latest
     steps:
@@ -24,10 +25,13 @@ jobs:
         with:
           persist-credentials: false
 
+      # The scanner's image is named by its digest (release v2.7.0), so its tag cannot be pointed at
+      # other code later. It is run directly rather than through Google's action, whose wrapper
+      # reports success when it finds no lock file, and which hands the image this job's cache
+      # token and the runner's Docker socket.
       - name: Scan dependencies against the OSV database
-        uses: google/osv-scanner-action/osv-scanner-action@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
-        with:
-          scan-args: |-
-            --config=osv-scanner.toml
-            --recursive
-            ./
+        run: |
+          docker run --rm --volume "$PWD:/src:ro" --workdir /src \
+            --entrypoint /root/osv-scanner \
+            ghcr.io/google/osv-scanner-action@sha256:d54770fe0b09493894e76a02aaed9f51a0513fa57c5186452a755d257b0068a6 \
+            --config=osv-scanner.toml --recursive ./
