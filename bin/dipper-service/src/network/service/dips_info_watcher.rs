@@ -16,12 +16,18 @@ use tokio::{
     time::{Instant, MissedTickBehavior},
 };
 
-use super::liveness_checker::{UNREACHABLE_CLEAR_CYCLES, unreachable_trips};
+use super::{
+    indexer_reply,
+    liveness_checker::{UNREACHABLE_CLEAR_CYCLES, unreachable_trips},
+};
 use crate::{
     config::DipsInfoWatcherConfig,
     network::provider::NetworkProviderService,
     registry::{DipsInfoChecks, DipsInfoRegistry},
 };
+
+/// The longest `/dips/info` reply that is read. A real one is a few hundred bytes.
+const DIPS_INFO_REPLY_LIMIT_BYTES: usize = 1024 * 1024;
 
 /// Handle for controlling the DIPs info watcher's lifecycle.
 #[derive(Clone)]
@@ -420,7 +426,9 @@ async fn ask_dips_info(
         .await
         .and_then(reqwest::Response::error_for_status)
         .map_err(|e| e.to_string())?;
-    let body = response.bytes().await.map_err(|e| e.to_string())?;
+    let body = indexer_reply::read_body(response, DIPS_INFO_REPLY_LIMIT_BYTES)
+        .await
+        .map_err(|e| e.to_string())?;
     readable_dips_info(&body).map_err(str::to_string)
 }
 
@@ -673,6 +681,28 @@ mod tests {
         let mut expected = vec![gone, invalid, unregistered];
         expected.sort();
         assert_eq!(missing, expected);
+    }
+
+    #[tokio::test]
+    async fn a_dips_info_reply_over_the_size_limit_is_not_read() {
+        //* Given a readable reply, padded past the limit
+        let server = MockServer::start().await;
+        let padding = "x".repeat(DIPS_INFO_REPLY_LIMIT_BYTES);
+        Mock::given(method("GET"))
+            .and(path("/dips/info"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(format!(r#"{{"note": "{padding}"}}"#)),
+            )
+            .mount(&server)
+            .await;
+        let url = format!("{}/", server.uri()).parse().unwrap();
+
+        //* When
+        let answer = ask_dips_info(&reqwest::Client::new(), &url).await;
+
+        //* Then
+        let why = answer.expect_err("a reply over the limit must not be read");
+        assert!(why.contains("longer than the limit"), "{why}");
     }
 
     #[tokio::test]

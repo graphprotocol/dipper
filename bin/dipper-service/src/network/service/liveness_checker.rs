@@ -55,6 +55,7 @@ use time::OffsetDateTime;
 use tokio::{sync::mpsc, time::MissedTickBehavior};
 use url::Url;
 
+use super::indexer_reply;
 use crate::{
     cancel_dispatch::{CancelReason, CancelStarted},
     chain_client::ChainClient,
@@ -1114,13 +1115,18 @@ pub(crate) fn decide_liveness_action(
     }
 }
 
+/// The longest status reply that is read. A real one is about 200 bytes for each deployment
+/// asked about.
+const STATUS_REPLY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+
 /// Query a single indexer's status endpoint for sync progress.
 ///
 /// Returns a map of deployment ID (IPFS hash string) to the latest block height,
 /// or `None` if the deployment is not found in the response.
 ///
-/// Returns an error only when the HTTP call itself fails (network error, timeout,
-/// non-2xx response). GraphQL-level errors are logged and treated as empty results.
+/// Returns an error when the HTTP call fails (network error, timeout, non-2xx response) or
+/// the reply is not JSON or is over the size limit. GraphQL-level errors are logged and treated
+/// as empty results.
 async fn query_indexer_status(
     client: &reqwest::Client,
     indexer_url: &Url,
@@ -1150,7 +1156,8 @@ async fn query_indexer_status(
         .await?
         .error_for_status()?;
 
-    let json: serde_json::Value = response.json().await?;
+    let reply = indexer_reply::read_body(response, STATUS_REPLY_LIMIT_BYTES).await?;
+    let json: serde_json::Value = serde_json::from_slice(&reply)?;
 
     let mut result: HashMap<String, Option<u64>> = HashMap::new();
 
@@ -1215,9 +1222,10 @@ mod tests {
     use url::Url;
 
     use super::{
-        Checker, HeldSpan, LivenessAction, Probe, Uncancellable, UnreachableBreaker,
-        UnreachablePolicy, cancel_and_reassess, decide_liveness_action, group_by_indexer_id,
-        record_progress, replace_abandoned, tolerance_duration, unreachable_trips,
+        Checker, HeldSpan, LivenessAction, Probe, STATUS_REPLY_LIMIT_BYTES, Uncancellable,
+        UnreachableBreaker, UnreachablePolicy, cancel_and_reassess, decide_liveness_action,
+        group_by_indexer_id, query_indexer_status, record_progress, replace_abandoned,
+        tolerance_duration, unreachable_trips,
     };
     use crate::{
         chain_client::{AgreementOnChain, ChainClient, ChainClientError},
@@ -2564,5 +2572,29 @@ mod tests {
         let updates = calls.progress_updates.lock().unwrap();
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0], (agr_id, 12345));
+    }
+
+    #[tokio::test]
+    async fn a_status_reply_over_the_size_limit_is_not_read() {
+        //* Given a well-formed status reply, padded past the limit
+        let server = wiremock::MockServer::start().await;
+        let padding = "x".repeat(STATUS_REPLY_LIMIT_BYTES);
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/status"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_string(format!(
+                    r#"{{"data": {{"indexingStatuses": []}}, "note": "{padding}"}}"#
+                )),
+            )
+            .mount(&server)
+            .await;
+        let url: Url = format!("{}/", server.uri()).parse().unwrap();
+
+        //* When
+        let answer = query_indexer_status(&reqwest::Client::new(), &url, &[]).await;
+
+        //* Then
+        let why = answer.expect_err("a reply over the limit must not be read");
+        assert!(why.to_string().contains("longer than the limit"), "{why}");
     }
 }
