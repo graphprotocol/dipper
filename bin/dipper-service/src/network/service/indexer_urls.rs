@@ -131,7 +131,7 @@ pub async fn fetch_snapshot(
             } else {
                 tracing::warn!(
                     indexer = %entry.id,
-                    url = %url_for_log(&entry.url),
+                    url = %crate::log_text::untrusted(&entry.url),
                     "skipping indexer with unparseable id or invalid URL"
                 );
             }
@@ -143,21 +143,6 @@ pub async fn fetch_snapshot(
     }
 
     Ok(snapshot)
-}
-
-/// The most characters of a registered URL that are logged.
-const MAX_LOGGED_URL_CHARS: usize = 200;
-
-/// A registered URL in a form that is safe to log. The indexer wrote it on-chain, so it is quoted
-/// with its control characters escaped, so a line break in it can't start a fake log line, and
-/// cut short, so a huge one can't flood the log on every refresh.
-fn url_for_log(raw: &str) -> String {
-    let shown: String = raw.chars().take(MAX_LOGGED_URL_CHARS).collect();
-    if shown.len() < raw.len() {
-        format!("{shown:?}...")
-    } else {
-        format!("{shown:?}")
-    }
 }
 
 /// Parse a single indexer entry into an ID and validated URL.
