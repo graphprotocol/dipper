@@ -43,6 +43,9 @@ All environment variables used by the CLI are prefixed with `DIPS_`. The main co
 - `DIPS_SERVER_URL`: The URL of the DIPs gateway server
 - `DIPS_SIGNING_KEY`: The secret key used to sign requests (in hex format)
 - `DIPS_IPFS_URL`: The IPFS API that subgraph manifests are read from (defaults to `https://ipfs.thegraph.com`)
+- `DIPS_PROTOCOL_CHAIN_ID`: The chain the DIPs contracts are on (42161 for Arbitrum One, 421614 for Arbitrum Sepolia). `indexings set-target-candidates` needs it, or `--protocol-chain-id`, because each request is signed for the dipper on that chain
+
+A dipper answers 403 to a request signed for another chain, and 401 to one signed more than 5 minutes from its own clock, so keep the clock of the machine running the CLI in sync.
 
 Environment variables take precedence over command-line arguments and can be used to avoid repeating common configuration:
 

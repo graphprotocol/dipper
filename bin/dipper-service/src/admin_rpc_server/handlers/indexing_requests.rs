@@ -24,6 +24,11 @@ use crate::{
     worker::service::{JobPriority, WorkerQueue},
 };
 
+/// How far a request's `signed_at` may be from this server's clock, in either direction. Long
+/// enough for a slow connection and for clocks that disagree a little, and short enough that a
+/// request someone recorded is soon no use to them.
+const MAX_SIGNED_AT_DISTANCE_SECS: u64 = 300;
+
 /// The substate for the [`IndexingRequestsRpc`] handler
 ///
 /// See: https://docs.rs/axum/0.7.7/axum/extract/struct.State.html#substates
@@ -33,6 +38,8 @@ pub struct Ctx<R, W> {
     pub registry: R,
     pub worker: W,
     pub max_candidates: usize,
+    /// The current time in seconds since the Unix epoch, a field so tests can set it.
+    pub clock: fn() -> u64,
     pub subgraph_indexing_agreements_events_emitter:
         Arc<dyn SubgraphIndexingAgreementEventsProducer>,
 }
@@ -103,14 +110,45 @@ where
             }
         };
         if !self.gateway_operator_allowlist.contains(&requested_by) {
-            return Err(ErrorObject::borrowed(403, "Forbidden", None));
+            // A request signed for the dipper on another chain lands here too, since it
+            // recovers to an address nobody allowed, so say which chain this one serves.
+            return Err(ErrorObject::owned(
+                403,
+                format!(
+                    "Forbidden: the request's signer {requested_by} is not an allowed operator. \
+                     This dipper serves chain {}; a request signed for another chain recovers \
+                     to a different signer",
+                    self.signer.chain_id()
+                ),
+                None::<()>,
+            ));
         }
 
         let SetIndexingTargetCandidates {
             deployment_id,
             chain_id,
             num_candidates,
+            signed_at,
         } = req.into_message();
+
+        let now = (self.clock)();
+        if now.abs_diff(signed_at) > MAX_SIGNED_AT_DISTANCE_SECS {
+            tracing::warn!(
+                %requested_by,
+                signed_at,
+                now,
+                "Refused a request signed too far from this server's clock"
+            );
+            return Err(ErrorObject::owned(
+                401,
+                format!(
+                    "the request was signed at {signed_at}, more than \
+                     {MAX_SIGNED_AT_DISTANCE_SECS} seconds from this server's clock ({now}); \
+                     sign and send it again"
+                ),
+                None::<()>,
+            ));
+        }
 
         let num_candidates = num_candidates.unwrap_or(self.max_candidates);
         let agreements_requested = match i32::try_from(num_candidates) {
@@ -298,12 +336,21 @@ mod tests {
     /// distinct from [`SIGNER_CHAIN_ID`].
     const DEPLOYMENT_CHAIN_ID: ChainId = 1;
 
+    /// The time on the test server's clock, in seconds since the Unix epoch.
+    const NOW: u64 = 1_800_000_000;
+
+    fn clock() -> u64 {
+        NOW
+    }
+
     /// A registry whose `set_indexing_target_candidates` returns a configured
     /// outcome. All other trait methods are unused by the handler path under
     /// test and therefore `unimplemented!()`.
     #[derive(Clone)]
     struct MockRegistry {
         outcome: SetTargetOutcome,
+        /// The indexer count of every request that got past the signature check.
+        accepted_counts: Arc<std::sync::Mutex<Vec<usize>>>,
     }
 
     #[async_trait]
@@ -313,8 +360,9 @@ mod tests {
             _requested_by: Address,
             _deployment_id: DeploymentId,
             _deployment_chain_id: ChainId,
-            _num_candidates: usize,
+            num_candidates: usize,
         ) -> RegistryResult<SetTargetOutcome> {
+            self.accepted_counts.lock().unwrap().push(num_candidates);
             Ok(self.outcome.clone())
         }
 
@@ -414,14 +462,54 @@ mod tests {
         num_candidates: Option<usize>,
     ) -> (PrivateKeySigner, SignedMessage<SetIndexingTargetCandidates>) {
         let signer = PrivateKeySigner::random();
-        let domain = dipper_rpc::admin::eip712_domain();
+        let request = signed_for(
+            SIGNER_CHAIN_ID,
+            &signer,
+            deployment_id,
+            chain_id,
+            num_candidates,
+            NOW,
+        );
+        (signer, request)
+    }
+
+    /// Sign a `set_indexing_target_candidates` request at `signed_at`, for the dipper that
+    /// serves the protocol on `protocol_chain`.
+    fn signed_for(
+        protocol_chain: ChainId,
+        signer: &PrivateKeySigner,
+        deployment_id: DeploymentId,
+        chain_id: ChainId,
+        num_candidates: Option<usize>,
+        signed_at: u64,
+    ) -> SignedMessage<SetIndexingTargetCandidates> {
+        let domain = dipper_rpc::admin::eip712_domain(protocol_chain);
         let message = SetIndexingTargetCandidates {
             deployment_id,
             chain_id,
             num_candidates,
+            signed_at,
         };
-        let inner = sign(&signer, &domain, message).expect("signing failed");
-        (signer, inner.into())
+        sign(signer, &domain, message)
+            .expect("signing failed")
+            .into()
+    }
+
+    /// What anyone who saw `request` on the wire can send without the key: the same signature
+    /// over a body of their choosing, here with `num_candidates` swapped.
+    fn with_count(
+        request: &SignedMessage<SetIndexingTargetCandidates>,
+        num_candidates: Option<usize>,
+    ) -> SignedMessage<SetIndexingTargetCandidates> {
+        SignedMessage::new(
+            SetIndexingTargetCandidates {
+                deployment_id: request.message().deployment_id,
+                chain_id: request.message().chain_id,
+                num_candidates,
+                signed_at: request.message().signed_at,
+            },
+            request.signature,
+        )
     }
 
     /// Assemble an `RpcServerImpl` whose signer's chain id is
@@ -435,19 +523,35 @@ mod tests {
         RpcServerImpl<MockRegistry, MockWorker>,
         CapturingEventsProducer,
     ) {
-        let domain = dipper_rpc::admin::eip712_domain();
+        server_on(SIGNER_CHAIN_ID, allowed, outcome)
+    }
+
+    /// [`server`], for a dipper whose protocol network is `signer_chain`.
+    fn server_on(
+        signer_chain: ChainId,
+        allowed: Address,
+        outcome: SetTargetOutcome,
+    ) -> (
+        RpcServerImpl<MockRegistry, MockWorker>,
+        CapturingEventsProducer,
+    ) {
+        let domain = dipper_rpc::admin::eip712_domain(signer_chain);
         // The signer's own address is irrelevant to recovery here (the handler
         // recovers the *message* signer), so any address works.
-        let signer = Eip712Signer::new(SIGNER_CHAIN_ID, domain);
+        let signer = Eip712Signer::new(signer_chain, domain);
 
         let events = CapturingEventsProducer::new();
 
         let ctx = Ctx {
             signer: Arc::new(signer),
             gateway_operator_allowlist: Arc::new(BTreeSet::from([allowed])),
-            registry: MockRegistry { outcome },
+            registry: MockRegistry {
+                outcome,
+                accepted_counts: Arc::default(),
+            },
             worker: MockWorker,
             max_candidates: 10,
+            clock,
             subgraph_indexing_agreements_events_emitter: Arc::new(events.clone()),
         };
 
@@ -572,6 +676,176 @@ mod tests {
 
         assert!(result.is_ok(), "handler returned an error: {result:?}");
         assert_eq!(events.events().len(), 1);
+    }
+
+    /// The counts of the requests that got past every check and reached the registry.
+    fn accepted_counts(server: &RpcServerImpl<MockRegistry, MockWorker>) -> Vec<usize> {
+        server.registry.accepted_counts.lock().unwrap().clone()
+    }
+
+    /// A signed cancel (a count of 0) must not also pass as a request for the default count,
+    /// which is what the same body asks for once the count is left out.
+    #[tokio::test]
+    async fn a_signed_cancel_is_refused_with_the_count_removed() {
+        let deployment = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
+        let (signer, cancel) = signed_request(deployment, DEPLOYMENT_CHAIN_ID, Some(0));
+        let (server, _events) = server(
+            signer.address(),
+            SetTargetOutcome::Inserted {
+                id: IndexingRequestId::new(),
+            },
+        );
+
+        let result = server
+            .set_indexing_target_candidates(with_count(&cancel, None))
+            .await;
+
+        let err = result.expect_err("a cancel with its count removed must be refused");
+        assert_eq!(err.code(), 403, "{err:?}");
+        assert_eq!(accepted_counts(&server), Vec::<usize>::new());
+    }
+
+    /// A request for the default count (the count left out) must not also pass as a cancel.
+    #[tokio::test]
+    async fn a_signed_default_count_is_refused_as_a_cancel() {
+        let deployment = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
+        let (signer, request) = signed_request(deployment, DEPLOYMENT_CHAIN_ID, None);
+        let (server, _events) = server(
+            signer.address(),
+            SetTargetOutcome::Canceled {
+                id: IndexingRequestId::new(),
+            },
+        );
+
+        let result = server
+            .set_indexing_target_candidates(with_count(&request, Some(0)))
+            .await;
+
+        let err = result.expect_err("a default-count request must be refused as a cancel");
+        assert_eq!(err.code(), 403, "{err:?}");
+        assert_eq!(accepted_counts(&server), Vec::<usize>::new());
+    }
+
+    /// A count left out is still accepted when it is what the operator signed, and asks for
+    /// the server's default.
+    #[tokio::test]
+    async fn a_signed_default_count_asks_for_the_default() {
+        let deployment = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
+        let (signer, request) = signed_request(deployment, DEPLOYMENT_CHAIN_ID, None);
+        let (server, _events) = server(
+            signer.address(),
+            SetTargetOutcome::Inserted {
+                id: IndexingRequestId::new(),
+            },
+        );
+
+        let result = server.set_indexing_target_candidates(request).await;
+
+        assert!(result.is_ok(), "handler returned an error: {result:?}");
+        assert_eq!(accepted_counts(&server), vec![server.max_candidates]);
+    }
+
+    /// A request signed for the dipper on 1 network is refused by the dipper on another, even
+    /// where the same operator key is allowed, and the refusal names the chain it serves.
+    #[tokio::test]
+    async fn a_request_for_one_network_is_refused_on_another() {
+        const ARBITRUM_ONE: ChainId = 42161;
+        const ARBITRUM_SEPOLIA: ChainId = 421_614;
+        let deployment = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
+        let signer = PrivateKeySigner::random();
+        let request = || {
+            signed_for(
+                ARBITRUM_ONE,
+                &signer,
+                deployment,
+                DEPLOYMENT_CHAIN_ID,
+                Some(3),
+                NOW,
+            )
+        };
+        let outcome = SetTargetOutcome::Inserted {
+            id: IndexingRequestId::new(),
+        };
+        let (mainnet, _events) = server_on(ARBITRUM_ONE, signer.address(), outcome.clone());
+        let (testnet, _events) = server_on(ARBITRUM_SEPOLIA, signer.address(), outcome);
+        mainnet
+            .set_indexing_target_candidates(request())
+            .await
+            .expect("accepted by the dipper it was signed for");
+
+        let result = testnet.set_indexing_target_candidates(request()).await;
+
+        let err = result.expect_err("a request for Arbitrum One must be refused on Sepolia");
+        assert_eq!(err.code(), 403, "{err:?}");
+        assert!(err.message().contains("serves chain 421614"), "{err:?}");
+        assert_eq!(accepted_counts(&testnet), Vec::<usize>::new());
+    }
+
+    /// A request signed further from the server's clock than the limit is refused, whether it
+    /// is old (a recorded request sent again later) or dated ahead.
+    #[tokio::test]
+    async fn a_request_signed_too_far_from_now_is_refused() {
+        let deployment = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
+        let too_old = NOW - MAX_SIGNED_AT_DISTANCE_SECS - 1;
+        let too_far_ahead = NOW + MAX_SIGNED_AT_DISTANCE_SECS + 1;
+        for signed_at in [too_old, too_far_ahead, 0] {
+            let signer = PrivateKeySigner::random();
+            let request = signed_for(
+                SIGNER_CHAIN_ID,
+                &signer,
+                deployment,
+                DEPLOYMENT_CHAIN_ID,
+                Some(3),
+                signed_at,
+            );
+            let (server, events) = server(
+                signer.address(),
+                SetTargetOutcome::Inserted {
+                    id: IndexingRequestId::new(),
+                },
+            );
+
+            let result = server.set_indexing_target_candidates(request).await;
+
+            let err = result.expect_err("a request signed too far from now must be refused");
+            assert_eq!(err.code(), 401, "signed at {signed_at}: {err:?}");
+            assert!(
+                err.message().contains(&format!("signed at {signed_at}")),
+                "{err:?}"
+            );
+            assert_eq!(accepted_counts(&server), Vec::<usize>::new());
+            assert!(events.events().is_empty(), "signed at {signed_at}");
+        }
+    }
+
+    /// A request signed exactly at the limit, on either side of the server's clock, is accepted.
+    #[tokio::test]
+    async fn a_request_signed_at_the_limit_is_accepted() {
+        let deployment = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
+        let oldest = NOW - MAX_SIGNED_AT_DISTANCE_SECS;
+        let furthest_ahead = NOW + MAX_SIGNED_AT_DISTANCE_SECS;
+        for signed_at in [oldest, furthest_ahead] {
+            let signer = PrivateKeySigner::random();
+            let request = signed_for(
+                SIGNER_CHAIN_ID,
+                &signer,
+                deployment,
+                DEPLOYMENT_CHAIN_ID,
+                Some(3),
+                signed_at,
+            );
+            let (server, _events) = server(
+                signer.address(),
+                SetTargetOutcome::Inserted {
+                    id: IndexingRequestId::new(),
+                },
+            );
+
+            let result = server.set_indexing_target_candidates(request).await;
+
+            assert!(result.is_ok(), "signed at {signed_at}: {result:?}");
+            assert_eq!(accepted_counts(&server), vec![3]);
+        }
     }
 
     /// Drive the handler with `outcome` and assert no lifecycle event is

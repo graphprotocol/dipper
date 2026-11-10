@@ -103,7 +103,7 @@ Two safeguards keep this honest. If more than 50% of the DIPs-accepting indexers
 
 Dipper runs as a single service backed by Postgres, with a job worker, a chain listener that polls the indexing-payments subgraph, and the background services described above. A full configuration example lives in [k8s/configmap-example.yaml](./k8s/configmap-example.yaml).
 
-The admin JSON-RPC surface has 8 methods: 7 unauthenticated reads over requests and agreements, and 1 write, `set_indexing_target_candidates`, which requires an EIP-712 signature from an address on the operator allowlist. The [Admin CLI](docs/dipper-cli.md) signs and sends these requests for you. A health endpoint returns 200 while the worker is keeping up and 503 when it stalls.
+The admin JSON-RPC surface has 8 methods: 7 unauthenticated reads over requests and agreements, and 1 write, `set_indexing_target_candidates`, which requires an EIP-712 signature from an address on the operator allowlist, made for this dipper's chain and no more than 5 minutes old. The [Admin CLI](docs/dipper-cli.md) signs and sends these requests for you. A health endpoint returns 200 while the worker is keeping up and 503 when it stalls.
 
 Dipper depends on the IISA service for every fresh selection decision. When IISA is unreachable, the selection request is retried with exponential backoff and the failure is surfaced in logs; there is no fallback selection path. New registrations, target-count changes, and the daily sweep all block until IISA answers, so operators should treat a prolonged IISA outage as a dipper outage for any change to the target indexer set. Already-accepted agreements are unaffected: indexers continue indexing and collecting payment independently of IISA.
 

@@ -207,7 +207,7 @@ pub async fn main() -> anyhow::Result<()> {
     tracing::info!(address=%wallet_signer.address(), "Signer wallet imported");
 
     let signer = {
-        let domain = dipper_rpc::admin::eip712_domain();
+        let domain = dipper_rpc::admin::eip712_domain(chain_id);
         Arc::new(Eip712Signer::new(chain_id, domain))
     };
 
