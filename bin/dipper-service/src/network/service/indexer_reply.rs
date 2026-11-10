@@ -14,7 +14,7 @@ pub(super) enum ReplyError {
 }
 
 /// Read a reply's body, giving up as soon as it is known to be longer than `limit` bytes: at
-/// once when its declared length says so, otherwise once that many bytes have arrived.
+/// once when its declared length says so, otherwise once more than that many bytes have arrived.
 pub(super) async fn read_body(
     mut response: reqwest::Response,
     limit: usize,
@@ -65,47 +65,63 @@ mod tests {
         assert_eq!(body, b"12345");
     }
 
-    #[tokio::test]
-    async fn a_body_declared_longer_than_the_limit_is_refused() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("123456"))
-            .mount(&server)
-            .await;
-
-        let refused = read_body(get(&server.uri()).await, 5).await.unwrap_err();
-
-        assert!(
-            matches!(refused, ReplyError::TooLong { limit: 5 }),
-            "{refused}"
-        );
-    }
-
-    /// A server that declares no length and never stops sending is the case a declared length
-    /// can't catch: without a limit on the bytes that arrive, the read would go on until the
-    /// request timed out, holding everything sent so far.
-    #[tokio::test]
-    async fn a_body_that_never_ends_is_refused_once_it_passes_the_limit() {
-        //* Given a server that streams 1,024 bytes at a time for as long as anyone listens
+    /// Serve 1 connection: send `head`, then each of `pieces`, then keep the connection open
+    /// without sending anything more, as a stalled server would. Returns the server's URL.
+    async fn stalling_server(head: &'static str, pieces: Vec<Vec<u8>>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = [0u8; 1024];
             let _ = socket.read(&mut request).await;
-            let head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
             if socket.write_all(head.as_bytes()).await.is_err() {
                 return;
             }
-            let chunk = format!("400\r\n{}\r\n", "x".repeat(1024));
-            while socket.write_all(chunk.as_bytes()).await.is_ok() {}
+            for piece in pieces {
+                // The client hangs up once it refuses the body.
+                if socket.write_all(&piece).await.is_err() {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(60)).await;
         });
-        let response = get(&format!("http://{address}/")).await;
+        format!("http://{address}/")
+    }
+
+    /// The server declares a long body and sends none of it, so only the declared length can
+    /// refuse this reply: a read that waited for the body would never return.
+    #[tokio::test]
+    async fn a_body_declared_longer_than_the_limit_is_refused_before_any_of_it_arrives() {
+        //* Given
+        let head = "HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n";
+        let response = get(&stalling_server(head, Vec::new()).await).await;
+
+        //* When
+        let refused = tokio::time::timeout(Duration::from_secs(5), read_body(response, 5))
+            .await
+            .expect("the declared length alone must refuse the reply");
+
+        //* Then
+        assert!(
+            matches!(refused, Err(ReplyError::TooLong { limit: 5 })),
+            "{refused:?}"
+        );
+    }
+
+    /// A server that declares no length is the case a declared length can't catch. This one
+    /// sends 4 times the limit and then stalls, so a read that didn't count the bytes arriving
+    /// would wait for more until the test's timeout, holding all of it.
+    #[tokio::test]
+    async fn a_body_of_no_declared_length_is_refused_once_it_passes_the_limit() {
+        //* Given a server that streams 256 pieces of 1,024 bytes
+        let head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let piece = format!("400\r\n{}\r\n", "x".repeat(1024)).into_bytes();
+        let response = get(&stalling_server(head, vec![piece; 256]).await).await;
 
         //* When
         let refused = tokio::time::timeout(Duration::from_secs(5), read_body(response, 64 * 1024))
             .await
-            .expect("the read must stop at the limit, not run until a timeout");
+            .expect("the read must stop at the limit, not wait for the rest");
 
         //* Then
         assert!(
