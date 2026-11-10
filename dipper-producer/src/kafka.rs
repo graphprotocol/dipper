@@ -23,5 +23,7 @@
 //! ```
 
 mod producer;
+mod reconnect;
 
 pub use producer::{Error, KafkaConfig, KafkaProducer};
+pub use reconnect::Reconnecting;
