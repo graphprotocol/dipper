@@ -36,7 +36,20 @@ pub struct Reconnecting<T> {
 struct Shared<T> {
     name: &'static str,
     state: Mutex<State<T>>,
+    signals: Arc<Signals>,
+}
+
+/// Wakes the background task: to connect again, or to stop once every handle is gone.
+#[derive(Default)]
+struct Signals {
     rebuild: Notify,
+    closed: Notify,
+}
+
+impl<T> Drop for Shared<T> {
+    fn drop(&mut self) {
+        self.signals.closed.notify_one();
+    }
 }
 
 /// The client and, while sends through it are failing, when the first of those failures was seen.
@@ -70,26 +83,37 @@ impl<T: Send + Sync + 'static> Reconnecting<T> {
         Fut: Future<Output = Result<T, E>> + Send,
         E: Display + Send,
     {
+        let signals = Arc::new(Signals::default());
         let shared = Arc::new(Shared {
             name,
             state: Mutex::new(State {
                 client: None,
                 failing_since: None,
             }),
-            rebuild: Notify::new(),
+            signals: signals.clone(),
         });
-        let task = shared.clone();
+        let task = Arc::downgrade(&shared);
         tokio::spawn(async move {
             loop {
-                let client = connect_with_retry(name, &connect).await;
-                *task.lock() = State {
+                let client = tokio::select! {
+                    client = connect_with_retry(name, &connect) => client,
+                    _ = signals.closed.notified() => return,
+                };
+                let Some(shared) = task.upgrade() else {
+                    return;
+                };
+                *shared.lock() = State {
                     client: Some(Arc::new(client)),
                     failing_since: None,
                 };
+                drop(shared);
                 tracing::info!(broker = name, "connected to the brokers");
-                // `notify_one` stores a permit, so a rebuild asked for before this wait starts is
-                // not missed.
-                task.rebuild.notified().await;
+                // `notify_one` stores a permit, so a rebuild or close asked for before this wait
+                // starts is not missed.
+                tokio::select! {
+                    _ = signals.rebuild.notified() => {}
+                    _ = signals.closed.notified() => return,
+                }
             }
         });
         Self { shared }
@@ -132,7 +156,7 @@ impl<T: Send + Sync + 'static> Reconnecting<T> {
             failing_for_secs = (now - since).as_secs(),
             "brokers unreachable; connecting again from the bootstrap addresses"
         );
-        self.shared.rebuild.notify_one();
+        self.shared.signals.rebuild.notify_one();
         true
     }
 }
@@ -219,6 +243,24 @@ mod tests {
 
         assert_eq!(*client, Client(3));
         assert_eq!(attempts.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stops_once_every_handle_is_dropped() {
+        let (_, connect) = connector(0);
+        let held = Arc::new(());
+        let marker = held.clone();
+        let conn = Reconnecting::spawn("test", move || {
+            let _keep = &marker;
+            connect()
+        });
+        next_client(&conn, None).await;
+
+        drop(conn);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // The connector, which holds the broker credentials, went with the background task.
+        assert_eq!(Arc::strong_count(&held), 1);
     }
 
     #[tokio::test(start_paused = true)]
