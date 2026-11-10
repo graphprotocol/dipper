@@ -2417,6 +2417,10 @@ mod tests {
         fail_set_aside: bool,
         /// A batch apply holding any of these agreements fails.
         fail_apply_for: std::collections::HashSet<IndexingAgreementId>,
+        /// When true, reading the set-aside changes fails.
+        fail_set_aside_read: bool,
+        /// When true, reading agreements fails.
+        fail_agreement_reads: bool,
     }
 
     impl MockRegistry {
@@ -2577,6 +2581,14 @@ mod tests {
         fn fail_apply_for(&self, id: IndexingAgreementId) {
             self.state.lock().unwrap().fail_apply_for.insert(id);
         }
+
+        fn set_fail_set_aside_read(&self, fail: bool) {
+            self.state.lock().unwrap().fail_set_aside_read = fail;
+        }
+
+        fn set_fail_agreement_reads(&self, fail: bool) {
+            self.state.lock().unwrap().fail_agreement_reads = fail;
+        }
     }
 
     #[async_trait::async_trait]
@@ -2585,7 +2597,15 @@ mod tests {
             &self,
             id: &IndexingAgreementId,
         ) -> RegistryResult<Option<IndexingAgreement>> {
-            Ok(self.state.lock().unwrap().agreements.get(id).cloned())
+            let state = self.state.lock().unwrap();
+            if state.fail_agreement_reads {
+                return Err(crate::registry::Error::BackendError(
+                    dipper_pgregistry::Error::DbError(sqlx::Error::Protocol(
+                        "forced agreement read failure (test)".into(),
+                    )),
+                ));
+            }
+            Ok(state.agreements.get(id).cloned())
         }
 
         async fn get_indexing_agreements_by_deployment_id(
@@ -4429,6 +4449,13 @@ mod tests {
         async fn get_set_aside_changes(
             &self,
         ) -> crate::registry::Result<Vec<crate::registry::SetAsideChange>> {
+            if self.state.lock().unwrap().fail_set_aside_read {
+                return Err(crate::registry::Error::BackendError(
+                    dipper_pgregistry::Error::DbError(sqlx::Error::Protocol(
+                        "forced set-aside read failure (test)".into(),
+                    )),
+                ));
+            }
             Ok(self.set_aside())
         }
 
@@ -5516,6 +5543,59 @@ mod tests {
         assert_eq!(warned.len(), 1, "{logged}");
         assert!(warned[0].contains("still fail"), "{logged}");
         assert!(warned[0].contains("failed to apply the change"), "{logged}");
+    }
+
+    /// A failed read of the record changes nothing in it, and says so rather than passing over
+    /// the changes in silence.
+    #[tokio::test]
+    async fn test_retry_leaves_the_record_as_it_is_when_it_cannot_be_read() {
+        let (registry, event_source, agreement_id) = a_page_accepting_an_agreement();
+        set_aside_at(&registry, agreement_id, 10).await;
+        registry.set_fail_set_aside_read(true);
+
+        let logged = crate::test_support::logged(retry_set_aside(
+            &registry,
+            &event_source,
+            &mut SetAsideWarning::default(),
+        ))
+        .await;
+
+        assert!(!registry.was_marked_accepted_on_chain(&agreement_id));
+        assert_eq!(registry.set_aside().len(), 1, "still recorded");
+        let warned = logged
+            .lines()
+            .find(|line| line.contains("Failed to read the on-chain changes set aside"))
+            .expect("the failed read is logged");
+        assert!(warned.contains("WARN"), "{warned}");
+    }
+
+    /// A failed read of the agreements' state from the subgraph says nothing about them, so
+    /// every change stays recorded.
+    #[tokio::test]
+    async fn test_retry_keeps_set_aside_changes_when_the_subgraph_read_fails() {
+        let (registry, event_source, agreement_id) = a_page_accepting_an_agreement();
+        set_aside_at(&registry, agreement_id, 10).await;
+        event_source.set_snapshots_error(super::super::chain_events::ChainEventError::Transient(
+            "timed out".into(),
+        ));
+
+        retry_set_aside(&registry, &event_source, &mut SetAsideWarning::default()).await;
+
+        assert!(!registry.was_marked_accepted_on_chain(&agreement_id));
+        assert_eq!(registry.set_aside().len(), 1, "still recorded");
+    }
+
+    /// Nor does a failed read of the agreements from the database, which must not pass for the
+    /// agreements not being there.
+    #[tokio::test]
+    async fn test_retry_keeps_set_aside_changes_when_the_agreements_cannot_be_read() {
+        let (registry, event_source, agreement_id) = a_page_accepting_an_agreement();
+        set_aside_at(&registry, agreement_id, 10).await;
+        registry.set_fail_agreement_reads(true);
+
+        retry_set_aside(&registry, &event_source, &mut SetAsideWarning::default()).await;
+
+        assert_eq!(registry.set_aside().len(), 1, "still recorded");
     }
 
     #[test]

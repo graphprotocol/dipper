@@ -976,6 +976,7 @@ pub mod mock {
         page_size: Arc<Mutex<Option<usize>>>,
         error: Arc<Mutex<Option<ChainEventError>>>,
         unreadable: Arc<Mutex<Vec<IndexingAgreementId>>>,
+        snapshots_error: Arc<Mutex<Option<ChainEventError>>>,
     }
 
     impl MockEventSource {
@@ -988,6 +989,7 @@ pub mod mock {
                 page_size: Arc::new(Mutex::new(None)),
                 error: Arc::new(Mutex::new(None)),
                 unreadable: Arc::new(Mutex::new(Vec::new())),
+                snapshots_error: Arc::new(Mutex::new(None)),
             }
         }
 
@@ -1021,6 +1023,11 @@ pub mod mock {
         /// Fail the next query with `error`.
         pub fn set_error(&self, error: ChainEventError) {
             *self.error.lock().unwrap() = Some(error);
+        }
+
+        /// Fail the next read of agreements by id with `error`.
+        pub fn set_snapshots_error(&self, error: ChainEventError) {
+            *self.snapshots_error.lock().unwrap() = Some(error);
         }
 
         /// Return the state of `agreement_ids` in a form that can't be read, when read by id.
@@ -1113,6 +1120,9 @@ pub mod mock {
             &self,
             agreement_ids: &[IndexingAgreementId],
         ) -> Result<AgreementSnapshots, ChainEventError> {
+            if let Some(error) = self.snapshots_error.lock().unwrap().take() {
+                return Err(error);
+            }
             // The subgraph keeps 1 entity per agreement, so only the latest snapshot of each.
             let mut latest: std::collections::HashMap<IndexingAgreementId, AgreementStateSnapshot> =
                 std::collections::HashMap::new();
