@@ -213,7 +213,7 @@ pub async fn main() -> anyhow::Result<()> {
 
     //- DB connect and run migrations
     let db_conn = db::connect(&conf.db).await?;
-    tracing::info!(db_url=%conf.db.url, "initialized DB connection pool");
+    tracing::info!(db = %config::database_name(&conf.db.url), "initialized DB connection pool");
 
     dipper_pgmq::run_db_migrations(&db_conn).await?;
     dipper_pgregistry::run_db_migrations(&db_conn).await?;
