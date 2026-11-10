@@ -141,6 +141,45 @@ fn example(schema: &Value, api: &Value) -> Value {
     }
 }
 
+/// Replies of every shape `schema` allows, 1 place at a time: [`example`] first, then 1 for each
+/// choice of each `anyOf`, null included, and 1 with each list empty.
+fn examples(schema: &Value, api: &Value) -> Vec<Value> {
+    let schema = resolved(schema, api);
+    let base = example(schema, api);
+    let mut shapes = vec![base.clone()];
+    if let Some(alternatives) = schema["anyOf"].as_array() {
+        for alternative in alternatives {
+            shapes.extend(examples(alternative, api));
+        }
+        return shapes;
+    }
+    match schema["type"].as_str() {
+        Some("array") => {
+            shapes.push(json!([]));
+            let items = examples(&schema["items"], api).into_iter().skip(1);
+            shapes.extend(items.map(|item| json!([item])));
+        }
+        Some("object") => {
+            let fields: Vec<(String, &Value)> = match schema["properties"].as_object() {
+                Some(properties) => properties
+                    .iter()
+                    .map(|(name, field)| (name.clone(), field))
+                    .collect(),
+                None => vec![("key".to_string(), &schema["additionalProperties"])],
+            };
+            for (name, field) in fields {
+                for shape in examples(field, api).into_iter().skip(1) {
+                    let mut variant = base.clone();
+                    variant[&name] = shape;
+                    shapes.push(variant);
+                }
+            }
+        }
+        _ => {}
+    }
+    shapes
+}
+
 fn keys(value: &Value) -> BTreeSet<String> {
     value
         .as_object()
@@ -535,19 +574,28 @@ fn every_field_dipper_reads_from_a_reply_is_in_the_reply_schema() {
     );
 }
 
-/// A reply with every field IISA describes, each of the type IISA gives it, is one dipper reads.
+/// A reply of every shape IISA's schema allows is one dipper reads: every field present, each
+/// choice of each `anyOf` (null included) and each list empty, at every place they appear.
 #[test]
-fn every_reply_iisa_describes_is_read_by_dipper() {
+fn every_shape_of_reply_iisa_describes_is_read_by_dipper() {
     let api = api();
+    let mut unread = Vec::new();
     for reply in replies() {
-        let example = example(component(&api, reply.iisa), &api);
-        if let Err(err) = (reply.parses)(example.clone()) {
-            panic!(
-                "{} cannot read {example}, which IISA's {} describes: {err}. {IF_IISA_CHANGED}",
-                reply.dipper, reply.iisa
-            );
+        for shape in examples(component(&api, reply.iisa), &api) {
+            if let Err(err) = (reply.parses)(shape.clone()) {
+                unread.push(format!(
+                    "{} cannot read {shape}, which IISA's {} allows: {err}",
+                    reply.dipper, reply.iisa
+                ));
+            }
         }
     }
+
+    assert!(
+        unread.is_empty(),
+        "{}\n{IF_IISA_CHANGED}",
+        unread.join("\n")
+    );
 }
 
 /// Every reply field dipper cannot read a reply without is one IISA always sends. Dipper fills in
