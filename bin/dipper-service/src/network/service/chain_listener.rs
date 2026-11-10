@@ -21,6 +21,9 @@
 //! | CanceledByRequester | Accepted           | queue a chain check, which reopens its cancel if live                  |
 //! | Canceled*          | *                   | no-op (terminal)                                                       |
 //!
+//! Recording an indexer's cancel also queues a reassessment of its request, which nothing else
+//! would refill before the daily pass.
+//!
 //! ## Data Source
 //!
 //! Snapshots come from the indexing-payments-subgraph's aggregated
@@ -243,6 +246,7 @@ where
     E: ChainEventSource,
     T: ChainClient + Send + Sync,
     W: WorkerQueue + Send + Sync,
+    R: crate::registry::IndexingRequestRegistry,
 {
     let (tx_stop, mut rx_stop) = mpsc::channel(1);
 
@@ -553,6 +557,7 @@ where
     E: ChainEventSource,
     T: ChainClient + Send + Sync,
     W: WorkerQueue + Sync,
+    R: crate::registry::IndexingRequestRegistry,
 {
     // Read-side cursor backs off by `reorg_buffer_blocks` so a
     // reorg that moves a state change across the boundary is still
@@ -771,6 +776,7 @@ where
                     drain_errors += 1;
                 }
             }
+            reassess_after_indexer_cancel(&prep, outcome, registry, &live_checks.queue).await;
         }
 
         pages_per_tick += 1;
@@ -1596,6 +1602,136 @@ where
     }
 
     Ok(())
+}
+
+/// Queue a reassessment of the request whose indexer has just been recorded cancelling its
+/// agreement on-chain, which leaves the request a slot short. Nothing else fills it before the
+/// daily pass, as the hourly top-up and the sweep of freed requests only take requests a
+/// reassessment has marked short. A request with a reassessment already queued or running gets
+/// no second one. A failure is logged, not returned: the cancel is on record either way, and
+/// the daily pass reassesses the request.
+async fn reassess_after_indexer_cancel<R, W>(
+    prep: &PreparedReconciliation,
+    outcome: crate::registry::ReconciliationOutcome,
+    registry: &R,
+    worker_queue: &W,
+) where
+    R: crate::registry::IndexingRequestRegistry + Sync,
+    W: WorkerQueue + Sync,
+{
+    if !outcome.did_cancel || !matches!(prep.item.cancel, Some(CancelKind::ByIndexer)) {
+        return;
+    }
+    let agreement = &prep.agreement;
+    let Some(request) = open_request_of(agreement, registry).await else {
+        return;
+    };
+    if reassessment_queued(worker_queue, &request).await {
+        tracing::debug!(
+            agreement_id = %agreement.id,
+            indexing_request_id = %request.id,
+            "Reassessment already queued for the request of an agreement its indexer cancelled"
+        );
+        return;
+    }
+    queue_reassessment_of(&request, agreement, worker_queue).await;
+}
+
+/// Queue a reassessment of `request`, which lost `agreement` to its indexer's cancel.
+async fn queue_reassessment_of<W: WorkerQueue + Sync>(
+    request: &crate::registry::IndexingRequest,
+    agreement: &IndexingAgreement,
+    worker_queue: &W,
+) {
+    let queued = worker_queue
+        .reassess_indexing_request(
+            request.id,
+            request.deployment_id,
+            request.deployment_chain_id,
+            request.num_candidates,
+            // Background: replacing an indexer yields to interactive work.
+            JobPriority::Background,
+        )
+        .await;
+    match queued {
+        Ok(_) => tracing::info!(
+            agreement_id = %agreement.id,
+            indexing_request_id = %request.id,
+            "Queued reassessment for the request of an agreement its indexer cancelled"
+        ),
+        Err(err) => tracing::warn!(
+            agreement_id = %agreement.id,
+            indexing_request_id = %request.id,
+            error = format!("{err:#}"),
+            "Failed to queue reassessment for the request of an agreement its indexer cancelled; \
+             the daily pass reassesses it"
+        ),
+    }
+}
+
+/// Whether a reassessment is queued or running for `request`. When the queue can't be listed
+/// the answer is no, as a duplicate only repeats a reassessment.
+async fn reassessment_queued<W: WorkerQueue + Sync>(
+    worker_queue: &W,
+    request: &crate::registry::IndexingRequest,
+) -> bool {
+    match worker_queue.queued_reassessments().await {
+        Ok(queued) => queued.contains(&request.id),
+        Err(err) => {
+            tracing::warn!(
+                indexing_request_id = %request.id,
+                error = format!("{err:#}"),
+                "Can't list queued reassessments; queueing without that check"
+            );
+            false
+        }
+    }
+}
+
+/// The request `agreement` serves while it is open. `None`, logged, when it is cancelled, gone
+/// or can't be read; an unreadable one is left to the daily pass.
+async fn open_request_of<R>(
+    agreement: &IndexingAgreement,
+    registry: &R,
+) -> Option<crate::registry::IndexingRequest>
+where
+    R: crate::registry::IndexingRequestRegistry + Sync,
+{
+    match registry
+        .get_indexing_request_by_id(&agreement.indexing_request_id)
+        .await
+    {
+        Ok(Some(request)) if request.status == crate::registry::IndexingRequestStatus::Open => {
+            Some(request)
+        }
+        Ok(Some(request)) => {
+            tracing::debug!(
+                agreement_id = %agreement.id,
+                indexing_request_id = %request.id,
+                request_status = %request.status,
+                "Not reassessing a cancelled request after its indexer cancelled an agreement"
+            );
+            None
+        }
+        Ok(None) => {
+            tracing::warn!(
+                agreement_id = %agreement.id,
+                indexing_request_id = %agreement.indexing_request_id,
+                "Indexing request not found for an agreement its indexer cancelled"
+            );
+            None
+        }
+        Err(err) => {
+            tracing::warn!(
+                agreement_id = %agreement.id,
+                indexing_request_id = %agreement.indexing_request_id,
+                error = %err,
+                "Failed to read the request of an agreement its indexer cancelled; the daily pass \
+                 reassesses it"
+            );
+            None
+        }
+    }
 }
 
 /// Reconcile a single agreement snapshot against dipper's local DB.
@@ -3256,11 +3392,22 @@ mod tests {
     pub(super) struct MockWorkerQueue {
         checks: Arc<Mutex<Vec<QueuedCheck>>>,
         fail: Arc<std::sync::atomic::AtomicBool>,
+        reassessments: Arc<Mutex<Vec<QueuedReassessment>>>,
+        /// Requests listed as already having a reassessment queued or running.
+        reassessing: Arc<Mutex<std::collections::HashSet<IndexingRequestId>>>,
+        fail_reassessments: Arc<std::sync::atomic::AtomicBool>,
     }
+
+    /// A reassessment queued: the request, and the target it was queued with.
+    type QueuedReassessment = (IndexingRequestId, usize);
 
     impl MockWorkerQueue {
         pub(super) fn queued(&self) -> Vec<QueuedCheck> {
             self.checks.lock().unwrap().clone()
+        }
+
+        fn reassessments(&self) -> Vec<QueuedReassessment> {
+            self.reassessments.lock().unwrap().clone()
         }
     }
 
@@ -3280,13 +3427,29 @@ mod tests {
 
         async fn reassess_indexing_request(
             &self,
-            _indexing_request_id: IndexingRequestId,
+            indexing_request_id: IndexingRequestId,
             _deployment_id: DeploymentId,
             _deployment_chain_id: ChainId,
-            _num_candidates: usize,
+            num_candidates: usize,
             _priority: JobPriority,
         ) -> anyhow::Result<dipper_pgmq::JobId> {
-            unimplemented!()
+            if self
+                .fail_reassessments
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                anyhow::bail!("queue unavailable");
+            }
+            self.reassessments
+                .lock()
+                .unwrap()
+                .push((indexing_request_id, num_candidates));
+            Ok(dipper_pgmq::JobId::default())
+        }
+
+        async fn queued_reassessments(
+            &self,
+        ) -> anyhow::Result<std::collections::HashSet<IndexingRequestId>> {
+            Ok(self.reassessing.lock().unwrap().clone())
         }
 
         async fn cancel_rejected_agreement_on_chain(
@@ -3320,6 +3483,231 @@ mod tests {
             at: TEST_ACCEPTED_AT,
             tx: TEST_ACCEPTED_TX.to_string(),
         })
+    }
+
+    /// The target of every open request the mock registry hands out.
+    const REQUEST_TARGET: usize = 3;
+
+    /// Answers for the requests the mock's agreements name: open with [`REQUEST_TARGET`]
+    /// indexers, or cancelled once marked so. A request no agreement names doesn't exist.
+    #[async_trait::async_trait]
+    impl crate::registry::IndexingRequestRegistry for MockRegistry {
+        async fn set_indexing_target_candidates(
+            &self,
+            _requested_by: Address,
+            _deployment_id: DeploymentId,
+            _deployment_chain_id: ChainId,
+            _num_candidates: usize,
+        ) -> RegistryResult<crate::registry::SetTargetOutcome> {
+            unimplemented!()
+        }
+
+        async fn get_all_indexing_requests(
+            &self,
+        ) -> RegistryResult<Vec<crate::registry::IndexingRequest>> {
+            unimplemented!()
+        }
+
+        async fn get_indexing_request_by_id(
+            &self,
+            id: &IndexingRequestId,
+        ) -> RegistryResult<Option<crate::registry::IndexingRequest>> {
+            let state = self.state.lock().unwrap();
+            let Some(agreement) = state
+                .agreements
+                .values()
+                .find(|agreement| agreement.indexing_request_id == *id)
+            else {
+                return Ok(None);
+            };
+            let status = if state.canceled_request_ids.contains(id) {
+                crate::registry::IndexingRequestStatus::Canceled
+            } else {
+                crate::registry::IndexingRequestStatus::Open
+            };
+            Ok(Some(crate::registry::IndexingRequest {
+                id: *id,
+                created_at: OffsetDateTime::now_utc(),
+                updated_at: OffsetDateTime::now_utc(),
+                status,
+                requested_by: Address::ZERO,
+                deployment_id: agreement.terms.metadata.subgraph_deployment_id,
+                deployment_chain_id: agreement.terms.metadata.chain_id,
+                num_candidates: REQUEST_TARGET,
+            }))
+        }
+
+        async fn get_indexing_requests_by_deployment_id(
+            &self,
+            _deployment_id: &DeploymentId,
+        ) -> RegistryResult<Vec<crate::registry::IndexingRequest>> {
+            unimplemented!()
+        }
+
+        async fn get_open_indexing_requests_for_reassessment(
+            &self,
+            _min_age_seconds: i64,
+            _batch_size: i64,
+        ) -> RegistryResult<Vec<crate::registry::IndexingRequest>> {
+            unimplemented!()
+        }
+
+        async fn get_short_requests_on_deployments_with_ended_agreements(
+            &self,
+            _since_seconds: i64,
+            _batch_size: i64,
+        ) -> RegistryResult<Vec<crate::registry::IndexingRequest>> {
+            unimplemented!()
+        }
+    }
+
+    /// Drain 1 page holding `snapshot` into `registry`, queueing on `queue`.
+    async fn drain_page_of(
+        snapshot: AgreementStateSnapshot,
+        registry: &MockRegistry,
+        queue: MockWorkerQueue,
+    ) -> DrainOutcome {
+        let event_source = super::super::chain_events::mock::MockEventSource::new();
+        event_source.set_latest_block(snapshot.last_state_change_block + 10);
+        event_source.set_latest_block_timestamp(Some(1_700_000_000));
+        event_source.add_snapshots(vec![snapshot]);
+        let (_tx_stop, mut rx_stop) = mpsc::channel::<()>(1);
+        drain_once(
+            &mut Cursor::genesis(),
+            &mut None,
+            &mut None,
+            &mut 0,
+            &mut 0,
+            &mut 0,
+            1337,
+            0,
+            10,
+            false,
+            registry,
+            &MockChainClient::default(),
+            &mut LiveChecks::new(queue),
+            &event_source,
+            &mut rx_stop,
+            test_agreement_conf().as_ref(),
+        )
+        .await
+        .expect("the subgraph fetch succeeds")
+    }
+
+    /// An accepted agreement whose indexer cancelled it on-chain leaves its request a slot short,
+    /// and only a reassessment fills it before the daily pass: the hourly top-up and the sweep
+    /// of freed requests both pass over a request no reassessment has marked short.
+    #[tokio::test]
+    async fn reconciling_an_indexer_cancel_queues_a_reassessment_of_its_request() {
+        let registry = MockRegistry::new();
+        let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+        registry.add_agreement(agreement_id, IndexingAgreementStatus::AcceptedOnChain);
+        let request_id = IndexingRequestId::new();
+        registry.set_agreement_request_id(agreement_id, request_id);
+        let queue = MockWorkerQueue::default();
+
+        let outcome = drain_page_of(
+            make_snapshot(
+                agreement_id,
+                AgreementState::CanceledByServiceProvider,
+                Address::ZERO,
+            ),
+            &registry,
+            queue.clone(),
+        )
+        .await;
+
+        assert!(registry.was_marked_canceled_by_indexer(&agreement_id));
+        assert_eq!(queue.reassessments(), [(request_id, REQUEST_TARGET)]);
+        assert_eq!((outcome.processed, outcome.errors), (1, 0));
+    }
+
+    /// A request with a reassessment already queued or running gets no second one: that 1 reads
+    /// the agreements as they stand when it runs.
+    #[tokio::test]
+    async fn an_indexer_cancel_queues_no_reassessment_while_one_is_queued() {
+        let registry = MockRegistry::new();
+        let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+        registry.add_agreement(agreement_id, IndexingAgreementStatus::AcceptedOnChain);
+        let request_id = IndexingRequestId::new();
+        registry.set_agreement_request_id(agreement_id, request_id);
+        let queue = MockWorkerQueue::default();
+        queue.reassessing.lock().unwrap().insert(request_id);
+
+        drain_page_of(
+            make_snapshot(
+                agreement_id,
+                AgreementState::CanceledByServiceProvider,
+                Address::ZERO,
+            ),
+            &registry,
+            queue.clone(),
+        )
+        .await;
+
+        assert!(registry.was_marked_canceled_by_indexer(&agreement_id));
+        assert_eq!(queue.reassessments(), []);
+    }
+
+    /// The cancel is on record whether or not its reassessment could be queued, so a queue
+    /// that is down leaves the change applied and says so, rather than failing the page.
+    #[tokio::test]
+    async fn an_indexer_cancel_stays_recorded_when_its_reassessment_cannot_be_queued() {
+        let registry = MockRegistry::new();
+        let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+        registry.add_agreement(agreement_id, IndexingAgreementStatus::AcceptedOnChain);
+        let queue = MockWorkerQueue::default();
+        queue
+            .fail_reassessments
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let (outcome, logs) = {
+            let mut outcome = None;
+            let logs = crate::test_support::logged(async {
+                outcome = Some(
+                    drain_page_of(
+                        make_snapshot(
+                            agreement_id,
+                            AgreementState::CanceledByServiceProvider,
+                            Address::ZERO,
+                        ),
+                        &registry,
+                        queue.clone(),
+                    )
+                    .await,
+                );
+            })
+            .await;
+            (outcome.expect("the drain ran"), logs)
+        };
+
+        assert!(registry.was_marked_canceled_by_indexer(&agreement_id));
+        assert_eq!((outcome.processed, outcome.errors), (1, 0));
+        let line = logs
+            .lines()
+            .find(|line| line.contains("queue unavailable"))
+            .unwrap_or_else(|| panic!("the failed queueing is logged:\n{logs}"));
+        assert!(line.contains("WARN"), "{line}");
+    }
+
+    /// A cancel by dipper itself needs no reassessment from here: the paths that end an agreement
+    /// for dipper queue their own.
+    #[tokio::test]
+    async fn a_cancel_by_dipper_queues_no_reassessment() {
+        let registry = MockRegistry::new();
+        let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+        registry.add_agreement(agreement_id, IndexingAgreementStatus::AcceptedOnChain);
+        let queue = MockWorkerQueue::default();
+
+        drain_page_of(
+            make_snapshot(agreement_id, AgreementState::CanceledByPayer, Address::ZERO),
+            &registry,
+            queue.clone(),
+        )
+        .await;
+
+        assert!(registry.was_marked_canceled_by_requester(&agreement_id));
+        assert_eq!(queue.reassessments(), []);
     }
 
     // -- reconcile_agreement tests --
