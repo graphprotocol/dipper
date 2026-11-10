@@ -15,6 +15,20 @@ pub(crate) fn untrusted(raw: &str) -> String {
     }
 }
 
+/// The most characters of an error that are logged.
+const MAX_LOGGED_ERROR_CHARS: usize = 500;
+
+/// An error from a call to an indexer's server, cut short. Such an error can repeat text the
+/// server chose, such as the status line of its reply, which may be hundreds of thousands of
+/// characters long. The libraries that build these errors escape that text already.
+pub(crate) fn shortened(error: &impl std::fmt::Display) -> String {
+    let text = error.to_string();
+    match text.char_indices().nth(MAX_LOGGED_ERROR_CHARS) {
+        Some((cut, _)) => format!("{}...", &text[..cut]),
+        None => text,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -31,6 +45,15 @@ mod tests {
         let shown = untrusted("a\nb\rc\u{1b}[31md\u{202e}e");
 
         assert_eq!(shown, r#""a\nb\rc\u{1b}[31md\u{202e}e""#);
+    }
+
+    #[test]
+    fn a_long_error_is_cut_between_characters_and_marked() {
+        let exactly = "é".repeat(MAX_LOGGED_ERROR_CHARS);
+        let over = "é".repeat(MAX_LOGGED_ERROR_CHARS + 1);
+
+        assert_eq!(shortened(&exactly), exactly);
+        assert_eq!(shortened(&over), format!("{exactly}..."));
     }
 
     #[test]

@@ -17,11 +17,20 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// A snapshot of the registered indexers' URLs, keyed by indexer ID.
 pub type Snapshot = BTreeMap<IndexerId, Url>;
 
+/// The longest registered URL dipper will use, counted as it would be sent. A real one is a few
+/// dozen characters. Dipper logs an indexer's URL whenever a call to it fails, so without a limit
+/// an indexer could register one of any length and have it logged in full on every failed call.
+const MAX_INDEXER_URL_CHARS: usize = 2_048;
+
 /// Parse and validate an indexer URL: `Some(Url)` if it parses, uses an
-/// HTTP(S) scheme, and has a host component; `None` otherwise.
+/// HTTP(S) scheme, has a host component and is no longer than
+/// [`MAX_INDEXER_URL_CHARS`]; `None` otherwise.
 fn parse_indexer_url(raw: &str) -> Option<Url> {
     let url = raw.parse::<Url>().ok()?;
-    (matches!(url.scheme(), "http" | "https") && url.has_host()).then_some(url)
+    let usable = matches!(url.scheme(), "http" | "https")
+        && url.has_host()
+        && url.as_str().len() <= MAX_INDEXER_URL_CHARS;
+    usable.then_some(url)
 }
 
 /// Handle for interacting with the indexer URLs service.
@@ -355,6 +364,25 @@ mod tests {
         //* Then
         assert!(logs.contains("skipping indexer"), "{logs:.300}");
         assert!(logs.len() < 1_000, "logged {} bytes", logs.len());
+    }
+
+    #[test]
+    fn a_registered_url_far_longer_than_a_real_one_is_refused() {
+        let base = "https://indexer.example.com/";
+        let longest_allowed = format!("{base}{}", "a".repeat(MAX_INDEXER_URL_CHARS - base.len()));
+        let too_long = format!("{longest_allowed}a");
+
+        assert!(parse_indexer_url(&longest_allowed).is_some());
+        assert!(parse_indexer_url(&too_long).is_none());
+    }
+
+    #[test]
+    fn a_registered_url_is_measured_as_it_would_be_sent() {
+        // Each of these letters is sent as 6 characters, so 500 of them make a 3,000 character
+        // path out of 500 characters of registered text.
+        let short_as_written = format!("https://indexer.example.com/{}", "é".repeat(500));
+
+        assert!(parse_indexer_url(&short_as_written).is_none());
     }
 
     #[test]
