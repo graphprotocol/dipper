@@ -28,6 +28,11 @@ spec:
           image: ghcr.io/graphprotocol/dipper-service:v0.2.10 # x-release-please-version
           args:
             - /config/config.json
+          # Dipper logs at info without it; `dipper_service=debug,info`, for example, adds
+          # dipper's own debug lines.
+          env:
+            - name: RUST_LOG
+              value: info
           ports:
             - name: admin-rpc
               containerPort: 8545

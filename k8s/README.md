@@ -10,7 +10,7 @@ Kubernetes manifests for deploying the dipper service.
 
 ## Files
 
-- `deployment.yaml` - Dipper deployment with health probes and security context
+- `deployment.yaml` - Dipper deployment with health probes, security context, and its log level (`RUST_LOG`, `info` unless changed)
 - `service.yaml` - ClusterIP service exposing Admin RPC (8545) and Indexer RPC (50051)
 - `configmap-example.yaml` - Example ConfigMap showing config.json structure (do not apply directly)
 

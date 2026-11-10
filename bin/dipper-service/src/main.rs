@@ -79,7 +79,7 @@ pub async fn main() -> anyhow::Result<()> {
         .with(
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
-                .with_filter(EnvFilter::from_default_env()),
+                .with_filter(log_filter(env::var(EnvFilter::DEFAULT_ENV).ok().as_deref())),
         )
         .with(alerts::layer(&conf.alerts).map(|layer| layer.with_filter(LevelFilter::WARN)))
         .init();
@@ -912,6 +912,15 @@ enum SignalHandlerError {
 
 // -------- Private app helpers --------
 
+/// The filter for dipper's own log output, given the value of `RUST_LOG`. Its directives are
+/// used as written, skipping any that cannot be read; with none, dipper logs at info rather than
+/// the library's default of errors only, so warnings and agreement changes are seen.
+fn log_filter(rust_log: Option<&str>) -> EnvFilter {
+    EnvFilter::builder()
+        .with_default_directive(LevelFilter::INFO.into())
+        .parse_lossy(rust_log.unwrap_or_default())
+}
+
 /// Stop one service, giving up after [`STOP_STEP_TIMEOUT`]. Returns whether it stopped in time,
 /// naming the service when it did not so the errors it goes on to log are attributable.
 async fn stop_service(name: &str, stop: impl std::future::Future<Output = ()>) -> bool {
@@ -980,7 +989,9 @@ async fn create_subgraph_indexing_agreements_events_emitter(
 
 #[cfg(test)]
 mod tests {
-    use super::stop_service;
+    use tracing_subscriber::filter::LevelFilter;
+
+    use super::{log_filter, stop_service};
 
     /// The normal path: a service that stops promptly reports success, which is
     /// what lets the graceful DB pool close go ahead.
@@ -995,5 +1006,43 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn stop_service_gives_up_on_a_wedged_service() {
         assert!(!stop_service("wedged", std::future::pending::<()>()).await);
+    }
+
+    fn level(rust_log: Option<&str>) -> Option<LevelFilter> {
+        log_filter(rust_log).max_level_hint()
+    }
+
+    /// Without `RUST_LOG`, as in a deployment from the repo's manifests, warnings and the
+    /// agreement changes logged at info are still written, not only errors.
+    #[test]
+    fn logs_at_info_when_rust_log_is_unset_or_empty() {
+        assert_eq!(level(None), Some(LevelFilter::INFO));
+        assert_eq!(level(Some("")), Some(LevelFilter::INFO));
+    }
+
+    #[test]
+    fn a_rust_log_that_is_set_is_used_as_written() {
+        for (rust_log, most) in [
+            ("error", LevelFilter::ERROR),
+            ("warn", LevelFilter::WARN),
+            ("debug", LevelFilter::DEBUG),
+            ("dipper_service=debug,warn", LevelFilter::DEBUG),
+            ("off", LevelFilter::OFF),
+        ] {
+            assert_eq!(level(Some(rust_log)), Some(most), "{rust_log}");
+        }
+    }
+
+    /// A value with no directive that can be read does not silence logging; one with some keeps
+    /// those, as before.
+    #[test]
+    fn an_unreadable_rust_log_logs_at_info() {
+        for rust_log in ["dipper_service=loud", "[{", "dipper_service=loud,[{"] {
+            assert_eq!(level(Some(rust_log)), Some(LevelFilter::INFO), "{rust_log}");
+        }
+        assert_eq!(
+            level(Some("warn,dipper_service=loud")),
+            Some(LevelFilter::WARN)
+        );
     }
 }
