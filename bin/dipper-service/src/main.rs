@@ -598,7 +598,7 @@ pub async fn main() -> anyhow::Result<()> {
     //- The liveness checker service (optional, enabled by config)
     // Detects indexers who silently stop indexing active AcceptedOnChain agreements
     let liveness_checker_handle = match conf.liveness_checker {
-        Some(ref lc_conf) if lc_conf.enabled => {
+        Some(ref lc_conf) if lc_conf.is_enabled() => {
             let ctx = network::service::liveness_checker::Ctx {
                 registry: registry.clone(),
                 worker_queue: worker_handle.queue().clone(),
@@ -616,7 +616,7 @@ pub async fn main() -> anyhow::Result<()> {
     //- The DIPs info watcher (optional, enabled by config)
     // Alerts on, then blocks, agreement holders whose /dips/info stays unreadable
     let dips_info_watcher_handle = match conf.dips_info_watcher {
-        Some(ref watcher_conf) if watcher_conf.enabled => {
+        Some(ref watcher_conf) if watcher_conf.is_enabled() => {
             let ctx = network::service::dips_info_watcher::Ctx {
                 registry: registry.clone(),
                 network: network_provider.clone(),

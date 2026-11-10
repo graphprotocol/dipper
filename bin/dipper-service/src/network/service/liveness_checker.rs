@@ -1708,7 +1708,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = LivenessCheckerConfig::default();
-        assert!(!config.enabled); // off by default
+        assert!(!config.is_enabled()); // off by default
         assert_eq!(config.interval, std::time::Duration::from_secs(300));
         assert_eq!(config.max_tolerance_days, 4);
         assert_eq!(config.request_timeout, std::time::Duration::from_secs(10));
