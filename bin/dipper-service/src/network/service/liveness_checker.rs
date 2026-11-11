@@ -335,7 +335,7 @@ async fn probe_indexer(
             tracing::warn!(
                 indexer_id = %indexer_id,
                 indexer_url = %indexer.url,
-                error = %err,
+                error = %crate::log_text::shortened(&err),
                 "failed to query indexer status, treating as unreachable"
             );
             Probe::Unreachable
@@ -1232,8 +1232,8 @@ mod tests {
     use super::{
         Checker, HeldSpan, LivenessAction, Probe, Uncancellable, UnreachableBreaker,
         UnreachablePolicy, cancel_and_reassess, decide_liveness_action, group_by_indexer_id,
-        query_indexer_status, record_progress, replace_abandoned, status_reply_limit_bytes,
-        tolerance_duration, unreachable_trips,
+        probe_indexer, query_indexer_status, record_progress, replace_abandoned,
+        status_reply_limit_bytes, tolerance_duration, unreachable_trips,
     };
     use crate::{
         chain_client::{AgreementOnChain, ChainClient, ChainClientError},
@@ -2640,5 +2640,46 @@ mod tests {
             panic!("a reply about 2,000 deployments was read in answer to a question about 1");
         };
         assert!(why.to_string().contains("longer than the limit"), "{why}");
+    }
+
+    #[tokio::test]
+    async fn a_huge_status_line_from_an_indexer_is_cut_short_in_the_log() {
+        //* Given an indexer whose server answers with a status line of 100,000 characters
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request).await;
+            let reply = format!(
+                "HTTP/1.1 500 {}\r\nContent-Length: 0\r\n\r\n",
+                "x".repeat(100_000)
+            );
+            let _ = socket.write_all(reply.as_bytes()).await;
+        });
+        let indexer_id: IndexerId = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            .parse()
+            .unwrap();
+        let url: Url = format!("http://{address}/").parse().unwrap();
+        let network = crate::network::provider::NetworkProviderService::new(
+            crate::network::service::indexer_urls::Handle::for_test(
+                std::collections::BTreeMap::from([(indexer_id, url)]),
+            ),
+        );
+
+        //* When
+        let logs = logged(async {
+            let probe = probe_indexer(&network, &reqwest::Client::new(), &indexer_id, &[]).await;
+            assert!(matches!(probe, Probe::Unreachable));
+        })
+        .await;
+
+        //* Then
+        assert!(
+            logs.contains("failed to query indexer status"),
+            "{logs:.500}"
+        );
+        assert!(logs.len() < 5_000, "logged {} bytes", logs.len());
     }
 }
