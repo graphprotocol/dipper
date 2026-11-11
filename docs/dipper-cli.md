@@ -56,13 +56,15 @@ dipper-cli init keygen --output .env.unencrypted
 
 #### .env File
 
-You can use a `.env` file to store your configuration. The CLI looks for a `.env` file in the current directory only, never in the directories above it. The `indexings` and `agreements` commands also take a custom path with the `--env-file` flag, and a file named that way is read instead of the one in the current directory:
+You can use a `.env` file to store the configuration of the `indexings` and `agreements` commands. They look for a `.env` file in the current directory only, never in the directories above it, and also take a custom path with the `--env-file` flag. A file named that way is read instead of the one in the current directory, so a setting it leaves out, such as a private `DIPS_IPFS_URL` kept only in the other file, falls back to your shell or to the default, not to that file:
 
 ```bash
 dipper-cli indexings --env-file /path/to/.env <subcommand>
 ```
 
 Each setting comes from the first of these that sets it: a command-line flag, a variable already set in your shell, then the file. The CLI prints a warning, naming the setting but never its value, whenever a flag or a shell variable overrides a setting in the file, whether you named it with `--env-file` or the CLI found it in the current directory. It also warns when the server URL and the signing key come from different places, naming both, so a variable left exported in your shell cannot quietly send a command to a different server. A flag or variable that repeats the file's value, even written differently, such as a URL without its trailing slash, raises no warning.
+
+Only `DIPS_` settings are read from a file. Other variables in it are not passed on, so a proxy setting such as `HTTPS_PROXY`, which the manifest and networks registry downloads in `set-target-candidates` follow, has to be exported in your shell. The `init keygen` and `init placeholder` commands read no file at all: they take the server URL from `--server-url` or from `DIPS_SERVER_URL` in your shell.
 
 #### CLI Flags
 
