@@ -477,8 +477,9 @@ where
     // accepted on-chain (see pending cancellations below).
     //
     // `now` denominates `terms.deadline` and `terms.ends_at`. The
-    // expiration service compares both against the chain_listener's
-    // persisted chain timestamp. In production the two clocks track
+    // expiration service compares the deadline against the chain_listener's
+    // persisted chain timestamp; nothing reads `ends_at` back, which is why
+    // the config refuses a fixed agreement length. In production the two clocks track
     // each other so wall time is fine; in local-network where
     // `evm_increaseTime` advances chain time independently of wall,
     // `bypass_chain_clock_defenses` reroutes us to chain time so

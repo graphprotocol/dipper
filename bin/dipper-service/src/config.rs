@@ -1062,7 +1062,9 @@ pub struct DipsAgreementConfig {
     pub max_seconds_per_collection: u32,
     /// Minimum seconds per collection.
     pub min_seconds_per_collection: u32,
-    /// Agreement duration in seconds (None = u64::MAX).
+    /// Agreement duration in seconds. Must be left out or `null`, which makes agreements
+    /// open-ended (`u64::MAX` on-chain): dipper does not act on an agreement reaching its end,
+    /// so [`Self::validate`] refuses any number here.
     pub duration_seconds: Option<u64>,
     /// Deadline duration in seconds (how long the indexer has to accept on-chain).
     #[serde(default = "default_deadline_seconds")]
@@ -1252,23 +1254,14 @@ impl DipsAgreementConfig {
                  {MIN_SECONDS_COLLECTION_WINDOW} seconds"
             ));
         }
+        // Nothing in dipper acts on an agreement's end: one that reached it would keep its slot,
+        // with its indexer unpaid and never replaced. Agreements end by cancellation instead.
         if let Some(duration) = self.duration_seconds {
-            if duration <= self.deadline_seconds {
-                return Err(format!(
-                    "duration_seconds ({duration}) must exceed deadline_seconds ({}): the \
-                     agreement would end before its acceptance deadline",
-                    self.deadline_seconds
-                ));
-            }
-            if duration - self.deadline_seconds < min + MIN_SECONDS_COLLECTION_WINDOW {
-                return Err(format!(
-                    "duration_seconds ({duration}) minus deadline_seconds ({}) must be at \
-                     least min_seconds_per_collection ({min}) plus the \
-                     {MIN_SECONDS_COLLECTION_WINDOW}-second minimum collection window, so one \
-                     collection fits even when acceptance lands at the deadline",
-                    self.deadline_seconds
-                ));
-            }
+            return Err(format!(
+                "duration_seconds ({duration}) must be left out or null: dipper only supports \
+                 open-ended agreements, and would never replace an indexer whose agreement had \
+                 reached its end"
+            ));
         }
         Ok(())
     }
@@ -2180,12 +2173,11 @@ mod tests {
         );
     }
 
+    /// Nothing in dipper acts on an agreement's end, so one with a fixed length would keep its
+    /// slot after it ended: its indexer unpaid, and never replaced.
     #[test]
-    fn validate_rejects_a_duration_too_short_for_its_deadline() {
-        // With a bounded duration the agreement must outlive the acceptance
-        // deadline by min_seconds_per_collection + 600, so a collection fits
-        // even when acceptance lands exactly at the deadline.
-        fn conf(duration: &str, deadline: u64) -> DipsAgreementConfig {
+    fn validate_refuses_a_fixed_agreement_length() {
+        fn conf(duration: &str) -> DipsAgreementConfig {
             let json = format!(
                 r#"{{
                     "data_service": "0x1111111111111111111111111111111111111111",
@@ -2194,7 +2186,7 @@ mod tests {
                     "min_seconds_per_collection": 60,
                     "max_seconds_per_collection": 3600,
                     "duration_seconds": {duration},
-                    "deadline_seconds": {deadline},
+                    "deadline_seconds": 600,
                     "pricing_table": {{}}
                 }}"#
             );
@@ -2202,21 +2194,16 @@ mod tests {
         }
 
         assert!(
-            conf("null", 600).validate().is_ok(),
-            "an unbounded duration passes the duration checks"
+            conf("null").validate().is_ok(),
+            "an open-ended agreement is the supported kind"
         );
-        assert!(
-            conf("600", 600).validate().is_err(),
-            "an agreement ending at its deadline must be rejected"
-        );
-        assert!(
-            conf("1259", 600).validate().is_err(),
-            "1 second short of a full collection window must be rejected"
-        );
-        assert!(
-            conf("1260", 600).validate().is_ok(),
-            "exactly one collection window past the deadline is valid"
-        );
+        for duration in ["600", "1260", "2592000"] {
+            let err = conf(duration)
+                .validate()
+                .expect_err("a fixed agreement length must be refused");
+            assert!(err.contains("duration_seconds"), "{duration}: {err}");
+            assert!(err.contains("open-ended"), "{duration}: {err}");
+        }
     }
 
     #[test]
