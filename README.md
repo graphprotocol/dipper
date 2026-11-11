@@ -103,7 +103,7 @@ Three safeguards keep this honest. If more than 50% of the DIPs-accepting indexe
 
 ## Operating dipper
 
-Dipper runs as a single service backed by Postgres, with a job worker, a chain listener that polls the indexing-payments subgraph, and the background services described above. A full configuration example lives in [k8s/configmap-example.yaml](./k8s/configmap-example.yaml).
+Dipper runs as a single service backed by Postgres, with a job worker, a chain listener that polls the indexing-payments subgraph, and the background services described above. A full configuration example lives in [k8s/configmap-example.yaml](./k8s/configmap-example.yaml). It logs to standard output at `info`, or as `RUST_LOG` says when that is set (for example `RUST_LOG=dipper_service=debug,info`); a `RUST_LOG` with no directive dipper can read falls back to `info` as well.
 
 The admin JSON-RPC surface has 8 methods: 7 unauthenticated reads over requests and agreements, and 1 write, `set_indexing_target_candidates`, which requires an EIP-712 signature from an address on the operator allowlist. The [Admin CLI](docs/dipper-cli.md) signs and sends these requests for you. A health endpoint returns 200 while the worker is keeping up and 503 when it stalls.
 

@@ -38,6 +38,16 @@ pub fn endpoint_name(url: &Url) -> String {
     }
 }
 
+/// How the database is named in logs: its host, port and name, leaving out any user, password or
+/// query the URL carries.
+pub fn database_name(url: &Url) -> String {
+    format!("{}{}", endpoint_name(url), url.path())
+}
+
+fn debug_database(url: &Url, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.write_str(&database_name(url))
+}
+
 fn debug_endpoint(url: &Url, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     f.write_str(&endpoint_name(url))
 }
@@ -1479,7 +1489,7 @@ pub struct DbConfig {
     /// The PostgreSQL database URL
     ///
     /// The URL should be in the format `postgres://<host>:<port>/<database>`.
-    #[debug(with = std::fmt::Display::fmt)]
+    #[debug(with = debug_database)]
     #[serde_as(as = "serde_with::DisplayFromStr")]
     pub url: Url,
 
@@ -2875,6 +2885,25 @@ mod tests {
         }
         assert!(dumped.contains("gateway.example.com"), "{dumped}");
         assert!(dumped.contains("rpc.example.com"), "{dumped}");
+    }
+
+    /// A database URL may carry a user and password, so logs name the database by host, port
+    /// and name only, both in the startup line and in the config dump.
+    #[test]
+    fn the_database_is_named_without_its_credentials() {
+        let db = serde_json::from_value::<DbConfig>(serde_json::json!({
+            "url": "postgres://dipper:url-password@db.example.com:5432/dipper?password=query-password",
+            "username": "dipper",
+            "password": "field-password",
+        }))
+        .expect("db config");
+
+        assert_eq!(database_name(&db.url), "db.example.com:5432/dipper");
+        let dumped = format!("{db:?}");
+        for secret in ["url-password", "query-password", "field-password"] {
+            assert!(!dumped.contains(secret), "{secret} in {dumped}");
+        }
+        assert!(dumped.contains("db.example.com:5432/dipper"), "{dumped}");
     }
 
     #[test]
