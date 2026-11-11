@@ -765,7 +765,16 @@ where
             let Some(outcome) = outcomes.get(&prep.agreement.id).copied() else {
                 continue;
             };
-            match finalize_reconciliation(&prep, outcome, registry, chain_client, config).await {
+            match finalize_reconciliation(
+                &prep,
+                outcome,
+                registry,
+                chain_client,
+                config,
+                &live_checks.queue,
+            )
+            .await
+            {
                 Ok(()) => drain_processed += 1,
                 Err(err) => {
                     tracing::warn!(
@@ -776,7 +785,6 @@ where
                     drain_errors += 1;
                 }
             }
-            reassess_after_indexer_cancel(&prep, outcome, registry, &live_checks.queue).await;
         }
 
         pages_per_tick += 1;
@@ -989,7 +997,11 @@ async fn retry_set_aside_changes<R, E, T, W>(
     rx_stop: &mut mpsc::Receiver<()>,
 ) -> bool
 where
-    R: AgreementRegistry + PendingCancellationRegistry + SetAsideChangeRegistry + Sync,
+    R: AgreementRegistry
+        + PendingCancellationRegistry
+        + SetAsideChangeRegistry
+        + crate::registry::IndexingRequestRegistry
+        + Sync,
     E: ChainEventSource,
     T: ChainClient + Sync,
     W: WorkerQueue + Sync,
@@ -1133,7 +1145,10 @@ async fn apply_set_aside_change<R, T, W>(
     config: &crate::config::IndexingAgreementConfig,
 ) -> anyhow::Result<()>
 where
-    R: AgreementRegistry + PendingCancellationRegistry + Sync,
+    R: AgreementRegistry
+        + PendingCancellationRegistry
+        + crate::registry::IndexingRequestRegistry
+        + Sync,
     T: ChainClient + Sync,
     W: WorkerQueue + Sync,
 {
@@ -1179,7 +1194,10 @@ async fn apply_snapshot<R, T, W>(
     config: &crate::config::IndexingAgreementConfig,
 ) -> anyhow::Result<()>
 where
-    R: AgreementRegistry + PendingCancellationRegistry + Sync,
+    R: AgreementRegistry
+        + PendingCancellationRegistry
+        + crate::registry::IndexingRequestRegistry
+        + Sync,
     T: ChainClient + Sync,
     W: WorkerQueue + Sync,
 {
@@ -1197,7 +1215,15 @@ where
         .context("applying the change returned no outcome for the agreement")?;
     // The change is applied, as when a page's finalize fails; the pending cancellation sweep
     // finishes what this leaves.
-    if let Err(err) = finalize_reconciliation(&prep, outcome, registry, chain_client, config).await
+    if let Err(err) = finalize_reconciliation(
+        &prep,
+        outcome,
+        registry,
+        chain_client,
+        config,
+        &live_checks.queue,
+    )
+    .await
     {
         tracing::warn!(
             error = %err,
@@ -1537,22 +1563,28 @@ async fn record_accept_of_cancelling<R: AgreementRegistry + Sync>(
         .context("failed to record the on-chain accept of an agreement being cancelled")
 }
 
-/// Log the transition that landed and, on fresh accepts, fan out the
-/// linked pending cancellations.
+/// Log the transition that landed, fan out the linked pending cancellations on a fresh accept, and
+/// queue a reassessment of the request on an indexer's cancel. Every path that applies a change,
+/// from a page or from the retry of set-aside changes, finishes here, so none can miss a step.
 #[expect(
     clippy::cognitive_complexity,
     reason = "predates this lint; fix when next touched"
 )]
-async fn finalize_reconciliation<R, T>(
+async fn finalize_reconciliation<R, T, W>(
     prep: &PreparedReconciliation,
     outcome: crate::registry::ReconciliationOutcome,
     registry: &R,
     chain_client: &T,
     config: &crate::config::IndexingAgreementConfig,
+    worker_queue: &W,
 ) -> anyhow::Result<()>
 where
-    R: AgreementRegistry + PendingCancellationRegistry + Sync,
+    R: AgreementRegistry
+        + PendingCancellationRegistry
+        + crate::registry::IndexingRequestRegistry
+        + Sync,
     T: ChainClient,
+    W: WorkerQueue + Sync,
 {
     if outcome.did_accept {
         let (old_status, reason) = match prep.agreement.status {
@@ -1597,11 +1629,15 @@ where
     // Gated on `did_accept` so it only fires on a fresh AcceptedOnChain
     // write — repeating it on a CAS no-op would re-enqueue work that
     // already ran in a prior poll.
-    if outcome.did_accept {
-        execute_pending_cancellations(&prep.agreement.id, registry, chain_client, config).await?;
-    }
-
-    Ok(())
+    let fanned_out = if outcome.did_accept {
+        execute_pending_cancellations(&prep.agreement.id, registry, chain_client, config).await
+    } else {
+        Ok(())
+    };
+    // After the fan-out, so the reassessment finds the agreements it replaced already marked, and
+    // whether or not the fan-out worked, as the cancel is on record either way.
+    reassess_after_indexer_cancel(prep, outcome, registry, worker_queue).await;
+    fanned_out
 }
 
 /// Queue a reassessment of the request whose indexer has just been recorded cancelling its
@@ -1747,7 +1783,10 @@ async fn reconcile_agreement<R, T>(
     config: &crate::config::IndexingAgreementConfig,
 ) -> anyhow::Result<Vec<tests::QueuedCheck>>
 where
-    R: AgreementRegistry + PendingCancellationRegistry + Sync,
+    R: AgreementRegistry
+        + PendingCancellationRegistry
+        + crate::registry::IndexingRequestRegistry
+        + Sync,
     T: ChainClient,
 {
     let mut live_checks = LiveChecks::new(tests::MockWorkerQueue::default());
@@ -1764,7 +1803,15 @@ where
         .apply_reconciliation(&prep.agreement.id, prep.item.apply_accept, prep.item.cancel)
         .await?;
 
-    finalize_reconciliation(&prep, outcome, registry, chain_client, config).await?;
+    finalize_reconciliation(
+        &prep,
+        outcome,
+        registry,
+        chain_client,
+        config,
+        &live_checks.queue,
+    )
+    .await?;
     Ok(queued)
 }
 
@@ -5715,8 +5762,19 @@ mod tests {
         event_source: &super::super::chain_events::mock::MockEventSource,
         warning: &mut SetAsideWarning,
     ) {
+        retry_set_aside_queueing_on(registry, event_source, warning, MockWorkerQueue::default())
+            .await;
+    }
+
+    /// Try the set-aside changes again once, queueing jobs on `queue`.
+    async fn retry_set_aside_queueing_on(
+        registry: &MockRegistry,
+        event_source: &super::super::chain_events::mock::MockEventSource,
+        warning: &mut SetAsideWarning,
+        queue: MockWorkerQueue,
+    ) {
         let (_tx_stop, mut rx_stop) = mpsc::channel::<()>(1);
-        let mut live_checks = LiveChecks::new(MockWorkerQueue::default());
+        let mut live_checks = LiveChecks::new(queue);
         let stopped = retry_set_aside_changes(
             registry,
             event_source,
@@ -5741,6 +5799,38 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// An indexer's cancel that was set aside and applied later by the retry leaves its request a
+    /// slot short just the same, so it queues the same reassessment as one applied from a page.
+    #[tokio::test]
+    async fn test_retry_of_an_indexer_cancel_queues_a_reassessment_of_its_request() {
+        let registry = MockRegistry::new();
+        let event_source = super::super::chain_events::mock::MockEventSource::new();
+        event_source.set_latest_block(200);
+        let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+        registry.add_agreement(agreement_id, IndexingAgreementStatus::AcceptedOnChain);
+        let request_id = IndexingRequestId::new();
+        registry.set_agreement_request_id(agreement_id, request_id);
+        event_source.add_snapshots(vec![make_snapshot(
+            agreement_id,
+            AgreementState::CanceledByServiceProvider,
+            Address::ZERO,
+        )]);
+        set_aside_at(&registry, agreement_id, 100).await;
+        let queue = MockWorkerQueue::default();
+
+        retry_set_aside_queueing_on(
+            &registry,
+            &event_source,
+            &mut SetAsideWarning::default(),
+            queue.clone(),
+        )
+        .await;
+
+        assert!(registry.was_marked_canceled_by_indexer(&agreement_id));
+        assert!(registry.set_aside().is_empty());
+        assert_eq!(queue.reassessments(), [(request_id, REQUEST_TARGET)]);
     }
 
     /// A change set aside is read again on a later poll and applied, then no longer recorded.
