@@ -1,0 +1,88 @@
+// Subgraph Indexing Requests Events Protocol Buffer Schema
+//
+// Vendored copy of the schema owned by Subgraph Studio:
+//   repo:   edgeandnode/subgraph-studio
+//   path:   packages/shared/src/helpers/dips/proto/SubgraphIndexingRequest.proto
+//   commit: a8140613
+//
+// Studio produces these messages on a Redpanda topic; the dipper consumes them
+// and turns each propose event into a set_indexing_target_candidates call.
+// When Studio's copy changes, re-vendor it here and regenerate the bindings
+// (see the crate README).
+//
+// Local divergence from the vendored source, kept intentionally:
+//   - SubgraphIndexingRequestPropose.indexed_network_caip2id (field 2) is the
+//     network the subgraph indexes, which the dipper needs to key the indexing
+//     request and Studio has at every call site. It is a backward-compatible
+//     proto3 addition agreed as the preferred fix for that gap; drop this note
+//     once Studio's copy carries the field.
+//
+// Event flow:
+// 1. subgraph.indexing.request.propose - Emitted when the developer sends a request to have their Subgraph indexed
+// 2. subgraph.indexing.agreements.terminate - Emitted when the developer sends a request to terminate active Indexing agreements
+//
+// Partition key format: {the_graph_network_caip2id}/{subgraph_deployment_qm_hash}/{request/terminate}
+//
+//  - the_graph_network_caip2id -> CAIP2 ID of The Graph network where the Subgraph is published
+//  - subgraph_deployment_qm_hash -> Qm hash of the Subgraph deployment requesting to be indexed
+//  Example: eip155:42161/QmTXzATwNfgGVukV1fX2T6xw9f6LAYRVWpsdXyRWzUR2H9/request
+
+syntax = "proto3";
+
+package studio.subgraph.indexing.requests.events.v1;
+
+// SubgraphIndexingRequestEvent is the envelope that wraps all the Subgraph Indexing Request event types.
+//
+// Provides:
+//  - event_id -> unique identifier (uuid)
+//  - event_type -> event type discrimination
+//  - event_version -> versioning for schema evolution awareness to the consumer
+//  - timestamp -> when the event occurred, useful for ordering/debugging
+//  - subgraph_deployment_qm_hash -> Qm hash of the Subgraph deployment
+//  - the_graph_network_caip2id -> CAIP-2 chain id of The Graph protocol network the Subgraph Deployment is published to (e.g. eip155:42161)
+//  - payload -> the event payload, determined by the event_type
+message SubgraphIndexingRequestEvent {
+  // Unique event identifier.
+  // Format: UUID v7 (time-ordered) for natural chronological sorting.
+  // Example: "01912345-6789-7abc-def0-123456789abc"
+  string event_id = 1;
+
+  // Event type discriminator for routing and filtering.
+  // Values: "subgraph.indexing.request.propose", "subgraph.indexing.agreements.terminate"
+  string event_type = 2;
+
+  // Schema version for forward compatibility.
+  // Consumers should handle unknown fields gracefully.
+  // Current version: "1.0"
+  string event_version = 3;
+
+  // Event timestamp in RFC 3339 format.
+  // Example: "2024-01-15T10:30:00.123Z"
+  string timestamp = 4;
+
+  // Qm hash of the Subgraph deployment with a submitted indexing agreement event.
+  string subgraph_deployment_qm_hash = 5;
+
+  // CAIP-2 chain id of The Graph protocol network where the Subgraph was published to.
+  // Format: "eip155:{chain_id}". Examples: "eip155:42161" (arbitrum), "eip155:421614" (arbitrum-sepolia)
+  string the_graph_network_caip2id = 6;
+
+  // Event payload - exactly one of the specific event types.
+  // Use event_type field to determine which payload is present.
+  oneof payload {
+    SubgraphIndexingRequestPropose subgraph_indexing_request_propose = 7;
+  }
+}
+
+// SubgraphIndexingRequestPropose is emitted when the Subgraph developer initiates a request to have the Subgraph indexed
+//
+// Event type: subgraph.indexing.request.propose
+message SubgraphIndexingRequestPropose {
+  // Number of requested Indexing agreements to find
+  int32 indexing_agreements_requested = 1;
+
+  // CAIP-2 chain id of the network the Subgraph indexes (its data source),
+  // distinct from the_graph_network_caip2id on the envelope.
+  // Format: "eip155:{chain_id}". Example: "eip155:1" for a subgraph indexing Ethereum mainnet.
+  string indexed_network_caip2id = 2;
+}

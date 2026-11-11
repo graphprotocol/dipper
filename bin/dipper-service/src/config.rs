@@ -9,7 +9,7 @@ use std::{
 };
 
 use dipper_core::config::{Hidden, HiddenSecretKeyAsHexStr};
-use dipper_producer::kafka::KafkaConfig;
+use dipper_producer::kafka::{KafkaConfig, KafkaConsumerConfig};
 use serde_with::serde_as;
 use thegraph_core::alloy::{
     primitives::{Address, ChainId, U256},
@@ -121,6 +121,10 @@ pub struct Config {
     /// Events configuration for sending dipper events on the configured topic for streaming
     #[serde(default)]
     pub event_streaming_config: Option<EventStreamingConfig>,
+    /// The Studio indexing request consumer configuration (reads subgraph
+    /// indexing requests from a Redpanda topic; absent means off)
+    #[serde(default)]
+    pub indexing_request_consumer: Option<IndexingRequestConsumerConfig>,
     /// Number of concurrent worker loops draining the job queue (default: 8).
     /// Each loop can hold up to three pooled DB connections at once and shares
     /// the pool with the registry and background services; size accordingly.
@@ -136,6 +140,64 @@ pub struct Config {
     /// none are sent.
     #[serde(default)]
     pub alerts: AlertsConfig,
+    /// Refusing indexing requests whose chain is not the one their subgraph manifest
+    /// indexes. On by default, so omitting the section keeps the check.
+    #[serde(default)]
+    pub request_chain_check: RequestChainCheckConfig,
+}
+
+/// How indexing requests are checked against their subgraph manifest's chain. A request
+/// whose manifest can't be read is refused, so a check that can't run never waves it through.
+#[serde_as]
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RequestChainCheckConfig {
+    /// Whether to check at all. Turn it off only where manifests can't be read, or for a
+    /// chain neither the networks registry nor `additional_networks` names.
+    pub enabled: bool,
+
+    /// The IPFS API subgraph manifests are read from.
+    #[serde_as(as = "serde_with::DisplayFromStr")]
+    pub ipfs_url: Url,
+
+    /// How long to wait on IPFS for 1 manifest, in seconds. IPFS takes about 30 seconds
+    /// to say it has no such manifest, so a shorter wait turns that into a retry.
+    #[serde_as(as = "serde_with::DurationSeconds")]
+    pub timeout: Duration,
+}
+
+impl RequestChainCheckConfig {
+    /// Rejects a check that would fail every request.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.enabled && self.timeout.is_zero() {
+            return Err("request_chain_check.timeout must be greater than 0".to_string());
+        }
+        Ok(())
+    }
+
+    /// The IPFS endpoint named by host, for logs: an IPFS URL can carry credentials.
+    pub fn ipfs_host(&self) -> String {
+        match (self.ipfs_url.host_str(), self.ipfs_url.port()) {
+            (Some(host), Some(port)) => format!("{host}:{port}"),
+            (Some(host), None) => host.to_string(),
+            (None, _) => "unnamed endpoint".to_string(),
+        }
+    }
+}
+
+impl Default for RequestChainCheckConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ipfs_url: default_ipfs_url(),
+            timeout: Duration::from_secs(45),
+        }
+    }
+}
+
+#[expect(clippy::expect_used, reason = "a fixed URL that always parses")]
+fn default_ipfs_url() -> Url {
+    Url::parse("https://ipfs.thegraph.com").expect("a valid URL")
 }
 
 /// Alerts for the log lines an operator has to act on, picked out by their `event` tag and
@@ -177,6 +239,7 @@ impl Default for AlertsConfig {
                 "chain_listener_fetch_failing",
                 "stale_agreement_uncancellable",
                 "liveness_abandonment_paused",
+                "studio_request_chain_refused",
                 "iisa_request_rejected",
                 "dips_info_missing",
                 "dips_info_checks_paused",
@@ -1828,9 +1891,151 @@ pub fn default_event_queue_capacity() -> NonZeroUsize {
     NonZeroUsize::new(1024).expect("default event queue capacity is non-zero")
 }
 
+/// Configuration for the Studio indexing request consumer, which reads
+/// subgraph indexing request events from a Redpanda topic and applies them
+/// through the same path as the admin RPC.
+#[serde_as]
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndexingRequestConsumerConfig {
+    /// Whether the consumer is enabled (default: false). Leave off until
+    /// Studio's propose events carry `indexed_network_caip2id`: without the
+    /// field every consumed request is skipped and its offset committed, so
+    /// enabling early permanently discards real requests.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Kafka connection settings and the topic Studio produces on. The topic
+    /// is required with no default; a wrong or missing name fails at startup.
+    pub kafka: KafkaConsumerConfig,
+
+    /// The identity recorded as the requester on consumed requests, since
+    /// Kafka messages carry no signature to recover one from. Use the address
+    /// Studio signs the admin RPC with, so both doors share request rows.
+    pub requested_by: Address,
+
+    /// How long a fetch waits server-side for new records before returning
+    /// empty, in seconds (default: 5).
+    #[serde_as(as = "serde_with::DurationSeconds<u64>")]
+    #[serde(default = "default_indexing_request_consumer_max_wait")]
+    pub max_wait: Duration,
+
+    /// Maximum bytes per fetch (default: 1,048,576).
+    #[serde(default = "default_indexing_request_consumer_fetch_max_bytes")]
+    pub fetch_max_bytes: i32,
+}
+
+fn default_indexing_request_consumer_max_wait() -> Duration {
+    Duration::from_secs(5)
+}
+
+fn default_indexing_request_consumer_fetch_max_bytes() -> i32 {
+    1_048_576
+}
+
+impl IndexingRequestConsumerConfig {
+    /// Reject a configuration the consumer cannot run with. Checked even when
+    /// disabled, so a broken value cannot lie dormant until the flag flips.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.kafka.brokers.is_empty() {
+            return Err(
+                "indexing_request_consumer.kafka.brokers must list at least 1 broker".to_string(),
+            );
+        }
+        // 0 makes every connect time out instantly, so startup would fail with
+        // a message blaming the broker instead of the config typo.
+        if self.kafka.connect_timeout_secs == 0 {
+            return Err(
+                "indexing_request_consumer.kafka.connect_timeout_secs must be at least 1"
+                    .to_string(),
+            );
+        }
+        // A zero requester is almost certainly an unset value, and it would
+        // silently key every consumed request under the zero address.
+        if self.requested_by == Address::ZERO {
+            return Err(
+                "indexing_request_consumer.requested_by must be a non-zero address".to_string(),
+            );
+        }
+        // Below ~1 KB a fetch cannot hold a whole record, so the consumer
+        // would poll forever without ever making progress.
+        if self.fetch_max_bytes < 1_024 {
+            return Err(format!(
+                "indexing_request_consumer.fetch_max_bytes ({}) must be at least 1024",
+                self.fetch_max_bytes
+            ));
+        }
+        if self.max_wait.is_zero() || self.max_wait.as_millis() > i32::MAX as u128 {
+            return Err(format!(
+                "indexing_request_consumer.max_wait ({}s) must be between 1 second and {} seconds",
+                self.max_wait.as_secs(),
+                i32::MAX / 1_000
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn consumer_config(json: serde_json::Value) -> IndexingRequestConsumerConfig {
+        serde_json::from_value(json).expect("deserializes")
+    }
+
+    #[test]
+    fn indexing_request_consumer_config_defaults_and_validation() {
+        let config = consumer_config(serde_json::json!({
+            "kafka": { "brokers": ["localhost:9092"], "topic": "t" },
+            "requested_by": "0x8f8c426f956876325b1e037c6eae9b189952994c",
+        }));
+        assert!(
+            !config.enabled,
+            "the consumer must be off unless opted into"
+        );
+        assert_eq!(config.max_wait, Duration::from_secs(5));
+        assert_eq!(config.fetch_max_bytes, 1_048_576);
+        assert!(config.validate().is_ok());
+
+        // Validation runs even for a disabled section, so broken values are
+        // caught at startup rather than the day the flag flips.
+        let broken = consumer_config(serde_json::json!({
+            "enabled": false,
+            "kafka": { "brokers": ["localhost:9092"], "topic": "t" },
+            "requested_by": "0x0000000000000000000000000000000000000000",
+        }));
+        assert!(broken.validate().unwrap_err().contains("requested_by"));
+
+        let no_brokers = consumer_config(serde_json::json!({
+            "kafka": { "brokers": [], "topic": "t" },
+            "requested_by": "0x8f8c426f956876325b1e037c6eae9b189952994c",
+        }));
+        assert!(no_brokers.validate().unwrap_err().contains("brokers"));
+
+        let zero_connect_timeout = consumer_config(serde_json::json!({
+            "kafka": { "brokers": ["localhost:9092"], "topic": "t", "connect_timeout_secs": 0 },
+            "requested_by": "0x8f8c426f956876325b1e037c6eae9b189952994c",
+        }));
+        assert!(
+            zero_connect_timeout
+                .validate()
+                .unwrap_err()
+                .contains("connect_timeout_secs")
+        );
+
+        let tiny_fetch = consumer_config(serde_json::json!({
+            "kafka": { "brokers": ["localhost:9092"], "topic": "t" },
+            "requested_by": "0x8f8c426f956876325b1e037c6eae9b189952994c",
+            "fetch_max_bytes": 512,
+        }));
+        assert!(
+            tiny_fetch
+                .validate()
+                .unwrap_err()
+                .contains("fetch_max_bytes")
+        );
+    }
 
     #[test]
     fn test_dips_agreement_config_deserialization() {
@@ -2832,6 +3037,45 @@ mod tests {
             liveness.unreachable_trip_min_indexers,
             defaults.unreachable_trip_min_indexers
         );
+    }
+
+    #[test]
+    fn the_example_configmap_request_chain_check_section_parses() {
+        let check = serde_json::from_value::<RequestChainCheckConfig>(
+            example_config()["request_chain_check"].clone(),
+        )
+        .expect("the example's request_chain_check section is a valid config");
+        let defaults = RequestChainCheckConfig::default();
+
+        assert_eq!(check.enabled, defaults.enabled);
+        assert_eq!(check.ipfs_url, defaults.ipfs_url);
+        assert_eq!(check.timeout, defaults.timeout);
+    }
+
+    #[test]
+    fn a_request_chain_check_that_would_fail_every_request_is_rejected() {
+        let zero = RequestChainCheckConfig {
+            timeout: Duration::ZERO,
+            ..RequestChainCheckConfig::default()
+        };
+        let off = RequestChainCheckConfig {
+            enabled: false,
+            ..zero.clone()
+        };
+
+        assert!(zero.validate().is_err());
+        assert!(off.validate().is_ok(), "a check that is off never waits");
+        assert!(RequestChainCheckConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn the_ipfs_endpoint_is_logged_without_its_credentials() {
+        let config = RequestChainCheckConfig {
+            ipfs_url: Url::parse("https://project:secret@ipfs.example.com:5001/").unwrap(),
+            ..RequestChainCheckConfig::default()
+        };
+
+        assert_eq!(config.ipfs_host(), "ipfs.example.com:5001");
     }
 
     #[test]

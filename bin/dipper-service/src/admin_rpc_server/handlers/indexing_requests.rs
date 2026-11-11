@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use async_trait::async_trait;
 use dipper_core::{ids::IndexingRequestId, state::FromState};
-use dipper_producer::{events::SubgraphIndexingAgreementEventsProducer, proto};
+use dipper_producer::events::SubgraphIndexingAgreementEventsProducer;
 use dipper_rpc::admin::{
     SignedMessage,
     indexing_requests::{
@@ -18,8 +18,10 @@ use crate::{
     config::MAX_NUM_CANDIDATES,
     registry::{
         IndexingRequest as IndexingRequestRecord, IndexingRequestRegistry,
-        IndexingRequestStatus as IndexingRequestRecordStatus, SetTargetOutcome,
+        IndexingRequestStatus as IndexingRequestRecordStatus,
     },
+    request_chain_check::RequestChainCheck,
+    set_indexing_target::{ApplyError, SetIndexingTarget, apply_set_indexing_target},
     signing::eip712::Eip712Signer,
     worker::service::{JobPriority, WorkerQueue},
 };
@@ -35,6 +37,7 @@ pub struct Ctx<R, W> {
     pub max_candidates: usize,
     pub subgraph_indexing_agreements_events_emitter:
         Arc<dyn SubgraphIndexingAgreementEventsProducer>,
+    pub request_chain_check: Arc<dyn RequestChainCheck>,
 }
 
 pub struct RpcServerImpl<R, W>(Ctx<R, W>);
@@ -87,10 +90,6 @@ where
         )
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "predates this lint; fix when next touched"
-    )]
     async fn set_indexing_target_candidates(
         &self,
         req: SignedMessage<SetIndexingTargetCandidates>,
@@ -113,130 +112,43 @@ where
         } = req.into_message();
 
         let num_candidates = num_candidates.unwrap_or(self.max_candidates);
-        let agreements_requested = match i32::try_from(num_candidates) {
-            Ok(count) if num_candidates <= MAX_NUM_CANDIDATES => count,
-            _ => {
-                return Err(ErrorObject::owned(
-                    400,
-                    format!(
-                        "num_candidates must be at most {MAX_NUM_CANDIDATES}, got {num_candidates}"
-                    ),
-                    None::<()>,
-                ));
-            }
-        };
-
-        let outcome = match self
-            .registry
-            .set_indexing_target_candidates(requested_by, deployment_id, chain_id, num_candidates)
-            .await
-        {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                tracing::error!(error=?err, "Failed to set indexing target candidates");
-                return Err(ErrorObject::borrowed(503, "Service unavailable", None));
-            }
-        };
-
-        // Translate the outcome into the appropriate follow-up worker job and the
-        // wire-level return value.
-        let (id_opt, reassess_count): (Option<IndexingRequestId>, Option<usize>) = match outcome {
-            SetTargetOutcome::Inserted { id } => {
-                tracing::info!(
-                    indexing_request_id = %id,
-                    %requested_by,
-                    %deployment_id,
-                    %chain_id,
-                    num_candidates,
-                    "Inserted new indexing request"
-                );
-
-                // A new request was received: emit the lifecycle event. Only the
-                // `Inserted` outcome is a genuinely new request; `Updated`/`Canceled`
-                // are later transitions in the lifecycle, not "request received".
-                // `the_graph_network` is the protocol network (signer chain id), not
-                // the deployment's data-source `chain_id`.
-                self.subgraph_indexing_agreements_events_emitter
-                    .produce_subgraph_indexing_agreement_request_received(
-                        deployment_id,
-                        self.signer.chain_id(),
-                        proto::SubgraphIndexingAgreementRequestReceived {
-                            agreements_requested,
-                        },
-                    );
-
-                (Some(id), Some(num_candidates))
-            }
-            SetTargetOutcome::Updated {
-                id,
-                new_num_candidates,
-            } => {
-                tracing::info!(
-                    indexing_request_id = %id,
-                    %requested_by,
-                    %deployment_id,
-                    %chain_id,
-                    num_candidates = new_num_candidates,
-                    "Updated num_candidates on open indexing request"
-                );
-                (Some(id), Some(new_num_candidates))
-            }
-            SetTargetOutcome::NoOp { id } => {
-                tracing::debug!(
-                    indexing_request_id = %id,
-                    "Set target candidates is a no-op (count unchanged)"
-                );
-                (Some(id), None)
-            }
-            SetTargetOutcome::Canceled { id } => {
-                tracing::info!(
-                    indexing_request_id = %id,
-                    %requested_by,
-                    %deployment_id,
-                    %chain_id,
-                    "Canceled indexing request (target candidates set to zero)"
-                );
-                (Some(id), Some(0))
-            }
-            SetTargetOutcome::NoOpAlreadyEmpty => {
-                tracing::warn!(
-                    %requested_by,
-                    %deployment_id,
-                    %chain_id,
-                    "set_indexing_target_candidates with num_candidates=0 against a key with no open request \
-                     - nothing to cancel"
-                );
-                (None, None)
-            }
-        };
-
-        // Queue reassessment if the row changed. Reassessment computes the
-        // diff between the IISA target group of size `num_candidates` and the
-        // current active agreements, then grows or shrinks accordingly. With
-        // num_candidates=0 it shrinks to zero, firing the on-chain cancel for
-        // every active agreement on the key.
-        if let (Some(id), Some(count)) = (id_opt, reassess_count)
-            && let Err(err) = self
-                .worker
-                .reassess_indexing_request(
-                    id,
-                    deployment_id,
-                    chain_id,
-                    count,
-                    // Interactive: a caller is waiting on this set-target result.
-                    JobPriority::Interactive,
-                )
-                .await
-        {
-            tracing::error!(
-                indexing_request_id = %id,
-                error = ?err,
-                "Failed to queue task: 'reassess_indexing_request'"
-            );
-            return Err(ErrorObject::borrowed(500, "Internal server error", None));
+        if num_candidates > MAX_NUM_CANDIDATES {
+            return Err(ErrorObject::owned(
+                400,
+                format!(
+                    "num_candidates must be at most {MAX_NUM_CANDIDATES}, got {num_candidates}"
+                ),
+                None::<()>,
+            ));
         }
 
-        Ok(id_opt)
+        apply_set_indexing_target(
+            &self.registry,
+            &self.worker,
+            &self.subgraph_indexing_agreements_events_emitter,
+            self.request_chain_check.as_ref(),
+            self.signer.chain_id(),
+            SetIndexingTarget {
+                requested_by,
+                deployment_id,
+                deployment_chain_id: chain_id,
+                num_candidates,
+                // Interactive: a caller is waiting on this set-target result.
+                priority: JobPriority::Interactive,
+            },
+        )
+        .await
+        .map_err(|err| match err {
+            // The caller sees why, so it can resend with the manifest's chain.
+            ApplyError::WrongChain(err) => ErrorObject::owned(400, err.to_string(), None::<()>),
+            ApplyError::ChainCheckUnavailable(err) => {
+                ErrorObject::owned(503, err.to_string(), None::<()>)
+            }
+            ApplyError::Registry(_) => ErrorObject::borrowed(503, "Service unavailable", None),
+            ApplyError::QueueReassess { .. } => {
+                ErrorObject::borrowed(500, "Internal server error", None)
+            }
+        })
     }
 }
 
@@ -284,8 +196,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        registry::Result as RegistryResult,
-        test_support::{CapturedEvent, CapturingEventsProducer},
+        registry::{Result as RegistryResult, SetTargetOutcome},
+        request_chain_check::SkipChainCheck,
+        test_support::{CapturedEvent, CapturingEventsProducer, RefusingChainCheck},
         worker::queue::JobId,
     };
 
@@ -404,8 +317,7 @@ mod tests {
         }
     }
 
-    /// Build a signed `set_indexing_target_candidates` request using the
-    /// canonical `thegraph_core::signed_message::sign` helper and the admin
+    /// Build a signed `set_indexing_target_candidates` request under the admin
     /// EIP-712 domain, returning both the signer (so its address can be
     /// allowlisted) and the wrapped `SignedMessage`.
     fn signed_request(
@@ -424,13 +336,24 @@ mod tests {
         (signer, inner.into())
     }
 
-    /// Assemble an `RpcServerImpl` whose signer's chain id is
-    /// [`SIGNER_CHAIN_ID`], whose allowlist contains `allowed`, and whose
-    /// registry returns `outcome`. Returns the server and the shared events
-    /// capture for assertions.
+    /// Assemble an `RpcServerImpl` with [`SIGNER_CHAIN_ID`], allowlist
+    /// `allowed`, and a registry returning `outcome`; also returns the shared
+    /// events capture for assertions.
     fn server(
         allowed: Address,
         outcome: SetTargetOutcome,
+    ) -> (
+        RpcServerImpl<MockRegistry, MockWorker>,
+        CapturingEventsProducer,
+    ) {
+        server_with_check(allowed, outcome, Arc::new(SkipChainCheck))
+    }
+
+    /// As [`server`], with `chain_check` deciding which chains are accepted.
+    fn server_with_check(
+        allowed: Address,
+        outcome: SetTargetOutcome,
+        chain_check: Arc<dyn RequestChainCheck>,
     ) -> (
         RpcServerImpl<MockRegistry, MockWorker>,
         CapturingEventsProducer,
@@ -449,6 +372,7 @@ mod tests {
             worker: MockWorker,
             max_candidates: 10,
             subgraph_indexing_agreements_events_emitter: Arc::new(events.clone()),
+            request_chain_check: chain_check,
         };
 
         (RpcServerImpl(ctx), events)
@@ -590,5 +514,76 @@ mod tests {
             "expected no emitted events, got {:?}",
             events.events()
         );
+    }
+
+    #[tokio::test]
+    async fn a_request_on_another_chain_is_refused_with_the_reason() {
+        let deployment = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
+        let (signer, req) = signed_request(deployment, DEPLOYMENT_CHAIN_ID, Some(3));
+        let (server, events) = server_with_check(
+            signer.address(),
+            SetTargetOutcome::Inserted {
+                id: IndexingRequestId::new(),
+            },
+            Arc::new(RefusingChainCheck::wrong_chain()),
+        );
+
+        let err = server
+            .set_indexing_target_candidates(req)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), 400);
+        assert!(
+            err.message().contains("indexes arbitrum-sepolia"),
+            "the caller learns the manifest's chain: {}",
+            err.message()
+        );
+        assert!(
+            events.events().is_empty(),
+            "a refused request emits nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_manifest_answers_service_unavailable() {
+        let deployment = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
+        let (signer, req) = signed_request(deployment, DEPLOYMENT_CHAIN_ID, Some(3));
+        let (server, _) = server_with_check(
+            signer.address(),
+            SetTargetOutcome::Inserted {
+                id: IndexingRequestId::new(),
+            },
+            Arc::new(RefusingChainCheck::unavailable()),
+        );
+
+        let err = server
+            .set_indexing_target_candidates(req)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), 503);
+    }
+
+    #[tokio::test]
+    async fn a_cancel_is_not_checked_against_the_manifest() {
+        //* Arrange - a request stored under the wrong chain must still be cancellable
+        let deployment = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
+        let (signer, req) = signed_request(deployment, DEPLOYMENT_CHAIN_ID, Some(0));
+        let check = Arc::new(RefusingChainCheck::wrong_chain());
+        let (server, _) = server_with_check(
+            signer.address(),
+            SetTargetOutcome::Canceled {
+                id: IndexingRequestId::new(),
+            },
+            check.clone(),
+        );
+
+        //* Act
+        let result = server.set_indexing_target_candidates(req).await;
+
+        //* Assert
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(check.calls(), 0);
     }
 }

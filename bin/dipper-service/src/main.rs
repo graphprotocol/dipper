@@ -29,6 +29,8 @@ mod health;
 mod indexer_rpc_client;
 mod network;
 mod registry;
+mod request_chain_check;
+mod set_indexing_target;
 mod signing;
 mod supervisor;
 #[cfg(test)]
@@ -103,6 +105,11 @@ pub async fn main() -> anyhow::Result<()> {
     {
         anyhow::bail!("invalid event streaming config: {err}");
     }
+    if let Some(consumer_conf) = &conf.indexing_request_consumer
+        && let Err(err) = consumer_conf.validate()
+    {
+        anyhow::bail!("invalid indexing request consumer config: {err}");
+    }
     if let Err(err) = conf.health.validate(conf.admin_rpc.listen_addr) {
         anyhow::bail!("invalid health config: {err}");
     }
@@ -110,6 +117,9 @@ pub async fn main() -> anyhow::Result<()> {
         && let Err(err) = liveness_conf.validate()
     {
         anyhow::bail!("invalid liveness checker config: {err}");
+    }
+    if let Err(err) = conf.request_chain_check.validate() {
+        anyhow::bail!("invalid request chain check config: {err}");
     }
     if let Some(watcher_conf) = &conf.dips_info_watcher
         && let Err(err) = watcher_conf.validate()
@@ -353,6 +363,25 @@ pub async fn main() -> anyhow::Result<()> {
     );
 
     let additional_networks = Arc::new(conf.additional_networks);
+
+    //- The check that refuses indexing requests for a chain their subgraph doesn't index
+    let request_chain_check: Arc<dyn request_chain_check::RequestChainCheck> =
+        if conf.request_chain_check.enabled {
+            tracing::info!(
+                ipfs = %conf.request_chain_check.ipfs_host(),
+                "checking each indexing request's chain against its subgraph manifest"
+            );
+            Arc::new(request_chain_check::ManifestChainCheck::new(
+                &conf.request_chain_check,
+                Arc::clone(&networks_registry),
+                Arc::clone(&additional_networks),
+            )?)
+        } else {
+            tracing::warn!(
+                "request_chain_check is disabled: indexing requests are accepted for any chain"
+            );
+            Arc::new(request_chain_check::SkipChainCheck)
+        };
 
     // Application services
 
@@ -638,6 +667,35 @@ pub async fn main() -> anyhow::Result<()> {
         None
     };
 
+    //- The Studio indexing request consumer service (optional, enabled by config)
+    // Reads subgraph indexing requests from Redpanda and applies them through
+    // the same path as the admin RPC.
+    let indexing_request_consumer_handle = match conf.indexing_request_consumer {
+        Some(ref consumer_conf) if consumer_conf.enabled => {
+            let ctx = network::service::indexing_request_consumer::Ctx {
+                registry: registry.clone(),
+                worker_queue: worker_handle.queue().clone(),
+                events: subgraph_indexing_agreements_events_emitter.clone(),
+                protocol_chain_id: chain_id,
+                max_candidates: DEFAULT_MAX_CANDIDATES,
+                chain_check: Arc::clone(&request_chain_check),
+                config: consumer_conf.clone(),
+            };
+            let (handle, service) = network::service::indexing_request_consumer::new(ctx);
+            // A reassessment push lost at the shutdown edge is only repaired by
+            // the periodic reassignment sweep; without it the request would sit
+            // open with no job behind it.
+            if !conf.reassignment.as_ref().is_some_and(|r| r.enabled) {
+                tracing::warn!(
+                    "the indexing request consumer is enabled without the reassignment service; \
+                     a reassessment job lost during a shutdown would never be retried"
+                );
+            }
+            Some((handle, service))
+        }
+        _ => None,
+    };
+
     //- The admin RPC service
     let (admin_rpc_handle, admin_rpc_service) = {
         let config = admin_rpc_server::service::Config {
@@ -652,6 +710,7 @@ pub async fn main() -> anyhow::Result<()> {
             worker: worker_handle.queue().clone(),
             subgraph_indexing_agreements_events_emitter:
                 subgraph_indexing_agreements_events_emitter.clone(),
+            request_chain_check,
         };
 
         admin_rpc_server::service::new(config, ctx)
@@ -761,6 +820,16 @@ pub async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Spawn the indexing request consumer service if enabled
+    let indexing_request_consumer_stop_handle =
+        if let Some((handle, service)) = indexing_request_consumer_handle {
+            let task_handle = task_tree.spawn(service);
+            tracing::debug!(task_id=%task_handle.id(), "Indexing request consumer service started");
+            Some(handle)
+        } else {
+            None
+        };
+
     // Spawn the health endpoint if enabled
     let health_stop_handle = if let Some((handle, service)) = health_handle {
         let task_handle = task_tree.spawn(service);
@@ -842,6 +911,11 @@ pub async fn main() -> anyhow::Result<()> {
         // Stop escrow reconciler service before the DB pool closes
         if let Some(handle) = escrow_reconciler_stop_handle {
             all_stopped &= stop_service("Escrow reconciler", handle.stop()).await;
+        }
+
+        // Stop the indexing request consumer before worker (it queues worker jobs)
+        if let Some(handle) = indexing_request_consumer_stop_handle {
+            all_stopped &= stop_service("Indexing request consumer", handle.stop()).await;
         }
 
         // Stop entity count cache service
