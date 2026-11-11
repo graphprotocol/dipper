@@ -60,7 +60,7 @@ fn keygen(args: &ArgMatches) -> Result<()> {
         You are storing a private key in an environment file.
         This is potentially insecure as environment files may be:
           - Committed to version control accidentally
-          - Readable by other users or processes on this system
+          - Readable by every process that runs as your user
           - Included in backups or logs
 
         Consider using a secure credential manager instead.
@@ -151,10 +151,40 @@ fn write_config(server_url: &Url, signing_key: &str, output_path: &Path) -> Resu
         .map_err(|err| anyhow::anyhow!("Failed to serialize config: {}", err))?;
 
     // Write the configuration to the output file
-    std::fs::write(output_path, env_content)
+    write_private(output_path, &env_content)
         .map_err(|err| anyhow::anyhow!("Failed to write config file: {}", err))?;
 
     Ok(())
+}
+
+/// Write `content` to the file at `path`, replacing what is there, and leave the file readable
+/// and writable by its owner alone, since it holds the key that requests are signed with.
+fn write_private(path: &Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    // Opened without emptying it: if the permissions below can't be set, the file still holds
+    // what it held before.
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    // A pipe or a device such as `/dev/stdout` has no contents to replace and no permissions
+    // this user can set, so only a file of its own gets either.
+    if file.metadata()?.is_file() {
+        // The mode above only applies to a file this call creates. A file that was already
+        // there keeps its own, so close it to other users before the key goes in.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        file.set_len(0)?;
+    }
+    file.write_all(content.as_bytes())
 }
 
 /// Create the `init` DIPs CLI configuration bootstrap command
@@ -187,8 +217,80 @@ pub(super) fn cmd() -> Command {
         ])
 }
 
+// 2 attributes, not `cfg(all(test, unix))`: clippy only lets tests unwrap under a plain `cfg(test)`.
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
+    use std::{
+        os::unix::fs::PermissionsExt,
+        path::{Path, PathBuf},
+    };
+
+    use url::Url;
+
+    use super::write_config;
+
+    /// A path for a test's own key file, removed again when the guard is dropped.
+    struct KeyFile(PathBuf);
+
+    impl KeyFile {
+        fn new(name: &str) -> Self {
+            let file = format!("dipper-cli-init-{name}-{}.env", std::process::id());
+            Self(std::env::temp_dir().join(file))
+        }
+    }
+
+    impl Drop for KeyFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// Who may read, write or run the file at `path`, as `chmod` would write it: `600` for
+    /// the owner alone.
+    fn mode(path: &Path) -> String {
+        let bits = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        format!("{bits:o}")
+    }
+
+    fn write_key_file(path: &Path) {
+        let server_url = Url::parse("http://localhost:8545").unwrap();
+        write_config(&server_url, "0xsecret", path).unwrap();
+    }
+
+    #[test]
+    fn test_a_new_key_file_is_readable_only_by_its_owner() {
+        let key_file = KeyFile::new("new");
+
+        write_key_file(&key_file.0);
+
+        assert_eq!(mode(&key_file.0), "600");
+    }
+
+    /// Output that is not a file of its own, such as a pipe or `/dev/stdout`, has no permissions
+    /// this user can set, and still gets the key written to it.
+    #[test]
+    fn test_the_key_can_be_written_to_output_that_is_not_a_file() {
+        write_key_file(Path::new("/dev/null"));
+    }
+
+    #[test]
+    fn test_overwriting_a_key_file_closes_it_to_other_users() {
+        let key_file = KeyFile::new("existing");
+        std::fs::write(&key_file.0, "DIPS_SERVER_URL=http://old\n").unwrap();
+        std::fs::set_permissions(&key_file.0, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_key_file(&key_file.0);
+
+        assert_eq!(mode(&key_file.0), "600");
+        let written = std::fs::read_to_string(&key_file.0).unwrap();
+        assert!(written.contains("0xsecret"), "{written}");
+        assert!(!written.contains("http://old"), "{written}");
+    }
+}
+
+#[cfg(test)]
+mod instructions_tests {
     use super::*;
 
     /// The printed commands must run as printed: `op inject` only writes the filled-in file (its

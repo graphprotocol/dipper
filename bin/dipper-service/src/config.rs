@@ -1063,7 +1063,8 @@ pub struct DipsAgreementConfig {
     /// RCA regardless of chain. Drives the RCA's `maxOngoingTokensPerSecond`
     /// (as a rate). `maxInitialTokens` is hard-coded to zero in v1 of the
     /// pricing system, so this value alone determines the on-chain monthly
-    /// ceiling.
+    /// ceiling. Every base-price ceiling and `pricing_table` price must sit at
+    /// or below it, as the contract refuses an agreement priced above its cap.
     ///
     /// Per-chain variation is left to `max_grt_per_30_days` (selection filter
     /// on the indexer's advertised base price). The on-chain cap is flat
@@ -1075,7 +1076,9 @@ pub struct DipsAgreementConfig {
     pub max_seconds_per_collection: u32,
     /// Minimum seconds per collection.
     pub min_seconds_per_collection: u32,
-    /// Agreement duration in seconds (None = u64::MAX).
+    /// Agreement duration in seconds. Must be left out or `null`, which makes agreements
+    /// open-ended (`u64::MAX` on-chain): dipper does not act on an agreement reaching its end,
+    /// so [`Self::validate`] refuses any number here.
     pub duration_seconds: Option<u64>,
     /// Deadline duration in seconds (how long the indexer has to accept on-chain).
     #[serde(default = "default_deadline_seconds")]
@@ -1227,6 +1230,7 @@ impl DipsAgreementConfig {
                 "fallback_max_grt_per_30_days ({fallback}) must be a positive number"
             ));
         }
+        self.validate_prices_within_agreement_cap()?;
         // A test offer due at once means an indexer that stopped accepting is never held back.
         if self.non_accepting_test_interval_minutes <= 0 {
             return Err(format!(
@@ -1265,21 +1269,52 @@ impl DipsAgreementConfig {
                  {MIN_SECONDS_COLLECTION_WINDOW} seconds"
             ));
         }
+        // Nothing in dipper acts on an agreement's end: one that reached it would keep its slot,
+        // with its indexer unpaid and never replaced. Agreements end by cancellation instead.
         if let Some(duration) = self.duration_seconds {
-            if duration <= self.deadline_seconds {
+            return Err(format!(
+                "duration_seconds ({duration}) must be left out or null: dipper only supports \
+                 open-ended agreements, and would never replace an indexer whose agreement had \
+                 reached its end"
+            ));
+        }
+        Ok(())
+    }
+
+    /// The contract refuses an agreement whose base price per second is above its cap, and dipper
+    /// offers base prices up to each ceiling and table prices as they stand, so a base price
+    /// allowed above the cap makes offers no indexer can accept, then benches the indexers for
+    /// missing them. Prices are compared in wei per second, rounded up as dipper rounds them,
+    /// since that is what the contract compares. The per-entity price is not checked: nothing
+    /// checks it at acceptance, and what it adds depends on the deployment's entity count, which
+    /// the config can't know. Collection still pays at most the cap per second for the base and
+    /// per-entity parts together.
+    fn validate_prices_within_agreement_cap(&self) -> Result<(), String> {
+        let cap_grt = self.max_agreement_grt_per_30_days;
+        let cap = crate::worker::grt_per_30_days_to_wei_per_second(cap_grt);
+        let ceilings = self
+            .max_grt_per_30_days
+            .iter()
+            .map(|(chain, ceiling)| (format!("max_grt_per_30_days for chain {chain}"), *ceiling))
+            .chain(std::iter::once((
+                "fallback_max_grt_per_30_days".to_string(),
+                self.fallback_max_grt_per_30_days,
+            )));
+        for (name, ceiling) in ceilings {
+            if crate::worker::grt_per_30_days_to_wei_per_second(ceiling) > cap {
                 return Err(format!(
-                    "duration_seconds ({duration}) must exceed deadline_seconds ({}): the \
-                     agreement would end before its acceptance deadline",
-                    self.deadline_seconds
+                    "{name} ({ceiling}) is above max_agreement_grt_per_30_days ({cap_grt}): \
+                     indexers can't accept an agreement priced above its cap"
                 ));
             }
-            if duration - self.deadline_seconds < min + MIN_SECONDS_COLLECTION_WINDOW {
+        }
+        for (chain_id, prices) in &self.pricing_table {
+            if prices.tokens_per_second > cap {
                 return Err(format!(
-                    "duration_seconds ({duration}) minus deadline_seconds ({}) must be at \
-                     least min_seconds_per_collection ({min}) plus the \
-                     {MIN_SECONDS_COLLECTION_WINDOW}-second minimum collection window, so one \
-                     collection fits even when acceptance lands at the deadline",
-                    self.deadline_seconds
+                    "pricing_table tokens_per_second for chain {chain_id} ({}) is above \
+                     max_agreement_grt_per_30_days ({cap_grt}), which is {cap} wei per second: \
+                     indexers can't accept an agreement priced above its cap",
+                    prices.tokens_per_second
                 ));
             }
         }
@@ -1960,6 +1995,9 @@ mod tests {
             let err = conf.validate().expect_err(&format!("{cap}"));
             assert!(err.contains("max_agreement_grt_per_30_days"), "{err}");
         }
+        // The price ceilings may not exceed the cap, so a tiny cap needs ceilings as small.
+        conf.max_grt_per_30_days.clear();
+        conf.fallback_max_grt_per_30_days = 0.01;
         for cap in [0.01, 20_000.0] {
             conf.max_agreement_grt_per_30_days = cap;
             assert!(conf.validate().is_ok(), "{cap}");
@@ -2014,6 +2052,93 @@ mod tests {
                 .insert("arbitrum-one".to_string(), ceiling);
             assert!(conf.validate().is_ok(), "{ceiling}");
         }
+    }
+
+    /// A minimal agreement config with the default price ceilings and agreement cap.
+    fn dips_conf_with_default_prices() -> DipsAgreementConfig {
+        serde_json::from_str(
+            r#"{
+                "data_service": "0x1111111111111111111111111111111111111111",
+                "recurring_collector": "0x2222222222222222222222222222222222222222",
+                "recurring_agreement_manager": "0x3333333333333333333333333333333333333333",
+                "min_seconds_per_collection": 60,
+                "max_seconds_per_collection": 3600,
+                "pricing_table": {}
+            }"#,
+        )
+        .expect("deserialization")
+    }
+
+    /// The contract refuses an agreement whose price per second is above its cap, so a ceiling
+    /// that lets dipper offer more than the cap sends offers no indexer can accept.
+    #[test]
+    fn validate_rejects_a_price_ceiling_above_the_agreement_cap() {
+        let mut conf = dips_conf_with_default_prices();
+        conf.max_agreement_grt_per_30_days = 20_000.0;
+
+        conf.max_grt_per_30_days
+            .insert("arbitrum-one".to_string(), 20_001.0);
+        let err = conf
+            .validate()
+            .expect_err("a chain ceiling above the cap must be refused");
+        assert!(err.contains("arbitrum-one"), "{err}");
+        assert!(err.contains("max_agreement_grt_per_30_days"), "{err}");
+
+        conf.max_grt_per_30_days
+            .insert("arbitrum-one".to_string(), 20_000.0);
+        conf.fallback_max_grt_per_30_days = 20_001.0;
+        let err = conf
+            .validate()
+            .expect_err("a fallback ceiling above the cap must be refused");
+        assert!(err.contains("fallback_max_grt_per_30_days"), "{err}");
+
+        // A ceiling at the cap is fine: the highest price it allows is exactly the cap.
+        conf.fallback_max_grt_per_30_days = 20_000.0;
+        assert_eq!(conf.validate(), Ok(()));
+    }
+
+    /// A price table entry is offered as it stands, already in wei per second, so it is held to
+    /// the cap as the contract sees it: in wei per second, rounded up as dipper rounds it.
+    #[test]
+    fn validate_rejects_a_price_table_entry_above_the_agreement_cap() {
+        let mut conf = dips_conf_with_default_prices();
+        let cap =
+            crate::worker::grt_per_30_days_to_wei_per_second(conf.max_agreement_grt_per_30_days);
+
+        conf.pricing_table.insert(
+            42161,
+            ChainPrices {
+                tokens_per_second: cap + U256::from(1),
+                tokens_per_entity_per_second: U256::ZERO,
+            },
+        );
+        let err = conf
+            .validate()
+            .expect_err("a table price above the cap must be refused");
+        assert!(err.contains("pricing_table"), "{err}");
+        assert!(err.contains("42161"), "{err}");
+
+        conf.pricing_table.insert(
+            42161,
+            ChainPrices {
+                tokens_per_second: cap,
+                tokens_per_entity_per_second: U256::ZERO,
+            },
+        );
+        assert_eq!(conf.validate(), Ok(()));
+    }
+
+    /// The agreement settings in the example configmap must still start dipper once its
+    /// placeholders for contracts not yet deployed are filled in.
+    #[test]
+    fn the_example_configmap_dips_section_passes_validation() {
+        let mut dips = example_config()["dips"].clone();
+        dips["recurring_collector"] = "0x2222222222222222222222222222222222222222".into();
+        dips["recurring_agreement_manager"] = "0x3333333333333333333333333333333333333333".into();
+        let conf: DipsAgreementConfig =
+            serde_json::from_value(dips).expect("the example's dips section parses");
+
+        assert_eq!(conf.validate(), Ok(()));
     }
 
     #[test]
@@ -2193,12 +2318,11 @@ mod tests {
         );
     }
 
+    /// Nothing in dipper acts on an agreement's end, so one with a fixed length would keep its
+    /// slot after it ended: its indexer unpaid, and never replaced.
     #[test]
-    fn validate_rejects_a_duration_too_short_for_its_deadline() {
-        // With a bounded duration the agreement must outlive the acceptance
-        // deadline by min_seconds_per_collection + 600, so a collection fits
-        // even when acceptance lands exactly at the deadline.
-        fn conf(duration: &str, deadline: u64) -> DipsAgreementConfig {
+    fn validate_refuses_a_fixed_agreement_length() {
+        fn conf(duration: &str) -> DipsAgreementConfig {
             let json = format!(
                 r#"{{
                     "data_service": "0x1111111111111111111111111111111111111111",
@@ -2207,7 +2331,7 @@ mod tests {
                     "min_seconds_per_collection": 60,
                     "max_seconds_per_collection": 3600,
                     "duration_seconds": {duration},
-                    "deadline_seconds": {deadline},
+                    "deadline_seconds": 600,
                     "pricing_table": {{}}
                 }}"#
             );
@@ -2215,21 +2339,16 @@ mod tests {
         }
 
         assert!(
-            conf("null", 600).validate().is_ok(),
-            "an unbounded duration passes the duration checks"
+            conf("null").validate().is_ok(),
+            "an open-ended agreement is the supported kind"
         );
-        assert!(
-            conf("600", 600).validate().is_err(),
-            "an agreement ending at its deadline must be rejected"
-        );
-        assert!(
-            conf("1259", 600).validate().is_err(),
-            "1 second short of a full collection window must be rejected"
-        );
-        assert!(
-            conf("1260", 600).validate().is_ok(),
-            "exactly one collection window past the deadline is valid"
-        );
+        for duration in ["600", "1260", "2592000"] {
+            let err = conf(duration)
+                .validate()
+                .expect_err("a fixed agreement length must be refused");
+            assert!(err.contains("duration_seconds"), "{duration}: {err}");
+            assert!(err.contains("open-ended"), "{duration}: {err}");
+        }
     }
 
     #[test]
