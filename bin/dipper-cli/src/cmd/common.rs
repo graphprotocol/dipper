@@ -38,12 +38,11 @@ pub(super) fn server_url_arg() -> Arg {
         .value_parser(value_parser!(Url))
 }
 
-/// Create the `--signing-key` CLI argument: the secret key to sign requests with.
+/// Create the `--signing-key` CLI argument: the secret key to sign requests with. It is checked
+/// when the settings load, not by clap, whose error for a value it can't parse quotes the value.
+/// For the same reason clap does not read the variable; the settings loader does.
 pub(super) fn signing_key_arg() -> Arg {
-    arg!(--"signing-key" <KEY> "The secret key to sign requests with (hex)")
-        .env(name_prefixed!("SIGNING_KEY"))
-        .hide_env_values(true)
-        .value_parser(secret_key_from_str)
+    arg!(--"signing-key" <KEY> "The secret key to sign requests with (hex) [env: DIPS_SIGNING_KEY]")
 }
 
 /// Load the configuration from the command line, the shell and a file, printing a warning on
@@ -143,6 +142,15 @@ fn load_conf_from(
         warnings.push(format!(
             "warning: the server URL comes from {url_from} but the signing key from {key_from}"
         ));
+    }
+    // The parse error is left out on purpose: it can quote characters of the key.
+    if let Some((key, source)) = chosen.get("signing_key")
+        && secret_key_from_str(key).is_err()
+    {
+        anyhow::bail!(
+            "The signing key from {source} is not a valid secret key: it must be a secp256k1 \
+             private key written as 64 hex digits, with or without 0x in front"
+        );
     }
 
     let values: BTreeMap<&str, &str> = chosen
@@ -497,6 +505,102 @@ mod tests {
                 key_only.display()
             )]
         );
+    }
+
+    /// A signing key that is not valid hex is reported with where it came from but not what it
+    /// is, whichever way it arrives: a key with 1 wrong character is otherwise nearly all shown.
+    #[test]
+    fn a_malformed_signing_key_is_reported_without_its_value() {
+        let folder = Folder::new("malformed-key");
+        let malformed = format!("{}Q", &KEY[..KEY.len() - 1]);
+        let url_only = folder.file("url-only", "DIPS_SERVER_URL=https://staging.example\n");
+        let bad_key_file = folder.file(
+            "bad-key",
+            &format!("DIPS_SERVER_URL=https://staging.example\nDIPS_SIGNING_KEY={malformed}\n"),
+        );
+        let error = |args: &[&str], shell: &[(&str, &str)]| -> String {
+            let parsed = crate::cmd::indexings::cmd().try_get_matches_from(
+                ["indexings"]
+                    .into_iter()
+                    .chain(args.iter().copied())
+                    .chain(["list"]),
+            );
+            let matches = match parsed {
+                Ok(matches) => matches,
+                Err(err) => return err.to_string(),
+            };
+            let shell = shell
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()));
+            match load_conf_from(matches.subcommand().unwrap().1, shell, &folder.0) {
+                Ok(_) => panic!("a malformed key was accepted"),
+                Err(err) => err.to_string(),
+            }
+        };
+
+        let by_flag = error(
+            &["--env-file", path(&url_only), "--signing-key", &malformed],
+            &[],
+        );
+        let by_shell = error(
+            &["--env-file", path(&url_only)],
+            &[("DIPS_SIGNING_KEY", &malformed)],
+        );
+        let by_file = error(&["--env-file", path(&bad_key_file)], &[]);
+
+        for (message, source) in [
+            (&by_flag, "the --signing-key flag".to_owned()),
+            (&by_shell, "the shell environment".to_owned()),
+            (&by_file, bad_key_file.display().to_string()),
+        ] {
+            assert!(
+                !message.contains(&malformed[2..40]),
+                "the key was shown: {message}"
+            );
+            assert!(
+                message.contains(&format!("The signing key from {source} is not a valid")),
+                "{message}"
+            );
+        }
+    }
+
+    /// clap would quote a value from the environment that it fails to parse, so it reads no
+    /// signing key from there; the settings loader reads the variable instead, and the help still
+    /// names it.
+    #[test]
+    fn clap_reads_no_signing_key_from_the_environment_but_the_help_names_the_variable() {
+        let help = crate::cmd::indexings::cmd().render_long_help().to_string();
+
+        assert_eq!(signing_key_arg().get_env(), None);
+        assert!(help.contains("[env: DIPS_SIGNING_KEY]"), "{help}");
+    }
+
+    /// A value clap took from the environment for a flag is left out, since the shell's variables
+    /// are read separately so they rank the same however they arrive. `PATH` stands in for such a
+    /// variable because every test run has it, and this test must not change the environment.
+    #[test]
+    fn a_flag_value_clap_took_from_the_environment_is_left_out() {
+        let folder = Folder::new("clap-env");
+        let staging = folder.file(
+            "staging",
+            &format!("DIPS_SERVER_URL=https://staging.example\nDIPS_SIGNING_KEY={KEY}\n"),
+        );
+        let matches = clap::Command::new("test")
+            .args([
+                env_file_arg(),
+                Arg::new("server-url").long("server-url").env("PATH"),
+            ])
+            .try_get_matches_from(["test", "--env-file", path(&staging)])
+            .unwrap();
+        assert_eq!(
+            matches.value_source("server-url"),
+            Some(ValueSource::EnvVariable)
+        );
+
+        let loaded = load_conf_from(&matches, Vec::<(String, String)>::new(), &folder.0).unwrap();
+
+        assert_eq!(loaded.conf.server_url.as_str(), "https://staging.example/");
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
     }
 
     /// The agreements command loads its settings the same way as the indexings command.
