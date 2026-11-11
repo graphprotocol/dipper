@@ -4,7 +4,7 @@ use time::OffsetDateTime;
 use super::{
     id::JobId,
     job::{JobGuard, JobInner},
-    postgres,
+    postgres::{self, RetryOutcome},
 };
 pub use super::{listener::PgQueueListener, postgres::JobPriority};
 
@@ -79,7 +79,7 @@ impl PgQueue {
     }
 
     /// Pulls the next job this release can read from the queue. Each job ahead of it that can't
-    /// be read is taken off the queue first, as [`Self::take_next`] does, and logged as an error.
+    /// be read is put off or failed first, as [`Self::take_next`] does, and logged.
     pub async fn pop<T>(&self) -> anyhow::Result<Option<JobGuard<'_, T>>>
     where
         T: for<'de> serde::Deserialize<'de> + Send + Unpin + 'static,
@@ -87,11 +87,19 @@ impl PgQueue {
         loop {
             match self.take_next().await? {
                 Some(Popped::Job(job)) => return Ok(Some(job)),
+                Some(Popped::Unreadable(job)) if job.outcome == RetryOutcome::WillRetry => {
+                    tracing::warn!(
+                        job_id = %job.id,
+                        error = %job.error,
+                        failed_attempts = job.failed_attempts,
+                        "Put off a job that can't be read, to be tried again later"
+                    );
+                }
                 Some(Popped::Unreadable(job)) => tracing::error!(
                     job_id = %job.id,
                     error = %job.error,
                     stored = %job.stored_excerpt(),
-                    "Took a job that can't be read off the queue; it is kept as failed"
+                    "Gave up on a job that can't be read; it is kept as failed"
                 ),
                 None => return Ok(None),
             }
@@ -99,9 +107,11 @@ impl PgQueue {
     }
 
     /// Takes the job at the head of the queue. A stored job that can't be read as `T`, such as
-    /// 1 queued by a release whose job types differ, is marked failed for good with its stored
-    /// form kept, and handed back as [`Popped::Unreadable`], so it can't hold up the jobs behind
-    /// it. A database error is returned as an error, leaving the queue as it was.
+    /// 1 queued by a release whose job types differ, counts as a failed attempt: it is put off for
+    /// a while, or failed for good once its attempts run out, its stored form kept either way, and
+    /// handed back as [`Popped::Unreadable`]. Either way it leaves the head of the queue, so it
+    /// can't hold up the jobs behind it. A database error is returned as an error, leaving the
+    /// queue as it was.
     #[expect(
         clippy::cast_sign_loss,
         reason = "predates this lint; fix when next touched"
@@ -118,12 +128,15 @@ impl PgQueue {
         let desc = match T::deserialize(&job.descriptor.0) {
             Ok(desc) => desc,
             Err(error) => {
-                postgres::mark_as_unreadable(tx.as_mut(), &job.id).await?;
+                let outcome = put_off_unreadable(&mut tx, &job).await?;
                 tx.commit().await?;
                 return Ok(Some(Popped::Unreadable(UnreadableJob {
                     id: job.id,
                     error,
                     stored: job.descriptor.0.to_string(),
+                    failed_attempts: job.attempt_count,
+                    max_attempts: job.max_attempts,
+                    outcome,
                 })));
             }
         };
@@ -154,15 +167,37 @@ impl PgQueue {
     }
 }
 
+/// How long a job that can't be read is put off before it is tried again. A job this release
+/// can't read may be 1 a newer release, running alongside it during a rollout, can; this is long
+/// enough for the rollout to finish and the newer release to take the job.
+const UNREADABLE_RETRY_DELAY: time::Duration = time::Duration::minutes(5);
+
+/// Record a failed attempt at a job that can't be read, putting it off by
+/// [`UNREADABLE_RETRY_DELAY`], or failing it for good once its attempts run out. Its stored form is
+/// left as it is either way. A job whose attempt count can't be trusted, being negative or already
+/// at its limit though queued, can't be counted towards giving up, so it is failed for good at once
+/// rather than risk an update that can't be made, which would leave it at the head of the queue.
+async fn put_off_unreadable(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    job: &postgres::PgJob<serde_json::Value>,
+) -> anyhow::Result<RetryOutcome> {
+    if job.attempt_count < 0 || job.attempt_count >= job.max_attempts {
+        postgres::mark_as_unreadable(tx.as_mut(), &job.id).await?;
+        return Ok(RetryOutcome::GaveUp);
+    }
+    let retry_at = OffsetDateTime::now_utc() + UNREADABLE_RETRY_DELAY;
+    postgres::mark_as_failed(tx.as_mut(), &job.id, Some(retry_at)).await
+}
+
 /// What taking the job at the head of the queue found.
 pub enum Popped<'c, T> {
     /// A job to run.
     Job(JobGuard<'c, T>),
-    /// A stored job that can't be read, now marked failed for good.
+    /// A stored job that can't be read, with its failed attempt recorded.
     Unreadable(UnreadableJob),
 }
 
-/// A stored job that couldn't be read, kept in the queue as failed for good.
+/// A stored job that couldn't be read, and what became of that failed attempt.
 #[derive(Debug)]
 pub struct UnreadableJob {
     /// The job's id.
@@ -171,6 +206,12 @@ pub struct UnreadableJob {
     pub error: serde_json::Error,
     /// The job as stored.
     pub stored: String,
+    /// The attempts that had failed before this 1, as stored.
+    pub failed_attempts: i32,
+    /// The attempts it is allowed, as stored.
+    pub max_attempts: i32,
+    /// Whether it was put off to be tried again, or failed for good with its stored form kept.
+    pub outcome: RetryOutcome,
 }
 
 /// Most characters of a stored job a log line carries; the full form stays in the queue.
@@ -249,13 +290,16 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{JobId, STORED_EXCERPT_CHARS, UnreadableJob};
+    use super::{JobId, RetryOutcome, STORED_EXCERPT_CHARS, UnreadableJob};
 
     fn unreadable(stored: String) -> UnreadableJob {
         UnreadableJob {
             id: JobId::default(),
             error: serde_json::from_str::<u8>("\"x\"").unwrap_err(),
             stored,
+            failed_attempts: 0,
+            max_attempts: 3,
+            outcome: RetryOutcome::WillRetry,
         }
     }
 

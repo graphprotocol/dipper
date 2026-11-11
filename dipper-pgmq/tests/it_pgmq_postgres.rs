@@ -997,41 +997,60 @@ async fn future_interactive_does_not_preempt_eligible_background() {
     );
 }
 
-/// A stored job this release can't read, such as 1 of a type a rollback removed, and a readable
-/// job queued after it.
+/// A stored job this release can't read, such as 1 of a type a newer release added, allowed
+/// `max_retries` retries, and a readable job queued after it.
 async fn unreadable_job_ahead_of_a_good_one(
     queue: &PgQueue,
+    max_retries: u32,
 ) -> anyhow::Result<(dipper_pgmq::JobId, serde_json::Value, dipper_pgmq::JobId)> {
-    let unreadable = serde_json::json!({"type": "RemovedJobType", "request": 7});
-    let unreadable_id = queue.push(unreadable.clone()).await?;
+    let unreadable = serde_json::json!({"type": "JobTypeOfANewerRelease", "request": 7});
+    let unreadable_id = queue
+        .push(JobBuilder::new(unreadable.clone()).max_retries(max_retries))
+        .await?;
     let good_id = queue.push(Faker.fake::<TestMsg>()).await?;
     Ok((unreadable_id, unreadable, good_id))
 }
 
-/// The status and stored form of a job.
+/// A job's status, failed attempts, schedule and stored form.
 async fn stored_job(
     db: &Pool<Postgres>,
     id: dipper_pgmq::JobId,
-) -> anyhow::Result<(i32, serde_json::Value)> {
-    let (status, descriptor): (i32, sqlx::types::Json<serde_json::Value>) =
-        sqlx::query_as("SELECT status, descriptor FROM pgmq_queue WHERE id = $1")
-            .bind(id)
-            .fetch_one(db)
-            .await?;
-    Ok((status, descriptor.0))
+) -> anyhow::Result<(i32, i32, time::OffsetDateTime, serde_json::Value)> {
+    let (status, attempt_count, scheduled_for, descriptor): (
+        i32,
+        i32,
+        time::OffsetDateTime,
+        sqlx::types::Json<serde_json::Value>,
+    ) = sqlx::query_as(
+        "SELECT status, attempt_count, scheduled_for, descriptor FROM pgmq_queue WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(db)
+    .await?;
+    Ok((status, attempt_count, scheduled_for, descriptor.0))
 }
 
-/// A stored job that can't be read used to fail every pop and stay first in line for ever. It is
-/// now handed back once as unreadable, marked failed for good with its stored form kept for an
-/// operator, and the job behind it is delivered next.
+/// Make a postponed job due now, as if its delay had passed.
+async fn make_due(db: &Pool<Postgres>, id: dipper_pgmq::JobId) -> anyhow::Result<()> {
+    sqlx::query("UPDATE pgmq_queue SET scheduled_for = timezone('UTC', now()) WHERE id = $1")
+        .bind(id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// A job this release can't read may be 1 a newer release, running alongside it during a
+/// rollout, can: it counts as a failed attempt and is put off for a while, which also takes it
+/// off the head of the queue, so the job behind it is delivered at once.
 #[tokio::test]
-async fn an_unreadable_job_is_failed_for_good_and_the_next_job_delivered() {
+async fn an_unreadable_job_is_put_off_and_the_next_job_delivered() {
     //* Given
     let (db, _temp_db) = temp_pgmq_db().await;
     let queue = PgQueue::new(db.clone());
-    let (unreadable_id, unreadable, good_id) = unreadable_job_ahead_of_a_good_one(&queue)
+    let (unreadable_id, unreadable, good_id) = unreadable_job_ahead_of_a_good_one(&queue, 2)
         .await
         .expect("Failed to push the jobs");
+    let before = time::OffsetDateTime::now_utc();
 
     //* When
     let first = queue
@@ -1050,6 +1069,8 @@ async fn an_unreadable_job_is_failed_for_good_and_the_next_job_delivered() {
         panic!("the unreadable job must be reported as unreadable");
     };
     assert_eq!(first.id, unreadable_id);
+    assert_eq!(first.outcome, RetryOutcome::WillRetry);
+    assert_eq!((first.failed_attempts, first.max_attempts), (0, 3));
     assert!(first.error.to_string().contains("data"), "{}", first.error);
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&first.stored).expect("stored JSON"),
@@ -1064,18 +1085,116 @@ async fn an_unreadable_job_is_failed_for_good_and_the_next_job_delivered() {
         .await
         .expect("Failed to remove the good job");
 
-    assert_eq!(
-        stored_job(&db, unreadable_id)
-            .await
-            .expect("Failed to read the job row"),
-        (1, unreadable),
-        "the unreadable job ends failed (status = 1) with its stored JSON intact"
+    let (status, attempt_count, scheduled_for, stored) = stored_job(&db, unreadable_id)
+        .await
+        .expect("Failed to read the job row");
+    assert_eq!(status, 0, "a postponed job stays queued (status = 0)");
+    assert_eq!(attempt_count, 1, "the failed attempt is recorded");
+    assert!(
+        scheduled_for >= before + time::Duration::minutes(4),
+        "put off long enough for a rollout to finish, until {scheduled_for}"
     );
+    assert_eq!(stored, unreadable, "its stored JSON is untouched");
+    let next = queue.take_next::<TestMsg>().await.expect("Failed to take");
+    assert!(next.is_none(), "the postponed job isn't due yet");
+}
+
+/// Once its last attempt fails too, the unreadable job is failed for good, with its stored JSON
+/// kept for an operator to look at, and not handed out again.
+#[tokio::test]
+async fn an_unreadable_job_is_failed_for_good_after_its_last_attempt() {
+    //* Given
+    let (db, _temp_db) = temp_pgmq_db().await;
+    let queue = PgQueue::new(db.clone());
+    let (unreadable_id, unreadable, good_id) = unreadable_job_ahead_of_a_good_one(&queue, 1)
+        .await
+        .expect("Failed to push the jobs");
+
+    //* When
+    let first = queue
+        .take_next::<TestMsg>()
+        .await
+        .expect("Failed to take")
+        .expect("expected the unreadable job");
+    let Popped::Unreadable(first) = first else {
+        panic!("the unreadable job must be reported as unreadable");
+    };
+    assert_eq!(first.outcome, RetryOutcome::WillRetry);
+    let Popped::Job(good) = queue
+        .take_next::<TestMsg>()
+        .await
+        .expect("Failed to take")
+        .expect("expected the good job")
+    else {
+        panic!("the good job must be delivered");
+    };
+    assert_eq!(good.id(), &good_id);
+    good.remove().await.expect("Failed to remove the good job");
+    make_due(&db, unreadable_id)
+        .await
+        .expect("Failed to make the job due");
+    let last = queue
+        .take_next::<TestMsg>()
+        .await
+        .expect("Failed to take")
+        .expect("expected the unreadable job again");
+
+    //* Then
+    let Popped::Unreadable(last) = last else {
+        panic!("the unreadable job must be reported as unreadable");
+    };
+    assert_eq!(last.outcome, RetryOutcome::GaveUp);
+    assert_eq!((last.failed_attempts, last.max_attempts), (1, 2));
+    let (status, attempt_count, _, stored) = stored_job(&db, unreadable_id)
+        .await
+        .expect("Failed to read the job row");
+    assert_eq!(
+        (status, attempt_count),
+        (1, 2),
+        "failed (status = 1) after both attempts"
+    );
+    assert_eq!(stored, unreadable, "its stored JSON is untouched");
     let next = queue.take_next::<TestMsg>().await.expect("Failed to take");
     assert!(
         next.is_none(),
         "a job failed for good is not handed out again"
     );
+}
+
+/// An unreadable job whose attempt count can't be trusted, here already at its limit though it
+/// is queued, can't be counted towards giving up, so it is failed for good at once rather than
+/// left to stall the queue.
+#[tokio::test]
+async fn an_unreadable_job_with_an_untrustworthy_attempt_count_is_failed_at_once() {
+    //* Given
+    let (db, _temp_db) = temp_pgmq_db().await;
+    let queue = PgQueue::new(db.clone());
+    let (unreadable_id, unreadable, _) = unreadable_job_ahead_of_a_good_one(&queue, 2)
+        .await
+        .expect("Failed to push the jobs");
+    sqlx::query("UPDATE pgmq_queue SET attempt_count = 2147483647 WHERE id = $1")
+        .bind(unreadable_id)
+        .execute(&db)
+        .await
+        .expect("Failed to corrupt the attempt count");
+
+    //* When
+    let first = queue
+        .take_next::<TestMsg>()
+        .await
+        .expect("an unreadable job is not a database error")
+        .expect("expected the unreadable job");
+
+    //* Then
+    let Popped::Unreadable(first) = first else {
+        panic!("the unreadable job must be reported as unreadable");
+    };
+    assert_eq!(first.outcome, RetryOutcome::GaveUp);
+    let (status, _, _, stored) = stored_job(&db, unreadable_id)
+        .await
+        .expect("Failed to read the job row");
+    assert_eq!(status, 1, "failed for good (status = 1)");
+    assert_eq!(stored, unreadable, "its stored JSON is untouched");
 }
 
 /// `pop` gets past an unreadable job the same way, delivering the job behind it.
@@ -1084,7 +1203,7 @@ async fn pop_delivers_the_job_behind_an_unreadable_one() {
     //* Given
     let (db, _temp_db) = temp_pgmq_db().await;
     let queue = PgQueue::new(db.clone());
-    let (unreadable_id, unreadable, good_id) = unreadable_job_ahead_of_a_good_one(&queue)
+    let (unreadable_id, unreadable, good_id) = unreadable_job_ahead_of_a_good_one(&queue, 2)
         .await
         .expect("Failed to push the jobs");
 
@@ -1098,10 +1217,9 @@ async fn pop_delivers_the_job_behind_an_unreadable_one() {
     //* Then
     assert_eq!(job.id(), &good_id);
     job.remove().await.expect("Failed to remove the good job");
-    assert_eq!(
-        stored_job(&db, unreadable_id)
-            .await
-            .expect("Failed to read the job row"),
-        (1, unreadable)
-    );
+    let (status, attempt_count, _, stored) = stored_job(&db, unreadable_id)
+        .await
+        .expect("Failed to read the job row");
+    assert_eq!((status, attempt_count), (0, 1), "put off, not failed");
+    assert_eq!(stored, unreadable);
 }

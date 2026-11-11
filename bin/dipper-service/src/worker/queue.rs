@@ -107,8 +107,8 @@ where
     }
 }
 
-/// Takes jobs until 1 can be read, so a stored job this release can't read, which the queue
-/// has already marked failed for good, can't hold up the jobs behind it. A database error is
+/// Takes jobs until 1 can be read, so a stored job this release can't read, which the queue has
+/// already put off or failed for good, can't hold up the jobs behind it. A database error is
 /// returned as it is.
 async fn first_readable<'c, M, F, Fut>(mut take_next: F) -> anyhow::Result<Option<JobGuard<'c, M>>>
 where
@@ -124,16 +124,31 @@ where
     }
 }
 
-/// Alerts that a stored job couldn't be read and won't run, as a job failed for good. The full
-/// stored job stays in the queue, marked failed, for an operator to look at.
+/// Logs a stored job this release couldn't read. Put off for another try, it is a warning, as a
+/// newer release running alongside this one during a rollout may read it. Given up on, it is
+/// alerted on as a job failed for good; the full stored job stays in the queue, marked failed,
+/// for an operator to look at.
 fn log_unreadable_job(job: &UnreadableJob) {
-    tracing::error!(
-        event = super::service::JOB_FAILED_EVENT,
-        job_id = %job.id,
-        error = %job.error,
-        stored = %job.stored_excerpt(),
-        "Job can't be read by this release, so it was marked failed and will not run"
-    );
+    let attempt = job.failed_attempts.saturating_add(1);
+    match job.outcome {
+        RetryOutcome::WillRetry => tracing::warn!(
+            job_id = %job.id,
+            error = %job.error,
+            attempt,
+            max_attempts = job.max_attempts,
+            "Job can't be read by this release; put off to be tried again later"
+        ),
+        RetryOutcome::GaveUp => tracing::error!(
+            event = super::service::JOB_FAILED_EVENT,
+            job_id = %job.id,
+            error = %job.error,
+            attempt,
+            max_attempts = job.max_attempts,
+            stored = %job.stored_excerpt(),
+            "Job can't be read by this release and its attempts have run out, so it was marked \
+             failed and will not run"
+        ),
+    }
 }
 
 /// A listener for the queue job available notification
@@ -159,15 +174,27 @@ impl JobNotifications for QueueImplListener {
 mod tests {
     use std::collections::VecDeque;
 
-    use super::{JobId, Popped, UnreadableJob, first_readable, log_unreadable_job};
+    use super::{JobId, Popped, RetryOutcome, UnreadableJob, first_readable, log_unreadable_job};
     use crate::{test_support::logged, worker::messages::Message};
 
-    fn unreadable(stored: &str) -> UnreadableJob {
+    /// A stored job that can't be read as a job, on its `attempt` of 3, and what the queue made
+    /// of that failed attempt.
+    fn unreadable(stored: &str, attempt: i32, outcome: RetryOutcome) -> UnreadableJob {
         UnreadableJob {
             id: JobId::default(),
             error: serde_json::from_str::<Message>(stored).unwrap_err(),
             stored: stored.to_string(),
+            failed_attempts: attempt - 1,
+            max_attempts: 3,
+            outcome,
         }
+    }
+
+    /// The lines tagged for the alert that a job will never run.
+    fn alerts(logs: &str) -> Vec<&str> {
+        logs.lines()
+            .filter(|line| line.contains(r#"event="job_failed_permanently""#))
+            .collect()
     }
 
     /// Takes from `takes` in turn, as the queue would hand them out.
@@ -190,16 +217,21 @@ mod tests {
         (found.expect("ran"), logs)
     }
 
-    /// Unreadable jobs at the head of the queue are each alerted on, and the worker goes on to
-    /// what lies behind them instead of stopping at the first.
+    /// Unreadable jobs at the head of the queue are passed, the worker going on to what lies
+    /// behind them: a job put off for another try is a warning, and only the 1 given up on is
+    /// alerted on.
     #[tokio::test]
-    async fn unreadable_jobs_are_each_alerted_on_and_passed() {
+    async fn unreadable_jobs_are_passed_and_only_the_one_given_up_on_alerts() {
         let (found, logs) = take_from(vec![
             Ok(Some(Popped::Unreadable(unreadable(
-                r#"{"type":"RemovedJobType"}"#,
+                r#"{"type":"JobTypeOfANewerRelease"}"#,
+                1,
+                RetryOutcome::WillRetry,
             )))),
             Ok(Some(Popped::Unreadable(unreadable(
-                r#"{"type":"AnotherOne"}"#,
+                r#"{"type":"RemovedJobType"}"#,
+                3,
+                RetryOutcome::GaveUp,
             )))),
             Ok(None),
         ])
@@ -209,13 +241,14 @@ mod tests {
             !found.expect("no database error"),
             "the queue is then empty"
         );
-        let alerts: Vec<&str> = logs
-            .lines()
-            .filter(|line| line.contains(r#"event="job_failed_permanently""#))
-            .collect();
-        assert_eq!(alerts.len(), 2, "{logs}");
+        let alerts = alerts(&logs);
+        assert_eq!(alerts.len(), 1, "{logs}");
         assert!(alerts[0].contains("RemovedJobType"), "{logs}");
-        assert!(alerts[1].contains("AnotherOne"), "{logs}");
+        let postponed = logs
+            .lines()
+            .find(|line| line.contains("JobTypeOfANewerRelease"))
+            .unwrap_or_else(|| panic!("the postponed job is logged:\n{logs}"));
+        assert!(postponed.contains(" WARN "), "{postponed}");
     }
 
     /// A database error still comes back as an error, for the worker to warn about and retry.
@@ -224,6 +257,8 @@ mod tests {
         let (found, logs) = take_from(vec![
             Ok(Some(Popped::Unreadable(unreadable(
                 r#"{"type":"RemovedJobType"}"#,
+                3,
+                RetryOutcome::GaveUp,
             )))),
             Err(anyhow::anyhow!("connection refused")),
         ])
@@ -231,29 +266,55 @@ mod tests {
 
         let err = found.expect_err("the database error is returned");
         assert!(err.to_string().contains("connection refused"), "{err}");
-        assert_eq!(logs.matches("job_failed_permanently").count(), 1, "{logs}");
+        assert_eq!(alerts(&logs).len(), 1, "{logs}");
     }
 
-    /// The alert names the job and why it couldn't be read, and carries the stored job cut to
-    /// a safe length.
+    /// A job put off for another try, perhaps 1 a newer release running alongside this one can
+    /// read, is a warning with no alert tag, naming the job, why it couldn't be read and which
+    /// attempt failed.
     #[tokio::test]
-    async fn an_unreadable_job_alert_names_the_job_the_error_and_what_was_stored() {
+    async fn a_postponed_unreadable_job_is_a_warning_without_an_alert() {
+        let job = unreadable(
+            r#"{"type":"JobTypeOfANewerRelease"}"#,
+            1,
+            RetryOutcome::WillRetry,
+        );
+
+        let logs = logged(async { log_unreadable_job(&job) }).await;
+
+        assert_eq!(alerts(&logs), Vec::<&str>::new(), "{logs}");
+        let line = logs
+            .lines()
+            .find(|line| line.contains("JobTypeOfANewerRelease"))
+            .unwrap_or_else(|| panic!("the postponed job is logged:\n{logs}"));
+        assert!(line.contains(" WARN "), "{line}");
+        assert!(line.contains(&JobId::default().to_string()), "{line}");
+        assert!(
+            line.contains("unknown variant `JobTypeOfANewerRelease`"),
+            "{line}"
+        );
+        assert!(line.contains("attempt=1"), "{line}");
+        assert!(line.contains("max_attempts=3"), "{line}");
+    }
+
+    /// The job given up on is alerted on, naming the job and why it couldn't be read, and
+    /// carrying the stored job cut to a safe length.
+    #[tokio::test]
+    async fn an_unreadable_job_given_up_on_alerts_with_the_job_the_error_and_what_was_stored() {
         let stored = format!(
             r#"{{"type":"RemovedJobType","padding":"{}"}}"#,
             "x".repeat(5_000)
         );
-        let job = unreadable(&stored);
+        let job = unreadable(&stored, 3, RetryOutcome::GaveUp);
 
         let logs = logged(async { log_unreadable_job(&job) }).await;
 
-        let line = logs
-            .lines()
-            .find(|line| line.contains(r#"event="job_failed_permanently""#))
-            .unwrap_or_else(|| panic!("the alert is logged:\n{logs}"));
+        let alerts = alerts(&logs);
+        assert_eq!(alerts.len(), 1, "{logs}");
+        let line = alerts[0];
         assert!(line.contains("ERROR"), "{line}");
         assert!(line.contains(&JobId::default().to_string()), "{line}");
         assert!(line.contains("unknown variant `RemovedJobType`"), "{line}");
-        assert!(line.contains("RemovedJobType"), "{line}");
         assert!(line.contains("characters in all"), "{line}");
         assert!(
             line.len() < 2_000,
