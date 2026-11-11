@@ -286,12 +286,13 @@ where
     context.max_grt_per_billion_entities_per_30_days =
         ceilings.max_grt_per_billion_entities_per_30_days;
 
-    // Select the target group of indexers via IISA. If IISA is unreachable
-    // we retry with exponential backoff rather than falling back to a
-    // different selection mechanism: cancelling existing good indexers to
-    // assign random ones would be destructive, and there is no per-indexer
-    // /dips/info fallback for new requests either. Prolonged IISA outages
-    // stall new requests until IISA recovers — see README "IISA dependency".
+    // Select the target group of indexers via IISA. If IISA is unreachable or
+    // refuses the request, the job is retried, by default twice, 1 and then 2
+    // minutes later, and then dropped, rather than falling back to a different
+    // selection mechanism: cancelling existing good indexers to assign random
+    // ones would be destructive, and there is no per-indexer /dips/info
+    // fallback for new requests either. A dropped request waits for the daily
+    // pass, which skips requests less than 1 day old.
     let target_selected: Vec<SelectedIndexer> = match ctx
         .iisa
         .select_indexers(*deployment_id, num_candidates, &context)

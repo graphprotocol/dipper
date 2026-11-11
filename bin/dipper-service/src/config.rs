@@ -352,7 +352,11 @@ impl Default for IndexerClientConfig {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReassignmentConfig {
-    /// Whether the reassignment service is enabled (default: true)
+    /// Whether the reassignment service runs (default: true). This default only applies once the
+    /// section exists: without a `reassignment` section it does not run, so there is no daily
+    /// reassessment of open requests and no hourly top-up of short ones. A request is then only
+    /// re-checked when something else queues it, such as a target change or an expired offer,
+    /// even 1 whose last reassessment was dropped during an IISA outage.
     #[serde(default = "default_reassignment_enabled")]
     pub enabled: bool,
 
@@ -444,7 +448,11 @@ impl Default for ReassignmentConfig {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExpirationConfig {
-    /// Whether the expiration service is enabled (default: true)
+    /// Whether the expiration service runs (default: true). This default only applies once the
+    /// section exists: without an `expiration` section it does not run. Nothing else marks an
+    /// offer expired, so a lapsed offer stays created for ever and keeps counting as an offer in
+    /// flight, whatever its deadline: with the default caps an indexer gets no more offers once it
+    /// has 5 and nobody does once there are 100, and no replacement is picked for a lapsed offer.
     #[serde(default = "default_expiration_enabled")]
     pub enabled: bool,
 
@@ -808,11 +816,13 @@ impl Default for DipsInfoWatcherConfig {
     }
 }
 
-/// Configuration for the on-chain event listener service.
+/// Configuration for the chain listener, which keeps dipper's agreement records in step with the
+/// chain.
 ///
-/// This service monitors the SubgraphService contract for `IndexingAgreementAccepted`
-/// and `IndexingAgreementCanceled` events via a subgraph. When a `Rejected` agreement
-/// is accepted on-chain, it triggers automatic cancellation via `cancelIndexingAgreementByPayer`.
+/// It polls the indexing-payments subgraph for agreements paid by the RecurringAgreementManager
+/// whose on-chain state changed, and records each acceptance and cancellation. When an agreement
+/// dipper rejected or cancelled shows up accepted on-chain, it queues a job that checks the chain
+/// and, if the agreement is live, puts it back in line to be cancelled through the manager.
 #[serde_as]
 #[derive(custom_debug::CustomDebug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -839,10 +849,11 @@ pub struct ChainListenerConfig {
     #[serde(default = "default_chain_id")]
     pub chain_id: u64,
 
-    /// Poll interval in seconds (default: 30s)
+    /// Poll interval in seconds while any agreement is waiting to be accepted or is accepted
+    /// (default: 30s). With none of those to watch, the listener polls every 300 seconds instead.
     ///
-    /// How often to query the subgraph for new events. Since subgraphs have some
-    /// indexing latency, polling more frequently than ~30s provides diminishing returns.
+    /// Since subgraphs have some indexing latency, polling more frequently than ~30s provides
+    /// diminishing returns.
     #[serde_as(as = "serde_with::DurationSeconds<u64>")]
     #[serde(default = "default_chain_listener_poll_interval")]
     pub poll_interval: Duration,
@@ -1040,8 +1051,10 @@ fn default_gas_max_addition() -> u64 {
 pub struct DipsAgreementConfig {
     /// The data service address (SubgraphService contract).
     pub data_service: Address,
-    /// The RecurringCollector contract address. Dipper posts on-chain offers
-    /// here via `RecurringCollector.offer()` before dispatching gRPC proposals.
+    /// The RecurringCollector contract address. Dipper reads its EIP-712 domain at startup and
+    /// names it as the collector when it offers and cancels agreements through the
+    /// RecurringAgreementManager; an offer goes on-chain only after the indexer accepts the
+    /// gRPC proposal.
     pub recurring_collector: Address,
     /// The RecurringAgreementManager contract address. The manager is the
     /// on-chain payer; dipper routes every offer and cancel through it.
@@ -1126,8 +1139,8 @@ pub struct DipsAgreementConfig {
     #[serde(default = "default_uncertain_rejection_lookback_days")]
     pub uncertain_rejection_lookback_days: i32,
 
-    /// Days to skip an indexer across ALL deployments after it failed to respond
-    /// to a proposal (status `Unresponsive`). Default: 1 day.
+    /// Days to skip an indexer on every deployment of a chain after it failed to respond
+    /// to a proposal there (status `Unresponsive`). Default: 1 day.
     #[serde(default = "default_unresponsive_indexer_lookback_days")]
     pub unresponsive_indexer_lookback_days: i32,
 
@@ -1136,8 +1149,8 @@ pub struct DipsAgreementConfig {
     #[serde(default = "default_non_accepting_test_interval_minutes")]
     pub non_accepting_test_interval_minutes: i32,
 
-    /// Fraction of the DIPs-accepting pool that must be unresponsive before the
-    /// breaker trips and suppresses the network-wide exclusion. Default 0.50.
+    /// Fraction of a chain's DIPs-accepting pool that must be unresponsive before the
+    /// breaker trips and suppresses that chain's unresponsive exclusion. Default 0.50.
     #[serde(default = "default_mass_unresponsive_trip_fraction")]
     pub mass_unresponsive_trip_fraction: f64,
 
@@ -1515,7 +1528,7 @@ pub struct IndexingAgreementConfig {
     pub transient_rejection_lookback_minutes: i32,
     /// Number of days to look back for uncertain rejections (sender-not-trusted, unspecified).
     pub uncertain_rejection_lookback_days: i32,
-    /// Number of days to skip an unresponsive indexer across all deployments.
+    /// Number of days to skip an unresponsive indexer on every deployment of the chain.
     pub unresponsive_indexer_lookback_days: i32,
     /// Minutes between test offers to an indexer that stopped accepting offers.
     pub non_accepting_test_interval_minutes: i32,

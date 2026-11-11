@@ -11,7 +11,7 @@ Kubernetes manifests for deploying the dipper service.
 ## Files
 
 - `deployment.yaml` - Dipper deployment with health probes and security context
-- `service.yaml` - ClusterIP service exposing Admin RPC (8545) and Indexer RPC (50051)
+- `service.yaml` - ClusterIP service exposing Admin RPC (8545)
 - `configmap-example.yaml` - Example ConfigMap showing config.json structure (do not apply directly)
 
 ## Deployment
@@ -47,7 +47,6 @@ This assumes IISA is deployed with a Service named `iisa` in the same namespace.
 | Service | Port | Protocol | Purpose |
 |---------|------|----------|---------|
 | Admin RPC | 8545 | TCP | JSON-RPC for admin operations |
-| Indexer RPC | 50051 | TCP | gRPC for indexer interactions |
 | Health | 8546 | TCP | HTTP `GET /health` for the startup and liveness probes |
 
 The health port is deliberately absent from `service.yaml`: the kubelet probes the pod directly, so
