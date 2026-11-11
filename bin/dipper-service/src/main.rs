@@ -27,6 +27,7 @@ mod config;
 mod db;
 mod health;
 mod indexer_rpc_client;
+mod log_text;
 mod network;
 mod registry;
 mod signing;
