@@ -62,7 +62,7 @@ You can use a `.env` file to store your configuration. The CLI looks for a `.env
 dipper-cli indexings --env-file /path/to/.env <subcommand>
 ```
 
-Each setting comes from the first of these that sets it: a command-line flag, a variable already set in your shell, then the file. When a flag or a shell variable overrides a setting in the file named with `--env-file`, the CLI prints a warning naming that setting, without its value, so a variable left exported in your shell cannot quietly send a command to a different server.
+Each setting comes from the first of these that sets it: a command-line flag, a variable already set in your shell, then the file. The CLI prints a warning, naming the setting but never its value, whenever a flag or a shell variable overrides a setting in the file, whether you named it with `--env-file` or the CLI found it in the current directory. It also warns when the server URL and the signing key come from different places, naming both, so a variable left exported in your shell cannot quietly send a command to a different server. A flag or variable that repeats the file's value, even written differently, such as a URL without its trailing slash, raises no warning.
 
 #### CLI Flags
 

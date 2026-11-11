@@ -3,16 +3,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use clap::{
-    Arg, ArgMatches, Error, FromArgMatches, arg,
-    error::ErrorKind,
-    parser::{MatchesError, ValueSource},
-    value_parser,
-};
-use dipper_core::config::{Hidden, HiddenSecretKeyAsHexStr};
+use clap::{Arg, ArgMatches, arg, parser::ValueSource, value_parser};
+use dipper_core::config::secret_key_from_str;
 use figment::{Figment, providers::Serialized};
-use serde_with::{DisplayFromStr, serde_as, skip_serializing_none};
-use thegraph_core::alloy::signers::k256::SecretKey;
 use url::Url;
 
 use crate::config::Config;
@@ -50,7 +43,7 @@ pub(super) fn signing_key_arg() -> Arg {
     arg!(--"signing-key" <KEY> "The secret key to sign requests with (hex)")
         .env(name_prefixed!("SIGNING_KEY"))
         .hide_env_values(true)
-        .value_parser(dipper_core::config::secret_key_from_str)
+        .value_parser(secret_key_from_str)
 }
 
 /// Load the configuration from the command line, the shell and a file, printing a warning on
@@ -74,87 +67,134 @@ struct Loaded {
     warnings: Vec<String>,
 }
 
+/// The flags that set a setting each: `--server-url` sets `server_url`.
+const SETTING_FLAGS: [&str; 3] = ["server-url", "signing-key", "ipfs-url"];
+
+/// Where a setting's value came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Source {
+    /// Typed on the command line as this flag.
+    Flag(&'static str),
+    /// Set in the shell's environment.
+    Shell,
+    /// Read from this file, named with `--env-file` or found in the current directory.
+    File(PathBuf),
+}
+
+impl Source {
+    /// Whether 2 settings came from the same place, counting every flag as the command line.
+    fn same_place(&self, other: &Self) -> bool {
+        matches!((self, other), (Self::Flag(_), Self::Flag(_))) || self == other
+    }
+}
+
+impl std::fmt::Display for Source {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Flag(flag) => write!(f, "the --{flag} flag"),
+            Self::Shell => f.write_str("the shell environment"),
+            Self::File(path) => write!(f, "{}", path.display()),
+        }
+    }
+}
+
 /// Build the configuration, taking each setting from the first source that has it: a flag typed
 /// on the command line, `shell` (the variables the shell set), then 1 file, the one `--env-file`
-/// names or else the one in `current_dir`.
+/// names or else the one in `current_dir`. Warnings name settings, never their values.
 fn load_conf_from(
     args: &ArgMatches,
     shell: impl IntoIterator<Item = (String, String)>,
     current_dir: &Path,
 ) -> anyhow::Result<Loaded> {
-    let shell = settings(shell);
     let mut warnings = Vec::new();
     // The named file replaces the one in the directory, so that one can't fill in a setting the
     // named file leaves out, such as a production signing key under a staging server.
-    let file = match args.get_one::<PathBuf>("env-file") {
-        Some(path) => {
-            let named = read_env_file(path)?;
-            warnings.extend(overridden_settings(path, &named, &shell, args));
-            named
-        }
+    let (file_path, file) = match args.get_one::<PathBuf>("env-file") {
+        Some(path) => (path.clone(), read_env_file(path)?),
         None => read_env_file_in(current_dir, &mut warnings),
     };
-    let cli_conf = CliConfig::from_arg_matches(args)?;
 
-    let conf = Figment::new()
-        .merge(Serialized::defaults(file))
-        .merge(Serialized::defaults(shell))
-        .merge(Serialized::defaults(cli_conf))
-        .extract()?;
+    let mut chosen: BTreeMap<String, (String, Source)> = BTreeMap::new();
+    for flag in SETTING_FLAGS {
+        if let Some(value) = typed_value(args, flag) {
+            chosen.insert(flag.replace('-', "_"), (value, Source::Flag(flag)));
+        }
+    }
+    for (setting, value) in settings(shell) {
+        chosen.entry(setting).or_insert((value, Source::Shell));
+    }
+    for (setting, value) in file {
+        match chosen.get(&setting) {
+            Some((used, source)) if !same_value(&setting, used, &value) => warnings.push(format!(
+                "warning: ignoring {ENV_PREFIX}{} from {}: {source} sets it",
+                setting.to_ascii_uppercase(),
+                file_path.display()
+            )),
+            Some(_) => {}
+            None => {
+                chosen.insert(setting, (value, Source::File(file_path.clone())));
+            }
+        }
+    }
+    if let (Some((_, url_from)), Some((_, key_from))) =
+        (chosen.get("server_url"), chosen.get("signing_key"))
+        && !url_from.same_place(key_from)
+    {
+        warnings.push(format!(
+            "warning: the server URL comes from {url_from} but the signing key from {key_from}"
+        ));
+    }
+
+    let values: BTreeMap<&str, &str> = chosen
+        .iter()
+        .map(|(setting, (value, _))| (setting.as_str(), value.as_str()))
+        .collect();
+    let conf = Figment::from(Serialized::defaults(values)).extract()?;
 
     Ok(Loaded { conf, warnings })
 }
 
-/// A warning for each setting in the named file that a flag or the shell gives another value. It
-/// names the setting but never shows a value, which may be a secret.
-fn overridden_settings(
-    path: &Path,
-    file: &BTreeMap<String, String>,
-    shell: &BTreeMap<String, String>,
-    args: &ArgMatches,
-) -> Vec<String> {
-    file.iter()
-        .filter_map(|(setting, value)| {
-            let flag = setting.replace('_', "-");
-            let overrider = match typed_value(args, &flag) {
-                Some(typed) => (typed != *value).then(|| format!("the --{flag} flag")),
-                None => shell
-                    .get(setting)
-                    .filter(|shell_value| *shell_value != value)
-                    .map(|_| "the shell environment".to_owned()),
-            }?;
-            Some(format!(
-                "warning: ignoring {ENV_PREFIX}{} from {}: {overrider} sets it",
-                setting.to_ascii_uppercase(),
-                path.display()
-            ))
-        })
-        .collect()
+/// Whether 2 values of `setting` mean the same, so that one written differently, such as a URL
+/// without its trailing slash or a key without `0x`, is not reported as overriding the other.
+fn same_value(setting: &str, a: &str, b: &str) -> bool {
+    match setting {
+        "server_url" | "ipfs_url" => match (Url::parse(a), Url::parse(b)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => a == b,
+        },
+        "signing_key" => match (secret_key_from_str(a), secret_key_from_str(b)) {
+            (Ok(a), Ok(b)) => a.to_bytes() == b.to_bytes(),
+            _ => a == b,
+        },
+        _ => a == b,
+    }
 }
 
-/// The settings in the file named [`ENV_FILE_NAME`] in `dir`. Only `dir` is searched: a file in a
-/// directory above, such as a home folder, could point a command at the wrong server. A file that
-/// can't be read is skipped as before, but now with a warning instead of only a debug log.
-fn read_env_file_in(dir: &Path, warnings: &mut Vec<String>) -> BTreeMap<String, String> {
+/// The path of the file named [`ENV_FILE_NAME`] in `dir`, and its settings. Only `dir` is
+/// searched: a file in a directory above, such as a home folder, could point a command at the
+/// wrong server. A file that can't be read is skipped as before, now with a warning.
+fn read_env_file_in(dir: &Path, warnings: &mut Vec<String>) -> (PathBuf, BTreeMap<String, String>) {
     let path = dir.join(ENV_FILE_NAME);
-    match dotenvy::from_path_iter(&path).and_then(|vars| vars.collect::<Result<Vec<_>, _>>()) {
-        Ok(vars) => {
-            tracing::debug!("Loaded envfile '{}'", path.display());
-            settings(vars)
-        }
-        Err(err) if err.not_found() => {
-            tracing::debug!("No envfile at '{}'", path.display());
-            BTreeMap::new()
-        }
-        Err(err) => {
-            warnings.push(format!(
-                "warning: skipping '{}': {}",
-                path.display(),
-                describe(&err)
-            ));
-            BTreeMap::new()
-        }
-    }
+    let found =
+        match dotenvy::from_path_iter(&path).and_then(|vars| vars.collect::<Result<Vec<_>, _>>()) {
+            Ok(vars) => {
+                tracing::debug!("Loaded envfile '{}'", path.display());
+                settings(vars)
+            }
+            Err(err) if err.not_found() => {
+                tracing::debug!("No envfile at '{}'", path.display());
+                BTreeMap::new()
+            }
+            Err(err) => {
+                warnings.push(format!(
+                    "warning: skipping '{}': {}",
+                    path.display(),
+                    describe(&err)
+                ));
+                BTreeMap::new()
+            }
+        };
+    (path, found)
 }
 
 /// What went wrong reading an env file, leaving out the text of a line that failed to parse,
@@ -210,56 +250,6 @@ fn typed_value(args: &ArgMatches, id: &str) -> Option<String> {
     (args.value_source(id) == Some(ValueSource::CommandLine))
         .then(|| raw.to_str().map(str::to_owned))
         .flatten()
-}
-
-/// The `id` flag's parsed value when it was typed on the command line. Values clap took from the
-/// environment are left out: the shell's variables are read separately, so they rank the same
-/// wherever they come from.
-fn typed<T: Clone + Send + Sync + 'static>(
-    args: &ArgMatches,
-    id: &str,
-) -> Result<Option<T>, Error> {
-    match args.try_get_one::<T>(id) {
-        Ok(value) => Ok(value
-            .filter(|_| args.value_source(id) == Some(ValueSource::CommandLine))
-            .cloned()),
-        // Only some subcommands define each flag.
-        Err(MatchesError::UnknownArgument { .. }) => Ok(None),
-        Err(err) => Err(Error::raw(
-            ErrorKind::InvalidValue,
-            format!("Failed to read --{id}: {err}"),
-        )),
-    }
-}
-
-/// The CLI provided config
-#[serde_as]
-#[skip_serializing_none]
-#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
-struct CliConfig {
-    /// The URL of the DIPs gateway server
-    #[serde_as(as = "Option<DisplayFromStr>")]
-    pub server_url: Option<Url>,
-    /// The secret key to sign requests with
-    #[serde_as(as = "Option<HiddenSecretKeyAsHexStr>")]
-    pub signing_key: Option<Hidden<SecretKey>>,
-    /// The IPFS API to read subgraph manifests from
-    #[serde_as(as = "Option<DisplayFromStr>")]
-    pub ipfs_url: Option<Url>,
-}
-
-impl FromArgMatches for CliConfig {
-    fn from_arg_matches(matches: &ArgMatches) -> Result<Self, Error> {
-        Ok(Self {
-            server_url: typed(matches, "server-url")?,
-            signing_key: typed(matches, "signing-key")?,
-            ipfs_url: typed(matches, "ipfs-url")?,
-        })
-    }
-
-    fn update_from_arg_matches(&mut self, _matches: &ArgMatches) -> Result<(), Error> {
-        unimplemented!()
-    }
 }
 
 #[cfg(test)]
@@ -456,28 +446,105 @@ mod tests {
     }
 
     /// A shell variable or flag giving the same value as the named file changes nothing, so it
-    /// is not worth a warning.
+    /// is not worth a warning, even when it is written differently.
     #[test]
     fn no_warning_when_the_shell_or_a_flag_gives_the_named_files_own_value() {
         let folder = Folder::new("same-value");
         let staging = folder.file(
             "staging",
-            &format!("DIPS_SERVER_URL=https://staging.example\nDIPS_SIGNING_KEY={KEY}\n"),
+            &format!(
+                "DIPS_SERVER_URL=https://staging.example\nDIPS_SIGNING_KEY={KEY}\n\
+                 DIPS_IPFS_URL=http://ipfs.staging.example\n"
+            ),
         );
+        let key_written_differently = KEY[2..].to_ascii_uppercase();
 
         let loaded = load(
             &[
                 "--env-file",
                 path(&staging),
                 "--server-url",
-                "https://staging.example",
+                "https://staging.example/",
+                "--signing-key",
+                &key_written_differently,
             ],
-            &[("DIPS_SIGNING_KEY", KEY)],
+            &[("DIPS_IPFS_URL", "http://ipfs.staging.example/")],
             &folder.0,
         );
 
         assert_eq!(loaded.conf.server_url.as_str(), "https://staging.example/");
         assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+    }
+
+    /// A server URL and a signing key from different places may belong to different
+    /// environments, such as a key in a file and a production URL left exported in the shell.
+    #[test]
+    fn a_server_url_and_signing_key_from_different_places_are_reported() {
+        let folder = Folder::new("mixed-sources");
+        let key_only = folder.file("key-only", &format!("DIPS_SIGNING_KEY={KEY}\n"));
+
+        let loaded = load(
+            &["--env-file", path(&key_only)],
+            &[("DIPS_SERVER_URL", "https://production.example")],
+            &folder.0,
+        );
+
+        assert_eq!(
+            loaded.warnings,
+            [format!(
+                "warning: the server URL comes from the shell environment but the signing key from \
+                 {}",
+                key_only.display()
+            )]
+        );
+    }
+
+    /// The agreements command loads its settings the same way as the indexings command.
+    #[test]
+    fn the_agreements_command_reports_a_named_file_overridden_by_the_shell() {
+        let folder = Folder::new("agreements");
+        let staging = folder.file(
+            "staging",
+            &format!("DIPS_SERVER_URL=https://staging.example\nDIPS_SIGNING_KEY={KEY}\n"),
+        );
+        let matches = crate::cmd::agreements::cmd()
+            .try_get_matches_from([
+                "agreements",
+                "--env-file",
+                path(&staging),
+                "list",
+                "0196f6d2-4ae0-7a1c-9b7e-3d2c1b0a9f8e",
+            ])
+            .unwrap();
+
+        let loaded = load_conf_from(
+            matches.subcommand().unwrap().1,
+            [(
+                "DIPS_SERVER_URL".to_owned(),
+                "https://production.example".to_owned(),
+            )],
+            &folder.0,
+        )
+        .unwrap();
+
+        assert_eq!(
+            loaded.conf.server_url.as_str(),
+            "https://production.example/"
+        );
+        assert_eq!(
+            loaded.warnings,
+            [
+                format!(
+                    "warning: ignoring DIPS_SERVER_URL from {}: the shell environment sets it",
+                    staging.display()
+                ),
+                format!(
+                    "warning: the server URL comes from the shell environment but the signing key \
+                     from {}",
+                    staging.display()
+                ),
+            ]
+        );
     }
 
     /// A file in the current directory that can't be parsed is skipped, as before, but now with a
@@ -529,11 +596,12 @@ mod tests {
     }
 
     /// With no file named, one in the current directory still supplies settings, below the shell
-    /// and the flags, and overriding it needs no warning.
+    /// and the flags, and a shell variable overriding it is reported just as for a named file:
+    /// a production URL left exported would otherwise take a staging folder's command silently.
     #[test]
-    fn a_file_in_the_current_directory_is_read_when_none_is_named() {
+    fn a_file_in_the_current_directory_is_read_and_overrides_of_it_reported() {
         let folder = Folder::new("found-when-unnamed");
-        folder.file(
+        let found = folder.file(
             ENV_FILE_NAME,
             &format!(
                 "DIPS_SERVER_URL=https://found.example\nDIPS_SIGNING_KEY={KEY}\n\
@@ -549,6 +617,19 @@ mod tests {
 
         assert_eq!(loaded.conf.server_url.as_str(), "https://shell.example/");
         assert_eq!(loaded.conf.ipfs_url.as_str(), "http://ipfs.found.example/");
-        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        assert_eq!(
+            loaded.warnings,
+            [
+                format!(
+                    "warning: ignoring DIPS_SERVER_URL from {}: the shell environment sets it",
+                    found.display()
+                ),
+                format!(
+                    "warning: the server URL comes from the shell environment but the signing key \
+                     from {}",
+                    found.display()
+                ),
+            ]
+        );
     }
 }
