@@ -145,6 +145,24 @@ fn listed_ids(ids: &[IndexingAgreementId]) -> String {
         format!("{} and {more} more", shown.join(", "))
     }
 }
+
+/// Whether to poll at the fast interval, given the check for any agreement that is offered or
+/// accepted. A failed check counts as yes: polling slowly while offers are out would record their
+/// acceptances, and the cancellations those trigger, up to [`SLOW_POLL_INTERVAL`] late.
+fn wants_fast_polling(active_check: crate::registry::Result<bool>) -> bool {
+    match active_check {
+        Ok(any_active) => any_active,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "could not check for offered or accepted agreements; polling at the fast interval \
+                 until the check works"
+            );
+            true
+        }
+    }
+}
+
 /// Cap on the cancellation-sweep batch so a backlog drains across polls
 /// instead of blocking one tick.
 const SWEEP_BATCH_SIZE: i64 = 1000;
@@ -323,9 +341,7 @@ where
             }
 
             // Adaptive interval: check if any agreement is Created or AcceptedOnChain
-            let has_pending = registry.exists_active_agreements().await.unwrap_or(false);
-
-            let want_fast = has_pending;
+            let want_fast = wants_fast_polling(registry.exists_active_agreements().await);
             if want_fast != using_fast_interval {
                 let new_interval = if want_fast {
                     fast_interval
@@ -338,7 +354,7 @@ where
                 using_fast_interval = want_fast;
                 tracing::info!(
                     interval_secs = new_interval.as_secs(),
-                    has_pending_agreements = has_pending,
+                    has_pending_agreements = want_fast,
                     "Chain listener polling interval changed"
                 );
             }
@@ -1991,6 +2007,8 @@ mod tests {
     #[derive(Default)]
     struct MockRegistryState {
         agreements: std::collections::HashMap<IndexingAgreementId, IndexingAgreement>,
+        /// When true, the check for offered or accepted agreements fails.
+        fail_active_check: bool,
         marked_accepted_on_chain: Vec<IndexingAgreementId>,
         marked_canceled_by_requester: Vec<IndexingAgreementId>,
         marked_cancelling: Vec<IndexingAgreementId>,
@@ -2558,6 +2576,16 @@ mod tests {
                 }
             }
             Ok(counts)
+        }
+
+        async fn exists_active_agreements(&self) -> RegistryResult<bool> {
+            if self.state.lock().unwrap().fail_active_check {
+                return Err(crate::registry::Error::NoRecordsUpdated);
+            }
+            let counts =
+                crate::registry::StubAgreementRegistry::count_active_agreements_by_deployment(self)
+                    .await?;
+            Ok(!counts.is_empty())
         }
 
         async fn count_created_agreements_by_indexer(
@@ -5292,5 +5320,77 @@ mod tests {
             events.events().is_empty(),
             "nothing pending means nothing announced"
         );
+    }
+
+    /// A failed check for offered or accepted agreements counts as having some, with a warning:
+    /// polling slowly while offers are out would record their acceptances, and the cancellations
+    /// those trigger, up to 5 minutes late.
+    #[tokio::test]
+    async fn a_failed_check_for_active_agreements_keeps_polling_fast_and_warns() {
+        let mut fast = None;
+        let logs = crate::test_support::logged(async {
+            fast = Some(wants_fast_polling(Err(
+                crate::registry::Error::NoRecordsUpdated,
+            )));
+        })
+        .await;
+
+        assert_eq!(fast, Some(true));
+        assert!(
+            logs.contains("WARN") && logs.contains("polling at the fast interval"),
+            "no warning logged: {logs}"
+        );
+        assert!(wants_fast_polling(Ok(true)));
+        assert!(!wants_fast_polling(Ok(false)));
+    }
+
+    /// How many times the listener reads the subgraph in 30 seconds, polling every second while it
+    /// has agreements to watch, when the check for them fails or not.
+    async fn polls_in_30_seconds(active_check_fails: bool) -> usize {
+        let poll_times: Arc<Mutex<Vec<tokio::time::Instant>>> = Arc::new(Mutex::new(vec![]));
+        let registry = MockRegistry::new();
+        registry.state.lock().unwrap().fail_active_check = active_check_fails;
+        // Read from settings, as the service does, so the test does not depend on how each field
+        // is typed.
+        let config: crate::config::ChainListenerConfig =
+            serde_json::from_value(serde_json::json!({
+                "subgraph_endpoint": "http://localhost:8000/subgraphs/name/test",
+                "poll_interval": 1,
+                "max_retries": 0,
+                "reorg_buffer_blocks": 0,
+            }))
+            .unwrap();
+        let ctx = Ctx {
+            registry,
+            chain_client: MockChainClient::default(),
+            event_source: TimingEventSource {
+                poll_times: poll_times.clone(),
+            },
+            config,
+            agreement_conf: test_agreement_conf(),
+            chain_listener_notify: Arc::new(tokio::sync::Notify::new()),
+            subgraph_indexing_agreements_events_emitter: Arc::new(
+                SubgraphIndexingAgreementsEventsEmitter::disabled(),
+            ),
+            worker_queue: MockWorkerQueue::default(),
+        };
+
+        let (handle, service) = new(ctx);
+        let service = tokio::spawn(service);
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        handle.stop().await;
+        let _ = service.await;
+        poll_times.lock().unwrap().len()
+    }
+
+    /// While the check keeps failing the listener stays on its fast interval, instead of falling
+    /// back to the 300 second one as it does when it finds nothing to watch.
+    #[tokio::test(start_paused = true)]
+    async fn the_listener_polls_fast_while_it_cannot_check_for_active_agreements() {
+        let idle = polls_in_30_seconds(false).await;
+        let failing = polls_in_30_seconds(true).await;
+
+        assert!(idle <= 2, "nothing to watch: {idle} polls");
+        assert!(failing >= 20, "check failing: {failing} polls");
     }
 }
