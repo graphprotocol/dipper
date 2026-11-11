@@ -32,9 +32,6 @@ spec:
             - name: admin-rpc
               containerPort: 8545
               protocol: TCP
-            - name: indexer-rpc
-              containerPort: 50051
-              protocol: TCP
             - name: health
               containerPort: 8546
               protocol: TCP

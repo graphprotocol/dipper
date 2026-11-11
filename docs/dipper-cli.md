@@ -68,7 +68,7 @@ Only `DIPS_` settings are read from a file. Other variables in it are not passed
 
 #### CLI Flags
 
-The CLI provides several flags for authentication:
+The `indexings` and `agreements` commands take these flags for authentication, before or after their subcommand; `init keygen` and `init placeholder` take only `--server-url`:
 
 - `--server-url <URL>`: Specify the DIPs gateway server URL
 - `--signing-key <KEY>`: Provide the signing key in hex format
@@ -88,7 +88,7 @@ export DIPS_SIGNING_KEY=$(op read "op://mainnet/dips/signing-key-1")
 dipper-cli <command>
 
 # Using CLI flags
-dipper-cli --signing-key "$(op read "op://mainnet/dips/signing-key-1")" <command>
+dipper-cli indexings --signing-key "$(op read "op://mainnet/dips/signing-key-1")" <subcommand>
 ```
 
 This approach is useful for:
@@ -107,13 +107,18 @@ DIPS_SERVER_URL=https://admin.dips.example.com
 DIPS_SIGNING_KEY={{ op://mainnet/dips/signing-key-1 }}
 ```
 
-2. Use `op inject` to write a copy with the secrets filled in, then point the CLI at that copy:
+2. Use `op inject` to write a copy of the template with the secrets filled in, then point the CLI at that copy:
 ```bash
 op inject --in-file .env.template --out-file .env.injected
 dipper-cli indexings --env-file .env.injected <subcommand>
 ```
 
-The copy holds the secrets in plain text, so delete it when you are done.
+3. The injected file holds the signing key in plain text, so delete it once you are done:
+```bash
+rm .env.injected
+```
+
+As with any `--env-file` file, a variable already set in your shell beats the one in `.env.injected`, and the CLI warns when it does; a `.env` file in the current directory is not read at all.
 
 This approach is beneficial when:
 - Managing multiple secrets
@@ -167,11 +172,11 @@ DIPS_SERVER_URL=https://admin.dips.example.com
 DIPS_SIGNING_KEY={{ op://mainnet/dips/signing-key-1 }}
 ```
 
-To use the generated template:
+To use the generated template, inject the secrets into a copy, run the command with it, then delete the copy, which holds the signing key in plain text:
 ```bash
-# Write a copy with the secret filled in, then run a command with it
 op inject --in-file .env.template --out-file .env.injected
 dipper-cli indexings --env-file .env.injected <subcommand>
+rm .env.injected
 ```
 
 ## Development
@@ -203,8 +208,8 @@ You can build and run the CLI directly using Cargo:
 cargo run --bin dipper-cli <command> [options]
 
 # Examples:
-cargo run --bin dipper-cli init --server-url https://admin.dips.example.com
-cargo run --bin dipper-cli --env-file .env indexings list
+cargo run --bin dipper-cli init keygen --server-url https://admin.dips.example.com
+cargo run --bin dipper-cli indexings --env-file .env list
 ```
 
 ### Debugging the CLI
