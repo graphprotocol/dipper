@@ -286,12 +286,13 @@ where
     context.max_grt_per_billion_entities_per_30_days =
         ceilings.max_grt_per_billion_entities_per_30_days;
 
-    // Select the target group of indexers via IISA. If IISA is unreachable
-    // we retry with exponential backoff rather than falling back to a
-    // different selection mechanism: cancelling existing good indexers to
-    // assign random ones would be destructive, and there is no per-indexer
-    // /dips/info fallback for new requests either. Prolonged IISA outages
-    // stall new requests until IISA recovers — see README "IISA dependency".
+    // Select the target group of indexers via IISA. If IISA is unreachable or
+    // refuses the request, the job is retried, by default twice, 1 and then 2
+    // minutes later, and then dropped, rather than falling back to a different
+    // selection mechanism: cancelling existing good indexers to assign random
+    // ones would be destructive, and there is no per-indexer /dips/info
+    // fallback for new requests either. A dropped request waits for the daily
+    // pass, which skips requests less than 1 day old.
     let target_selected: Vec<SelectedIndexer> = match ctx
         .iisa
         .select_indexers(*deployment_id, num_candidates, &context)
@@ -477,8 +478,9 @@ where
     // accepted on-chain (see pending cancellations below).
     //
     // `now` denominates `terms.deadline` and `terms.ends_at`. The
-    // expiration service compares both against the chain_listener's
-    // persisted chain timestamp. In production the two clocks track
+    // expiration service compares the deadline against the chain_listener's
+    // persisted chain timestamp; nothing reads `ends_at` back, which is why
+    // the config refuses a fixed agreement length. In production the two clocks track
     // each other so wall time is fine; in local-network where
     // `evm_increaseTime` advances chain time independently of wall,
     // `bypass_chain_clock_defenses` reroutes us to chain time so
