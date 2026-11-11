@@ -759,6 +759,7 @@ where
             }
         };
 
+        let mut queued_reassessments = QueuedReassessments::default();
         for prep in prepared {
             // Items absent from outcomes are batch-failures, already
             // counted as errors above — finalize would double-count.
@@ -772,6 +773,7 @@ where
                 chain_client,
                 config,
                 &live_checks.queue,
+                &mut queued_reassessments,
             )
             .await
             {
@@ -1215,6 +1217,8 @@ where
         .context("applying the change returned no outcome for the agreement")?;
     // The change is applied, as when a page's finalize fails; the pending cancellation sweep
     // finishes what this leaves.
+    // A fresh listing for each change: the retry applies them 1 at a time, so a reassessment
+    // listed as waiting for one could start before the next is applied.
     if let Err(err) = finalize_reconciliation(
         &prep,
         outcome,
@@ -1222,6 +1226,7 @@ where
         chain_client,
         config,
         &live_checks.queue,
+        &mut QueuedReassessments::default(),
     )
     .await
     {
@@ -1577,6 +1582,7 @@ async fn finalize_reconciliation<R, T, W>(
     chain_client: &T,
     config: &crate::config::IndexingAgreementConfig,
     worker_queue: &W,
+    queued_reassessments: &mut QueuedReassessments,
 ) -> anyhow::Result<()>
 where
     R: AgreementRegistry
@@ -1636,7 +1642,8 @@ where
     };
     // After the fan-out, so the reassessment finds the agreements it replaced already marked, and
     // whether or not the fan-out worked, as the cancel is on record either way.
-    reassess_after_indexer_cancel(prep, outcome, registry, worker_queue).await;
+    reassess_after_indexer_cancel(prep, outcome, registry, worker_queue, queued_reassessments)
+        .await;
     fanned_out
 }
 
@@ -1651,6 +1658,7 @@ async fn reassess_after_indexer_cancel<R, W>(
     outcome: crate::registry::ReconciliationOutcome,
     registry: &R,
     worker_queue: &W,
+    queued: &mut QueuedReassessments,
 ) where
     R: crate::registry::IndexingRequestRegistry + Sync,
     W: WorkerQueue + Sync,
@@ -1662,7 +1670,7 @@ async fn reassess_after_indexer_cancel<R, W>(
     let Some(request) = open_request_of(agreement, registry).await else {
         return;
     };
-    if reassessment_queued(worker_queue, &request).await {
+    if queued.contains(worker_queue, &request).await {
         tracing::debug!(
             agreement_id = %agreement.id,
             indexing_request_id = %request.id,
@@ -1670,15 +1678,18 @@ async fn reassess_after_indexer_cancel<R, W>(
         );
         return;
     }
-    queue_reassessment_of(&request, agreement, worker_queue).await;
+    if queue_reassessment_of(&request, agreement, worker_queue).await {
+        queued.add(request.id);
+    }
 }
 
-/// Queue a reassessment of `request`, which lost `agreement` to its indexer's cancel.
+/// Queue a reassessment of `request`, which lost `agreement` to its indexer's cancel; whether it
+/// was queued.
 async fn queue_reassessment_of<W: WorkerQueue + Sync>(
     request: &crate::registry::IndexingRequest,
     agreement: &IndexingAgreement,
     worker_queue: &W,
-) {
+) -> bool {
     let queued = worker_queue
         .reassess_indexing_request(
             request.id,
@@ -1690,37 +1701,68 @@ async fn queue_reassessment_of<W: WorkerQueue + Sync>(
         )
         .await;
     match queued {
-        Ok(_) => tracing::info!(
-            agreement_id = %agreement.id,
-            indexing_request_id = %request.id,
-            "Queued reassessment for the request of an agreement its indexer cancelled"
-        ),
-        Err(err) => tracing::warn!(
-            agreement_id = %agreement.id,
-            indexing_request_id = %request.id,
-            error = format!("{err:#}"),
-            "Failed to queue reassessment for the request of an agreement its indexer cancelled; \
-             the daily pass reassesses it"
-        ),
-    }
-}
-
-/// Whether a reassessment is queued or running for `request`. When the queue can't be listed
-/// the answer is no, as a duplicate only repeats a reassessment.
-async fn reassessment_queued<W: WorkerQueue + Sync>(
-    worker_queue: &W,
-    request: &crate::registry::IndexingRequest,
-) -> bool {
-    match worker_queue.queued_reassessments().await {
-        Ok(queued) => queued.contains(&request.id),
+        Ok(_) => {
+            tracing::info!(
+                agreement_id = %agreement.id,
+                indexing_request_id = %request.id,
+                "Queued reassessment for the request of an agreement its indexer cancelled"
+            );
+            true
+        }
         Err(err) => {
             tracing::warn!(
+                agreement_id = %agreement.id,
                 indexing_request_id = %request.id,
                 error = format!("{err:#}"),
-                "Can't list queued reassessments; queueing without that check"
+                "Failed to queue reassessment for the request of an agreement its indexer \
+                 cancelled; the daily pass reassesses it"
             );
             false
         }
+    }
+}
+
+/// The requests with a reassessment queued or running, listed from the job queue the first time
+/// a page of changes asks, as listing reads every unfinished job. A page's changes are all applied
+/// before any is finalized, so a reassessment listed as waiting will see every one of them.
+#[derive(Debug, Default)]
+struct QueuedReassessments {
+    listed: Option<std::collections::HashSet<dipper_core::ids::IndexingRequestId>>,
+}
+
+impl QueuedReassessments {
+    /// Whether a reassessment is queued or running for `request`. When the queue can't be listed
+    /// none counts as queued for the rest of the page, as a duplicate only repeats a
+    /// reassessment.
+    async fn contains<W: WorkerQueue + Sync>(
+        &mut self,
+        worker_queue: &W,
+        request: &crate::registry::IndexingRequest,
+    ) -> bool {
+        if self.listed.is_none() {
+            let listed = match worker_queue.queued_reassessments().await {
+                Ok(listed) => listed,
+                Err(err) => {
+                    tracing::warn!(
+                        indexing_request_id = %request.id,
+                        error = format!("{err:#}"),
+                        "Can't list queued reassessments; queueing without that check"
+                    );
+                    std::collections::HashSet::new()
+                }
+            };
+            self.listed = Some(listed);
+        }
+        self.listed
+            .as_ref()
+            .is_some_and(|listed| listed.contains(&request.id))
+    }
+
+    /// Count the reassessment just queued for `request_id` as queued for the rest of the page.
+    fn add(&mut self, request_id: dipper_core::ids::IndexingRequestId) {
+        self.listed
+            .get_or_insert_with(Default::default)
+            .insert(request_id);
     }
 }
 
@@ -1810,6 +1852,7 @@ where
         chain_client,
         config,
         &live_checks.queue,
+        &mut QueuedReassessments::default(),
     )
     .await?;
     Ok(queued)
@@ -3443,6 +3486,8 @@ mod tests {
         /// Requests listed as already having a reassessment queued or running.
         reassessing: Arc<Mutex<std::collections::HashSet<IndexingRequestId>>>,
         fail_reassessments: Arc<std::sync::atomic::AtomicBool>,
+        /// How many times the queued reassessments were listed.
+        listings: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     /// A reassessment queued: the request, and the target it was queued with.
@@ -3490,12 +3535,16 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((indexing_request_id, num_candidates));
+            // Listed from now on, as the real queue lists the jobs waiting in it.
+            self.reassessing.lock().unwrap().insert(indexing_request_id);
             Ok(dipper_pgmq::JobId::default())
         }
 
         async fn queued_reassessments(
             &self,
         ) -> anyhow::Result<std::collections::HashSet<IndexingRequestId>> {
+            self.listings
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(self.reassessing.lock().unwrap().clone())
         }
 
@@ -3614,10 +3663,24 @@ mod tests {
         registry: &MockRegistry,
         queue: MockWorkerQueue,
     ) -> DrainOutcome {
+        drain_page_holding(vec![snapshot], registry, queue).await
+    }
+
+    /// Drain 1 page holding `snapshots` into `registry`, queueing on `queue`.
+    async fn drain_page_holding(
+        snapshots: Vec<AgreementStateSnapshot>,
+        registry: &MockRegistry,
+        queue: MockWorkerQueue,
+    ) -> DrainOutcome {
         let event_source = super::super::chain_events::mock::MockEventSource::new();
-        event_source.set_latest_block(snapshot.last_state_change_block + 10);
+        let last_block = snapshots
+            .iter()
+            .map(|snapshot| snapshot.last_state_change_block)
+            .max()
+            .unwrap_or_default();
+        event_source.set_latest_block(last_block + 10);
         event_source.set_latest_block_timestamp(Some(1_700_000_000));
-        event_source.add_snapshots(vec![snapshot]);
+        event_source.add_snapshots(snapshots);
         let (_tx_stop, mut rx_stop) = mpsc::channel::<()>(1);
         drain_once(
             &mut Cursor::genesis(),
@@ -3735,6 +3798,60 @@ mod tests {
             .find(|line| line.contains("queue unavailable"))
             .unwrap_or_else(|| panic!("the failed queueing is logged:\n{logs}"));
         assert!(line.contains("WARN"), "{line}");
+    }
+
+    /// Listing the queued reassessments reads every unfinished job, so a page of indexer cancels
+    /// lists them once, not once per cancel.
+    #[tokio::test]
+    async fn a_page_of_indexer_cancels_lists_the_queued_reassessments_once() {
+        let registry = MockRegistry::new();
+        let queue = MockWorkerQueue::default();
+        let mut snapshots = Vec::new();
+        let mut requests = Vec::new();
+        for _ in 0..3 {
+            let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+            registry.add_agreement(agreement_id, IndexingAgreementStatus::AcceptedOnChain);
+            let request_id = IndexingRequestId::new();
+            registry.set_agreement_request_id(agreement_id, request_id);
+            requests.push((request_id, REQUEST_TARGET));
+            snapshots.push(make_snapshot(
+                agreement_id,
+                AgreementState::CanceledByServiceProvider,
+                Address::ZERO,
+            ));
+        }
+
+        drain_page_holding(snapshots, &registry, queue.clone()).await;
+
+        let mut queued = queue.reassessments();
+        queued.sort();
+        requests.sort();
+        assert_eq!(queued, requests);
+        assert_eq!(queue.listings.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// 2 indexer cancels on 1 request in a page queue 1 reassessment, as the first one queued
+    /// counts as queued for the second.
+    #[tokio::test]
+    async fn indexer_cancels_on_1_request_in_a_page_queue_1_reassessment() {
+        let registry = MockRegistry::new();
+        let queue = MockWorkerQueue::default();
+        let request_id = IndexingRequestId::new();
+        let mut snapshots = Vec::new();
+        for _ in 0..2 {
+            let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+            registry.add_agreement(agreement_id, IndexingAgreementStatus::AcceptedOnChain);
+            registry.set_agreement_request_id(agreement_id, request_id);
+            snapshots.push(make_snapshot(
+                agreement_id,
+                AgreementState::CanceledByServiceProvider,
+                Address::ZERO,
+            ));
+        }
+
+        drain_page_holding(snapshots, &registry, queue.clone()).await;
+
+        assert_eq!(queue.reassessments(), [(request_id, REQUEST_TARGET)]);
     }
 
     /// A cancel by dipper itself needs no reassessment from here: the paths that end an agreement
