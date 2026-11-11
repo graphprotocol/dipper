@@ -44,7 +44,7 @@ All environment variables used by the CLI are prefixed with `DIPS_`. The main co
 - `DIPS_SIGNING_KEY`: The secret key used to sign requests (in hex format)
 - `DIPS_IPFS_URL`: The IPFS API that subgraph manifests are read from (defaults to `https://ipfs.thegraph.com`)
 
-Environment variables take precedence over command-line arguments and can be used to avoid repeating common configuration:
+A command-line flag takes precedence over the matching environment variable. Environment variables can be used to avoid repeating common configuration:
 
 ```bash
 # Set the server URL in the environment
@@ -56,15 +56,17 @@ dipper-cli init keygen --output .env.unencrypted
 
 #### .env File
 
-You can use a `.env` file to store your configuration. The CLI will automatically look for a `.env` file in the current directory. You can also specify a custom path using the `--env-file` flag:
+You can use a `.env` file to store your configuration. The CLI automatically loads the first `.env` file it finds in the current directory or any directory above it. The `indexings` and `agreements` commands also take a custom path with the `--env-file` flag:
 
 ```bash
-dipper-cli --env-file /path/to/.env <command>
+dipper-cli indexings --env-file /path/to/.env <subcommand>
 ```
+
+The automatically found file is loaded first and the `--env-file` file after it, and neither replaces a variable that is already set. So a setting is taken from, in order: a command-line flag, then the shell environment, then the automatically found `.env` file, then the `--env-file` file. A value in the shell or in the automatically found file therefore beats the same key in the `--env-file` file.
 
 #### CLI Flags
 
-The CLI provides several flags for authentication:
+The `indexings` and `agreements` commands take these flags for authentication, before or after their subcommand; `init keygen` and `init placeholder` take only `--server-url`:
 
 - `--server-url <URL>`: Specify the DIPs gateway server URL
 - `--signing-key <KEY>`: Provide the signing key in hex format
@@ -84,7 +86,7 @@ export DIPS_SIGNING_KEY=$(op read "op://mainnet/dips/signing-key-1")
 dipper-cli <command>
 
 # Using CLI flags
-dipper-cli --signing-key "$(op read "op://mainnet/dips/signing-key-1")" <command>
+dipper-cli indexings --signing-key "$(op read "op://mainnet/dips/signing-key-1")" <subcommand>
 ```
 
 This approach is useful for:
@@ -103,10 +105,18 @@ DIPS_SERVER_URL=https://admin.dips.example.com
 DIPS_SIGNING_KEY={{ op://mainnet/dips/signing-key-1 }}
 ```
 
-2. Use `op inject` to inject the secrets:
+2. Use `op inject` to write a copy of the template with the secrets filled in, then point the CLI at that copy:
 ```bash
-op inject --in-file .env.template --out-file .env.injected -- dipper-cli --env-file .env.injected <command>
+op inject --in-file .env.template --out-file .env.injected
+dipper-cli indexings --env-file .env.injected <subcommand>
 ```
+
+3. The injected file holds the signing key in plain text, so delete it once you are done:
+```bash
+rm .env.injected
+```
+
+As with any `--env-file` file, a value already set in the shell or in an automatically found `.env` file beats the one in `.env.injected`.
 
 This approach is beneficial when:
 - Managing multiple secrets
@@ -137,6 +147,7 @@ This command will:
 > [!IMPORTANT]
 > When saving to a file, the command will display a security warning about storing private keys in environment files. 
 > Consider using a secure credential manager instead.
+> On Linux and macOS the file is left readable and writable by your user only. If it replaces a file that others could read, a process that already had that file open can still read the new key, so write to a new file where that matters.
 
 ### Creating 1Password Templates
 
@@ -160,10 +171,11 @@ DIPS_SERVER_URL=https://admin.dips.example.com
 DIPS_SIGNING_KEY={{ op://mainnet/dips/signing-key-1 }}
 ```
 
-To use the generated template:
+To use the generated template, inject the secrets into a copy, run the command with it, then delete the copy, which holds the signing key in plain text:
 ```bash
-# Inject secrets and run a command
-op inject --in-file .env.template --out-file .env.injected -- dipper-cli --env-file .env.injected <command>
+op inject --in-file .env.template --out-file .env.injected
+dipper-cli indexings --env-file .env.injected <subcommand>
+rm .env.injected
 ```
 
 ## Development
@@ -195,8 +207,8 @@ You can build and run the CLI directly using Cargo:
 cargo run --bin dipper-cli <command> [options]
 
 # Examples:
-cargo run --bin dipper-cli init --server-url https://admin.dips.example.com
-cargo run --bin dipper-cli --env-file .env indexings list
+cargo run --bin dipper-cli init keygen --server-url https://admin.dips.example.com
+cargo run --bin dipper-cli indexings --env-file .env list
 ```
 
 ### Debugging the CLI
