@@ -908,11 +908,11 @@ mod tests {
         declined.insert(selected, declined_here.clone());
         let context = SelectionContext {
             declined_indexers: declined,
-            ..Default::default()
+            ..with_chain()
         };
         let only_this_deployment = SelectionContext {
             declined_indexers: HashMap::from([(selected, declined_here)]),
-            ..Default::default()
+            ..with_chain()
         };
 
         let body = selection_request_body(selected, &context).await;
@@ -959,14 +959,14 @@ mod tests {
         pending.insert(selected, vec![other_member, member]);
         let context = SelectionContext {
             pending_agreements: pending,
-            ..Default::default()
+            ..with_chain()
         };
         let only_this_deployment = SelectionContext {
             pending_agreements: HashMap::from([(
                 selected,
                 vec![member, other_member, listed_elsewhere],
             )]),
-            ..Default::default()
+            ..with_chain()
         };
 
         let body = selection_request_body(selected, &context).await;
