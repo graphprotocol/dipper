@@ -4634,7 +4634,7 @@ mod tests {
 
         let config = crate::config::ChainListenerConfig {
             enabled: true,
-            subgraph_endpoint: "http://localhost:8000/subgraphs/name/test".parse().unwrap(),
+            subgraph_endpoint: Some("http://localhost:8000/subgraphs/name/test".parse().unwrap()),
             subgraph_api_key: None,
             chain_id: 1337,
             poll_interval: Duration::from_millis(20),
