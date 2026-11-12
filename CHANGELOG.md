@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.2.11](https://github.com/graphprotocol/dipper/compare/v0.2.10...v0.2.11) (2026-11-12)
+
+
+### Fixed
+
+* **admin:** refuse a signed admin request older than the newest ([#799](https://github.com/graphprotocol/dipper/issues/799)) ([08b9a52](https://github.com/graphprotocol/dipper/commit/08b9a525b1f4959dc4e6a77527130a8b029b1e00))
+* **admin:** stop signed admin requests being reused or altered ([#798](https://github.com/graphprotocol/dipper/issues/798)) ([12da417](https://github.com/graphprotocol/dipper/commit/12da417047e5975775d5fef0fffbc1b772eabc4d))
+* **cli:** stop a found env file overriding --env-file ([#819](https://github.com/graphprotocol/dipper/issues/819)) ([d05b2a9](https://github.com/graphprotocol/dipper/commit/d05b2a9b03afc39f33ef4eb5c40be6ff6af7fe15))
+* **cli:** write the signing key file for its owner only ([#797](https://github.com/graphprotocol/dipper/issues/797)) ([a6c3b7b](https://github.com/graphprotocol/dipper/commit/a6c3b7b273b56092c5151fb80541e2d2ee3d926e))
+* **config:** refuse price ceilings above the agreement cap ([#816](https://github.com/graphprotocol/dipper/issues/816)) ([7ef51a2](https://github.com/graphprotocol/dipper/commit/7ef51a2d458e25d6ae1386e33266287dc9ccd833))
+* **config:** refuse to start with a fixed agreement length ([#803](https://github.com/graphprotocol/dipper/issues/803)) ([0c0a531](https://github.com/graphprotocol/dipper/commit/0c0a5310b8a9fd13c1bf8518402e3a291e7e0541))
+* **iisa:** stop the selection request growing with workload ([#813](https://github.com/graphprotocol/dipper/issues/813)) ([9d0c20b](https://github.com/graphprotocol/dipper/commit/9d0c20b571d536ce93d0a6098ca2b4c09c625808))
+* **listener:** keep polling fast when the agreement check fails ([#822](https://github.com/graphprotocol/dipper/issues/822)) ([d572033](https://github.com/graphprotocol/dipper/commit/d5720338fa74bb4534e99d9adc8b1f45feea3c0e))
+* **listener:** reassess a request when its indexer cancels ([#818](https://github.com/graphprotocol/dipper/issues/818)) ([b436ce1](https://github.com/graphprotocol/dipper/commit/b436ce11e61aed55b9e2f092972fc4a83c572670))
+* **listener:** retry skipped on-chain changes until they apply ([#804](https://github.com/graphprotocol/dipper/issues/804)) ([9dd9842](https://github.com/graphprotocol/dipper/commit/9dd9842043c032d31011db996f3656b014d7777a))
+* **logging:** log at info when RUST_LOG is unset ([#817](https://github.com/graphprotocol/dipper/issues/817)) ([c8f0012](https://github.com/graphprotocol/dipper/commit/c8f0012092b45a5c749d056113275d65e64d21e1))
+* **logs:** stop indexer-written text forging or flooding logs ([#806](https://github.com/graphprotocol/dipper/issues/806)) ([c131c29](https://github.com/graphprotocol/dipper/commit/c131c29a2d28452a0eabc4e095f0802f0812dc87))
+* **network:** cap the size of replies read from indexers ([#805](https://github.com/graphprotocol/dipper/issues/805)) ([0db2e14](https://github.com/graphprotocol/dipper/commit/0db2e14302c1533c6db82087764fd910e6c5e8eb))
+* **network:** refuse to call indexers at private addresses ([#807](https://github.com/graphprotocol/dipper/issues/807)) ([760239a](https://github.com/graphprotocol/dipper/commit/760239a1a25ebeab283725fad100010ccf81b7e1))
+* **offers:** refuse to send offers to private addresses ([#808](https://github.com/graphprotocol/dipper/issues/808)) ([017cf5e](https://github.com/graphprotocol/dipper/commit/017cf5ee1b42f10cca47e6dfcaa681420878745a))
+* **startup:** refuse to start without chain listener settings ([#810](https://github.com/graphprotocol/dipper/issues/810)) ([79d9a3a](https://github.com/graphprotocol/dipper/commit/79d9a3afb72a6c7546a5ac0237aef58124bccb28))
+* **worker:** log an error when a job fails for good ([#812](https://github.com/graphprotocol/dipper/issues/812)) ([ee2c77f](https://github.com/graphprotocol/dipper/commit/ee2c77fa00fb98c57cc97c3b8bacfe94bd0a026d))
+
+
+### Changed
+
+* **ci:** scan dependencies for known vulnerabilities ([#811](https://github.com/graphprotocol/dipper/issues/811)) ([5176cd4](https://github.com/graphprotocol/dipper/commit/5176cd4b97e2969f17481813838ad7914dd10b43))
+* **ci:** use the Postgres signing key already on the runner ([#801](https://github.com/graphprotocol/dipper/issues/801)) ([e1b453b](https://github.com/graphprotocol/dipper/commit/e1b453b07e362d9545448d713734ac6661fc7037))
+* **deps:** update rustix past its xattr memory advisory ([#826](https://github.com/graphprotocol/dipper/issues/826)) ([d01829d](https://github.com/graphprotocol/dipper/commit/d01829d06b681619c9197ca981f482775fb91a3c))
+
+
+### Documentation
+
+* **guides:** correct guides and comments the code contradicts ([#815](https://github.com/graphprotocol/dipper/issues/815)) ([4638ca9](https://github.com/graphprotocol/dipper/commit/4638ca9a6c6590f9f74c12ea2c3361cbbec48cf5))
+
+
+### Tests
+
+* **chain:** check contract declarations against the contracts ([#802](https://github.com/graphprotocol/dipper/issues/802)) ([0b0d2f5](https://github.com/graphprotocol/dipper/commit/0b0d2f5b419ca87cfe7ca84929c290c8eb9bd977))
+
 ## [0.2.10](https://github.com/graphprotocol/dipper/compare/v0.2.9...v0.2.10) (2026-11-10)
 
 
