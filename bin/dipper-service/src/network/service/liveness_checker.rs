@@ -60,6 +60,7 @@ use crate::{
     cancel_dispatch::{CancelReason, CancelStarted},
     chain_client::ChainClient,
     config::LivenessCheckerConfig,
+    indexer_addresses::{AddressRule, Refused},
     network::provider::NetworkProviderService,
     registry::{
         AgreementRegistry, IndexingAgreement, IndexingRequestRegistry, IndexingRequestStatus,
@@ -99,6 +100,8 @@ pub struct Ctx<R, W, C> {
     pub agreement_conf: Arc<crate::config::IndexingAgreementConfig>,
     /// Service configuration.
     pub config: LivenessCheckerConfig,
+    /// The addresses dipper may call indexers at.
+    pub addresses: AddressRule,
 }
 
 /// Create a new liveness checker service.
@@ -125,6 +128,7 @@ where
         network,
         agreement_conf,
         config,
+        addresses,
     } = ctx;
 
     let service = async move {
@@ -142,10 +146,7 @@ where
         const DB_UPDATE_TIMEOUT: Duration = Duration::from_secs(10);
         const QUEUE_PUSH_TIMEOUT: Duration = Duration::from_secs(10);
 
-        let http_client = reqwest::Client::builder()
-            .timeout(config.request_timeout)
-            .build()
-            .map_err(|e| anyhow::anyhow!("failed to build HTTP client: {e}"))?;
+        let http_client = http_client(&config, addresses)?;
         let mut uncancellable = Uncancellable::default();
         let mut breaker = UnreachableBreaker::default();
 
@@ -256,6 +257,18 @@ where
     };
 
     (Handle { tx_stop }, service)
+}
+
+/// The HTTP client the checker asks indexers with.
+fn http_client(
+    config: &LivenessCheckerConfig,
+    addresses: AddressRule,
+) -> anyhow::Result<reqwest::Client> {
+    addresses
+        .http_client()
+        .timeout(config.request_timeout)
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build HTTP client: {e}"))
 }
 
 /// Group agreements by indexer ID for batched status queries.
@@ -1156,11 +1169,16 @@ async fn query_indexer_status(
 
     let body = serde_json::json!({ "query": query });
 
+    // A refused address leads the error, so its log line can't be read as a network fault.
     let response = client
         .post(status_url)
         .json(&body)
         .send()
-        .await?
+        .await
+        .map_err(|err| match Refused::behind(&err).map(ToString::to_string) {
+            Some(refused) => anyhow::Error::new(err).context(refused),
+            None => err.into(),
+        })?
         .error_for_status()?;
 
     let limit = status_reply_limit_bytes(deployment_ids.len());
@@ -1238,6 +1256,7 @@ mod tests {
     use crate::{
         chain_client::{AgreementOnChain, ChainClient, ChainClientError},
         config::LivenessCheckerConfig,
+        indexer_addresses::AddressRule,
         registry::{
             AgreementFeeRate, IndexingAgreement, IndexingAgreementStatus, IndexingAgreementTerms,
             IndexingAgreementTermsMetadata, IndexingRequest, IndexingRequestRegistry,
@@ -1719,6 +1738,105 @@ mod tests {
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[&indexer_a].len(), 2);
         assert_eq!(groups[&indexer_b].len(), 1);
+    }
+
+    /// An indexer whose server reports its status, with `localhost`, which resolves only to
+    /// addresses on this machine, in its URL.
+    async fn status_by_name() -> (wiremock::MockServer, Url) {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/status"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"data": {"indexingStatuses": []}})),
+            )
+            .mount(&server)
+            .await;
+        let url = format!("http://localhost:{}/", server.address().port());
+        (server, url.parse().unwrap())
+    }
+
+    #[tokio::test]
+    async fn an_indexer_whose_name_resolves_only_to_addresses_that_are_not_public_is_unreachable() {
+        //* Given
+        let (server, url) = status_by_name().await;
+        let indexer_id: IndexerId = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            .parse()
+            .unwrap();
+        let network = crate::network::provider::NetworkProviderService::new(
+            crate::network::service::indexer_urls::Handle::for_test(
+                std::collections::BTreeMap::from([(indexer_id, url)]),
+            ),
+        );
+        let client =
+            super::http_client(&LivenessCheckerConfig::default(), AddressRule::PublicOnly).unwrap();
+
+        //* When
+        let logs = logged(async {
+            let probe = super::probe_indexer(&network, &client, &indexer_id, &[]).await;
+            assert!(matches!(probe, Probe::Unreachable));
+        })
+        .await;
+
+        //* Then the log line says the address was refused
+        assert!(
+            logs.contains("error=refused localhost: it resolves only to addresses that are not"),
+            "{logs}"
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn with_private_addresses_allowed_an_indexer_on_this_machine_is_asked_by_name() {
+        //* Given
+        let (_server, url) = status_by_name().await;
+        let client =
+            super::http_client(&LivenessCheckerConfig::default(), AddressRule::Any).unwrap();
+
+        //* When
+        let heights = super::query_indexer_status(&client, &url, &[]).await;
+
+        //* Then
+        assert!(heights.unwrap().is_empty());
+    }
+
+    /// The indexer's own address is judged when its URL is read from the subgraph, not here, so a
+    /// server on this machine can stand in for an indexer at a public address.
+    #[tokio::test]
+    async fn an_indexer_cannot_redirect_the_status_query_to_an_address_that_is_not_public() {
+        //* Given an internal service, and an indexer that redirects its status query there
+        let internal = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&internal)
+            .await;
+        let indexer = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/status"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(307)
+                    .insert_header("Location", format!("{}/admin", internal.uri()).as_str()),
+            )
+            .mount(&indexer)
+            .await;
+        let url: Url = format!("{}/", indexer.uri()).parse().unwrap();
+        let client =
+            super::http_client(&LivenessCheckerConfig::default(), AddressRule::PublicOnly).unwrap();
+
+        //* When
+        let heights = super::query_indexer_status(&client, &url, &[]).await;
+
+        //* Then
+        let calls = internal.received_requests().await.unwrap();
+        assert!(
+            calls.is_empty(),
+            "dipper followed the redirect and called {}",
+            calls[0].url
+        );
+        let err = heights.unwrap_err().to_string();
+        assert!(
+            err.starts_with("refused 127.0.0.1: not a public address"),
+            "{err}"
+        );
     }
 
     #[test]

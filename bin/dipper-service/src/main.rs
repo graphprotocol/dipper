@@ -26,6 +26,7 @@ mod chain_client;
 mod config;
 mod db;
 mod health;
+mod indexer_addresses;
 mod indexer_rpc_client;
 mod log_text;
 mod network;
@@ -226,6 +227,15 @@ pub async fn main() -> anyhow::Result<()> {
     //- The registry component
     let registry = RegistryProvider::new(db_conn.clone());
 
+    //- The addresses dipper may call indexers at
+    let addresses = indexer_addresses::AddressRule::new(conf.indexer_urls.allow_private_addresses);
+    if conf.indexer_urls.allow_private_addresses {
+        tracing::warn!(
+            "indexer_urls.allow_private_addresses is on: dipper calls indexers at private \
+             addresses too, which only a local network should allow"
+        );
+    }
+
     //- The indexer client component (signs each outbound proposal; see DipsIndexerClient).
     let indexer_client = indexer_rpc_client::DipsIndexerClient::with_config(
         conf.indexer_client,
@@ -247,27 +257,28 @@ pub async fn main() -> anyhow::Result<()> {
                 .expect("failed to build HTTP client");
             let mut attempt: u32 = 0;
             loop {
-                match network::service::indexer_urls::fetch_snapshot(
+                match network::service::indexer_urls::fetch_allowed(
                     &client,
                     &subgraph_endpoint,
                     api_key.as_deref(),
+                    addresses,
                 )
                 .await
                 {
-                    Ok(s) if !s.is_empty() => break s,
-                    Ok(s) if conf.indexer_urls.allow_empty_at_startup => {
+                    Ok(allowed) if !allowed.snapshot.is_empty() => break allowed.snapshot,
+                    Ok(allowed) if conf.indexer_urls.allow_empty_at_startup => {
                         tracing::warn!(
-                            "subgraph reports 0 registered indexers; starting with an empty \
-                             snapshot (network.allow_empty_at_startup)"
+                            "{}; starting with an empty snapshot (network.allow_empty_at_startup)",
+                            allowed.none_left()
                         );
-                        break s;
+                        break allowed.snapshot;
                     }
                     // An empty snapshot is useless at startup (no offer can be
                     // sent) and usually means a wrong endpoint: retry like an
                     // error. The refresh loop tolerates empties separately.
                     result => {
                         let err = match result {
-                            Ok(_) => anyhow::anyhow!("subgraph returned 0 registered indexers"),
+                            Ok(allowed) => anyhow::anyhow!(allowed.none_left()),
                             Err(err) => err,
                         };
                         if attempt < INDEXER_URLS_FETCH_MAX_RETRIES {
@@ -297,6 +308,7 @@ pub async fn main() -> anyhow::Result<()> {
                 endpoint: subgraph_endpoint,
                 api_key,
                 update_interval: conf.indexer_urls.update_interval,
+                addresses,
             },
             init_snapshot,
         )
@@ -600,6 +612,7 @@ pub async fn main() -> anyhow::Result<()> {
                 network: network_provider.clone(),
                 agreement_conf: liveness_agreement_conf.clone(),
                 config: lc_conf.clone(),
+                addresses,
             };
             let (handle, service) = network::service::liveness_checker::new(ctx);
             Some((handle, service))
@@ -615,6 +628,7 @@ pub async fn main() -> anyhow::Result<()> {
                 registry: registry.clone(),
                 network: network_provider.clone(),
                 config: watcher_conf.clone(),
+                addresses,
             };
             Some(network::service::dips_info_watcher::new(ctx))
         }

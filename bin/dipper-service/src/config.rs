@@ -1533,6 +1533,12 @@ pub struct IndexerUrlsConfig {
     /// any indexer has registered (e.g. local networks); leave off elsewhere.
     #[serde(default)]
     pub allow_empty_at_startup: bool,
+
+    /// Call indexers at addresses that are not public too, such as `10.0.0.5` or `localhost`.
+    /// For local networks whose indexers sit at private addresses; leave off elsewhere, so no
+    /// indexer can point dipper at a service inside its own network.
+    #[serde(default)]
+    pub allow_private_addresses: bool,
 }
 
 /// The configuration for the signer
@@ -2828,6 +2834,21 @@ mod tests {
             .map(|line| format!("{}\n", line.strip_prefix("    ").unwrap_or(line)))
             .collect();
         serde_json::from_str(&json).expect("config.json is JSON")
+    }
+
+    #[test]
+    fn private_indexer_addresses_are_refused_unless_the_config_allows_them() {
+        let example =
+            serde_json::from_value::<IndexerUrlsConfig>(example_config()["indexer_urls"].clone())
+                .expect("the example's indexer_urls section is a valid indexer URLs config");
+        let unset = serde_json::from_value::<IndexerUrlsConfig>(serde_json::json!({
+            "subgraph_endpoint": "https://gateway.example.com/subgraphs/id/x",
+            "update_interval": 60,
+        }))
+        .expect("indexer URLs config");
+
+        assert!(!example.allow_private_addresses);
+        assert!(!unset.allow_private_addresses);
     }
 
     #[test]

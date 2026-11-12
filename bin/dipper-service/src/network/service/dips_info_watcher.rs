@@ -22,6 +22,7 @@ use super::{
 };
 use crate::{
     config::DipsInfoWatcherConfig,
+    indexer_addresses::{AddressRule, Refused},
     network::provider::NetworkProviderService,
     registry::{DipsInfoChecks, DipsInfoRegistry},
 };
@@ -56,6 +57,8 @@ pub struct Ctx<R> {
     pub network: NetworkProviderService,
     /// Service configuration.
     pub config: DipsInfoWatcherConfig,
+    /// The addresses dipper may call indexers at.
+    pub addresses: AddressRule,
 }
 
 /// Create a new DIPs info watcher. Returns a handle for stopping it and a future that must be
@@ -69,6 +72,7 @@ where
         registry,
         network,
         config,
+        addresses,
     } = ctx;
 
     let service = async move {
@@ -81,10 +85,7 @@ where
 
         let mut timer = tokio::time::interval(config.interval);
         timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let http_client = reqwest::Client::builder()
-            .timeout(config.request_timeout)
-            .build()
-            .map_err(|e| anyhow::anyhow!("failed to build HTTP client: {e}"))?;
+        let http_client = http_client(&config, addresses)?;
         let mut cycles = Cycles::default();
 
         loop {
@@ -105,6 +106,18 @@ where
     };
 
     (Handle { tx_stop }, service)
+}
+
+/// The HTTP client the watcher asks indexers with.
+fn http_client(
+    config: &DipsInfoWatcherConfig,
+    addresses: AddressRule,
+) -> anyhow::Result<reqwest::Client> {
+    addresses
+        .http_client()
+        .timeout(config.request_timeout)
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build HTTP client: {e}"))
 }
 
 /// Run 1 cycle: ask every agreement holder, and every indexer still blocked, for its DIPs info,
@@ -426,6 +439,15 @@ async fn ask_dips_info(
         .get(url)
         .send()
         .await
+        .inspect_err(|e| {
+            if let Some(refused) = Refused::behind(e) {
+                tracing::warn!(
+                    indexer_url = %indexer_url,
+                    error = %refused,
+                    "refused to ask an indexer for its DIPs info at an address that is not public"
+                );
+            }
+        })
         .and_then(reqwest::Response::error_for_status)
         .map_err(|e| e.to_string())?;
     let body = indexer_reply::read_body(response, DIPS_INFO_REPLY_LIMIT_BYTES)
@@ -670,9 +692,10 @@ mod tests {
         let network = NetworkProviderService::new(indexer_urls::Handle::for_test(snapshot));
 
         //* When
+        let http_client = http_client(&DipsInfoWatcherConfig::default(), AddressRule::Any).unwrap();
         let mut missing = missing_dips_info(
             &network,
-            &reqwest::Client::new(),
+            &http_client,
             &[answers, gone, invalid, unregistered],
             2,
         )
@@ -840,6 +863,7 @@ mod tests {
                 request_timeout: Duration::from_secs(60),
                 ..DipsInfoWatcherConfig::default()
             },
+            addresses: AddressRule::Any,
         });
         let task = tokio::spawn(service);
         while slow
@@ -1002,5 +1026,100 @@ mod tests {
     fn a_block_lasts_3_intervals_and_at_least_an_hour() {
         assert_eq!(block_duration(Duration::from_secs(300)), HOUR);
         assert_eq!(block_duration(2 * HOUR), 6 * HOUR);
+    }
+
+    /// An indexer whose server answers /dips/info readably, with `localhost`, which resolves only
+    /// to addresses on this machine, in its URL.
+    async fn readable_by_name() -> (MockServer, url::Url) {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/dips/info"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        let url = format!("http://localhost:{}/", server.address().port());
+        (server, url.parse().unwrap())
+    }
+
+    #[tokio::test]
+    async fn an_indexer_whose_name_resolves_only_to_addresses_that_are_not_public_is_not_asked() {
+        //* Given
+        let (server, url) = readable_by_name().await;
+        let http_client =
+            http_client(&DipsInfoWatcherConfig::default(), AddressRule::PublicOnly).unwrap();
+
+        //* When
+        let mut answer = Ok(());
+        let logs = crate::test_support::logged(async {
+            answer = ask_dips_info(&http_client, &url).await;
+        })
+        .await;
+
+        //* Then
+        assert!(answer.is_err());
+        assert!(
+            logs.contains("error=refused localhost: it resolves only to addresses that are not"),
+            "{logs}"
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn with_private_addresses_allowed_an_indexer_on_this_machine_is_asked_by_name() {
+        //* Given
+        let (_server, url) = readable_by_name().await;
+        let http_client = http_client(&DipsInfoWatcherConfig::default(), AddressRule::Any).unwrap();
+
+        //* When
+        let answer = ask_dips_info(&http_client, &url).await;
+
+        //* Then
+        assert_eq!(answer, Ok(()));
+    }
+
+    /// The indexer's own address is judged when its URL is read from the subgraph, not here, so a
+    /// server on this machine can stand in for an indexer at a public address.
+    #[tokio::test]
+    async fn an_indexer_cannot_redirect_the_dips_info_request_to_an_address_that_is_not_public() {
+        //* Given an internal service the indexer has no way to reach itself
+        let internal = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/delete-everything"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&internal)
+            .await;
+        //* And an indexer whose server answers /dips/info with a redirect to it
+        let indexer = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/dips/info"))
+            .respond_with(ResponseTemplate::new(302).insert_header(
+                "Location",
+                format!("{}/admin/delete-everything?confirm=yes", internal.uri()).as_str(),
+            ))
+            .mount(&indexer)
+            .await;
+        let url = format!("{}/", indexer.uri()).parse().unwrap();
+        let http_client =
+            http_client(&DipsInfoWatcherConfig::default(), AddressRule::PublicOnly).unwrap();
+
+        //* When
+        let mut answer = Ok(());
+        let logs = crate::test_support::logged(async {
+            answer = ask_dips_info(&http_client, &url).await;
+        })
+        .await;
+
+        //* Then the internal service must not have been called
+        let calls = internal.received_requests().await.unwrap();
+        assert!(
+            calls.is_empty(),
+            "dipper followed the redirect and called {} (answer: {answer:?})",
+            calls[0].url
+        );
+        assert!(answer.is_err());
+        assert!(
+            logs.contains("error=refused 127.0.0.1: not a public address"),
+            "{logs}"
+        );
     }
 }
