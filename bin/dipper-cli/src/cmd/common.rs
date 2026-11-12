@@ -6,6 +6,7 @@ use std::{
 use clap::{Arg, ArgMatches, arg, parser::ValueSource, value_parser};
 use dipper_core::config::secret_key_from_str;
 use figment::{Figment, providers::Serialized};
+use thegraph_core::alloy::primitives::ChainId;
 use url::Url;
 
 use crate::config::Config;
@@ -67,7 +68,7 @@ struct Loaded {
 }
 
 /// The flags that set a setting each: `--server-url` sets `server_url`.
-const SETTING_FLAGS: [&str; 3] = ["server-url", "signing-key", "ipfs-url"];
+const SETTING_FLAGS: [&str; 4] = ["server-url", "signing-key", "ipfs-url", "protocol-chain-id"];
 
 /// Where a setting's value came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,6 +173,10 @@ fn same_value(setting: &str, a: &str, b: &str) -> bool {
         },
         "signing_key" => match (secret_key_from_str(a), secret_key_from_str(b)) {
             (Ok(a), Ok(b)) => a.to_bytes() == b.to_bytes(),
+            _ => a == b,
+        },
+        "protocol_chain_id" => match (a.parse::<ChainId>(), b.parse::<ChainId>()) {
+            (Ok(a), Ok(b)) => a == b,
             _ => a == b,
         },
         _ => a == b,
@@ -337,6 +342,47 @@ mod tests {
         assert_eq!(loaded.conf.server_url.as_str(), "https://staging.example/");
         assert_eq!(loaded.conf.ipfs_url, default_ipfs_url());
         assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+    }
+
+    /// The chain a request is signed for comes from the shell or the env file like any other
+    /// setting, and the shell wins with a warning.
+    #[test]
+    fn the_protocol_chain_is_read_from_the_shell_and_from_an_env_file() {
+        let folder = Folder::new("protocol-chain");
+        let staging = folder.file(
+            "staging",
+            &format!(
+                "DIPS_SERVER_URL=https://staging.example\nDIPS_SIGNING_KEY={KEY}\n\
+                 DIPS_PROTOCOL_CHAIN_ID=421614\n"
+            ),
+        );
+
+        let from_file = load(&["--env-file", path(&staging)], &[], &folder.0);
+        let from_shell = load(
+            &["--env-file", path(&staging)],
+            &[("DIPS_PROTOCOL_CHAIN_ID", "42161")],
+            &folder.0,
+        );
+        let same_in_both = load(
+            &["--env-file", path(&staging)],
+            &[("DIPS_PROTOCOL_CHAIN_ID", "0421614")],
+            &folder.0,
+        );
+
+        assert_eq!(from_file.conf.protocol_chain_id, Some(421_614));
+        assert_eq!(from_shell.conf.protocol_chain_id, Some(42_161));
+        assert_eq!(
+            from_shell.warnings,
+            [format!(
+                "warning: ignoring DIPS_PROTOCOL_CHAIN_ID from {}: the shell environment sets it",
+                staging.display()
+            )]
+        );
+        assert!(
+            same_in_both.warnings.is_empty(),
+            "{:?}",
+            same_in_both.warnings
+        );
     }
 
     /// A file in a directory above the current one is never read, so one left in a home folder or
