@@ -337,7 +337,8 @@ pub mod fake_impl {
                 payer: Address::new(<[u8; 20]>::dummy_with_rng(config, rng)),
                 service_provider: Address::new(<[u8; 20]>::dummy_with_rng(config, rng)),
                 data_service: Address::new(<[u8; 20]>::dummy_with_rng(config, rng)),
-                // deadline and ends_at are cast to bigint in queries, so constrain them
+                // deadline is cast to bigint in queries, so constrain it; ends_at, which no query
+                // reads, is kept to the same range
                 deadline: bigint_safe_u64(config, rng),
                 ends_at: bigint_safe_u64(config, rng),
                 max_initial_tokens: bigint_safe_u256(config, rng),

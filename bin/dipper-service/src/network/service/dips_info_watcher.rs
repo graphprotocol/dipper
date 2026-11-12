@@ -16,12 +16,21 @@ use tokio::{
     time::{Instant, MissedTickBehavior},
 };
 
-use super::liveness_checker::{UNREACHABLE_CLEAR_CYCLES, unreachable_trips};
+use super::{
+    indexer_reply,
+    liveness_checker::{UNREACHABLE_CLEAR_CYCLES, unreachable_trips},
+};
 use crate::{
     config::DipsInfoWatcherConfig,
+    indexer_addresses::{AddressRule, Refused},
     network::provider::NetworkProviderService,
     registry::{DipsInfoChecks, DipsInfoRegistry},
 };
+
+/// The longest `/dips/info` reply that is read. A real one is about 55 bytes for each network the
+/// indexer prices, so this fits over 1,000 networks. It is kept that close because parsing a
+/// reply can take about 16 times its length in memory, and several are read at once.
+const DIPS_INFO_REPLY_LIMIT_BYTES: usize = 64 * 1024;
 
 /// Handle for controlling the DIPs info watcher's lifecycle.
 #[derive(Clone)]
@@ -48,6 +57,8 @@ pub struct Ctx<R> {
     pub network: NetworkProviderService,
     /// Service configuration.
     pub config: DipsInfoWatcherConfig,
+    /// The addresses dipper may call indexers at.
+    pub addresses: AddressRule,
 }
 
 /// Create a new DIPs info watcher. Returns a handle for stopping it and a future that must be
@@ -61,6 +72,7 @@ where
         registry,
         network,
         config,
+        addresses,
     } = ctx;
 
     let service = async move {
@@ -73,10 +85,7 @@ where
 
         let mut timer = tokio::time::interval(config.interval);
         timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let http_client = reqwest::Client::builder()
-            .timeout(config.request_timeout)
-            .build()
-            .map_err(|e| anyhow::anyhow!("failed to build HTTP client: {e}"))?;
+        let http_client = http_client(&config, addresses)?;
         let mut cycles = Cycles::default();
 
         loop {
@@ -97,6 +106,18 @@ where
     };
 
     (Handle { tx_stop }, service)
+}
+
+/// The HTTP client the watcher asks indexers with.
+fn http_client(
+    config: &DipsInfoWatcherConfig,
+    addresses: AddressRule,
+) -> anyhow::Result<reqwest::Client> {
+    addresses
+        .http_client()
+        .timeout(config.request_timeout)
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build HTTP client: {e}"))
 }
 
 /// Run 1 cycle: ask every agreement holder, and every indexer still blocked, for its DIPs info,
@@ -418,9 +439,20 @@ async fn ask_dips_info(
         .get(url)
         .send()
         .await
+        .inspect_err(|e| {
+            if let Some(refused) = Refused::behind(e) {
+                tracing::warn!(
+                    indexer_url = %indexer_url,
+                    error = %refused,
+                    "refused to ask an indexer for its DIPs info at an address that is not public"
+                );
+            }
+        })
         .and_then(reqwest::Response::error_for_status)
         .map_err(|e| e.to_string())?;
-    let body = response.bytes().await.map_err(|e| e.to_string())?;
+    let body = indexer_reply::read_body(response, DIPS_INFO_REPLY_LIMIT_BYTES)
+        .await
+        .map_err(|e| e.to_string())?;
     readable_dips_info(&body).map_err(str::to_string)
 }
 
@@ -660,9 +692,10 @@ mod tests {
         let network = NetworkProviderService::new(indexer_urls::Handle::for_test(snapshot));
 
         //* When
+        let http_client = http_client(&DipsInfoWatcherConfig::default(), AddressRule::Any).unwrap();
         let mut missing = missing_dips_info(
             &network,
-            &reqwest::Client::new(),
+            &http_client,
             &[answers, gone, invalid, unregistered],
             2,
         )
@@ -673,6 +706,69 @@ mod tests {
         let mut expected = vec![gone, invalid, unregistered];
         expected.sort();
         assert_eq!(missing, expected);
+    }
+
+    #[tokio::test]
+    async fn a_dips_info_reply_over_the_size_limit_is_not_read() {
+        //* Given a readable reply, padded past the limit
+        let server = MockServer::start().await;
+        let padding = "x".repeat(DIPS_INFO_REPLY_LIMIT_BYTES);
+        Mock::given(method("GET"))
+            .and(path("/dips/info"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(format!(r#"{{"note": "{padding}"}}"#)),
+            )
+            .mount(&server)
+            .await;
+        let url = format!("{}/", server.uri()).parse().unwrap();
+
+        //* When
+        let answer = ask_dips_info(&reqwest::Client::new(), &url).await;
+
+        //* Then
+        let why = answer.expect_err("a reply over the limit must not be read");
+        assert!(why.contains("longer than the limit"), "{why}");
+    }
+
+    #[tokio::test]
+    async fn the_dips_info_limit_fits_a_real_reply_and_little_more() {
+        //* Given the reply of an indexer that prices 200 networks, more than any does
+        let prices: Vec<String> = (0..200)
+            .map(|n| format!(r#""network-number-{n}": "450.5""#))
+            .collect();
+        let networks: Vec<String> = (0..200)
+            .map(|n| format!(r#""network-number-{n}""#))
+            .collect();
+        let real = format!(
+            r#"{{"pricing": {{"min_grt_per_30_days": {{{}}}, "min_grt_per_billion_entities_per_30_days": "2000"}}, "supported_networks": [{}]}}"#,
+            prices.join(", "),
+            networks.join(", ")
+        );
+        //* And a readable reply 16 times as long
+        let padded = format!(r#"{{"note": "{}"}}"#, "x".repeat(16 * real.len()));
+        let honest = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/dips/info"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(real))
+            .mount(&honest)
+            .await;
+        let bloated = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/dips/info"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(padded))
+            .mount(&bloated)
+            .await;
+        let url = |server: &MockServer| format!("{}/", server.uri()).parse().unwrap();
+        let client = reqwest::Client::new();
+
+        //* When
+        let real_answer = ask_dips_info(&client, &url(&honest)).await;
+        let padded_answer = ask_dips_info(&client, &url(&bloated)).await;
+
+        //* Then
+        assert_eq!(real_answer, Ok(()));
+        let why = padded_answer.expect_err("a reply 16 times a large real one must not be read");
+        assert!(why.contains("longer than the limit"), "{why}");
     }
 
     #[tokio::test]
@@ -763,10 +859,11 @@ mod tests {
             registry,
             network: NetworkProviderService::new(indexer_urls::Handle::for_test(snapshot)),
             config: DipsInfoWatcherConfig {
-                enabled: true,
+                enabled: Some(true),
                 request_timeout: Duration::from_secs(60),
                 ..DipsInfoWatcherConfig::default()
             },
+            addresses: AddressRule::Any,
         });
         let task = tokio::spawn(service);
         while slow
@@ -857,7 +954,7 @@ mod tests {
         };
         let network = NetworkProviderService::new(indexer_urls::Handle::for_test(BTreeMap::new()));
         let config = DipsInfoWatcherConfig {
-            enabled: true,
+            enabled: Some(true),
             ..DipsInfoWatcherConfig::default()
         };
 
@@ -902,7 +999,7 @@ mod tests {
         };
         let network = NetworkProviderService::new(indexer_urls::Handle::for_test(BTreeMap::new()));
         let config = DipsInfoWatcherConfig {
-            enabled: true,
+            enabled: Some(true),
             ..DipsInfoWatcherConfig::default()
         };
 
@@ -929,5 +1026,100 @@ mod tests {
     fn a_block_lasts_3_intervals_and_at_least_an_hour() {
         assert_eq!(block_duration(Duration::from_secs(300)), HOUR);
         assert_eq!(block_duration(2 * HOUR), 6 * HOUR);
+    }
+
+    /// An indexer whose server answers /dips/info readably, with `localhost`, which resolves only
+    /// to addresses on this machine, in its URL.
+    async fn readable_by_name() -> (MockServer, url::Url) {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/dips/info"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        let url = format!("http://localhost:{}/", server.address().port());
+        (server, url.parse().unwrap())
+    }
+
+    #[tokio::test]
+    async fn an_indexer_whose_name_resolves_only_to_addresses_that_are_not_public_is_not_asked() {
+        //* Given
+        let (server, url) = readable_by_name().await;
+        let http_client =
+            http_client(&DipsInfoWatcherConfig::default(), AddressRule::PublicOnly).unwrap();
+
+        //* When
+        let mut answer = Ok(());
+        let logs = crate::test_support::logged(async {
+            answer = ask_dips_info(&http_client, &url).await;
+        })
+        .await;
+
+        //* Then
+        assert!(answer.is_err());
+        assert!(
+            logs.contains("error=refused localhost: it resolves only to addresses that are not"),
+            "{logs}"
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn with_private_addresses_allowed_an_indexer_on_this_machine_is_asked_by_name() {
+        //* Given
+        let (_server, url) = readable_by_name().await;
+        let http_client = http_client(&DipsInfoWatcherConfig::default(), AddressRule::Any).unwrap();
+
+        //* When
+        let answer = ask_dips_info(&http_client, &url).await;
+
+        //* Then
+        assert_eq!(answer, Ok(()));
+    }
+
+    /// The indexer's own address is judged when its URL is read from the subgraph, not here, so a
+    /// server on this machine can stand in for an indexer at a public address.
+    #[tokio::test]
+    async fn an_indexer_cannot_redirect_the_dips_info_request_to_an_address_that_is_not_public() {
+        //* Given an internal service the indexer has no way to reach itself
+        let internal = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/delete-everything"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&internal)
+            .await;
+        //* And an indexer whose server answers /dips/info with a redirect to it
+        let indexer = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/dips/info"))
+            .respond_with(ResponseTemplate::new(302).insert_header(
+                "Location",
+                format!("{}/admin/delete-everything?confirm=yes", internal.uri()).as_str(),
+            ))
+            .mount(&indexer)
+            .await;
+        let url = format!("{}/", indexer.uri()).parse().unwrap();
+        let http_client =
+            http_client(&DipsInfoWatcherConfig::default(), AddressRule::PublicOnly).unwrap();
+
+        //* When
+        let mut answer = Ok(());
+        let logs = crate::test_support::logged(async {
+            answer = ask_dips_info(&http_client, &url).await;
+        })
+        .await;
+
+        //* Then the internal service must not have been called
+        let calls = internal.received_requests().await.unwrap();
+        assert!(
+            calls.is_empty(),
+            "dipper followed the redirect and called {} (answer: {answer:?})",
+            calls[0].url
+        );
+        assert!(answer.is_err());
+        assert!(
+            logs.contains("error=refused 127.0.0.1: not a public address"),
+            "{logs}"
+        );
     }
 }

@@ -30,7 +30,7 @@ pub enum Message {
     /// proposal terms.
     ///
     /// Runs after `send_indexing_agreement_proposal` receives an Accept
-    /// response: posts the RCA via `RecurringCollector.offer()` so the
+    /// response: posts the RCA through the RecurringAgreementManager so the
     /// contract has the offer hash when the indexer-agent later calls
     /// `acceptIndexingAgreement` on-chain.
     ///

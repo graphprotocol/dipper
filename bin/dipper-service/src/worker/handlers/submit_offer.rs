@@ -9,7 +9,8 @@
 //!    indexer, which validates pricing/metadata/networks and responds
 //!    Accept or Reject.
 //! 3. On Accept, `submit_offer` (this handler) posts the RCA offer on-chain
-//!    via `RecurringCollector.offer()`. The indexer-agent then calls
+//!    through the RecurringAgreementManager's `offerAgreement`, which hands it
+//!    to the RecurringCollector. The indexer-agent then calls
 //!    `acceptIndexingAgreement` — the contract checks `rcaOffers`.
 //!
 //! Nothing here is idempotent across a crash: a re-run submits the offer again. The

@@ -94,6 +94,22 @@ pub trait IndexingRequestRegistry {
     }
 }
 
+/// Keeps signed admin requests in the order they were signed, so one that someone recorded
+/// can't be sent again to undo a later one.
+#[async_trait]
+pub trait RequestOrderRegistry {
+    /// Record `signed_at` (seconds since the Unix epoch) as the newest signing time accepted for
+    /// `(requested_by, deployment_id, deployment_chain_id)`. Returns `false`, recording nothing,
+    /// when a request signed at or after it was already accepted for that key.
+    async fn accept_request_signed_at(
+        &self,
+        requested_by: Address,
+        deployment_id: DeploymentId,
+        deployment_chain_id: ChainId,
+        signed_at: u64,
+    ) -> RegistryResult<bool>;
+}
+
 /// What `set_indexing_target_candidates` actually did.
 ///
 /// The admin RPC handler inspects this to decide which worker job to queue
