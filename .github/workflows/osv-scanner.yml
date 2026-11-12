@@ -1,0 +1,42 @@
+name: osv-scanner
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [ 'main' ]
+  # A new advisory can be published while nothing here is changing. Without a daily run it would
+  # only show up on whichever pull request came next, or not at all during a quiet spell.
+  schedule:
+    - cron: '23 6 * * *'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+# Only reads the code: findings go to the job log rather than the repository's security tab,
+# which would need write access to security events.
+permissions:
+  contents: read
+
+jobs:
+  # Fails when Cargo.lock holds a crate with a known vulnerability that osv-scanner.toml does not
+  # ignore, and also when the scan itself fails or finds no lock file to read, so a broken scan
+  # never passes as a clean one.
+  scan-dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
+        with:
+          persist-credentials: false
+
+      # The scanner's image is named by its digest (release v2.7.0), so its tag cannot be pointed at
+      # other code later. It is run directly rather than through Google's action, whose wrapper
+      # reports success when it finds no lock file, and which hands the image this job's cache
+      # token and the runner's Docker socket. The lock file is named rather than searched for:
+      # the search skips whatever git ignores, so it can come back having read nothing.
+      - name: Scan dependencies against the OSV database
+        run: |
+          docker run --rm --volume "$PWD:/src:ro" --workdir /src \
+            --entrypoint /root/osv-scanner \
+            ghcr.io/google/osv-scanner-action@sha256:d54770fe0b09493894e76a02aaed9f51a0513fa57c5186452a755d257b0068a6 \
+            --config=osv-scanner.toml --lockfile=Cargo.lock
