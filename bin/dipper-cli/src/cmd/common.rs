@@ -7,7 +7,7 @@ use figment::{
     providers::{Env, Serialized},
 };
 use serde_with::{DisplayFromStr, serde_as, skip_serializing_none};
-use thegraph_core::alloy::signers::k256::SecretKey;
+use thegraph_core::alloy::{primitives::ChainId, signers::k256::SecretKey};
 use url::Url;
 
 use crate::config::Config;
@@ -98,6 +98,8 @@ struct CliConfig {
     /// The IPFS API to read subgraph manifests from
     #[serde_as(as = "Option<DisplayFromStr>")]
     pub ipfs_url: Option<Url>,
+    /// The chain the DIPs contracts are on
+    pub protocol_chain_id: Option<ChainId>,
 }
 
 impl FromArgMatches for CliConfig {
@@ -107,6 +109,11 @@ impl FromArgMatches for CliConfig {
             signing_key: matches.get_one("signing-key").cloned(),
             // Only some subcommands define this flag.
             ipfs_url: matches.try_get_one("ipfs-url").ok().flatten().cloned(),
+            protocol_chain_id: matches
+                .try_get_one("protocol-chain-id")
+                .ok()
+                .flatten()
+                .copied(),
         })
     }
 

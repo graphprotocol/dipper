@@ -1,6 +1,6 @@
 use dipper_core::config::{Hidden, HiddenSecretKeyAsHexStr};
 use serde_with::{DisplayFromStr, serde_as};
-use thegraph_core::alloy::signers::k256::SecretKey;
+use thegraph_core::alloy::{primitives::ChainId, signers::k256::SecretKey};
 use url::Url;
 
 /// The configuration for the DIPs CLI
@@ -20,6 +20,10 @@ pub struct Config {
     #[serde_as(as = "DisplayFromStr")]
     #[serde(default = "default_ipfs_url")]
     pub ipfs_url: Url,
+    /// The chain the DIPs contracts are on, which requests are signed for. Only a command that
+    /// signs a request needs it, so it is not required to load the configuration.
+    #[serde(default)]
+    pub protocol_chain_id: Option<ChainId>,
 }
 
 #[expect(

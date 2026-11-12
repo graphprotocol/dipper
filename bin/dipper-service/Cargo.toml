@@ -28,7 +28,7 @@ sqlx.workspace = true
 thegraph-core = { workspace = true, features = ["alloy-signer-local", "serde", "signed-message"] }
 thiserror.workspace = true
 time = { workspace = true, features = ["parsing", "formatting"] }
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio = { workspace = true, features = ["net", "rt-multi-thread"] }
 tonic = { version = "0.14", default-features = false, features = ["server", "channel", "tls-aws-lc", "tls-webpki-roots"] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }

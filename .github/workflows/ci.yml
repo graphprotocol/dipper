@@ -95,8 +95,20 @@ jobs:
 
       - name: Install integration tests dependencies
         run: |
-            sudo install -d /usr/share/postgresql-common/pgdg
-            sudo curl --fail -sSLo /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
+            KEY=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+            # The postgresql-common package on the runner ships the Postgres signing key, so it
+            # is downloaded only where that is missing. The download is retried, with a time
+            # limit on each try: a connection postgresql.org drops would otherwise fail the job
+            # before any database test has run.
+            if [ -s "$KEY" ]; then
+              echo "Using the Postgres signing key already at $KEY"
+            else
+              echo "No Postgres signing key at $KEY, downloading it"
+              sudo install -d "$(dirname "$KEY")"
+              sudo curl --fail -sSLo "$KEY" \
+                --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 15 --max-time 60 \
+                https://www.postgresql.org/media/keys/ACCC4CF8.asc
+            fi
             sudo sh -c 'echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
             sudo apt-get update
             sudo apt-get install -y postgresql-17
