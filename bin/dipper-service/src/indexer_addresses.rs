@@ -6,8 +6,11 @@ use std::{
     error::Error,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
 };
 
+use hyper_util::client::legacy::connect::{HttpConnector, dns::Name};
 use url::{Host, Url};
 
 /// Ends each refusal the switch can lift, so an operator learns of it without reading it as advice
@@ -70,7 +73,10 @@ impl AddressRule {
         // connection itself, since a proxy would look the indexer's name up in its place.
         reqwest::Client::builder()
             .no_proxy()
-            .dns_resolver(Arc::new(Resolver(self)))
+            .dns_resolver(Arc::new(Resolver {
+                rule: self,
+                limit: None,
+            }))
             .redirect(reqwest::redirect::Policy::custom(move |attempt| {
                 // The first URL in `previous` is the request itself, not a redirect.
                 if attempt.previous().len() > MAX_REDIRECTS {
@@ -81,6 +87,21 @@ impl AddressRule {
                     Err(refused) => attempt.error(refused),
                 }
             }))
+    }
+
+    /// A connector for gRPC calls to indexers that connects only to addresses this rule allows,
+    /// judging a name by what it resolves to; the lookup and the TCP connect each get
+    /// `connect_timeout`. An address in the URL skips the lookup, so check it with `check_url`.
+    pub fn grpc_connector(self, connect_timeout: Duration) -> HttpConnector<Resolver> {
+        let mut connector = HttpConnector::new_with_resolver(Resolver {
+            rule: self,
+            limit: Some(connect_timeout),
+        });
+        // gRPC adds TLS on top for an https URL, so this connector must take https URLs too.
+        connector.enforce_http(false);
+        connector.set_nodelay(true);
+        connector.set_connect_timeout(Some(connect_timeout));
+        connector
     }
 
     /// Look `name` up and keep the addresses this rule allows, failing when none is left.
@@ -108,22 +129,62 @@ impl AddressRule {
     }
 }
 
-/// Looks names up for an HTTP client, under an `AddressRule`.
-struct Resolver(AddressRule);
+/// Looks names up for a connection to an indexer, under an `AddressRule`, failing a lookup that
+/// takes longer than `limit`, if set.
+#[derive(Clone)]
+pub struct Resolver {
+    rule: AddressRule,
+    limit: Option<Duration>,
+}
 
-impl reqwest::dns::Resolve for Resolver {
-    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let rule = self.0;
+impl Resolver {
+    fn lookup(&self, name: String) -> reqwest::dns::Resolving {
+        let Self { rule, limit } = *self;
         Box::pin(async move {
-            let addrs = rule.resolve(name.as_str()).await?;
+            let addrs = within(limit, &name, rule.resolve(&name)).await?;
             Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
         })
     }
 }
 
+/// Wait for the lookup of `name`, failing it once `limit` passes, so that a lookup that hangs
+/// fails the connection like any other connect error.
+async fn within<T>(
+    limit: Option<Duration>,
+    name: &str,
+    lookup: impl std::future::Future<Output = Result<T, Box<dyn Error + Send + Sync>>>,
+) -> Result<T, Box<dyn Error + Send + Sync>> {
+    let Some(limit) = limit else {
+        return lookup.await;
+    };
+    tokio::time::timeout(limit, lookup)
+        .await
+        .map_err(|_| format!("looking up {name} took longer than {limit:?}"))?
+}
+
+impl reqwest::dns::Resolve for Resolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        self.lookup(name.as_str().to_string())
+    }
+}
+
+impl tower_service::Service<Name> for Resolver {
+    type Response = reqwest::dns::Addrs;
+    type Error = Box<dyn Error + Send + Sync>;
+    type Future = reqwest::dns::Resolving;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, name: Name) -> Self::Future {
+        self.lookup(name.as_str().to_string())
+    }
+}
+
 /// Dipper's refusal to connect to an indexer, at an address that is not public or by a URL it
 /// can't judge.
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum Refused {
     /// A URL whose scheme is not http or https.
     #[error("refused a {0} URL: dipper calls indexers only over http or https")]
@@ -442,6 +503,26 @@ mod tests {
         assert!(
             !scheme.contains("allow_private_addresses"),
             "the setting does not lift it: {scheme}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lookup_that_hangs_fails_once_its_time_is_up() {
+        //* Given a lookup that never answers
+        let hung = std::future::pending::<Result<Vec<SocketAddr>, Box<dyn Error + Send + Sync>>>();
+
+        //* When
+        let looked_up = tokio::time::timeout(
+            Duration::from_secs(60),
+            within(Some(Duration::from_secs(10)), "indexer.example.com", hung),
+        )
+        .await
+        .expect("the lookup should give up within its 10s");
+
+        //* Then
+        assert_eq!(
+            looked_up.unwrap_err().to_string(),
+            "looking up indexer.example.com took longer than 10s"
         );
     }
 
