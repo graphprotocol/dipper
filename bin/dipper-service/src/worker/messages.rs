@@ -37,3 +37,15 @@ pub enum Message {
     /// See [`SubmitOffer`] for more details.
     SubmitOffer(SubmitOffer),
 }
+
+impl Message {
+    /// The job's kind, named as in the copy of the job the queue stores.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::ReassessIndexingRequest(_) => "ReassessIndexingRequest",
+            Self::SendIndexingAgreementProposal(_) => "SendIndexingAgreementProposal",
+            Self::CancelRejectedAgreementOnChain(_) => "CancelRejectedAgreementOnChain",
+            Self::SubmitOffer(_) => "SubmitOffer",
+        }
+    }
+}

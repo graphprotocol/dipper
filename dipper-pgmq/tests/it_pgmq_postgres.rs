@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use dipper_pgmq::{JobBuilder, JobGuard, JobPriority, PgQueue};
+use dipper_pgmq::{JobBuilder, JobGuard, JobPriority, PgQueue, RetryOutcome};
 use fake::{Dummy, Fake, Faker};
 use pgtemp::PgTempDB;
 use sqlx::{Pool, Postgres};
@@ -668,11 +668,17 @@ async fn failed_job_gives_up_at_max_attempts() {
         .await
         .expect("Failed to pop job")
         .expect("expected a job");
-    job.mark_as_failed()
+    let outcome = job
+        .mark_as_failed()
         .await
         .expect("Failed to mark job as failed");
 
     //* Then
+    assert_eq!(
+        outcome,
+        RetryOutcome::GaveUp,
+        "the caller must be told the last attempt was the last"
+    );
     let (status, attempt_count, scheduled_after): (i32, i32, time::OffsetDateTime) =
         sqlx::query_as("SELECT status, attempt_count, scheduled_for FROM pgmq_queue WHERE id = $1")
             .bind(job_id)
@@ -722,11 +728,17 @@ async fn failed_job_below_ceiling_retries_with_incremented_attempt() {
         .expect("Failed to pop job")
         .expect("expected a job");
     let reschedule_to = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
-    job.mark_as_failed_and_reschedule(reschedule_to)
+    let outcome = job
+        .mark_as_failed_and_reschedule(reschedule_to)
         .await
         .expect("Failed to reschedule failed job");
 
     //* Then
+    assert_eq!(
+        outcome,
+        RetryOutcome::WillRetry,
+        "the caller must be told the job runs again"
+    );
     let (status, attempt_count, scheduled_after): (i32, i32, time::OffsetDateTime) =
         sqlx::query_as("SELECT status, attempt_count, scheduled_for FROM pgmq_queue WHERE id = $1")
             .bind(job_id)

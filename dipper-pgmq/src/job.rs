@@ -1,6 +1,9 @@
 use time::OffsetDateTime;
 
-use super::{id::JobId, postgres};
+use super::{
+    id::JobId,
+    postgres::{self, RetryOutcome},
+};
 
 /// A guard for a job in the queue
 ///
@@ -85,23 +88,23 @@ impl<T> JobGuard<'_, T> {
         Ok(())
     }
 
-    /// Mark the job as failed
+    /// Mark the job as failed, saying whether it will run again
     #[expect(
         clippy::expect_used,
         reason = "predates this lint; fix when next touched"
     )]
-    pub async fn mark_as_failed(mut self) -> anyhow::Result<()> {
+    pub async fn mark_as_failed(mut self) -> anyhow::Result<RetryOutcome> {
         self.consumed = true;
         let mut tx = self
             .tx
             .take()
             .expect("JobGuard tx already taken; remove/mark_as_failed called twice");
-        postgres::mark_as_failed(tx.as_mut(), &self.job.id, None).await?;
+        let outcome = postgres::mark_as_failed(tx.as_mut(), &self.job.id, None).await?;
         tx.commit().await?;
-        Ok(())
+        Ok(outcome)
     }
 
-    /// Mark the job as failed and reschedule it
+    /// Mark the job as failed and reschedule it, saying whether it will run again
     #[expect(
         clippy::expect_used,
         reason = "predates this lint; fix when next touched"
@@ -109,15 +112,15 @@ impl<T> JobGuard<'_, T> {
     pub async fn mark_as_failed_and_reschedule(
         mut self,
         schedule: time::OffsetDateTime,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<RetryOutcome> {
         self.consumed = true;
         let mut tx = self
             .tx
             .take()
             .expect("JobGuard tx already taken; remove/mark_as_failed called twice");
-        postgres::mark_as_failed(tx.as_mut(), &self.job.id, Some(schedule)).await?;
+        let outcome = postgres::mark_as_failed(tx.as_mut(), &self.job.id, Some(schedule)).await?;
         tx.commit().await?;
-        Ok(())
+        Ok(outcome)
     }
 
     /// Re-queue the job for a later time without counting an attempt. Used for

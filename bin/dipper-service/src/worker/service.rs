@@ -16,7 +16,7 @@ use super::{
         SendIndexingAgreementProposalCtx, SubmitOfferCtx,
     },
     messages::Message,
-    queue::{JobNotifications, Queue},
+    queue::{JobGuard, JobId, JobNotifications, Queue, RetryOutcome},
     result::{JobError, JobResult, calculate_backoff_delay, retries_within_window},
 };
 pub use super::{
@@ -544,10 +544,6 @@ where
 /// One worker loop: drains jobs until the stop signal fires. Each loop owns its
 /// own queue notification listener because the underlying `LISTEN`/`NOTIFY` is
 /// per-connection and can't be shared across tasks.
-#[expect(
-    clippy::cognitive_complexity,
-    reason = "predates this lint; fix when next touched"
-)]
 async fn run_loop<Q, R, C, I, T>(
     state: InnerCtx<R, WorkerQueueHandle<Q>, C, I, T>,
     queue: Q,
@@ -597,52 +593,199 @@ where
         };
 
         let _span = tracing::debug_span!("process_job", job = %job.id());
-        match run_job_with_timeout(PROCESS_JOB_TIMEOUT, process_job(&state, job.desc())).await {
-            Ok(..) => {
-                if let Err(err) = job.remove().await {
-                    tracing::debug!(error=?err, "Failed to remove job from queue");
-                }
-            }
-            Err(JobError::Retryable(err, base_delay)) => {
-                let attempt = job.failed_attempts();
-                let delay = calculate_backoff_delay(base_delay, attempt);
+        let result =
+            run_job_with_timeout(PROCESS_JOB_TIMEOUT, process_job(&state, job.desc())).await;
+        settle_job(job, result).await;
+    }
+}
 
-                tracing::debug!(
-                    error=?err,
-                    attempt=%attempt,
-                    delay_secs=%delay.as_secs(),
-                    "Rescheduling job after failure with backoff"
-                );
+/// What the worker does with a job once its run is over. A trait over the queue's own job guard
+/// so which of these happens, and what is logged, can be tested without a database.
+#[async_trait::async_trait]
+trait FinishedJob: Send + Sized {
+    fn id(&self) -> JobId;
+    fn message(&self) -> &Message;
+    fn failed_attempts(&self) -> u32;
+    fn max_attempts(&self) -> u32;
+    /// Takes the job off the queue.
+    async fn remove(self) -> anyhow::Result<()>;
+    /// Records a failed attempt, queueing the job to run again at `at` unless it was its last.
+    async fn retry_at(self, at: OffsetDateTime) -> anyhow::Result<RetryOutcome>;
+    /// Queues the job to run again at `at` without counting an attempt.
+    async fn defer_to(self, at: OffsetDateTime) -> anyhow::Result<()>;
+}
 
-                let scheduled_for = OffsetDateTime::now_utc() + delay;
-                if let Err(err) = job.mark_as_failed_and_reschedule(scheduled_for).await {
-                    tracing::error!(error=?err, "Failed to reschedule job");
-                }
-            }
-            Err(JobError::Deferred(delay)) => {
-                // Couldn't run now (the global reassess lock is busy, or pacing
-                // held it back); re-queue at a flat delay without counting a failed
-                // attempt. Logged at info so sustained contention is visible per job id.
-                let scheduled_for = OffsetDateTime::now_utc() + delay;
-                tracing::info!(
-                    job = %job.id(),
-                    delay_secs = %delay.as_secs(),
-                    "Deferring job; it can't run yet, will retry"
-                );
-                if let Err(err) = job.reschedule(scheduled_for).await {
-                    tracing::error!(error=?err, "Failed to reschedule deferred job");
-                }
-            }
-            Err(JobError::Fatal(err)) => {
-                tracing::debug!(error=?err, "Failed to process job");
+#[async_trait::async_trait]
+impl FinishedJob for JobGuard<'_, Message> {
+    fn id(&self) -> JobId {
+        *JobGuard::id(self)
+    }
 
-                // Remove the job from the queue as it failed and
-                // should not be retried
-                if let Err(err) = job.remove().await {
-                    tracing::error!(error=?err, "Failed to remove job from queue");
-                }
-            }
+    fn message(&self) -> &Message {
+        self.desc()
+    }
+
+    fn failed_attempts(&self) -> u32 {
+        JobGuard::failed_attempts(self)
+    }
+
+    fn max_attempts(&self) -> u32 {
+        JobGuard::max_attempts(self)
+    }
+
+    async fn remove(self) -> anyhow::Result<()> {
+        JobGuard::remove(self).await
+    }
+
+    async fn retry_at(self, at: OffsetDateTime) -> anyhow::Result<RetryOutcome> {
+        self.mark_as_failed_and_reschedule(at).await
+    }
+
+    async fn defer_to(self, at: OffsetDateTime) -> anyhow::Result<()> {
+        self.reschedule(at).await
+    }
+}
+
+/// Removes, retries or defers a job according to how its run went.
+async fn settle_job(job: impl FinishedJob, result: JobResult<()>) {
+    match result {
+        Ok(..) => remove_job(job).await,
+        Err(JobError::Retryable(err, base_delay)) => retry_job(job, &err, base_delay).await,
+        Err(JobError::Deferred(delay)) => defer_job(job, delay).await,
+        Err(JobError::Fatal(err)) => drop_job(job, &err).await,
+    }
+}
+
+/// Takes a job that failed in a way a retry can't fix off the queue, and only then alerts that it
+/// will not run again: if the removal fails, the job rolls back into the queue and runs again.
+async fn drop_job(job: impl FinishedJob, err: &anyhow::Error) {
+    let failed = FailedJob::of(&job);
+    match job.remove().await {
+        Ok(()) => log_job_failure(&failed, err, AfterFailure::NotRetryable),
+        Err(remove_err) => tracing::error!(
+            job_id = %failed.id,
+            kind = failed.kind,
+            job_error = %format_args!("{err:#}"),
+            error = %format_args!("{remove_err:#}"),
+            "Job failed with an error a retry can't fix, but couldn't be taken off the queue, so it \
+             will run again"
+        ),
+    }
+}
+
+/// Takes a finished job off the queue. If that fails, the job is left queued and runs again.
+async fn remove_job(job: impl FinishedJob) {
+    let id = job.id();
+    if let Err(err) = job.remove().await {
+        tracing::error!(job_id = %id, error = ?err, "Failed to remove job from queue");
+    }
+}
+
+/// Re-queues a job that couldn't run now (the global reassess lock is busy, or pacing held it
+/// back) at a flat delay without counting a failed attempt. Logged at info so sustained
+/// contention is visible per job id.
+async fn defer_job(job: impl FinishedJob, delay: Duration) {
+    let scheduled_for = OffsetDateTime::now_utc() + delay;
+    tracing::info!(
+        job = %job.id(),
+        delay_secs = %delay.as_secs(),
+        "Deferring job; it can't run yet, will retry"
+    );
+    if let Err(err) = job.defer_to(scheduled_for).await {
+        tracing::error!(error=?err, "Failed to reschedule deferred job");
+    }
+}
+
+/// Records a failed attempt, which queues the job to run again after a backoff unless that was its
+/// last allowed attempt.
+async fn retry_job(job: impl FinishedJob, err: &anyhow::Error, base_delay: Duration) {
+    let failed = FailedJob::of(&job);
+    let delay = calculate_backoff_delay(base_delay, job.failed_attempts());
+    let scheduled_for = OffsetDateTime::now_utc() + delay;
+    match job.retry_at(scheduled_for).await {
+        Ok(RetryOutcome::WillRetry) => {
+            log_job_failure(&failed, err, AfterFailure::WillRetry(delay));
         }
+        Ok(RetryOutcome::GaveUp) => log_job_failure(&failed, err, AfterFailure::OutOfAttempts),
+        Err(db_err) => tracing::error!(
+            job_id = %failed.id,
+            kind = failed.kind,
+            job_error = %format_args!("{err:#}"),
+            error = ?db_err,
+            "Failed to reschedule job"
+        ),
+    }
+}
+
+/// The `event` tag on the error logged for a job that will never run again, so an operator is
+/// alerted to work left undone.
+const JOB_FAILED_EVENT: &str = "job_failed_permanently";
+
+/// A job whose run failed, as its failure is logged.
+struct FailedJob {
+    id: JobId,
+    kind: &'static str,
+    /// The job as the queue stores it, so the request or agreement it was for can be found.
+    job: String,
+    /// The attempt that failed, counting from 1.
+    attempt: u32,
+    max_attempts: u32,
+}
+
+impl FailedJob {
+    fn of(job: &impl FinishedJob) -> Self {
+        Self {
+            id: job.id(),
+            kind: job.message().kind(),
+            job: serde_json::to_string(job.message())
+                .unwrap_or_else(|err| format!("<could not be written out: {err}>")),
+            attempt: job.failed_attempts().saturating_add(1),
+            max_attempts: job.max_attempts(),
+        }
+    }
+}
+
+/// What became of a job whose run failed.
+#[derive(Debug, Clone, Copy)]
+enum AfterFailure {
+    /// It is queued to run again after this long.
+    WillRetry(Duration),
+    /// That was its last allowed attempt, so the queue keeps it as failed.
+    OutOfAttempts,
+    /// Its error is not one a retry can fix, so it is dropped.
+    NotRetryable,
+}
+
+/// Logs a failed run. A retry is routine, so it shows at info; a job that will never run again
+/// leaves its work undone, so it is an error tagged for alerting.
+fn log_job_failure(job: &FailedJob, err: &anyhow::Error, after: AfterFailure) {
+    match after {
+        AfterFailure::WillRetry(delay) => tracing::info!(
+            job_id = %job.id,
+            kind = job.kind,
+            attempt = job.attempt,
+            max_attempts = job.max_attempts,
+            delay_secs = delay.as_secs(),
+            error = %format_args!("{err:#}"),
+            "Job failed; it will be retried"
+        ),
+        AfterFailure::OutOfAttempts => tracing::error!(
+            event = JOB_FAILED_EVENT,
+            job_id = %job.id,
+            kind = job.kind,
+            job = %job.job,
+            attempts = job.attempt,
+            error = %format_args!("{err:#}"),
+            "Job failed on its last attempt; it will not run again"
+        ),
+        AfterFailure::NotRetryable => tracing::error!(
+            event = JOB_FAILED_EVENT,
+            job_id = %job.id,
+            kind = job.kind,
+            job = %job.job,
+            error = %format_args!("{err:#}"),
+            "Job failed with an error a retry can't fix; it will not run again"
+        ),
     }
 }
 
@@ -725,11 +868,17 @@ mod tests {
     use tokio::sync::watch;
 
     use super::{
-        DEFAULT_QUEUE_POLL_PERIOD, JobError, Message, RESUBSCRIBE_BASE_DELAY,
-        RESUBSCRIBE_MAX_DELAY, RESUBSCRIBE_STABLE_PERIOD, ResubscribeBackoff, Subscription, Tick,
-        WARN_COOLDOWN, WarnPacer, await_next_tick, run_job_with_timeout, should_resubscribe,
+        AfterFailure, DEFAULT_QUEUE_POLL_PERIOD, FailedJob, FinishedJob, JOB_FAILED_EVENT,
+        JobError, Message, RESUBSCRIBE_BASE_DELAY, RESUBSCRIBE_MAX_DELAY,
+        RESUBSCRIBE_STABLE_PERIOD, ResubscribeBackoff, Subscription, Tick, WARN_COOLDOWN,
+        WarnPacer, await_next_tick, log_job_failure, run_job_with_timeout, settle_job,
+        should_resubscribe,
     };
-    use crate::worker::queue::{JobGuard, JobId, JobNotifications, JobPriority, Queue};
+    use crate::{
+        config::AlertsConfig,
+        test_support::logged,
+        worker::queue::{JobGuard, JobId, JobNotifications, JobPriority, Queue, RetryOutcome},
+    };
 
     /// A listener stub whose `wait_for_notification` always errors. Models a
     /// dropped/broken `LISTEN`/`NOTIFY` connection.
@@ -1248,6 +1397,321 @@ mod tests {
             matches!(result, Err(JobError::Retryable(..))),
             "a timed-out job should be retryable, got {result:?}"
         );
+    }
+
+    /// A reassessment on its 3rd and last attempt, as one is left after the scoring service
+    /// stays down through all its retries.
+    fn last_attempt_of_a_reassessment() -> FailedJob {
+        FailedJob {
+            id: JobId::default(),
+            kind: "ReassessIndexingRequest",
+            job: r#"{"type":"ReassessIndexingRequest","indexing_request_id":"request-7"}"#.into(),
+            attempt: 3,
+            max_attempts: 3,
+        }
+    }
+
+    /// The log line that carries `needle`, failing the test with every line logged if none does.
+    fn line_with<'a>(logs: &'a str, needle: &str) -> &'a str {
+        logs.lines()
+            .find(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("no line mentions {needle:?}; logged:\n{logs}"))
+    }
+
+    /// A job whose last allowed attempt fails never runs again, so an operator must be told:
+    /// 1 error, tagged for alerting, naming the job, its kind, what it was for and the error.
+    #[tokio::test]
+    async fn a_job_that_runs_out_of_attempts_logs_an_error_that_alerts() {
+        let job = last_attempt_of_a_reassessment();
+        let err = anyhow::anyhow!("IISA service is not available");
+
+        let logs = logged(async {
+            log_job_failure(&job, &err, AfterFailure::OutOfAttempts);
+        })
+        .await;
+
+        let line = line_with(&logs, "IISA service is not available");
+        assert!(line.contains("ERROR"), "{line}");
+        assert!(
+            line.contains(&format!(r#"event="{JOB_FAILED_EVENT}""#)),
+            "{line}"
+        );
+        assert!(line.contains(&JobId::default().to_string()), "{line}");
+        assert!(line.contains(r#"kind="ReassessIndexingRequest""#), "{line}");
+        assert!(line.contains("request-7"), "{line}");
+        assert_eq!(logs.matches("ERROR").count(), 1, "{logs}");
+    }
+
+    /// A job dropped for an error a retry can't fix is just as finished, and was logged only
+    /// at debug, which a deployment doesn't show.
+    #[tokio::test]
+    async fn a_job_dropped_for_an_unretryable_error_logs_an_error_that_alerts() {
+        let job = last_attempt_of_a_reassessment();
+        let err = anyhow::anyhow!("no network name for chain id 999");
+
+        let logs = logged(async {
+            log_job_failure(&job, &err, AfterFailure::NotRetryable);
+        })
+        .await;
+
+        let line = line_with(&logs, "no network name for chain id 999");
+        assert!(line.contains("ERROR"), "{line}");
+        assert!(
+            line.contains(&format!(r#"event="{JOB_FAILED_EVENT}""#)),
+            "{line}"
+        );
+        assert!(line.contains(&JobId::default().to_string()), "{line}");
+        assert!(line.contains(r#"kind="ReassessIndexingRequest""#), "{line}");
+    }
+
+    /// A failed attempt that will be tried again is routine, so it shows at info, which a
+    /// deployment logs, without an alert tag that would page someone for every retry.
+    #[tokio::test]
+    async fn a_retry_logs_at_info_without_alerting() {
+        let job = FailedJob {
+            attempt: 1,
+            ..last_attempt_of_a_reassessment()
+        };
+        let err = anyhow::anyhow!("IISA service is not available");
+
+        let logs = logged(async {
+            log_job_failure(&job, &err, AfterFailure::WillRetry(Duration::from_secs(60)));
+        })
+        .await;
+
+        let line = line_with(&logs, "IISA service is not available");
+        assert!(line.contains(" INFO "), "{line}");
+        assert!(!line.contains("event="), "{line}");
+        assert!(line.contains(r#"kind="ReassessIndexingRequest""#), "{line}");
+        assert!(line.contains("delay_secs=60"), "{line}");
+    }
+
+    /// The failure tag is only useful if a deployment that never listed its alerts gets it.
+    #[test]
+    fn a_job_failing_for_good_is_alerted_on_by_default() {
+        assert!(
+            AlertsConfig::default()
+                .events
+                .iter()
+                .any(|event| event == JOB_FAILED_EVENT),
+            "{JOB_FAILED_EVENT} is missing from the default alert events"
+        );
+    }
+
+    /// A job settled without a database: it records what the worker asked of the queue, and
+    /// answers as told.
+    struct TestJob {
+        message: Message,
+        failed_attempts: u32,
+        max_attempts: u32,
+        /// What recording a failed attempt answers; `None` makes it fail.
+        retry: Option<RetryOutcome>,
+        remove_fails: bool,
+        asked: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    impl TestJob {
+        /// A reassessment on attempt `attempt` of 3.
+        fn on_attempt(attempt: u32) -> Self {
+            Self {
+                message: Message::ReassessIndexingRequest(
+                    crate::worker::handlers::ReassessIndexingRequest {
+                        indexing_request_id: dipper_core::ids::IndexingRequestId::new(),
+                        deployment_id: "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"
+                            .parse()
+                            .unwrap(),
+                        deployment_chain_id: 42161,
+                        num_candidates: 3,
+                    },
+                ),
+                failed_attempts: attempt - 1,
+                max_attempts: 3,
+                retry: None,
+                remove_fails: false,
+                asked: Arc::default(),
+            }
+        }
+
+        fn note(&self, action: &'static str) {
+            self.asked.lock().unwrap().push(action);
+        }
+    }
+
+    #[async_trait]
+    impl FinishedJob for TestJob {
+        fn id(&self) -> JobId {
+            JobId::default()
+        }
+
+        fn message(&self) -> &Message {
+            &self.message
+        }
+
+        fn failed_attempts(&self) -> u32 {
+            self.failed_attempts
+        }
+
+        fn max_attempts(&self) -> u32 {
+            self.max_attempts
+        }
+
+        async fn remove(self) -> anyhow::Result<()> {
+            self.note("remove");
+            if self.remove_fails {
+                anyhow::bail!("the database is unavailable");
+            }
+            Ok(())
+        }
+
+        async fn retry_at(self, _at: time::OffsetDateTime) -> anyhow::Result<RetryOutcome> {
+            self.note("retry");
+            self.retry
+                .ok_or_else(|| anyhow::anyhow!("the database is unavailable"))
+        }
+
+        async fn defer_to(self, _at: time::OffsetDateTime) -> anyhow::Result<()> {
+            self.note("defer");
+            Ok(())
+        }
+    }
+
+    /// Settles `job` after a run ending in `result`: what the worker asked of the queue, and
+    /// what it logged.
+    async fn settle(job: TestJob, result: super::JobResult<()>) -> (Vec<&'static str>, String) {
+        let asked = Arc::clone(&job.asked);
+        let logs = logged(settle_job(job, result)).await;
+        let asked = asked.lock().unwrap().clone();
+        (asked, logs)
+    }
+
+    /// The lines tagged for the alert that a job will never run again.
+    fn alerts(logs: &str) -> Vec<&str> {
+        logs.lines()
+            .filter(|line| line.contains(&format!(r#"event="{JOB_FAILED_EVENT}""#)))
+            .collect()
+    }
+
+    /// A job failing with an error a retry can't fix is taken off the queue and alerted on.
+    #[tokio::test]
+    async fn settling_an_unretryable_failure_removes_the_job_and_alerts() {
+        let (asked, logs) = settle(
+            TestJob::on_attempt(1),
+            Err(JobError::Fatal(anyhow::anyhow!("no network name"))),
+        )
+        .await;
+
+        assert_eq!(asked, ["remove"]);
+        let alerts = alerts(&logs);
+        assert_eq!(alerts.len(), 1, "{logs}");
+        assert!(alerts[0].contains("ERROR"), "{logs}");
+        assert!(alerts[0].contains("no network name"), "{logs}");
+    }
+
+    /// A job whose removal fails rolls back into the queue and runs again, so its unretryable
+    /// failure must not be alerted on as final; the log says what is true instead.
+    #[tokio::test]
+    async fn an_unretryable_failure_left_in_the_queue_does_not_alert() {
+        let job = TestJob {
+            remove_fails: true,
+            ..TestJob::on_attempt(1)
+        };
+
+        let (asked, logs) = settle(
+            job,
+            Err(JobError::Fatal(anyhow::anyhow!("database read failed"))),
+        )
+        .await;
+
+        assert_eq!(asked, ["remove"]);
+        assert_eq!(alerts(&logs), Vec::<&str>::new(), "{logs}");
+        let line = logs
+            .lines()
+            .find(|line| line.contains("database read failed"))
+            .unwrap_or_else(|| panic!("the job's failure is logged:\n{logs}"));
+        assert!(line.contains("ERROR"), "{line}");
+        assert!(line.contains("will run again"), "{line}");
+        assert!(line.contains("the database is unavailable"), "{line}");
+    }
+
+    /// The queue's answer, not the worker's count, says a failed attempt was the last: then the
+    /// job is alerted on as failed for good.
+    #[tokio::test]
+    async fn settling_a_failure_the_queue_gives_up_on_alerts() {
+        let job = TestJob {
+            retry: Some(RetryOutcome::GaveUp),
+            ..TestJob::on_attempt(3)
+        };
+
+        let (asked, logs) = settle(
+            job,
+            Err(JobError::Retryable(
+                anyhow::anyhow!("IISA service is not available"),
+                Duration::from_secs(60),
+            )),
+        )
+        .await;
+
+        assert_eq!(asked, ["retry"]);
+        let alerts = alerts(&logs);
+        assert_eq!(alerts.len(), 1, "{logs}");
+        assert!(alerts[0].contains("last attempt"), "{logs}");
+    }
+
+    /// A failed attempt the queue will run again shows at info and raises no alert.
+    #[tokio::test]
+    async fn settling_a_failure_the_queue_will_retry_logs_it_without_alerting() {
+        let job = TestJob {
+            retry: Some(RetryOutcome::WillRetry),
+            ..TestJob::on_attempt(1)
+        };
+
+        let (asked, logs) = settle(
+            job,
+            Err(JobError::Retryable(
+                anyhow::anyhow!("IISA service is not available"),
+                Duration::from_secs(60),
+            )),
+        )
+        .await;
+
+        assert_eq!(asked, ["retry"]);
+        assert_eq!(alerts(&logs), Vec::<&str>::new(), "{logs}");
+        let line = logs
+            .lines()
+            .find(|line| line.contains("IISA service is not available"))
+            .unwrap_or_else(|| panic!("the retry is logged:\n{logs}"));
+        assert!(line.contains(" INFO "), "{line}");
+    }
+
+    /// A last attempt whose failure the queue could not record rolls back and runs again, so it
+    /// must not be alerted on as failed for good, whatever the attempt count says.
+    #[tokio::test]
+    async fn settling_a_failure_the_queue_could_not_record_does_not_alert() {
+        let (asked, logs) = settle(
+            TestJob::on_attempt(3),
+            Err(JobError::Retryable(
+                anyhow::anyhow!("IISA service is not available"),
+                Duration::from_secs(60),
+            )),
+        )
+        .await;
+
+        assert_eq!(asked, ["retry"]);
+        assert_eq!(alerts(&logs), Vec::<&str>::new(), "{logs}");
+        assert!(logs.contains("Failed to reschedule job"), "{logs}");
+    }
+
+    /// A job deferred for lack of the lock is queued again, uncounted and not alerted on.
+    #[tokio::test]
+    async fn settling_a_deferred_job_queues_it_again_without_alerting() {
+        let (asked, logs) = settle(
+            TestJob::on_attempt(1),
+            Err(JobError::Deferred(Duration::from_secs(1))),
+        )
+        .await;
+
+        assert_eq!(asked, ["defer"]);
+        assert_eq!(alerts(&logs), Vec::<&str>::new(), "{logs}");
     }
 
     /// A job that completes within the timeout passes its result through

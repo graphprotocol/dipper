@@ -382,6 +382,7 @@ impl Default for AlertsConfig {
                 "dips_info_missing",
                 "dips_info_checks_paused",
                 "dips_info_missing_denylisted",
+                "job_failed_permanently",
                 "chain_listener_off",
                 "expiration_off",
                 "reassignment_off",
