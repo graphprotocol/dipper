@@ -259,6 +259,77 @@ async fn set_indexing_target_candidates_reinsert_after_cancel() {
 }
 
 #[tokio::test]
+async fn accept_request_signed_at_refuses_a_request_no_newer_than_the_newest() {
+    //* Given
+    let requested_by = FakeAlloy.fake();
+    let deployment_id = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
+    let deployment_chain_id = Faker.fake::<ChainId>();
+
+    let (db, _temp_db) = temp_registry_db().await;
+    let registry = PgRegistry::new(db);
+    let accept = |signed_at| {
+        registry.accept_request_signed_at(
+            requested_by,
+            deployment_id,
+            deployment_chain_id,
+            signed_at,
+        )
+    };
+
+    //* When
+    let first = accept(1_000).await.expect("first request failed");
+    let older = accept(999).await.expect("older request failed");
+    let same = accept(1_000).await.expect("same-time request failed");
+    let newer = accept(1_001).await.expect("newer request failed");
+    let first_again = accept(1_000).await.expect("replayed request failed");
+
+    //* Then
+    assert!(first, "the first request for a key is recorded");
+    assert!(!older, "a request older than the newest is refused");
+    assert!(!same, "a request signed at the newest time is refused");
+    assert!(newer, "a newer request is recorded");
+    assert!(
+        !first_again,
+        "the first request is refused once a newer one is in"
+    );
+}
+
+#[tokio::test]
+async fn accept_request_signed_at_keeps_each_key_apart() {
+    //* Given
+    let requested_by = FakeAlloy.fake();
+    let other_requester = FakeAlloy.fake();
+    let deployment_id = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
+    let other_deployment = deployment_id!("QmQ5w3LqJdBGZvHNYTWq7np2B1qbBQMpHP77ZKQPzGVTrg");
+
+    let (db, _temp_db) = temp_registry_db().await;
+    let registry = PgRegistry::new(db);
+    registry
+        .accept_request_signed_at(requested_by, deployment_id, 1, 1_000)
+        .await
+        .expect("seed request failed");
+
+    //* When: older requests that differ in the requester, the deployment or the chain
+    let by_other_requester = registry
+        .accept_request_signed_at(other_requester, deployment_id, 1, 500)
+        .await
+        .expect("other requester failed");
+    let for_other_deployment = registry
+        .accept_request_signed_at(requested_by, other_deployment, 1, 500)
+        .await
+        .expect("other deployment failed");
+    let on_other_chain = registry
+        .accept_request_signed_at(requested_by, deployment_id, 2, 500)
+        .await
+        .expect("other chain failed");
+
+    //* Then
+    assert!(by_other_requester);
+    assert!(for_other_deployment);
+    assert!(on_other_chain);
+}
+
+#[tokio::test]
 async fn get_all_indexing_requests() {
     //* Given
     let (db, _temp_db) = temp_registry_db().await;
