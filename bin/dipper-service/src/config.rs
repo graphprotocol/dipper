@@ -608,9 +608,9 @@ impl Default for IndexerClientConfig {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReassignmentConfig {
-    /// Whether the reassignment service runs (default: true). This default only applies once the
-    /// section exists: without a `reassignment` section it does not run, so there is no daily
-    /// reassessment of open requests and no hourly top-up of short ones. A request is then only
+    /// Whether the reassignment service runs (default: true). Startup refuses a config with no
+    /// `reassignment` section, so only `false` here turns it off. Then there is no daily
+    /// reassessment of open requests and no hourly top-up of short ones: a request is only
     /// re-checked when something else queues it, such as a target change or an expired offer,
     /// even 1 whose last reassessment was dropped during an IISA outage.
     #[serde(default = "default_reassignment_enabled")]
@@ -704,9 +704,9 @@ impl Default for ReassignmentConfig {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExpirationConfig {
-    /// Whether the expiration service runs (default: true). This default only applies once the
-    /// section exists: without an `expiration` section it does not run. Nothing else marks an
-    /// offer expired, so a lapsed offer stays created for ever and keeps counting as an offer in
+    /// Whether the expiration service runs (default: true). Startup refuses a config with no
+    /// `expiration` section, so only `false` here turns it off. Nothing else marks an offer
+    /// expired, so a lapsed offer then stays created for ever and keeps counting as an offer in
     /// flight, whatever its deadline: with the default caps an indexer gets no more offers once it
     /// has 5 and nobody does once there are 100, and no replacement is picked for a lapsed offer.
     #[serde(default = "default_expiration_enabled")]
