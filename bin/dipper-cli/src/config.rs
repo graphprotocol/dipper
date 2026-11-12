@@ -21,7 +21,9 @@ pub struct Config {
     #[serde(default = "default_ipfs_url")]
     pub ipfs_url: Url,
     /// The chain the DIPs contracts are on, which requests are signed for. Only a command that
-    /// signs a request needs it, so it is not required to load the configuration.
+    /// signs a request needs it, so it is not required to load the configuration. Read from text
+    /// like the other settings, since a flag, the shell and an env file all give it as text.
+    #[serde_as(as = "Option<DisplayFromStr>")]
     #[serde(default)]
     pub protocol_chain_id: Option<ChainId>,
 }

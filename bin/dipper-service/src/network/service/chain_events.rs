@@ -176,6 +176,19 @@ pub struct ChangedAgreementsResult {
     pub cursor: Cursor,
 }
 
+/// What a read of agreements by id found.
+#[derive(Debug, Default)]
+pub struct AgreementSnapshots {
+    /// The state of each agreement asked for that came back in a form that could be read.
+    pub snapshots: Vec<AgreementStateSnapshot>,
+    /// The latest block the subgraph had indexed when it answered. With more than 1 query, the
+    /// lowest, so no block is taken as indexed that a query hadn't reached; 0 if none was made.
+    pub block: u64,
+    /// Agreements asked for whose state may have come back in a form that couldn't be read, so
+    /// their absence from `snapshots` doesn't mean the subgraph has no state for them.
+    pub unreadable: Vec<IndexingAgreementId>,
+}
+
 /// Trait for fetching agreement state snapshots from a subgraph.
 ///
 /// Implementations may use different data sources (subgraph, RPC, etc.)
@@ -210,6 +223,18 @@ pub trait ChainEventSource: Send + Sync {
         since: &Cursor,
         pinned_block: Option<u64>,
     ) -> Result<ChangedAgreementsResult, ChainEventError>;
+
+    /// Fetch the current state of each of `agreement_ids`, read at the subgraph's latest block,
+    /// with the same payer filter as [`Self::get_changed_agreements`], and the block it was read
+    /// at. The chain listener uses it to try again the changes it set aside.
+    ///
+    /// An agreement whose state came back malformed is reported as unreadable; one not returned
+    /// at all has no state at that block. A response naming an agreement not asked for, or
+    /// naming one twice, fails as transient.
+    async fn get_agreement_snapshots(
+        &self,
+        agreement_ids: &[IndexingAgreementId],
+    ) -> Result<AgreementSnapshots, ChainEventError>;
 }
 
 /// Configuration for the subgraph event source.
@@ -248,6 +273,16 @@ pub struct SubgraphEventSource {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ChangedAgreementsResponse {
+    indexing_agreements: Vec<IndexingAgreementEntity>,
+    #[serde(rename = "_meta")]
+    meta: SubgraphMeta,
+}
+
+/// GraphQL response wrapping the `indexingAgreements` list read by id, and the block it was read
+/// at: graph-node answers a query at 1 block, so the block and the entities agree.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgreementSnapshotsResponse {
     indexing_agreements: Vec<IndexingAgreementEntity>,
     #[serde(rename = "_meta")]
     meta: SubgraphMeta,
@@ -648,6 +683,105 @@ impl ChainEventSource for SubgraphEventSource {
             cursor,
         })
     }
+
+    async fn get_agreement_snapshots(
+        &self,
+        agreement_ids: &[IndexingAgreementId],
+    ) -> Result<AgreementSnapshots, ChainEventError> {
+        let query = format!(
+            r#"
+            query AgreementSnapshots($payer: Bytes!, $ids: [Bytes!]!) {{
+                indexingAgreements(
+                    where: {{ payer: $payer, id_in: $ids }}
+                    first: {SUBGRAPH_PAGE_SIZE}
+                ) {{
+                    id
+                    indexer
+                    state
+                    canceledBy
+                    lastStateChangeBlock
+                    acceptedAt
+                    acceptedAtTx
+                    canceledAt
+                    canceledAtTx
+                }}
+                _meta {{
+                    block {{
+                        number
+                    }}
+                }}
+            }}
+            "#
+        );
+
+        let mut read = AgreementSnapshots::default();
+        let mut lowest_block: Option<u64> = None;
+        // The query returns at most a page of rows, so it asks for at most a page of ids at once.
+        for ids in agreement_ids.chunks(SUBGRAPH_PAGE_SIZE) {
+            let variables = serde_json::json!({
+                "payer": format!("{:#x}", self.config.payer_address),
+                "ids": ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            });
+            let response: AgreementSnapshotsResponse =
+                self.query_with_retry(&query, variables).await?;
+            let block = response.meta.block.number;
+            lowest_block = Some(lowest_block.map_or(block, |lowest| lowest.min(block)));
+            let (snapshots, unreadable) = snapshots_asked_for(ids, &response.indexing_agreements)?;
+            read.snapshots.extend(snapshots);
+            read.unreadable.extend(unreadable);
+        }
+        read.block = lowest_block.unwrap_or(0);
+        Ok(read)
+    }
+}
+
+/// Parse the entities read for `asked_for`, returning the states that could be read and the
+/// agreements whose state may have come back malformed. A response naming an agreement not asked
+/// for, or naming one twice, is rejected: the subgraph isn't trusted, and the listener would apply
+/// whatever state it returned.
+fn snapshots_asked_for(
+    asked_for: &[IndexingAgreementId],
+    entities: &[IndexingAgreementEntity],
+) -> Result<(Vec<AgreementStateSnapshot>, Vec<IndexingAgreementId>), ChainEventError> {
+    let mut unseen: std::collections::HashSet<IndexingAgreementId> =
+        asked_for.iter().copied().collect();
+    let mut snapshots = Vec::with_capacity(entities.len());
+    let mut unreadable = Vec::new();
+    let mut unplaceable = false;
+    for entity in entities {
+        let (agreement_id, snapshot) = match parse_snapshot(entity) {
+            Some(snapshot) => (snapshot.agreement_id, Some(snapshot)),
+            None => {
+                // The listener warns, at a bounded rate, about each agreement left unreadable.
+                tracing::debug!(
+                    entity_id = %entity.id,
+                    "Malformed IndexingAgreement entity read by id"
+                );
+                match entity.id.parse::<IndexingAgreementId>() {
+                    Ok(agreement_id) => (agreement_id, None),
+                    Err(_) => {
+                        unplaceable = true;
+                        continue;
+                    }
+                }
+            }
+        };
+        if !unseen.remove(&agreement_id) {
+            return Err(ChainEventError::Transient(format!(
+                "subgraph returned agreement {agreement_id} that was not asked for, or more than once"
+            )));
+        }
+        match snapshot {
+            Some(snapshot) => snapshots.push(snapshot),
+            None => unreadable.push(agreement_id),
+        }
+    }
+    // A malformed entity whose id can't be read could be any agreement asked for that didn't come
+    // back readable, so none of them can be taken as having no state.
+    if unplaceable {
+        unreadable.extend(asked_for.iter().filter(|id| unseen.remove(id)));
+    }
+    Ok((snapshots, unreadable))
 }
 
 /// Reject a response whose `_meta.block.number` does not match the
@@ -841,6 +975,8 @@ pub mod mock {
         cursor_override: Arc<Mutex<Option<Cursor>>>,
         page_size: Arc<Mutex<Option<usize>>>,
         error: Arc<Mutex<Option<ChainEventError>>>,
+        unreadable: Arc<Mutex<Vec<IndexingAgreementId>>>,
+        snapshots_error: Arc<Mutex<Option<ChainEventError>>>,
     }
 
     impl MockEventSource {
@@ -852,6 +988,8 @@ pub mod mock {
                 cursor_override: Arc::new(Mutex::new(None)),
                 page_size: Arc::new(Mutex::new(None)),
                 error: Arc::new(Mutex::new(None)),
+                unreadable: Arc::new(Mutex::new(Vec::new())),
+                snapshots_error: Arc::new(Mutex::new(None)),
             }
         }
 
@@ -885,6 +1023,16 @@ pub mod mock {
         /// Fail the next query with `error`.
         pub fn set_error(&self, error: ChainEventError) {
             *self.error.lock().unwrap() = Some(error);
+        }
+
+        /// Fail the next read of agreements by id with `error`.
+        pub fn set_snapshots_error(&self, error: ChainEventError) {
+            *self.snapshots_error.lock().unwrap() = Some(error);
+        }
+
+        /// Return the state of `agreement_ids` in a form that can't be read, when read by id.
+        pub fn set_unreadable(&self, agreement_ids: Vec<IndexingAgreementId>) {
+            *self.unreadable.lock().unwrap() = agreement_ids;
         }
     }
 
@@ -965,6 +1113,45 @@ pub mod mock {
                 latest_block,
                 latest_block_timestamp,
                 cursor,
+            })
+        }
+
+        async fn get_agreement_snapshots(
+            &self,
+            agreement_ids: &[IndexingAgreementId],
+        ) -> Result<AgreementSnapshots, ChainEventError> {
+            if let Some(error) = self.snapshots_error.lock().unwrap().take() {
+                return Err(error);
+            }
+            // The subgraph keeps 1 entity per agreement, so only the latest snapshot of each.
+            let mut latest: std::collections::HashMap<IndexingAgreementId, AgreementStateSnapshot> =
+                std::collections::HashMap::new();
+            let unreadable: Vec<IndexingAgreementId> = self
+                .unreadable
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|id| agreement_ids.contains(id))
+                .copied()
+                .collect();
+            for snapshot in self.snapshots.lock().unwrap().iter() {
+                if !agreement_ids.contains(&snapshot.agreement_id)
+                    || unreadable.contains(&snapshot.agreement_id)
+                {
+                    continue;
+                }
+                match latest.get(&snapshot.agreement_id) {
+                    Some(kept)
+                        if kept.last_state_change_block >= snapshot.last_state_change_block => {}
+                    _ => {
+                        latest.insert(snapshot.agreement_id, snapshot.clone());
+                    }
+                }
+            }
+            Ok(AgreementSnapshots {
+                snapshots: latest.into_values().collect(),
+                block: *self.latest_block.lock().unwrap(),
+                unreadable,
             })
         }
     }
@@ -1216,6 +1403,160 @@ mod tests {
             matches!(err, ChainEventError::RateLimited(_)),
             "got {err:?}"
         );
+    }
+
+    /// The JSON the subgraph sends for [`valid_entity`], under `id`.
+    fn entity_json(id: IndexingAgreementId) -> serde_json::Value {
+        let entity = valid_entity();
+        serde_json::json!({
+            "id": id.to_string(),
+            "indexer": entity.indexer,
+            "state": entity.state,
+            "canceledBy": entity.canceled_by,
+            "lastStateChangeBlock": entity.last_state_change_block,
+            "acceptedAt": entity.accepted_at,
+            "acceptedAtTx": entity.accepted_at_tx,
+            "canceledAt": entity.canceled_at,
+            "canceledAtTx": entity.canceled_at_tx,
+        })
+    }
+
+    fn agreements_response(entities: Vec<serde_json::Value>) -> wiremock::ResponseTemplate {
+        agreements_response_at(entities, 4_321)
+    }
+
+    fn agreements_response_at(
+        entities: Vec<serde_json::Value>,
+        block: u64,
+    ) -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": {
+                "indexingAgreements": entities,
+                "_meta": { "block": { "number": block } },
+            }
+        }))
+    }
+
+    /// Reading agreements by id asks for those ids of the payer and the block it is answered at,
+    /// parses what comes back as a page does, and reports a malformed entity as unreadable rather
+    /// than leaving it out, which would read as the agreement having no state.
+    #[tokio::test]
+    async fn test_get_agreement_snapshots_reads_the_payers_agreements_by_id() {
+        let server = wiremock::MockServer::start().await;
+        let read = IndexingAgreementId::from_bytes([1; 16]);
+        let malformed = IndexingAgreementId::from_bytes([2; 16]);
+        let mut malformed_entity = entity_json(malformed);
+        malformed_entity["state"] = serde_json::json!("Garbage");
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_string_contains(
+                "where: { payer: $payer, id_in: $ids }",
+            ))
+            .and(wiremock::matchers::body_string_contains("_meta"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "variables": {
+                    "payer": "0x0000000000000000000000000000000000000000",
+                    "ids": [read.to_string(), malformed.to_string()],
+                }
+            })))
+            .respond_with(agreements_response(vec![
+                entity_json(read),
+                malformed_entity,
+            ]))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let found = event_source_for(&server)
+            .get_agreement_snapshots(&[read, malformed])
+            .await
+            .expect("the read succeeds");
+
+        assert_eq!(found.block, 4_321);
+        assert_eq!(found.unreadable, vec![malformed]);
+        assert_eq!(found.snapshots.len(), 1, "{found:?}");
+        let snapshot = &found.snapshots[0];
+        assert_eq!(snapshot.agreement_id, read);
+        assert_eq!(snapshot.state, AgreementState::Accepted);
+        assert_eq!(snapshot.last_state_change_block, 150);
+        assert_eq!(snapshot.accepted_at, 1_700_000_001);
+        assert_eq!(snapshot.canceled_by, Address::ZERO);
+    }
+
+    /// A malformed entity whose id can't be read either could be any agreement asked for, so
+    /// none that didn't come back readable can be taken as having no state.
+    #[tokio::test]
+    async fn test_get_agreement_snapshots_takes_none_as_missing_beside_an_entity_with_no_id() {
+        let server = wiremock::MockServer::start().await;
+        let read = IndexingAgreementId::from_bytes([1; 16]);
+        let missing = IndexingAgreementId::from_bytes([2; 16]);
+        let mut unplaceable = entity_json(missing);
+        unplaceable["id"] = serde_json::json!("not-an-id");
+        expect_single_query(
+            &server,
+            agreements_response(vec![entity_json(read), unplaceable]),
+        )
+        .await;
+
+        let found = event_source_for(&server)
+            .get_agreement_snapshots(&[read, missing])
+            .await
+            .expect("the read succeeds");
+
+        assert_eq!(found.snapshots.len(), 1, "{found:?}");
+        assert_eq!(found.unreadable, vec![missing]);
+    }
+
+    /// The subgraph isn't trusted: a state for an agreement not asked for, or for 1 twice, fails
+    /// the read rather than being applied.
+    #[tokio::test]
+    async fn test_get_agreement_snapshots_rejects_agreements_not_asked_for() {
+        let asked = IndexingAgreementId::from_bytes([1; 16]);
+        let other = IndexingAgreementId::from_bytes([3; 16]);
+        for returned in [vec![other], vec![asked, asked]] {
+            let server = wiremock::MockServer::start().await;
+            expect_single_query(
+                &server,
+                agreements_response(returned.iter().map(|id| entity_json(*id)).collect()),
+            )
+            .await;
+
+            let err = event_source_for(&server)
+                .get_agreement_snapshots(&[asked])
+                .await
+                .expect_err("the read fails");
+
+            assert!(err.is_transient(), "{returned:?}: {err:?}");
+        }
+    }
+
+    /// The query returns at most a page of rows, so more ids than that take more than 1 query,
+    /// and none take none. The read is as far as the furthest-behind query reached.
+    #[tokio::test]
+    async fn test_get_agreement_snapshots_asks_for_at_most_a_page_of_ids_at_once() {
+        let server = wiremock::MockServer::start().await;
+        for block in [500, 400] {
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(agreements_response_at(vec![], block))
+                .up_to_n_times(1)
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let source = event_source_for(&server);
+        let ids: Vec<IndexingAgreementId> = (0..=SUBGRAPH_PAGE_SIZE)
+            .map(|n| {
+                let mut bytes = [0u8; 16];
+                bytes[..8].copy_from_slice(&(n as u64).to_be_bytes());
+                IndexingAgreementId::from_bytes(bytes)
+            })
+            .collect();
+
+        let none = source.get_agreement_snapshots(&[]).await.unwrap();
+        assert!(none.snapshots.is_empty() && none.unreadable.is_empty());
+        assert_eq!(none.block, 0);
+        let found = source.get_agreement_snapshots(&ids).await.unwrap();
+        assert!(found.snapshots.is_empty() && found.unreadable.is_empty());
+        assert_eq!(found.block, 400);
     }
 
     #[test]

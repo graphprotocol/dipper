@@ -6,13 +6,17 @@ mod result;
 
 use self::result::Result;
 
-/// Create and execute the DIPs CLI command line interface
-pub async fn run() -> Result<()> {
-    let matches = clap::command!()
+/// Create the DIPs CLI command line interface
+pub(crate) fn command() -> clap::Command {
+    clap::command!()
         .subcommands([init::cmd(), indexings::cmd(), agreements::cmd()])
         .infer_long_args(true)
         .infer_subcommands(true)
-        .get_matches();
+}
+
+/// Create and execute the DIPs CLI command line interface
+pub async fn run() -> Result<()> {
+    let matches = command().get_matches();
 
     match matches.subcommand() {
         Some(("init", matches)) => init::run(matches).await,
