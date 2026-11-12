@@ -1145,8 +1145,9 @@ fn status_reply_limit_bytes(deployments: usize) -> usize {
 
 /// Query a single indexer's status endpoint for sync progress.
 ///
-/// Returns a map of deployment ID (IPFS hash string) to the latest block height,
-/// or `None` if the deployment is not found in the response.
+/// Returns a map of deployment ID (IPFS hash string) to the latest block height, which is `None`
+/// when the reply lists the deployment without a block. A deployment the reply leaves out is not
+/// in the map.
 ///
 /// Returns an error when the HTTP call fails (network error, timeout, non-2xx response), the
 /// reply is not JSON or is over the size limit, or it has no list of statuses, as when the
