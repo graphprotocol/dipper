@@ -56,7 +56,7 @@ use crate::{
     config::ChainListenerConfig,
     registry::{
         AgreementRegistry, CancelKind, IndexingAgreement, IndexingAgreementStatus,
-        PendingCancellationRegistry, ReconciliationItem,
+        PendingCancellationRegistry, ReconciliationItem, SetAsideChange, SetAsideChangeRegistry,
     },
     worker::service::{ChainAccept, JobPriority, WorkerQueue},
 };
@@ -94,10 +94,12 @@ const STALL_ERROR_THRESHOLD: u32 = 15;
 /// Sanity bound on a single tick's drain — not an operating point;
 /// steady-state drains are 0–1 pages.
 const MAX_PAGES_PER_DRAIN: u32 = 1000;
-/// How long the listener keeps re-reading a page whose changes fail to apply before moving past
-/// it: long enough to ride out a database failover, short enough that a change that can never
-/// apply doesn't hold up every later accept and cancel.
+/// How long the listener keeps re-reading a page whose changes fail to apply before setting them
+/// aside and moving past it: long enough to ride out a database failover, short enough that a
+/// change that can never apply doesn't hold up every later accept and cancel.
 const MAX_CURSOR_HOLD: Duration = Duration::from_secs(600);
+/// How often the retry of set-aside changes repeats its warning about the same agreements.
+const SET_ASIDE_WARNING_INTERVAL: Duration = Duration::from_secs(600);
 
 /// Where the cursor has been held, and since when, before a page whose changes failed to apply.
 #[derive(Debug)]
@@ -106,17 +108,14 @@ struct CursorHold {
     since: std::time::Instant,
 }
 
-/// Whether to move past a page at `cursor` whose changes failed to apply: once the cursor has
-/// been held before it for [`MAX_CURSOR_HOLD`]. Until then the hold is noted, so the page is
-/// read again.
+/// Whether to set aside the changes of a page at `cursor` that failed to apply and move past it:
+/// once the cursor has been held before it for [`MAX_CURSOR_HOLD`]. Until then the hold is noted,
+/// so the page is read again. The hold lasts until the page is passed, so if setting the changes
+/// aside fails, the next poll tries again.
 fn hold_expired(hold: &mut Option<CursorHold>, cursor: &Cursor, now: std::time::Instant) -> bool {
     match hold {
         Some(held) if held.cursor == *cursor => {
-            if now.saturating_duration_since(held.since) < MAX_CURSOR_HOLD {
-                return false;
-            }
-            *hold = None;
-            true
+            now.saturating_duration_since(held.since) >= MAX_CURSOR_HOLD
         }
         _ => {
             *hold = Some(CursorHold {
@@ -235,7 +234,12 @@ pub struct ChainListenerState {
 )]
 pub fn new<R, E, T, W>(ctx: Ctx<R, E, T, W>) -> (Handle, impl Future<Output = anyhow::Result<()>>)
 where
-    R: AgreementRegistry + ChainListenerStateRegistry + PendingCancellationRegistry + Send + Sync,
+    R: AgreementRegistry
+        + ChainListenerStateRegistry
+        + PendingCancellationRegistry
+        + SetAsideChangeRegistry
+        + Send
+        + Sync,
     E: ChainEventSource,
     T: ChainClient + Send + Sync,
     W: WorkerQueue + Send + Sync,
@@ -323,6 +327,7 @@ where
         // poll loop on every iteration.
         let mut broker_cooldown = BrokerCooldown::new(fast_interval, slow_interval);
         let mut live_checks = LiveChecks::new(worker_queue);
+        let mut set_aside_warning = SetAsideWarning::default();
 
         loop {
             tokio::select! {
@@ -372,6 +377,21 @@ where
                     "Applying failure backoff"
                 );
                 tokio::time::sleep(backoff).await;
+            }
+
+            if retry_set_aside_changes(
+                &registry,
+                &event_source,
+                &chain_client,
+                &mut live_checks,
+                &agreement_conf,
+                &mut set_aside_warning,
+                &mut rx_stop,
+            )
+            .await
+            {
+                tracing::debug!("chain listener stopping mid-cycle");
+                return Ok(());
             }
 
             let outcome = match drain_once(
@@ -524,7 +544,12 @@ async fn drain_once<R, E, T, W>(
     config: &crate::config::IndexingAgreementConfig,
 ) -> Result<DrainOutcome, ()>
 where
-    R: AgreementRegistry + ChainListenerStateRegistry + PendingCancellationRegistry + Send + Sync,
+    R: AgreementRegistry
+        + ChainListenerStateRegistry
+        + PendingCancellationRegistry
+        + SetAsideChangeRegistry
+        + Send
+        + Sync,
     E: ChainEventSource,
     T: ChainClient + Send + Sync,
     W: WorkerQueue + Sync,
@@ -653,8 +678,17 @@ where
         // another payer's) drop out as `None` below.
         let snapshot_ids: Vec<IndexingAgreementId> =
             result.snapshots.iter().map(|s| s.agreement_id).collect();
+        // Each change's block, kept for setting aside those that fail to apply.
+        let page_changes: Vec<SetAsideChange> = result
+            .snapshots
+            .iter()
+            .map(|s| SetAsideChange {
+                agreement_id: s.agreement_id,
+                block: s.last_state_change_block,
+            })
+            .collect();
         // Agreements whose change this page failed to apply. The cursor stays before the page
-        // until none fail, as nothing else would look at them again.
+        // until none fail, or they're set aside, as nothing else would look at them again.
         let mut unapplied: Vec<IndexingAgreementId> = Vec::new();
         let mut agreements_by_id =
             match registry.get_indexing_agreements_by_ids(&snapshot_ids).await {
@@ -769,8 +803,12 @@ where
         let already_held = cursor_hold
             .as_ref()
             .is_some_and(|hold| hold.cursor == *cursor);
-        let skip = !unapplied.is_empty() && hold_expired(cursor_hold, cursor, now_instant);
-        if unapplied.is_empty() {
+        let hold_over = !unapplied.is_empty() && hold_expired(cursor_hold, cursor, now_instant);
+        // Moving past the page drops its changes from the read, so those that failed are recorded
+        // first, to be tried again every poll. Until that works, the cursor stays held.
+        let skip =
+            hold_over && set_aside_unapplied(registry, &page_changes, &unapplied, cursor).await;
+        if unapplied.is_empty() || skip {
             *cursor_hold = None;
         }
         let advance_cursor = (unapplied.is_empty() || skip) && *cursor < new_cursor;
@@ -780,8 +818,8 @@ where
                 cursor_block = cursor.block,
                 agreement_count = unapplied.len(),
                 agreement_ids = %listed_ids(&unapplied),
-                "Skipped on-chain changes to agreements that kept failing to apply; they won't \
-                 be read again until their next change"
+                "Set aside on-chain changes to agreements that kept failing to apply, moving past \
+                 them; they're tried again every poll until they apply"
             );
         } else if !unapplied.is_empty() && already_held {
             // The hold started with the tagged ERROR below; a WARN on each poll it goes on, which
@@ -869,6 +907,363 @@ where
         subgraph_lag_seconds,
         stopped: drain_stopped,
     })
+}
+
+/// Record the changes on a page that failed to apply, at the block of each, so the cursor can
+/// move past the page and they're still tried again. False, with the reason logged, if recording
+/// failed.
+async fn set_aside_unapplied<R: SetAsideChangeRegistry + Sync>(
+    registry: &R,
+    page_changes: &[SetAsideChange],
+    unapplied: &[IndexingAgreementId],
+    cursor: &Cursor,
+) -> bool {
+    let unapplied_ids: std::collections::HashSet<&IndexingAgreementId> = unapplied.iter().collect();
+    let changes: Vec<SetAsideChange> = page_changes
+        .iter()
+        .filter(|change| unapplied_ids.contains(&change.agreement_id))
+        .copied()
+        .collect();
+    match registry.record_set_aside_changes(&changes).await {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                cursor_block = cursor.block,
+                agreement_count = unapplied.len(),
+                agreement_ids = %listed_ids(unapplied),
+                "Failed to set aside on-chain changes to agreements that keep failing to apply; \
+                 holding the cursor before them so they aren't dropped"
+            );
+            false
+        }
+    }
+}
+
+/// The set-aside changes the last warning named as still failing, and when, so the warning
+/// repeats only when they change or every [`SET_ASIDE_WARNING_INTERVAL`].
+#[derive(Debug, Default)]
+struct SetAsideWarning {
+    failing: Vec<IndexingAgreementId>,
+    warned_at: Option<Instant>,
+}
+
+impl SetAsideWarning {
+    /// Whether to warn at `now` that `failing`, sorted, still fail to apply. None failing ends
+    /// the run, so the next failure warns at once.
+    fn due(&mut self, failing: &[IndexingAgreementId], now: Instant) -> bool {
+        if failing.is_empty() {
+            *self = Self::default();
+            return false;
+        }
+        let repeat = self.failing == failing
+            && self
+                .warned_at
+                .is_some_and(|at| now.saturating_duration_since(at) < SET_ASIDE_WARNING_INTERVAL);
+        if repeat {
+            return false;
+        }
+        self.failing = failing.to_vec();
+        self.warned_at = Some(now);
+        true
+    }
+}
+
+/// Try again the on-chain changes set aside after they kept failing to apply, reading each
+/// agreement's current state from the subgraph and applying it 1 agreement at a time, so 1 that
+/// fails can't hold back the rest. An agreement leaves the record once its change applied or
+/// there was nothing to apply. Returns true if the listener was told to stop part way.
+async fn retry_set_aside_changes<R, E, T, W>(
+    registry: &R,
+    event_source: &E,
+    chain_client: &T,
+    live_checks: &mut LiveChecks<W>,
+    config: &crate::config::IndexingAgreementConfig,
+    warning: &mut SetAsideWarning,
+    rx_stop: &mut mpsc::Receiver<()>,
+) -> bool
+where
+    R: AgreementRegistry + PendingCancellationRegistry + SetAsideChangeRegistry + Sync,
+    E: ChainEventSource,
+    T: ChainClient + Sync,
+    W: WorkerQueue + Sync,
+{
+    let set_aside = match registry.get_set_aside_changes().await {
+        Ok(set_aside) => set_aside,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "Failed to read the on-chain changes set aside to try again; trying next poll"
+            );
+            return false;
+        }
+    };
+    if set_aside.is_empty() {
+        *warning = SetAsideWarning::default();
+        return false;
+    }
+
+    let mut finished = Vec::new();
+    let mut failing = Vec::new();
+    let mut stopped = false;
+    match read_set_aside(registry, event_source, &set_aside).await {
+        Err(err) => {
+            let reason = format!("{err:#}");
+            failing.extend(set_aside.iter().map(|c| (c.agreement_id, reason.clone())));
+        }
+        Ok((read, mut agreements)) => {
+            for change in &set_aside {
+                if rx_stop.try_recv().is_ok() {
+                    stopped = true;
+                    break;
+                }
+                let agreement = agreements.remove(&change.agreement_id);
+                match apply_set_aside_change(
+                    change,
+                    read.state_of(change),
+                    agreement,
+                    registry,
+                    chain_client,
+                    live_checks,
+                    config,
+                )
+                .await
+                {
+                    Ok(()) => finished.push(change.agreement_id),
+                    Err(err) => failing.push((change.agreement_id, format!("{err:#}"))),
+                }
+            }
+        }
+    }
+
+    forget_finished_set_aside(registry, &finished).await;
+    if !stopped {
+        warn_still_failing_set_aside(warning, &failing);
+    }
+    stopped
+}
+
+/// What a read of the subgraph showed for the set-aside agreements, and the block it was read at.
+struct SetAsideRead {
+    snapshots: std::collections::HashMap<IndexingAgreementId, AgreementStateSnapshot>,
+    unreadable: std::collections::HashSet<IndexingAgreementId>,
+    block: u64,
+}
+
+/// What the subgraph showed for 1 set-aside agreement.
+enum SetAsideState<'a> {
+    /// The subgraph hadn't yet indexed the block of the change, so it can't show it.
+    Behind { indexed: u64 },
+    /// The agreement's state came back in a form that couldn't be read.
+    Unreadable,
+    /// The subgraph, indexed past the change, has no state for the agreement.
+    Gone,
+    /// The agreement's state as the subgraph, indexed past the change, has it.
+    Readable(&'a AgreementStateSnapshot),
+}
+
+impl SetAsideRead {
+    fn state_of(&self, change: &SetAsideChange) -> SetAsideState<'_> {
+        if self.block < change.block {
+            SetAsideState::Behind {
+                indexed: self.block,
+            }
+        } else if let Some(snapshot) = self.snapshots.get(&change.agreement_id) {
+            SetAsideState::Readable(snapshot)
+        } else if self.unreadable.contains(&change.agreement_id) {
+            SetAsideState::Unreadable
+        } else {
+            SetAsideState::Gone
+        }
+    }
+}
+
+/// Read each set-aside agreement's current state from the subgraph and its row from the
+/// registry, by agreement. Either failing leaves every change to try again.
+async fn read_set_aside<R, E>(
+    registry: &R,
+    event_source: &E,
+    set_aside: &[SetAsideChange],
+) -> anyhow::Result<(
+    SetAsideRead,
+    std::collections::HashMap<IndexingAgreementId, IndexingAgreement>,
+)>
+where
+    R: AgreementRegistry + Sync,
+    E: ChainEventSource,
+{
+    let ids: Vec<IndexingAgreementId> = set_aside.iter().map(|c| c.agreement_id).collect();
+    let found = event_source
+        .get_agreement_snapshots(&ids)
+        .await
+        .context("failed to read their current state from the subgraph")?;
+    let agreements = registry
+        .get_indexing_agreements_by_ids(&ids)
+        .await
+        .context("failed to read the agreements from the database")?;
+    let read = SetAsideRead {
+        snapshots: found
+            .snapshots
+            .into_iter()
+            .map(|snapshot| (snapshot.agreement_id, snapshot))
+            .collect(),
+        unreadable: found.unreadable.into_iter().collect(),
+        block: found.block,
+    };
+    Ok((read, agreements))
+}
+
+/// Apply the current state of 1 agreement whose change was set aside, once the subgraph has
+/// indexed past the change: what it shows then is the chain as it is, even if a reorg or a change
+/// of the payer address took the change away. Ok once the state applied, there was nothing to
+/// apply, or the subgraph has no state for the agreement.
+async fn apply_set_aside_change<R, T, W>(
+    change: &SetAsideChange,
+    state: SetAsideState<'_>,
+    agreement: Option<IndexingAgreement>,
+    registry: &R,
+    chain_client: &T,
+    live_checks: &mut LiveChecks<W>,
+    config: &crate::config::IndexingAgreementConfig,
+) -> anyhow::Result<()>
+where
+    R: AgreementRegistry + PendingCancellationRegistry + Sync,
+    T: ChainClient + Sync,
+    W: WorkerQueue + Sync,
+{
+    let snapshot = match state {
+        SetAsideState::Behind { indexed } => anyhow::bail!(
+            "the subgraph has indexed up to block {indexed}, before the change at {}",
+            change.block
+        ),
+        SetAsideState::Unreadable => {
+            anyhow::bail!(
+                "the subgraph returned the agreement's state in a form that can't be read"
+            )
+        }
+        SetAsideState::Gone => {
+            warn_set_aside_change_gone(change, None);
+            return Ok(());
+        }
+        SetAsideState::Readable(snapshot) => snapshot,
+    };
+    apply_snapshot(
+        snapshot,
+        agreement,
+        registry,
+        chain_client,
+        live_checks,
+        config,
+    )
+    .await?;
+    // Warned only once the state applied, as the change then leaves the record.
+    if snapshot.last_state_change_block < change.block {
+        warn_set_aside_change_gone(change, Some(snapshot.last_state_change_block));
+    }
+    Ok(())
+}
+
+/// Apply 1 agreement's state with the same steps as a page, on its own.
+async fn apply_snapshot<R, T, W>(
+    snapshot: &AgreementStateSnapshot,
+    agreement: Option<IndexingAgreement>,
+    registry: &R,
+    chain_client: &T,
+    live_checks: &mut LiveChecks<W>,
+    config: &crate::config::IndexingAgreementConfig,
+) -> anyhow::Result<()>
+where
+    R: AgreementRegistry + PendingCancellationRegistry + Sync,
+    T: ChainClient + Sync,
+    W: WorkerQueue + Sync,
+{
+    let Some(prep) = prepare_reconciliation(snapshot, agreement, registry, live_checks).await?
+    else {
+        return Ok(());
+    };
+    let outcomes = registry
+        .apply_reconciliation_batch(std::slice::from_ref(&prep.item))
+        .await
+        .context("failed to apply the change")?;
+    let outcome = outcomes
+        .get(&prep.agreement.id)
+        .copied()
+        .context("applying the change returned no outcome for the agreement")?;
+    // The change is applied, as when a page's finalize fails; the pending cancellation sweep
+    // finishes what this leaves.
+    if let Err(err) = finalize_reconciliation(&prep, outcome, registry, chain_client, config).await
+    {
+        tracing::warn!(
+            error = %err,
+            agreement_id = %prep.agreement.id,
+            "Failed to finalize reconciliation outcome"
+        );
+    }
+    Ok(())
+}
+
+/// Warn that a set-aside change is no longer on the chain as the subgraph, indexed past it, has
+/// it, so it's no longer tried: the agreement's latest change there is older, or there is none.
+fn warn_set_aside_change_gone(change: &SetAsideChange, latest_change_block: Option<u64>) {
+    tracing::warn!(
+        event = "chain_listener_set_aside_change_gone",
+        agreement_id = %change.agreement_id,
+        change_block = change.block,
+        latest_change_block = ?latest_change_block,
+        "On-chain change set aside at this block is no longer on the chain as the subgraph has it, \
+         as after a reorg or a change of payer address; recorded the agreement as the subgraph has \
+         it now, if at all, and no longer trying the change"
+    );
+}
+
+/// Remove from the record the set-aside changes that applied or had nothing left to apply.
+async fn forget_finished_set_aside<R: SetAsideChangeRegistry + Sync>(
+    registry: &R,
+    finished: &[IndexingAgreementId],
+) {
+    if finished.is_empty() {
+        return;
+    }
+    match registry.delete_set_aside_changes(finished).await {
+        Ok(()) => tracing::info!(
+            agreement_count = finished.len(),
+            agreement_ids = %listed_ids(finished),
+            "Applied on-chain changes set aside earlier, or found nothing left to apply"
+        ),
+        Err(err) => tracing::warn!(
+            error = %err,
+            agreement_count = finished.len(),
+            agreement_ids = %listed_ids(finished),
+            "Finished with on-chain changes set aside earlier but failed to remove them from the \
+             record; trying them again next poll, which applies nothing new"
+        ),
+    }
+}
+
+/// Warn that set-aside changes still fail to apply, only when the agreements failing differ from
+/// the last warning's or every [`SET_ASIDE_WARNING_INTERVAL`], as this runs every poll.
+fn warn_still_failing_set_aside(
+    warning: &mut SetAsideWarning,
+    failing: &[(IndexingAgreementId, String)],
+) {
+    for (agreement_id, reason) in failing {
+        tracing::debug!(
+            agreement_id = %agreement_id,
+            error = reason,
+            "Set-aside on-chain change still fails to apply"
+        );
+    }
+    let mut ids: Vec<IndexingAgreementId> = failing.iter().map(|(id, _)| *id).collect();
+    ids.sort();
+    if !warning.due(&ids, Instant::now()) {
+        return;
+    }
+    tracing::warn!(
+        agreement_count = ids.len(),
+        agreement_ids = %listed_ids(&ids),
+        error = failing.first().map(|(_, reason)| reason.as_str()).unwrap_or_default(),
+        "On-chain changes set aside after failing to apply still fail; trying them again every poll"
+    );
 }
 
 /// Decision computed for one snapshot, plus the resolved agreement and
@@ -2037,6 +2432,16 @@ mod tests {
         initial_last_processed_block: u64,
         fail_batch: bool,
         pending_accepted: Vec<crate::registry::PendingAcceptedEvent>,
+        /// Changes recorded as set aside, in the order first recorded.
+        set_aside: Vec<crate::registry::SetAsideChange>,
+        /// When true, recording set-aside changes fails.
+        fail_set_aside: bool,
+        /// A batch apply holding any of these agreements fails.
+        fail_apply_for: std::collections::HashSet<IndexingAgreementId>,
+        /// When true, reading the set-aside changes fails.
+        fail_set_aside_read: bool,
+        /// When true, reading agreements fails.
+        fail_agreement_reads: bool,
     }
 
     impl MockRegistry {
@@ -2185,6 +2590,26 @@ mod tests {
         fn seed_pending_accepted(&self, event: crate::registry::PendingAcceptedEvent) {
             self.state.lock().unwrap().pending_accepted.push(event);
         }
+
+        fn set_aside(&self) -> Vec<crate::registry::SetAsideChange> {
+            self.state.lock().unwrap().set_aside.clone()
+        }
+
+        fn set_fail_set_aside(&self, fail: bool) {
+            self.state.lock().unwrap().fail_set_aside = fail;
+        }
+
+        fn fail_apply_for(&self, id: IndexingAgreementId) {
+            self.state.lock().unwrap().fail_apply_for.insert(id);
+        }
+
+        fn set_fail_set_aside_read(&self, fail: bool) {
+            self.state.lock().unwrap().fail_set_aside_read = fail;
+        }
+
+        fn set_fail_agreement_reads(&self, fail: bool) {
+            self.state.lock().unwrap().fail_agreement_reads = fail;
+        }
     }
 
     #[async_trait::async_trait]
@@ -2193,7 +2618,15 @@ mod tests {
             &self,
             id: &IndexingAgreementId,
         ) -> RegistryResult<Option<IndexingAgreement>> {
-            Ok(self.state.lock().unwrap().agreements.get(id).cloned())
+            let state = self.state.lock().unwrap();
+            if state.fail_agreement_reads {
+                return Err(crate::registry::Error::BackendError(
+                    dipper_pgregistry::Error::DbError(sqlx::Error::Protocol(
+                        "forced agreement read failure (test)".into(),
+                    )),
+                ));
+            }
+            Ok(state.agreements.get(id).cloned())
         }
 
         async fn get_indexing_agreements_by_deployment_id(
@@ -2479,7 +2912,14 @@ mod tests {
         ) -> RegistryResult<
             std::collections::HashMap<IndexingAgreementId, crate::registry::ReconciliationOutcome>,
         > {
-            if self.state.lock().unwrap().fail_batch {
+            let fails = {
+                let state = self.state.lock().unwrap();
+                state.fail_batch
+                    || items
+                        .iter()
+                        .any(|item| state.fail_apply_for.contains(&item.agreement_id))
+            };
+            if fails {
                 return Err(crate::registry::Error::BackendError(
                     dipper_pgregistry::Error::DbError(sqlx::Error::Protocol(
                         "forced batch failure (test)".into(),
@@ -4010,6 +4450,59 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl crate::registry::SetAsideChangeRegistry for MockRegistry {
+        async fn record_set_aside_changes(
+            &self,
+            changes: &[crate::registry::SetAsideChange],
+        ) -> crate::registry::Result<()> {
+            let mut state = self.state.lock().unwrap();
+            if state.fail_set_aside {
+                return Err(crate::registry::Error::BackendError(
+                    dipper_pgregistry::Error::DbError(sqlx::Error::Protocol(
+                        "forced set-aside failure (test)".into(),
+                    )),
+                ));
+            }
+            for change in changes {
+                match state
+                    .set_aside
+                    .iter_mut()
+                    .find(|kept| kept.agreement_id == change.agreement_id)
+                {
+                    Some(kept) => kept.block = kept.block.max(change.block),
+                    None => state.set_aside.push(*change),
+                }
+            }
+            Ok(())
+        }
+
+        async fn get_set_aside_changes(
+            &self,
+        ) -> crate::registry::Result<Vec<crate::registry::SetAsideChange>> {
+            if self.state.lock().unwrap().fail_set_aside_read {
+                return Err(crate::registry::Error::BackendError(
+                    dipper_pgregistry::Error::DbError(sqlx::Error::Protocol(
+                        "forced set-aside read failure (test)".into(),
+                    )),
+                ));
+            }
+            Ok(self.set_aside())
+        }
+
+        async fn delete_set_aside_changes(
+            &self,
+            agreement_ids: &[IndexingAgreementId],
+        ) -> crate::registry::Result<()> {
+            self.state
+                .lock()
+                .unwrap()
+                .set_aside
+                .retain(|change| !agreement_ids.contains(&change.agreement_id));
+            Ok(())
+        }
+    }
+
     /// A mock event source that records when it was polled.
     struct TimingEventSource {
         poll_times: Arc<Mutex<Vec<tokio::time::Instant>>>,
@@ -4035,6 +4528,16 @@ mod tests {
                 latest_block_timestamp: Some(1000),
                 cursor: Cursor::at_block(1),
             })
+        }
+
+        async fn get_agreement_snapshots(
+            &self,
+            _agreement_ids: &[IndexingAgreementId],
+        ) -> Result<
+            super::super::chain_events::AgreementSnapshots,
+            super::super::chain_events::ChainEventError,
+        > {
+            Ok(super::super::chain_events::AgreementSnapshots::default())
         }
     }
 
@@ -4110,6 +4613,60 @@ mod tests {
                 "timestamp must be persisted on every poll while the subgraph reports it"
             );
         }
+    }
+
+    /// Every poll tries the set-aside changes again, though the cursor is past them.
+    #[tokio::test]
+    async fn test_chain_listener_retries_set_aside_changes_each_poll() {
+        let registry = MockRegistry::new();
+        registry.set_initial_last_processed_block(200);
+        let event_source = super::super::chain_events::mock::MockEventSource::new();
+        event_source.set_latest_block(200);
+        event_source.set_latest_block_timestamp(Some(1_700_000_000));
+        let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+        registry.add_agreement(agreement_id, IndexingAgreementStatus::Created);
+        event_source.add_snapshots(vec![make_snapshot(
+            agreement_id,
+            AgreementState::Accepted,
+            Address::ZERO,
+        )]);
+        set_aside_at(&registry, agreement_id, 100).await;
+
+        let config = crate::config::ChainListenerConfig {
+            enabled: true,
+            subgraph_endpoint: Some("http://localhost:8000/subgraphs/name/test".parse().unwrap()),
+            subgraph_api_key: None,
+            chain_id: 1337,
+            poll_interval: Duration::from_millis(20),
+            request_timeout: Duration::from_secs(5),
+            max_retries: 0,
+            // The drain reads nothing before the cursor at 200, so only the retry can apply it.
+            reorg_buffer_blocks: 0,
+            wall_clock_skew_tolerance_secs: 60,
+            chain_ts_drift_tolerance_secs: 10,
+            bypass_chain_clock_defenses: false,
+        };
+        let ctx = Ctx {
+            registry: registry.clone(),
+            chain_client: MockChainClient::default(),
+            event_source,
+            config,
+            agreement_conf: test_agreement_conf(),
+            chain_listener_notify: Arc::new(tokio::sync::Notify::new()),
+            subgraph_indexing_agreements_events_emitter: Arc::new(
+                SubgraphIndexingAgreementsEventsEmitter::disabled(),
+            ),
+            worker_queue: MockWorkerQueue::default(),
+        };
+
+        let (handle, service) = new(ctx);
+        let svc_handle = tokio::spawn(service);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        handle.stop().await;
+        let _ = svc_handle.await;
+
+        assert!(registry.was_marked_accepted_on_chain(&agreement_id));
+        assert!(registry.set_aside().is_empty());
     }
 
     /// Drives a multi-page drain through the listener loop and asserts
@@ -4352,15 +4909,14 @@ mod tests {
         }
     }
 
-    /// Drain 1 page holding a change that accepts an agreement, its apply failing or not, with
-    /// the cursor held before it since `held_since` if given; the cursor it leaves, and whether
-    /// the agreement was accepted.
-    async fn drain_a_page(
-        apply_fails: &[bool],
-        held_since: Option<std::time::Instant>,
-    ) -> (Cursor, Option<CursorHold>, bool) {
+    /// A registry holding a `Created` agreement, and an event source whose 1 page holds a change
+    /// at block 10 that accepts it.
+    fn a_page_accepting_an_agreement() -> (
+        MockRegistry,
+        super::super::chain_events::mock::MockEventSource,
+        IndexingAgreementId,
+    ) {
         let registry = MockRegistry::new();
-        let chain_client = MockChainClient::default();
         let event_source = super::super::chain_events::mock::MockEventSource::new();
         event_source.set_latest_block(100);
         event_source.set_latest_block_timestamp(Some(1_700_000_000));
@@ -4377,6 +4933,33 @@ mod tests {
             canceled_at: 0,
             canceled_tx: String::new(),
         }]);
+        (registry, event_source, agreement_id)
+    }
+
+    /// Drain 1 page holding a change that accepts an agreement, its apply failing or not, with
+    /// the cursor held before it since `held_since` if given; the cursor it leaves, and whether
+    /// the agreement was accepted.
+    async fn drain_a_page(
+        apply_fails: &[bool],
+        held_since: Option<std::time::Instant>,
+    ) -> (Cursor, Option<CursorHold>, bool) {
+        let (registry, event_source, agreement_id) = a_page_accepting_an_agreement();
+        let (cursor, cursor_hold) =
+            drain_page(&registry, &event_source, apply_fails, held_since).await;
+        let accepted = registry.was_marked_accepted_on_chain(&agreement_id);
+        (cursor, cursor_hold, accepted)
+    }
+
+    /// Drain the page of `event_source` from the start once per entry of `apply_fails`, its apply
+    /// failing or not, with the cursor held before it since `held_since` if given; the cursor and
+    /// the hold it leaves.
+    async fn drain_page(
+        registry: &MockRegistry,
+        event_source: &super::super::chain_events::mock::MockEventSource,
+        apply_fails: &[bool],
+        held_since: Option<std::time::Instant>,
+    ) -> (Cursor, Option<CursorHold>) {
+        let chain_client = MockChainClient::default();
         let mut cursor = Cursor::genesis();
         let mut cursor_hold = held_since.map(|since| CursorHold {
             cursor: Cursor::genesis(),
@@ -4402,18 +4985,17 @@ mod tests {
                 0,
                 10,
                 false,
-                &registry,
+                registry,
                 &chain_client,
                 &mut live_checks,
-                &event_source,
+                event_source,
                 &mut rx_stop,
                 test_agreement_conf().as_ref(),
             )
             .await
             .expect("subgraph fetch succeeded");
         }
-        let accepted = registry.was_marked_accepted_on_chain(&agreement_id);
-        (cursor, cursor_hold, accepted)
+        (cursor, cursor_hold)
     }
 
     /// A page whose changes fail to apply keeps the cursor before it, so the next poll
@@ -4533,6 +5115,61 @@ mod tests {
         assert!(!accepted);
         assert!(cursor > Cursor::genesis());
         assert!(hold.is_none());
+    }
+
+    /// A time the cursor has been held since for longer than [`MAX_CURSOR_HOLD`].
+    fn held_too_long() -> std::time::Instant {
+        std::time::Instant::now()
+            .checked_sub(MAX_CURSOR_HOLD + Duration::from_secs(1))
+            .expect("instant")
+    }
+
+    /// Moving past a page drops its changes from the read, so the agreements whose change failed
+    /// are recorded first, at the block of the change, to be tried again.
+    #[tokio::test]
+    async fn test_drain_sets_aside_the_changes_of_a_page_it_moves_past() {
+        let (registry, event_source, agreement_id) = a_page_accepting_an_agreement();
+
+        let (cursor, hold) =
+            drain_page(&registry, &event_source, &[true], Some(held_too_long())).await;
+
+        assert!(cursor > Cursor::genesis());
+        assert!(hold.is_none());
+        assert_eq!(
+            registry.set_aside(),
+            vec![crate::registry::SetAsideChange {
+                agreement_id,
+                block: 10
+            }]
+        );
+    }
+
+    /// If recording the changes fails, the cursor stays before the page, so nothing is dropped,
+    /// and the next poll tries again to record them rather than holding for another 10 minutes.
+    #[tokio::test]
+    async fn test_drain_keeps_holding_a_page_whose_changes_fail_to_be_set_aside() {
+        let (registry, event_source, agreement_id) = a_page_accepting_an_agreement();
+        registry.set_fail_set_aside(true);
+        let since = held_too_long();
+
+        let (cursor, hold) = drain_page(&registry, &event_source, &[true], Some(since)).await;
+
+        assert_eq!(cursor, Cursor::genesis(), "held before the page");
+        assert!(registry.set_aside().is_empty());
+        let hold = hold.expect("still held");
+        assert_eq!(hold.since, since, "the hold is still over");
+
+        registry.set_fail_set_aside(false);
+        let (cursor, _) = drain_page(&registry, &event_source, &[true], Some(hold.since)).await;
+
+        assert!(cursor > Cursor::genesis());
+        assert_eq!(
+            registry.set_aside(),
+            vec![crate::registry::SetAsideChange {
+                agreement_id,
+                block: 10
+            }]
+        );
     }
 
     /// Drain a page holding a change in `state` to an agreement in `status` 3 times: with its
@@ -4684,6 +5321,338 @@ mod tests {
         }
     }
 
+    /// Try the set-aside changes again once, as a poll does before it drains.
+    async fn retry_set_aside(
+        registry: &MockRegistry,
+        event_source: &super::super::chain_events::mock::MockEventSource,
+        warning: &mut SetAsideWarning,
+    ) {
+        let (_tx_stop, mut rx_stop) = mpsc::channel::<()>(1);
+        let mut live_checks = LiveChecks::new(MockWorkerQueue::default());
+        let stopped = retry_set_aside_changes(
+            registry,
+            event_source,
+            &MockChainClient::default(),
+            &mut live_checks,
+            test_agreement_conf().as_ref(),
+            warning,
+            &mut rx_stop,
+        )
+        .await;
+        assert!(!stopped);
+    }
+
+    /// Record `agreement_id`'s change at `block` as set aside.
+    async fn set_aside_at(registry: &MockRegistry, agreement_id: IndexingAgreementId, block: u64) {
+        crate::registry::SetAsideChangeRegistry::record_set_aside_changes(
+            registry,
+            &[crate::registry::SetAsideChange {
+                agreement_id,
+                block,
+            }],
+        )
+        .await
+        .unwrap();
+    }
+
+    /// A change set aside is read again on a later poll and applied, then no longer recorded.
+    #[tokio::test]
+    async fn test_retry_applies_a_set_aside_change_and_forgets_it() {
+        let (registry, event_source, agreement_id) = a_page_accepting_an_agreement();
+        drain_page(&registry, &event_source, &[true], Some(held_too_long())).await;
+        assert!(!registry.was_marked_accepted_on_chain(&agreement_id));
+        registry.set_fail_batch(false);
+
+        retry_set_aside(&registry, &event_source, &mut SetAsideWarning::default()).await;
+
+        assert!(registry.was_marked_accepted_on_chain(&agreement_id));
+        assert!(registry.set_aside().is_empty());
+    }
+
+    /// A set-aside change that fails again stays recorded, and applies on a later poll.
+    #[tokio::test]
+    async fn test_retry_keeps_a_set_aside_change_that_fails_again() {
+        let (registry, event_source, agreement_id) = a_page_accepting_an_agreement();
+        drain_page(&registry, &event_source, &[true], Some(held_too_long())).await;
+        let mut warning = SetAsideWarning::default();
+
+        registry.set_fail_batch(true);
+        retry_set_aside(&registry, &event_source, &mut warning).await;
+
+        assert!(!registry.was_marked_accepted_on_chain(&agreement_id));
+        assert_eq!(
+            registry.set_aside(),
+            vec![crate::registry::SetAsideChange {
+                agreement_id,
+                block: 10
+            }]
+        );
+
+        registry.set_fail_batch(false);
+        retry_set_aside(&registry, &event_source, &mut warning).await;
+
+        assert!(registry.was_marked_accepted_on_chain(&agreement_id));
+        assert!(registry.set_aside().is_empty());
+    }
+
+    /// Set-aside changes apply 1 at a time, so 1 that fails can't roll back the others.
+    #[tokio::test]
+    async fn test_retry_applies_set_aside_changes_1_at_a_time() {
+        let registry = MockRegistry::new();
+        let event_source = super::super::chain_events::mock::MockEventSource::new();
+        event_source.set_latest_block(100);
+        let applies = IndexingAgreementId::from_bytes([1; 16]);
+        let fails = IndexingAgreementId::from_bytes([2; 16]);
+        for id in [applies, fails] {
+            registry.add_agreement(id, IndexingAgreementStatus::Created);
+            event_source.add_snapshots(vec![make_snapshot(
+                id,
+                AgreementState::Accepted,
+                Address::ZERO,
+            )]);
+            set_aside_at(&registry, id, 100).await;
+        }
+        registry.fail_apply_for(fails);
+
+        retry_set_aside(&registry, &event_source, &mut SetAsideWarning::default()).await;
+
+        assert!(registry.was_marked_accepted_on_chain(&applies));
+        assert!(!registry.was_marked_accepted_on_chain(&fails));
+        assert_eq!(
+            registry.set_aside(),
+            vec![crate::registry::SetAsideChange {
+                agreement_id: fails,
+                block: 100
+            }]
+        );
+    }
+
+    /// A subgraph that hasn't yet indexed the block of a set-aside change, such as one behind the
+    /// subgraph the change was read from, shows the agreement as it was before the change, or not
+    /// at all. Either way the change stays recorded until the subgraph reaches it.
+    #[tokio::test]
+    async fn test_retry_keeps_a_set_aside_change_while_the_subgraph_is_behind_it() {
+        for before_the_accept in [false, true] {
+            let registry = MockRegistry::new();
+            let event_source = super::super::chain_events::mock::MockEventSource::new();
+            event_source.set_latest_block(99);
+            let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+            registry.add_agreement(agreement_id, IndexingAgreementStatus::Created);
+            if before_the_accept {
+                let mut snapshot =
+                    make_snapshot(agreement_id, AgreementState::NotAccepted, Address::ZERO);
+                snapshot.last_state_change_block = 90;
+                event_source.add_snapshots(vec![snapshot]);
+            }
+            set_aside_at(&registry, agreement_id, 100).await;
+            let mut warning = SetAsideWarning::default();
+
+            retry_set_aside(&registry, &event_source, &mut warning).await;
+
+            assert!(!registry.was_marked_accepted_on_chain(&agreement_id));
+            assert_eq!(
+                registry.set_aside().len(),
+                1,
+                "still recorded, the subgraph showing the state before the accept: {before_the_accept}"
+            );
+
+            event_source.set_latest_block(100);
+            event_source.add_snapshots(vec![make_snapshot(
+                agreement_id,
+                AgreementState::Accepted,
+                Address::ZERO,
+            )]);
+            retry_set_aside(&registry, &event_source, &mut warning).await;
+
+            assert!(registry.was_marked_accepted_on_chain(&agreement_id));
+            assert!(registry.set_aside().is_empty());
+        }
+    }
+
+    /// Once the subgraph has indexed past a set-aside change, what it shows is the chain as it
+    /// is. A state older than the change, as when a reorg dropped the change, is applied, and the
+    /// change is no longer tried, with a warning saying so.
+    #[tokio::test]
+    async fn test_retry_applies_an_older_state_once_the_subgraph_is_past_the_change() {
+        let registry = MockRegistry::new();
+        let event_source = super::super::chain_events::mock::MockEventSource::new();
+        event_source.set_latest_block(200);
+        let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+        registry.add_agreement(agreement_id, IndexingAgreementStatus::Created);
+        let mut accepted_earlier =
+            make_snapshot(agreement_id, AgreementState::Accepted, Address::ZERO);
+        accepted_earlier.last_state_change_block = 90;
+        event_source.add_snapshots(vec![accepted_earlier]);
+        set_aside_at(&registry, agreement_id, 100).await;
+
+        let logged = crate::test_support::logged(retry_set_aside(
+            &registry,
+            &event_source,
+            &mut SetAsideWarning::default(),
+        ))
+        .await;
+
+        assert!(registry.was_marked_accepted_on_chain(&agreement_id));
+        assert!(registry.set_aside().is_empty());
+        let warned = logged
+            .lines()
+            .find(|line| line.contains(r#"event="chain_listener_set_aside_change_gone""#))
+            .expect("the change dropping out is logged");
+        assert!(warned.contains("WARN"), "{warned}");
+    }
+
+    /// An agreement the subgraph has no state for at all, once it has indexed past the change,
+    /// as after a reorg or a change of the payer address, is no longer tried, with a warning.
+    #[tokio::test]
+    async fn test_retry_forgets_a_set_aside_change_the_subgraph_past_it_has_no_state_for() {
+        let registry = MockRegistry::new();
+        let event_source = super::super::chain_events::mock::MockEventSource::new();
+        event_source.set_latest_block(200);
+        let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+        registry.add_agreement(agreement_id, IndexingAgreementStatus::Created);
+        set_aside_at(&registry, agreement_id, 100).await;
+
+        let logged = crate::test_support::logged(retry_set_aside(
+            &registry,
+            &event_source,
+            &mut SetAsideWarning::default(),
+        ))
+        .await;
+
+        assert!(!registry.was_marked_accepted_on_chain(&agreement_id));
+        assert!(registry.set_aside().is_empty());
+        let warned = logged
+            .lines()
+            .find(|line| line.contains(r#"event="chain_listener_set_aside_change_gone""#))
+            .expect("the change dropping out is logged");
+        assert!(warned.contains("WARN"), "{warned}");
+    }
+
+    /// A state the subgraph returns in a form that can't be read says nothing about the
+    /// agreement, so its change stays recorded however far the subgraph has indexed.
+    #[tokio::test]
+    async fn test_retry_keeps_a_set_aside_change_whose_state_cannot_be_read() {
+        let registry = MockRegistry::new();
+        let event_source = super::super::chain_events::mock::MockEventSource::new();
+        event_source.set_latest_block(200);
+        let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+        registry.add_agreement(agreement_id, IndexingAgreementStatus::Created);
+        event_source.add_snapshots(vec![make_snapshot(
+            agreement_id,
+            AgreementState::Accepted,
+            Address::ZERO,
+        )]);
+        event_source.set_unreadable(vec![agreement_id]);
+        set_aside_at(&registry, agreement_id, 100).await;
+
+        retry_set_aside(&registry, &event_source, &mut SetAsideWarning::default()).await;
+
+        assert!(!registry.was_marked_accepted_on_chain(&agreement_id));
+        assert_eq!(registry.set_aside().len(), 1, "still recorded");
+    }
+
+    /// The retry runs every poll, so changes that keep failing are warned about once, not on
+    /// each poll.
+    #[tokio::test]
+    async fn test_retry_warns_once_while_the_same_set_aside_changes_keep_failing() {
+        let (registry, event_source, _) = a_page_accepting_an_agreement();
+        drain_page(&registry, &event_source, &[true], Some(held_too_long())).await;
+        registry.set_fail_batch(true);
+        let mut warning = SetAsideWarning::default();
+
+        let logged = crate::test_support::logged(async {
+            for _ in 0..3 {
+                retry_set_aside(&registry, &event_source, &mut warning).await;
+            }
+        })
+        .await;
+
+        let warned: Vec<&str> = logged
+            .lines()
+            .filter(|line| line.contains("WARN"))
+            .collect();
+        assert_eq!(warned.len(), 1, "{logged}");
+        assert!(warned[0].contains("still fail"), "{logged}");
+        assert!(warned[0].contains("failed to apply the change"), "{logged}");
+    }
+
+    /// A failed read of the record changes nothing in it, and says so rather than passing over
+    /// the changes in silence.
+    #[tokio::test]
+    async fn test_retry_leaves_the_record_as_it_is_when_it_cannot_be_read() {
+        let (registry, event_source, agreement_id) = a_page_accepting_an_agreement();
+        set_aside_at(&registry, agreement_id, 10).await;
+        registry.set_fail_set_aside_read(true);
+
+        let logged = crate::test_support::logged(retry_set_aside(
+            &registry,
+            &event_source,
+            &mut SetAsideWarning::default(),
+        ))
+        .await;
+
+        assert!(!registry.was_marked_accepted_on_chain(&agreement_id));
+        assert_eq!(registry.set_aside().len(), 1, "still recorded");
+        let warned = logged
+            .lines()
+            .find(|line| line.contains("Failed to read the on-chain changes set aside"))
+            .expect("the failed read is logged");
+        assert!(warned.contains("WARN"), "{warned}");
+    }
+
+    /// A failed read of the agreements' state from the subgraph says nothing about them, so
+    /// every change stays recorded.
+    #[tokio::test]
+    async fn test_retry_keeps_set_aside_changes_when_the_subgraph_read_fails() {
+        let (registry, event_source, agreement_id) = a_page_accepting_an_agreement();
+        set_aside_at(&registry, agreement_id, 10).await;
+        event_source.set_snapshots_error(super::super::chain_events::ChainEventError::Transient(
+            "timed out".into(),
+        ));
+
+        retry_set_aside(&registry, &event_source, &mut SetAsideWarning::default()).await;
+
+        assert!(!registry.was_marked_accepted_on_chain(&agreement_id));
+        assert_eq!(registry.set_aside().len(), 1, "still recorded");
+    }
+
+    /// Nor does a failed read of the agreements from the database, which must not pass for the
+    /// agreements not being there.
+    #[tokio::test]
+    async fn test_retry_keeps_set_aside_changes_when_the_agreements_cannot_be_read() {
+        let (registry, event_source, agreement_id) = a_page_accepting_an_agreement();
+        set_aside_at(&registry, agreement_id, 10).await;
+        registry.set_fail_agreement_reads(true);
+
+        retry_set_aside(&registry, &event_source, &mut SetAsideWarning::default()).await;
+
+        assert_eq!(registry.set_aside().len(), 1, "still recorded");
+    }
+
+    #[test]
+    fn warns_about_set_aside_changes_when_those_failing_change_or_every_10_minutes() {
+        let now = Instant::now();
+        let first = IndexingAgreementId::from_bytes([1; 16]);
+        let second = IndexingAgreementId::from_bytes([2; 16]);
+        let mut warning = SetAsideWarning::default();
+
+        assert!(warning.due(&[first], now));
+        assert!(!warning.due(
+            &[first],
+            now + SET_ASIDE_WARNING_INTERVAL - Duration::from_secs(1)
+        ));
+        assert!(warning.due(&[first], now + SET_ASIDE_WARNING_INTERVAL));
+        let later = now + SET_ASIDE_WARNING_INTERVAL;
+        assert!(warning.due(&[first, second], later), "another fails");
+        assert!(!warning.due(&[first, second], later));
+        assert!(warning.due(&[second], later), "one applied");
+        assert!(!warning.due(&[], later), "none failing");
+        assert!(
+            warning.due(&[second], later),
+            "fails again after a run ended"
+        );
+    }
+
     #[test]
     fn holds_the_cursor_before_a_failing_page_for_a_while() {
         let now = std::time::Instant::now();
@@ -4700,7 +5669,7 @@ mod tests {
             now + MAX_CURSOR_HOLD - Duration::from_secs(1)
         ));
         assert!(hold_expired(&mut hold, &page, now + MAX_CURSOR_HOLD));
-        assert!(hold.is_none());
+        assert!(hold.is_some(), "the hold lasts until the page is passed");
     }
 
     #[test]
