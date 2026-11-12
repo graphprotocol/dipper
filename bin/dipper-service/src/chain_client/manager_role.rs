@@ -17,6 +17,7 @@ sol! {
     /// OpenZeppelin AccessControl membership check, the minimal slice needed to
     /// confirm dipper can drive the manager before it starts serving traffic.
     #[allow(missing_docs)]
+    #[sol(abi)]
     interface IAccessControl {
         function hasRole(bytes32 role, address account) external view returns (bool);
     }
