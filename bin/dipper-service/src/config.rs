@@ -162,10 +162,12 @@ pub struct Config {
 pub enum OffNoticeLevel {
     /// An opt-in service that was left out, which is normal.
     Debug,
-    /// A service its own config section turns off.
+    /// An opt-in service its own config section turns off.
     Info,
-    /// A service whose absence leaves dipper without a safeguard, with nothing in the config to
-    /// show that anyone chose to give it up. `event` tags the line for the Slack alerts.
+    /// A service whose absence leaves dipper without a safeguard: an opt-in one left off with
+    /// nothing in the config to show that anyone chose that, or one dipper is meant to run with
+    /// (the chain listener, expiration, reassignment) turned off in its section. `event` tags
+    /// the line for the Slack alerts.
     Warn { event: &'static str },
 }
 
@@ -249,9 +251,9 @@ impl Config {
             });
         }
         for (section, switch, event, consequence) in self.background_services() {
-            // A section left out says nothing about whether anyone chose it, so a safety service
-            // left off that way is a warning, alerted on under its own event.
-            let unannounced = event.map_or(OffNoticeLevel::Debug, |event| OffNoticeLevel::Warn {
+            // A warning, alerted on under the service's own event, for a safety service that is
+            // off; the escrow reconciler has no event, so its notice stays in the debug logs.
+            let alerted = event.map_or(OffNoticeLevel::Debug, |event| OffNoticeLevel::Warn {
                 event,
             });
             let (level, message) = match switch {
@@ -260,14 +262,15 @@ impl Config {
                 // but it is alerted on like the listener's; turning off an opt-in one is not.
                 Switch::Off => (
                     if STATED_SECTIONS.contains(&section) {
-                        unannounced
+                        alerted
                     } else {
                         OffNoticeLevel::Info
                     },
                     format!("{section} is turned off in its config section: {consequence}"),
                 ),
+                // Left out, a setting or a section says nothing about whether anyone chose it.
                 Switch::LeftOut => (
-                    unannounced,
+                    alerted,
                     format!(
                         "{section} is off because its config section leaves out \"enabled\", \
                          which defaults to false: {consequence}; add \"enabled\": true to the \
@@ -275,7 +278,7 @@ impl Config {
                     ),
                 ),
                 Switch::Missing => (
-                    unannounced,
+                    alerted,
                     format!(
                         "{section} is off because the config has no {section} section: \
                          {consequence}; add the section with \"enabled\": true to run it"
