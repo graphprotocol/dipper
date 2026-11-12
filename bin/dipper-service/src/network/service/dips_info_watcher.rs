@@ -859,7 +859,7 @@ mod tests {
             registry,
             network: NetworkProviderService::new(indexer_urls::Handle::for_test(snapshot)),
             config: DipsInfoWatcherConfig {
-                enabled: true,
+                enabled: Some(true),
                 request_timeout: Duration::from_secs(60),
                 ..DipsInfoWatcherConfig::default()
             },
@@ -954,7 +954,7 @@ mod tests {
         };
         let network = NetworkProviderService::new(indexer_urls::Handle::for_test(BTreeMap::new()));
         let config = DipsInfoWatcherConfig {
-            enabled: true,
+            enabled: Some(true),
             ..DipsInfoWatcherConfig::default()
         };
 
@@ -999,7 +999,7 @@ mod tests {
         };
         let network = NetworkProviderService::new(indexer_urls::Handle::for_test(BTreeMap::new()));
         let config = DipsInfoWatcherConfig {
-            enabled: true,
+            enabled: Some(true),
             ..DipsInfoWatcherConfig::default()
         };
 

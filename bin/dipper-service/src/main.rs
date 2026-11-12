@@ -118,6 +118,13 @@ pub async fn main() -> anyhow::Result<()> {
     {
         anyhow::bail!("invalid DIPs info watcher config: {err}");
     }
+    if let Err(err) = conf.validate_chain_listener() {
+        anyhow::bail!("invalid chain listener config: {err}");
+    }
+    // 1 line for each background service that will not run, so none is off unnoticed.
+    for off in conf.background_services_off() {
+        off.log();
+    }
 
     // TODO: Decouple the config file format from the internal representation
     let (agreement_conf, pricing_table) = conf.dips.into();
@@ -410,21 +417,24 @@ pub async fn main() -> anyhow::Result<()> {
 
     //- The entity count cache (shared with worker jobs for optimistic fee estimation)
     let entity_count_cache = network::service::entity_count_cache::new_cache();
+    // The listener's settings and the subgraph it polls, when it is to run.
+    let running_chain_listener = conf.chain_listener.as_ref().and_then(|cl_conf| {
+        cl_conf
+            .running_endpoint()
+            .map(|endpoint| (cl_conf, endpoint.clone()))
+    });
     // Spawned into the task tree below rather than detached, so a dead cache
     // restarts the process instead of quietly serving stale entity counts.
-    let entity_count_service = match conf.chain_listener {
-        Some(ref cl_conf) if cl_conf.enabled => Some(network::service::entity_count_cache::new(
-            network::service::entity_count_cache::Ctx {
-                cache: entity_count_cache.clone(),
-                endpoint: cl_conf.subgraph_endpoint.clone(),
-                api_key: cl_conf.subgraph_api_key.clone().map(|key| key.into_inner()),
-                // Entity counts change slowly (once per collection epoch).
-                // Refresh hourly to balance freshness and query cost.
-                interval: std::time::Duration::from_secs(3600),
-            },
-        )),
-        _ => None,
-    };
+    let entity_count_service = running_chain_listener.as_ref().map(|(cl_conf, endpoint)| {
+        network::service::entity_count_cache::new(network::service::entity_count_cache::Ctx {
+            cache: entity_count_cache.clone(),
+            endpoint: endpoint.clone(),
+            api_key: cl_conf.subgraph_api_key.clone().map(|key| key.into_inner()),
+            // Entity counts change slowly (once per collection epoch).
+            // Refresh hourly to balance freshness and query cost.
+            interval: std::time::Duration::from_secs(3600),
+        })
+    });
 
     // - The Subgraph Indexing Agreements Events emitter
     // Optional, enabled by the config
@@ -550,10 +560,10 @@ pub async fn main() -> anyhow::Result<()> {
         _ => None,
     };
 
-    //- The chain listener service (optional, enabled by config)
+    //- The chain listener service, on unless its config section turns it off
     // Monitors on-chain events for agreement acceptance/cancellation via subgraph
-    let chain_listener_handle = match conf.chain_listener {
-        Some(ref chain_listener_conf) if chain_listener_conf.enabled => {
+    let chain_listener_handle = match running_chain_listener {
+        Some((chain_listener_conf, endpoint)) => {
             // The subgraph filters agreements by on-chain payer, which is the
             // RecurringAgreementManager contract.
             let listener_payer_address =
@@ -561,7 +571,7 @@ pub async fn main() -> anyhow::Result<()> {
 
             // Create the subgraph event source
             let event_source_config = network::service::chain_events::SubgraphEventSourceConfig {
-                endpoint: chain_listener_conf.subgraph_endpoint.clone(),
+                endpoint,
                 api_key: chain_listener_conf
                     .subgraph_api_key
                     .clone()
@@ -589,7 +599,7 @@ pub async fn main() -> anyhow::Result<()> {
             let (handle, service) = network::service::chain_listener::new(ctx);
             Some((handle, service))
         }
-        _ => None,
+        None => None,
     };
 
     //- The cancel retry, always on: it alone finishes the cancels dipper starts
@@ -604,7 +614,7 @@ pub async fn main() -> anyhow::Result<()> {
     //- The liveness checker service (optional, enabled by config)
     // Detects indexers who silently stop indexing active AcceptedOnChain agreements
     let liveness_checker_handle = match conf.liveness_checker {
-        Some(ref lc_conf) if lc_conf.enabled => {
+        Some(ref lc_conf) if lc_conf.is_enabled() => {
             let ctx = network::service::liveness_checker::Ctx {
                 registry: registry.clone(),
                 worker_queue: worker_handle.queue().clone(),
@@ -623,7 +633,7 @@ pub async fn main() -> anyhow::Result<()> {
     //- The DIPs info watcher (optional, enabled by config)
     // Alerts on, then blocks, agreement holders whose /dips/info stays unreadable
     let dips_info_watcher_handle = match conf.dips_info_watcher {
-        Some(ref watcher_conf) if watcher_conf.enabled => {
+        Some(ref watcher_conf) if watcher_conf.is_enabled() => {
             let ctx = network::service::dips_info_watcher::Ctx {
                 registry: registry.clone(),
                 network: network_provider.clone(),
