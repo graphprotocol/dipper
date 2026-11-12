@@ -18,16 +18,21 @@ use crate::{
     config::MAX_NUM_CANDIDATES,
     registry::{
         IndexingRequest as IndexingRequestRecord, IndexingRequestRegistry,
-        IndexingRequestStatus as IndexingRequestRecordStatus, SetTargetOutcome,
+        IndexingRequestStatus as IndexingRequestRecordStatus, RequestOrderRegistry,
+        SetTargetOutcome,
     },
     signing::eip712::Eip712Signer,
     worker::service::{JobPriority, WorkerQueue},
 };
 
-/// How far a request's `signed_at` may be from this server's clock, in either direction. Long
-/// enough for a slow connection and for clocks that disagree a little, and short enough that a
-/// request someone recorded is soon no use to them.
-const MAX_SIGNED_AT_DISTANCE_SECS: u64 = 300;
+/// How long after it was signed a request is still accepted. Long enough for a slow connection,
+/// and short enough that a request someone recorded is soon no use to them.
+const MAX_SIGNED_AT_AGE_SECS: u64 = 300;
+
+/// How far ahead of this server's clock a request may be dated, for clocks that disagree a
+/// little. Kept small because the newest signing time accepted blocks every request signed
+/// before it: a request dated far ahead would lock its operator out until that time came.
+const MAX_SIGNED_AT_AHEAD_SECS: u64 = 30;
 
 /// The substate for the [`IndexingRequestsRpc`] handler
 ///
@@ -59,7 +64,7 @@ impl<R, W> RpcServerImpl<R, W> {
 #[async_trait]
 impl<R, W> IndexingRequestsRpcServer for RpcServerImpl<R, W>
 where
-    R: IndexingRequestRegistry + Clone + Send + Sync + 'static,
+    R: IndexingRequestRegistry + RequestOrderRegistry + Clone + Send + Sync + 'static,
     W: WorkerQueue + Clone + Send + Sync + 'static,
 {
     async fn get_all_indexing_requests(&self) -> RpcResult<Vec<IndexingRequest>> {
@@ -132,7 +137,20 @@ where
         } = req.into_message();
 
         let now = (self.clock)();
-        if now.abs_diff(signed_at) > MAX_SIGNED_AT_DISTANCE_SECS {
+        let refusal = if now.saturating_sub(signed_at) > MAX_SIGNED_AT_AGE_SECS {
+            Some(format!(
+                "more than {MAX_SIGNED_AT_AGE_SECS} seconds before this server's clock ({now}); \
+                 sign and send it again"
+            ))
+        } else if signed_at.saturating_sub(now) > MAX_SIGNED_AT_AHEAD_SECS {
+            Some(format!(
+                "more than {MAX_SIGNED_AT_AHEAD_SECS} seconds ahead of this server's clock \
+                 ({now}); check the clock of the machine that signed it"
+            ))
+        } else {
+            None
+        };
+        if let Some(refusal) = refusal {
             tracing::warn!(
                 %requested_by,
                 signed_at,
@@ -141,11 +159,7 @@ where
             );
             return Err(ErrorObject::owned(
                 401,
-                format!(
-                    "the request was signed at {signed_at}, more than \
-                     {MAX_SIGNED_AT_DISTANCE_SECS} seconds from this server's clock ({now}); \
-                     sign and send it again"
-                ),
+                format!("the request was signed at {signed_at}, {refusal}"),
                 None::<()>,
             ));
         }
@@ -163,6 +177,37 @@ where
                 ));
             }
         };
+
+        // Last of the checks, so a request refused for any other reason leaves no mark behind
+        // that would block the operator's next one.
+        match self
+            .registry
+            .accept_request_signed_at(requested_by, deployment_id, chain_id, signed_at)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(
+                    %requested_by,
+                    %deployment_id,
+                    %chain_id,
+                    signed_at,
+                    "Refused a request signed no later than one already accepted"
+                );
+                return Err(ErrorObject::owned(
+                    409,
+                    format!(
+                        "a request for this deployment and chain signed at or after {signed_at} \
+                         was already accepted; sign and send it again"
+                    ),
+                    None::<()>,
+                ));
+            }
+            Err(err) => {
+                tracing::error!(error=?err, "Failed to check the request's signing time");
+                return Err(ErrorObject::borrowed(503, "Service unavailable", None));
+            }
+        }
 
         let outcome = match self
             .registry
@@ -351,6 +396,26 @@ mod tests {
         outcome: SetTargetOutcome,
         /// The indexer count of every request that got past the signature check.
         accepted_counts: Arc<std::sync::Mutex<Vec<usize>>>,
+        /// The newest signing time accepted so far, kept the way the database keeps it.
+        newest_signed_at: Arc<std::sync::Mutex<Option<u64>>>,
+    }
+
+    #[async_trait]
+    impl RequestOrderRegistry for MockRegistry {
+        async fn accept_request_signed_at(
+            &self,
+            _requested_by: Address,
+            _deployment_id: DeploymentId,
+            _deployment_chain_id: ChainId,
+            signed_at: u64,
+        ) -> RegistryResult<bool> {
+            let mut newest = self.newest_signed_at.lock().unwrap();
+            let is_newest = newest.is_none_or(|newest| newest < signed_at);
+            if is_newest {
+                *newest = Some(signed_at);
+            }
+            Ok(is_newest)
+        }
     }
 
     #[async_trait]
@@ -548,6 +613,7 @@ mod tests {
             registry: MockRegistry {
                 outcome,
                 accepted_counts: Arc::default(),
+                newest_signed_at: Arc::default(),
             },
             worker: MockWorker,
             max_candidates: 10,
@@ -781,13 +847,151 @@ mod tests {
         assert_eq!(accepted_counts(&testnet), Vec::<usize>::new());
     }
 
+    /// An old request is refused after a newer one: sending a recorded "3 indexers" again
+    /// after the operator's cancel would otherwise bring the cancelled request back.
+    #[tokio::test]
+    async fn an_old_request_is_refused_after_a_newer_one() {
+        let deployment = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
+        let signer = PrivateKeySigner::random();
+        let sign = |count, signed_at| {
+            signed_for(
+                SIGNER_CHAIN_ID,
+                &signer,
+                deployment,
+                DEPLOYMENT_CHAIN_ID,
+                Some(count),
+                signed_at,
+            )
+        };
+        let (server, _events) = server(
+            signer.address(),
+            SetTargetOutcome::Inserted {
+                id: IndexingRequestId::new(),
+            },
+        );
+        server
+            .set_indexing_target_candidates(sign(3, NOW - 10))
+            .await
+            .expect("the first request is accepted");
+        server
+            .set_indexing_target_candidates(sign(0, NOW))
+            .await
+            .expect("the later cancel is accepted");
+
+        let result = server
+            .set_indexing_target_candidates(sign(3, NOW - 10))
+            .await;
+
+        let err = result.expect_err("the old request must be refused after the cancel");
+        assert_eq!(err.code(), 409, "{err:?}");
+        assert_eq!(accepted_counts(&server), vec![3, 0]);
+    }
+
+    /// A request dated well ahead of the server's clock is refused. Accepted, it would become
+    /// the newest signing time and block its operator's correctly dated requests until then.
+    #[tokio::test]
+    async fn a_request_dated_well_ahead_does_not_block_later_ones() {
+        let deployment = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
+        let signer = PrivateKeySigner::random();
+        let sign = |signed_at| {
+            signed_for(
+                SIGNER_CHAIN_ID,
+                &signer,
+                deployment,
+                DEPLOYMENT_CHAIN_ID,
+                Some(3),
+                signed_at,
+            )
+        };
+        let (server, _events) = server(
+            signer.address(),
+            SetTargetOutcome::Inserted {
+                id: IndexingRequestId::new(),
+            },
+        );
+        let from_a_fast_clock = server.set_indexing_target_candidates(sign(NOW + 200)).await;
+
+        let result = server.set_indexing_target_candidates(sign(NOW)).await;
+
+        let err = from_a_fast_clock.expect_err("a request dated 200 seconds ahead is refused");
+        assert_eq!(err.code(), 401, "{err:?}");
+        assert!(result.is_ok(), "handler returned an error: {result:?}");
+        assert_eq!(accepted_counts(&server), vec![3]);
+    }
+
+    /// The same request is refused the second time it arrives.
+    #[tokio::test]
+    async fn a_request_sent_twice_is_refused_the_second_time() {
+        let deployment = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
+        let signer = PrivateKeySigner::random();
+        let sign = || {
+            signed_for(
+                SIGNER_CHAIN_ID,
+                &signer,
+                deployment,
+                DEPLOYMENT_CHAIN_ID,
+                Some(3),
+                NOW,
+            )
+        };
+        let (server, _events) = server(
+            signer.address(),
+            SetTargetOutcome::Inserted {
+                id: IndexingRequestId::new(),
+            },
+        );
+        server
+            .set_indexing_target_candidates(sign())
+            .await
+            .expect("the request is accepted the first time");
+
+        let result = server.set_indexing_target_candidates(sign()).await;
+
+        let err = result.expect_err("the same request must be refused the second time");
+        assert_eq!(err.code(), 409, "{err:?}");
+        assert_eq!(accepted_counts(&server), vec![3]);
+    }
+
+    /// A count the server refuses leaves no trace: the same operator's next request, signed at
+    /// the same second, is still accepted.
+    #[tokio::test]
+    async fn a_refused_count_does_not_block_the_next_request() {
+        let deployment = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
+        let signer = PrivateKeySigner::random();
+        let sign = |count| {
+            signed_for(
+                SIGNER_CHAIN_ID,
+                &signer,
+                deployment,
+                DEPLOYMENT_CHAIN_ID,
+                Some(count),
+                NOW,
+            )
+        };
+        let (server, _events) = server(
+            signer.address(),
+            SetTargetOutcome::Inserted {
+                id: IndexingRequestId::new(),
+            },
+        );
+        server
+            .set_indexing_target_candidates(sign(MAX_NUM_CANDIDATES + 1))
+            .await
+            .expect_err("a count above the maximum is refused");
+
+        let result = server.set_indexing_target_candidates(sign(3)).await;
+
+        assert!(result.is_ok(), "handler returned an error: {result:?}");
+        assert_eq!(accepted_counts(&server), vec![3]);
+    }
+
     /// A request signed further from the server's clock than the limit is refused, whether it
     /// is old (a recorded request sent again later) or dated ahead.
     #[tokio::test]
     async fn a_request_signed_too_far_from_now_is_refused() {
         let deployment = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
-        let too_old = NOW - MAX_SIGNED_AT_DISTANCE_SECS - 1;
-        let too_far_ahead = NOW + MAX_SIGNED_AT_DISTANCE_SECS + 1;
+        let too_old = NOW - MAX_SIGNED_AT_AGE_SECS - 1;
+        let too_far_ahead = NOW + MAX_SIGNED_AT_AHEAD_SECS + 1;
         for signed_at in [too_old, too_far_ahead, 0] {
             let signer = PrivateKeySigner::random();
             let request = signed_for(
@@ -822,8 +1026,8 @@ mod tests {
     #[tokio::test]
     async fn a_request_signed_at_the_limit_is_accepted() {
         let deployment = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
-        let oldest = NOW - MAX_SIGNED_AT_DISTANCE_SECS;
-        let furthest_ahead = NOW + MAX_SIGNED_AT_DISTANCE_SECS;
+        let oldest = NOW - MAX_SIGNED_AT_AGE_SECS;
+        let furthest_ahead = NOW + MAX_SIGNED_AT_AHEAD_SECS;
         for signed_at in [oldest, furthest_ahead] {
             let signer = PrivateKeySigner::random();
             let request = signed_for(
