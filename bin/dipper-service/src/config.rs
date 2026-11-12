@@ -218,20 +218,8 @@ impl Config {
     /// reassignment a request left short of indexers is never topped up, so each may only be off
     /// when the config says so.
     pub fn validate_expiration_and_reassignment(&self) -> Result<(), String> {
-        let sections = [
-            (
-                "expiration",
-                self.expiration.is_some(),
-                EXPIRATION_OFF_MEANS,
-            ),
-            (
-                "reassignment",
-                self.reassignment.is_some(),
-                REASSIGNMENT_OFF_MEANS,
-            ),
-        ];
-        for (section, present, consequence) in sections {
-            if !present {
+        for (section, switch, _, consequence) in self.background_services() {
+            if STATED_SECTIONS.contains(&section) && matches!(switch, Switch::Missing) {
                 return Err(format!(
                     "the config has no {section} section, and without the {section} service \
                      {consequence}. Add \"{section}\": {{}} to run it with its defaults, or \
@@ -369,6 +357,7 @@ enum Switch {
 
 /// The sections, besides the chain listener's, that a config must have: their services run by
 /// default, so startup refuses a config that leaves one out and alerts when one is turned off.
+/// Both rules read this list, so a section added here gets both.
 const STATED_SECTIONS: [&str; 2] = ["expiration", "reassignment"];
 
 /// What running without the expiration service means.
