@@ -28,7 +28,8 @@
 //! - Block height decreased (resync) → also reset `last_progress_at`
 //! - Block height unchanged → check elapsed time against threshold
 //! - Indexer unreachable → treat as no progress (threshold check still applies)
-//! - Deployment missing from response → treat as no progress
+//! - Reply without a list of statuses (a GraphQL error, say) → the indexer counts as unreachable
+//! - Deployment missing from the list of statuses → treat as no progress
 //!
 //! When at least `unreachable_trip_fraction` of the indexers checked in a cycle can't be
 //! reached, the fault is likely dipper's own, so no agreement is abandoned for unreachability
@@ -306,7 +307,8 @@ fn tolerance_duration(
 enum Probe {
     /// It answered, with the latest block it reports for each deployment asked about.
     Reached(HashMap<String, Option<u64>>),
-    /// It could not be asked: its status call failed, or it is missing from the network registry.
+    /// It gave no answer to act on: its status call failed, its reply had no list of statuses, or
+    /// it is missing from the network registry.
     Unreachable,
 }
 
@@ -1144,9 +1146,10 @@ fn status_reply_limit_bytes(deployments: usize) -> usize {
 /// Returns a map of deployment ID (IPFS hash string) to the latest block height,
 /// or `None` if the deployment is not found in the response.
 ///
-/// Returns an error when the HTTP call fails (network error, timeout, non-2xx response) or
-/// the reply is not JSON or is over the size limit. GraphQL-level errors are logged and treated
-/// as empty results.
+/// Returns an error when the HTTP call fails (network error, timeout, non-2xx response), the
+/// reply is not JSON or is over the size limit, or it has no list of statuses, as when the
+/// indexer's graph-node rejects the query. Such a reply says nothing about the indexer's
+/// progress, so it is not read as an empty answer.
 async fn query_indexer_status(
     client: &reqwest::Client,
     indexer_url: &Url,
@@ -1187,19 +1190,26 @@ async fn query_indexer_status(
 
     let mut result: HashMap<String, Option<u64>> = HashMap::new();
 
-    let statuses = match json
+    let Some(statuses) = json
         .get("data")
         .and_then(|d| d.get("indexingStatuses"))
         .and_then(|s| s.as_array())
-    {
-        Some(arr) => arr,
-        None => {
-            tracing::debug!(
-                indexer_url = %indexer_url,
-                "indexingStatuses not present in response"
-            );
-            return Ok(result);
-        }
+    else {
+        // The indexer wrote this text, so it is quoted, escaped and cut short before it is logged.
+        let said = json
+            .get("errors")
+            .and_then(|errors| errors.as_array())
+            .and_then(|errors| errors.first())
+            .and_then(|error| error.get("message"))
+            .and_then(|message| message.as_str())
+            .map(|message| {
+                format!(
+                    ": its first error says {}",
+                    crate::log_text::untrusted(message)
+                )
+            })
+            .unwrap_or_default();
+        anyhow::bail!("the reply has no list of indexing statuses{said}");
     };
 
     for status in statuses {
@@ -2758,6 +2768,87 @@ mod tests {
             panic!("a reply about 2,000 deployments was read in answer to a question about 1");
         };
         assert!(why.to_string().contains("longer than the limit"), "{why}");
+    }
+
+    /// An indexer whose `/status` answers `reply`.
+    async fn status_answering(reply: serde_json::Value) -> (wiremock::MockServer, Url) {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/status"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(reply))
+            .mount(&server)
+            .await;
+        let url = format!("{}/", server.uri()).parse().unwrap();
+        (server, url)
+    }
+
+    /// A reply with no list of statuses is what a graph-node sends when it rejects the query. It
+    /// says nothing about the indexer's progress, and the query is dipper's, so it must not be
+    /// read as "asked, and indexing none of these deployments".
+    #[tokio::test]
+    async fn a_status_reply_without_the_list_of_statuses_is_an_error_not_an_answer() {
+        for reply in [
+            serde_json::json!({"errors": [{"message": "Unknown field indexingStatuses"}]}),
+            serde_json::json!({"data": null, "errors": [{"message": "query too large"}]}),
+            serde_json::json!({"data": {"indexingStatuses": null}}),
+            serde_json::json!({"data": {}}),
+        ] {
+            let (_server, url) = status_answering(reply.clone()).await;
+
+            let answer = query_indexer_status(&reqwest::Client::new(), &url, &[]).await;
+
+            let why = answer.expect_err("a reply with no list of statuses is not an answer");
+            assert!(
+                why.to_string().contains("no list of indexing statuses"),
+                "{reply}: {why}"
+            );
+        }
+    }
+
+    /// A list that leaves a deployment out is still an answer: the indexer was asked and is not
+    /// indexing it.
+    #[tokio::test]
+    async fn a_status_reply_with_an_empty_list_is_still_an_answer() {
+        let (_server, url) =
+            status_answering(serde_json::json!({"data": {"indexingStatuses": []}})).await;
+
+        let answer = query_indexer_status(&reqwest::Client::new(), &url, &[]).await;
+
+        assert!(answer.expect("an empty list is an answer").is_empty());
+    }
+
+    /// Counted as unreachable, such an indexer is covered by the hold that stops agreements being
+    /// abandoned when most indexers fail at once, which a reply read as "no progress" is not.
+    #[tokio::test]
+    async fn an_indexer_that_answers_without_the_list_of_statuses_counts_as_unreachable() {
+        //* Given an indexer whose graph-node rejects the query, with an error it wrote itself
+        let (_server, url) = status_answering(serde_json::json!({
+            "errors": [{"message": "rejected\n2026-01-01T00:00:00.000000Z ERROR dipper: forged"}]
+        }))
+        .await;
+        let indexer_id: IndexerId = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            .parse()
+            .unwrap();
+        let network = crate::network::provider::NetworkProviderService::new(
+            crate::network::service::indexer_urls::Handle::for_test(
+                std::collections::BTreeMap::from([(indexer_id, url)]),
+            ),
+        );
+
+        //* When
+        let logs = logged(async {
+            let probe = probe_indexer(&network, &reqwest::Client::new(), &indexer_id, &[]).await;
+            assert!(matches!(probe, Probe::Unreachable));
+        })
+        .await;
+
+        //* Then the warning says why, and the indexer's text can't start a log line of its own
+        assert!(logs.contains("treating as unreachable"), "{logs}");
+        assert!(logs.contains("no list of indexing statuses"), "{logs}");
+        assert!(
+            !logs.contains("\n2026-01-01T00:00:00.000000Z ERROR dipper: forged"),
+            "{logs}"
+        );
     }
 
     #[tokio::test]
