@@ -2819,8 +2819,8 @@ mod tests {
         assert!(answer.expect("an empty list is an answer").is_empty());
     }
 
-    /// Counted as unreachable, such an indexer is covered by the hold that stops agreements being
-    /// abandoned when most indexers fail at once, which a reply read as "no progress" is not.
+    /// The probe reports such an indexer as unreachable, which is what the hold on abandoning
+    /// agreements counts when most indexers fail at once; "no progress" is not counted by it.
     #[tokio::test]
     async fn an_indexer_that_answers_without_the_list_of_statuses_counts_as_unreachable() {
         //* Given an indexer whose graph-node rejects the query, with an error it wrote itself
@@ -2844,9 +2844,14 @@ mod tests {
         })
         .await;
 
-        //* Then the warning says why, and the indexer's text can't start a log line of its own
+        //* Then the warning says why and quotes the indexer's error, escaped, so that its text
+        //* can't start a log line of its own
         assert!(logs.contains("treating as unreachable"), "{logs}");
         assert!(logs.contains("no list of indexing statuses"), "{logs}");
+        assert!(
+            logs.contains(r#"its first error says "rejected\n2026-01-01T00:00:00.000000Z ERROR"#),
+            "{logs}"
+        );
         assert!(
             !logs.contains("\n2026-01-01T00:00:00.000000Z ERROR dipper: forged"),
             "{logs}"
