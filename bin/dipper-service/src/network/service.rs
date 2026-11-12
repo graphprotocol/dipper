@@ -6,6 +6,7 @@ pub mod domain_refresh;
 pub mod entity_count_cache;
 pub mod escrow_reconciler;
 pub mod expiration;
+mod indexer_reply;
 pub mod indexer_urls;
 pub mod liveness_checker;
 pub mod reassignment;

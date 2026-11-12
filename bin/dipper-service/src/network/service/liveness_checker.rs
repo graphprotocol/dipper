@@ -55,6 +55,7 @@ use time::OffsetDateTime;
 use tokio::{sync::mpsc, time::MissedTickBehavior};
 use url::Url;
 
+use super::indexer_reply;
 use crate::{
     cancel_dispatch::{CancelReason, CancelStarted},
     chain_client::ChainClient,
@@ -1114,13 +1115,25 @@ pub(crate) fn decide_liveness_action(
     }
 }
 
+/// The longest status reply that is read in answer to a question about `deployments`
+/// deployments. A real one is about 100 bytes for each, so 1 KiB each, on top of 64 KiB, leaves
+/// room to spare. The limit follows the question because parsing a reply can take about 16
+/// times its length in memory, which 1 limit large enough for every indexer would allow any
+/// indexer to use.
+fn status_reply_limit_bytes(deployments: usize) -> usize {
+    const BASE: usize = 64 * 1024;
+    const FOR_EACH_DEPLOYMENT: usize = 1024;
+    BASE.saturating_add(deployments.saturating_mul(FOR_EACH_DEPLOYMENT))
+}
+
 /// Query a single indexer's status endpoint for sync progress.
 ///
 /// Returns a map of deployment ID (IPFS hash string) to the latest block height,
 /// or `None` if the deployment is not found in the response.
 ///
-/// Returns an error only when the HTTP call itself fails (network error, timeout,
-/// non-2xx response). GraphQL-level errors are logged and treated as empty results.
+/// Returns an error when the HTTP call fails (network error, timeout, non-2xx response) or
+/// the reply is not JSON or is over the size limit. GraphQL-level errors are logged and treated
+/// as empty results.
 async fn query_indexer_status(
     client: &reqwest::Client,
     indexer_url: &Url,
@@ -1150,7 +1163,9 @@ async fn query_indexer_status(
         .await?
         .error_for_status()?;
 
-    let json: serde_json::Value = response.json().await?;
+    let limit = status_reply_limit_bytes(deployment_ids.len());
+    let reply = indexer_reply::read_body(response, limit).await?;
+    let json: serde_json::Value = serde_json::from_slice(&reply)?;
 
     let mut result: HashMap<String, Option<u64>> = HashMap::new();
 
@@ -1217,7 +1232,8 @@ mod tests {
     use super::{
         Checker, HeldSpan, LivenessAction, Probe, Uncancellable, UnreachableBreaker,
         UnreachablePolicy, cancel_and_reassess, decide_liveness_action, group_by_indexer_id,
-        probe_indexer, record_progress, replace_abandoned, tolerance_duration, unreachable_trips,
+        probe_indexer, query_indexer_status, record_progress, replace_abandoned,
+        status_reply_limit_bytes, tolerance_duration, unreachable_trips,
     };
     use crate::{
         chain_client::{AgreementOnChain, ChainClient, ChainClientError},
@@ -2565,6 +2581,67 @@ mod tests {
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0], (agr_id, 12345));
     }
+
+    #[tokio::test]
+    async fn a_status_reply_over_the_size_limit_is_not_read() {
+        //* Given a well-formed status reply, padded past the limit
+        let server = wiremock::MockServer::start().await;
+        let padding = "x".repeat(status_reply_limit_bytes(0));
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/status"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_string(format!(
+                    r#"{{"data": {{"indexingStatuses": []}}, "note": "{padding}"}}"#
+                )),
+            )
+            .mount(&server)
+            .await;
+        let url: Url = format!("{}/", server.uri()).parse().unwrap();
+
+        //* When
+        let answer = query_indexer_status(&reqwest::Client::new(), &url, &[]).await;
+
+        //* Then
+        let why = answer.expect_err("a reply over the limit must not be read");
+        assert!(why.to_string().contains("longer than the limit"), "{why}");
+    }
+    #[tokio::test]
+    async fn the_status_reply_limit_follows_the_number_of_deployments_asked_about() {
+        //* Given a real-sized reply about 2,000 deployments
+        let ids: Vec<String> = (0..2_000).map(|n| format!("Qm{n:044}")).collect();
+        let statuses: Vec<String> = ids
+            .iter()
+            .map(|id| {
+                format!(
+                    r#"{{"subgraph": "{id}", "chains": [{{"latestBlock": {{"number": "123456789"}}}}]}}"#
+                )
+            })
+            .collect();
+        let reply = format!(
+            r#"{{"data": {{"indexingStatuses": [{}]}}}}"#,
+            statuses.join(", ")
+        );
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/status"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(reply))
+            .mount(&server)
+            .await;
+        let url: Url = format!("{}/", server.uri()).parse().unwrap();
+        let client = reqwest::Client::new();
+
+        //* When it answers a question about all 2,000, and then a question about 1
+        let asked_about_all = query_indexer_status(&client, &url, &ids).await;
+        let asked_about_1 = query_indexer_status(&client, &url, &ids[..1]).await;
+
+        //* Then
+        assert_eq!(asked_about_all.unwrap().len(), 2_000);
+        let Err(why) = asked_about_1 else {
+            panic!("a reply about 2,000 deployments was read in answer to a question about 1");
+        };
+        assert!(why.to_string().contains("longer than the limit"), "{why}");
+    }
+
     #[tokio::test]
     async fn a_huge_status_line_from_an_indexer_is_cut_short_in_the_log() {
         //* Given an indexer whose server answers with a status line of 100,000 characters
