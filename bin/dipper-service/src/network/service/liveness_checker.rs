@@ -415,8 +415,9 @@ pub(super) const UNREACHABLE_CLEAR_CYCLES: u32 = 3;
 const UNREACHABLE_ALERT_REPEAT: time::Duration = time::Duration::hours(6);
 
 /// Stops agreements being abandoned for unreachability while so many indexers can't be reached
-/// at once that the fault is likely dipper's own (its network, or the network registry), which
-/// would hand every deployment to new indexers and bar the current ones for weeks.
+/// at once that the fault is likely dipper's own (its network, the network registry, or a status
+/// query that indexers reject), which would hand every deployment to new indexers and bar the
+/// current ones for weeks.
 #[derive(Default)]
 struct UnreachableBreaker {
     /// When the current trip began; `None` while clear.
@@ -533,9 +534,10 @@ impl UnreachableBreaker {
                 checked,
                 held_hours,
                 max_hold_days = max_hold.whole_days(),
-                "Too many indexers unreachable at once: a fault on dipper's side (its network or \
-                 the network registry), or that many really gone; not abandoning agreements for \
-                 unreachability while it lasts, for up to max_hold_days"
+                "Too many indexers unreachable at once: a fault on dipper's side (its network, the \
+                 network registry, or a status query that indexers reject), or that many really \
+                 gone; not abandoning agreements for unreachability while it lasts, for up to \
+                 max_hold_days"
             );
         } else if trips {
             tracing::warn!(
