@@ -26,7 +26,9 @@ mod chain_client;
 mod config;
 mod db;
 mod health;
+mod indexer_addresses;
 mod indexer_rpc_client;
+mod log_text;
 mod network;
 mod registry;
 mod signing;
@@ -79,7 +81,7 @@ pub async fn main() -> anyhow::Result<()> {
         .with(
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
-                .with_filter(EnvFilter::from_default_env()),
+                .with_filter(log_filter(env::var(EnvFilter::DEFAULT_ENV).ok().as_deref())),
         )
         .with(alerts::layer(&conf.alerts).map(|layer| layer.with_filter(LevelFilter::WARN)))
         .init();
@@ -115,6 +117,13 @@ pub async fn main() -> anyhow::Result<()> {
         && let Err(err) = watcher_conf.validate()
     {
         anyhow::bail!("invalid DIPs info watcher config: {err}");
+    }
+    if let Err(err) = conf.validate_chain_listener() {
+        anyhow::bail!("invalid chain listener config: {err}");
+    }
+    // 1 line for each background service that will not run, so none is off unnoticed.
+    for off in conf.background_services_off() {
+        off.log();
     }
 
     // TODO: Decouple the config file format from the internal representation
@@ -207,13 +216,13 @@ pub async fn main() -> anyhow::Result<()> {
     tracing::info!(address=%wallet_signer.address(), "Signer wallet imported");
 
     let signer = {
-        let domain = dipper_rpc::admin::eip712_domain();
+        let domain = dipper_rpc::admin::eip712_domain(chain_id);
         Arc::new(Eip712Signer::new(chain_id, domain))
     };
 
     //- DB connect and run migrations
     let db_conn = db::connect(&conf.db).await?;
-    tracing::info!(db_url=%conf.db.url, "initialized DB connection pool");
+    tracing::info!(db = %config::database_name(&conf.db.url), "initialized DB connection pool");
 
     dipper_pgmq::run_db_migrations(&db_conn).await?;
     dipper_pgregistry::run_db_migrations(&db_conn).await?;
@@ -224,6 +233,15 @@ pub async fn main() -> anyhow::Result<()> {
 
     //- The registry component
     let registry = RegistryProvider::new(db_conn.clone());
+
+    //- The addresses dipper may call indexers at
+    let addresses = indexer_addresses::AddressRule::new(conf.indexer_urls.allow_private_addresses);
+    if conf.indexer_urls.allow_private_addresses {
+        tracing::warn!(
+            "indexer_urls.allow_private_addresses is on: dipper calls indexers at private \
+             addresses too, which only a local network should allow"
+        );
+    }
 
     //- The indexer client component (signs each outbound proposal; see DipsIndexerClient).
     let indexer_client = indexer_rpc_client::DipsIndexerClient::with_config(
@@ -246,27 +264,28 @@ pub async fn main() -> anyhow::Result<()> {
                 .expect("failed to build HTTP client");
             let mut attempt: u32 = 0;
             loop {
-                match network::service::indexer_urls::fetch_snapshot(
+                match network::service::indexer_urls::fetch_allowed(
                     &client,
                     &subgraph_endpoint,
                     api_key.as_deref(),
+                    addresses,
                 )
                 .await
                 {
-                    Ok(s) if !s.is_empty() => break s,
-                    Ok(s) if conf.indexer_urls.allow_empty_at_startup => {
+                    Ok(allowed) if !allowed.snapshot.is_empty() => break allowed.snapshot,
+                    Ok(allowed) if conf.indexer_urls.allow_empty_at_startup => {
                         tracing::warn!(
-                            "subgraph reports 0 registered indexers; starting with an empty \
-                             snapshot (network.allow_empty_at_startup)"
+                            "{}; starting with an empty snapshot (network.allow_empty_at_startup)",
+                            allowed.none_left()
                         );
-                        break s;
+                        break allowed.snapshot;
                     }
                     // An empty snapshot is useless at startup (no offer can be
                     // sent) and usually means a wrong endpoint: retry like an
                     // error. The refresh loop tolerates empties separately.
                     result => {
                         let err = match result {
-                            Ok(_) => anyhow::anyhow!("subgraph returned 0 registered indexers"),
+                            Ok(allowed) => anyhow::anyhow!(allowed.none_left()),
                             Err(err) => err,
                         };
                         if attempt < INDEXER_URLS_FETCH_MAX_RETRIES {
@@ -296,6 +315,7 @@ pub async fn main() -> anyhow::Result<()> {
                 endpoint: subgraph_endpoint,
                 api_key,
                 update_interval: conf.indexer_urls.update_interval,
+                addresses,
             },
             init_snapshot,
         )
@@ -397,21 +417,24 @@ pub async fn main() -> anyhow::Result<()> {
 
     //- The entity count cache (shared with worker jobs for optimistic fee estimation)
     let entity_count_cache = network::service::entity_count_cache::new_cache();
+    // The listener's settings and the subgraph it polls, when it is to run.
+    let running_chain_listener = conf.chain_listener.as_ref().and_then(|cl_conf| {
+        cl_conf
+            .running_endpoint()
+            .map(|endpoint| (cl_conf, endpoint.clone()))
+    });
     // Spawned into the task tree below rather than detached, so a dead cache
     // restarts the process instead of quietly serving stale entity counts.
-    let entity_count_service = match conf.chain_listener {
-        Some(ref cl_conf) if cl_conf.enabled => Some(network::service::entity_count_cache::new(
-            network::service::entity_count_cache::Ctx {
-                cache: entity_count_cache.clone(),
-                endpoint: cl_conf.subgraph_endpoint.clone(),
-                api_key: cl_conf.subgraph_api_key.clone().map(|key| key.into_inner()),
-                // Entity counts change slowly (once per collection epoch).
-                // Refresh hourly to balance freshness and query cost.
-                interval: std::time::Duration::from_secs(3600),
-            },
-        )),
-        _ => None,
-    };
+    let entity_count_service = running_chain_listener.as_ref().map(|(cl_conf, endpoint)| {
+        network::service::entity_count_cache::new(network::service::entity_count_cache::Ctx {
+            cache: entity_count_cache.clone(),
+            endpoint: endpoint.clone(),
+            api_key: cl_conf.subgraph_api_key.clone().map(|key| key.into_inner()),
+            // Entity counts change slowly (once per collection epoch).
+            // Refresh hourly to balance freshness and query cost.
+            interval: std::time::Duration::from_secs(3600),
+        })
+    });
 
     // - The Subgraph Indexing Agreements Events emitter
     // Optional, enabled by the config
@@ -537,10 +560,10 @@ pub async fn main() -> anyhow::Result<()> {
         _ => None,
     };
 
-    //- The chain listener service (optional, enabled by config)
+    //- The chain listener service, on unless its config section turns it off
     // Monitors on-chain events for agreement acceptance/cancellation via subgraph
-    let chain_listener_handle = match conf.chain_listener {
-        Some(ref chain_listener_conf) if chain_listener_conf.enabled => {
+    let chain_listener_handle = match running_chain_listener {
+        Some((chain_listener_conf, endpoint)) => {
             // The subgraph filters agreements by on-chain payer, which is the
             // RecurringAgreementManager contract.
             let listener_payer_address =
@@ -548,7 +571,7 @@ pub async fn main() -> anyhow::Result<()> {
 
             // Create the subgraph event source
             let event_source_config = network::service::chain_events::SubgraphEventSourceConfig {
-                endpoint: chain_listener_conf.subgraph_endpoint.clone(),
+                endpoint,
                 api_key: chain_listener_conf
                     .subgraph_api_key
                     .clone()
@@ -576,7 +599,7 @@ pub async fn main() -> anyhow::Result<()> {
             let (handle, service) = network::service::chain_listener::new(ctx);
             Some((handle, service))
         }
-        _ => None,
+        None => None,
     };
 
     //- The cancel retry, always on: it alone finishes the cancels dipper starts
@@ -591,7 +614,7 @@ pub async fn main() -> anyhow::Result<()> {
     //- The liveness checker service (optional, enabled by config)
     // Detects indexers who silently stop indexing active AcceptedOnChain agreements
     let liveness_checker_handle = match conf.liveness_checker {
-        Some(ref lc_conf) if lc_conf.enabled => {
+        Some(ref lc_conf) if lc_conf.is_enabled() => {
             let ctx = network::service::liveness_checker::Ctx {
                 registry: registry.clone(),
                 worker_queue: worker_handle.queue().clone(),
@@ -599,6 +622,7 @@ pub async fn main() -> anyhow::Result<()> {
                 network: network_provider.clone(),
                 agreement_conf: liveness_agreement_conf.clone(),
                 config: lc_conf.clone(),
+                addresses,
             };
             let (handle, service) = network::service::liveness_checker::new(ctx);
             Some((handle, service))
@@ -609,11 +633,12 @@ pub async fn main() -> anyhow::Result<()> {
     //- The DIPs info watcher (optional, enabled by config)
     // Alerts on, then blocks, agreement holders whose /dips/info stays unreadable
     let dips_info_watcher_handle = match conf.dips_info_watcher {
-        Some(ref watcher_conf) if watcher_conf.enabled => {
+        Some(ref watcher_conf) if watcher_conf.is_enabled() => {
             let ctx = network::service::dips_info_watcher::Ctx {
                 registry: registry.clone(),
                 network: network_provider.clone(),
                 config: watcher_conf.clone(),
+                addresses,
             };
             Some(network::service::dips_info_watcher::new(ctx))
         }
@@ -912,6 +937,15 @@ enum SignalHandlerError {
 
 // -------- Private app helpers --------
 
+/// The filter for dipper's own log output, given the value of `RUST_LOG`. Its directives are
+/// used as written, skipping any that cannot be read; with none, dipper logs at info rather than
+/// the library's default of errors only, so warnings and agreement changes are seen.
+fn log_filter(rust_log: Option<&str>) -> EnvFilter {
+    EnvFilter::builder()
+        .with_default_directive(LevelFilter::INFO.into())
+        .parse_lossy(rust_log.unwrap_or_default())
+}
+
 /// Stop one service, giving up after [`STOP_STEP_TIMEOUT`]. Returns whether it stopped in time,
 /// naming the service when it did not so the errors it goes on to log are attributable.
 async fn stop_service(name: &str, stop: impl std::future::Future<Output = ()>) -> bool {
@@ -980,7 +1014,9 @@ async fn create_subgraph_indexing_agreements_events_emitter(
 
 #[cfg(test)]
 mod tests {
-    use super::stop_service;
+    use tracing_subscriber::filter::LevelFilter;
+
+    use super::{log_filter, stop_service};
 
     /// The normal path: a service that stops promptly reports success, which is
     /// what lets the graceful DB pool close go ahead.
@@ -995,5 +1031,43 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn stop_service_gives_up_on_a_wedged_service() {
         assert!(!stop_service("wedged", std::future::pending::<()>()).await);
+    }
+
+    fn level(rust_log: Option<&str>) -> Option<LevelFilter> {
+        log_filter(rust_log).max_level_hint()
+    }
+
+    /// Without `RUST_LOG`, as in a deployment from the repo's manifests, warnings and the
+    /// agreement changes logged at info are still written, not only errors.
+    #[test]
+    fn logs_at_info_when_rust_log_is_unset_or_empty() {
+        assert_eq!(level(None), Some(LevelFilter::INFO));
+        assert_eq!(level(Some("")), Some(LevelFilter::INFO));
+    }
+
+    #[test]
+    fn a_rust_log_that_is_set_is_used_as_written() {
+        for (rust_log, most) in [
+            ("error", LevelFilter::ERROR),
+            ("warn", LevelFilter::WARN),
+            ("debug", LevelFilter::DEBUG),
+            ("dipper_service=debug,warn", LevelFilter::DEBUG),
+            ("off", LevelFilter::OFF),
+        ] {
+            assert_eq!(level(Some(rust_log)), Some(most), "{rust_log}");
+        }
+    }
+
+    /// A value with no directive that can be read does not silence logging; one with some keeps
+    /// those, as before.
+    #[test]
+    fn an_unreadable_rust_log_logs_at_info() {
+        for rust_log in ["dipper_service=loud", "[{", "dipper_service=loud,[{"] {
+            assert_eq!(level(Some(rust_log)), Some(LevelFilter::INFO), "{rust_log}");
+        }
+        assert_eq!(
+            level(Some("warn,dipper_service=loud")),
+            Some(LevelFilter::WARN)
+        );
     }
 }

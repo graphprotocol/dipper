@@ -452,6 +452,38 @@ impl PgRegistry {
         Ok(outcome)
     }
 
+    /// Record `signed_at` (seconds since the Unix epoch) as the newest signing time accepted for
+    /// the key `(requested_by, deployment_id, deployment_chain_id)`. Returns `false`, recording
+    /// nothing, when a request signed at or after it was already recorded for that key.
+    ///
+    /// The check and the write are 1 statement, so of 2 requests racing for the same key the
+    /// older can never be recorded after the newer.
+    pub async fn accept_request_signed_at(
+        &self,
+        requested_by: Address,
+        deployment_id: DeploymentId,
+        deployment_chain_id: ChainId,
+        signed_at: i64,
+    ) -> Result<bool, Error> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO dipper_reg_request_signing_times
+                (requested_by, deployment_id, deployment_chain_id, newest_signed_at)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (requested_by, deployment_id, deployment_chain_id)
+            DO UPDATE SET newest_signed_at = EXCLUDED.newest_signed_at
+            WHERE dipper_reg_request_signing_times.newest_signed_at < EXCLUDED.newest_signed_at
+            "#,
+        )
+        .bind(PgAddress(requested_by))
+        .bind(PgDeploymentId(deployment_id))
+        .bind(PgU64(deployment_chain_id))
+        .bind(signed_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     pub async fn get_all_indexing_requests(&self) -> Result<Vec<IndexingRequest>, Error> {
         sqlx::query_as(
             r#"

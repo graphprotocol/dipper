@@ -67,6 +67,9 @@ pub struct SetIndexingTargetCandidates {
     /// Defaults to the server-side maximum when omitted.
     #[serde(default)]
     pub num_candidates: Option<usize>,
+    /// When the request was signed, in seconds since the Unix epoch. The server refuses a
+    /// request signed too long ago, so one that was recorded can't be sent again later.
+    pub signed_at: u64,
 }
 
 impl ToSolStruct<SetIndexingTargetCandidatesSol> for SetIndexingTargetCandidates {
@@ -74,11 +77,15 @@ impl ToSolStruct<SetIndexingTargetCandidatesSol> for SetIndexingTargetCandidates
         SetIndexingTargetCandidatesSol {
             deployment_id: self.deployment_id.into(),
             chain_id: self.chain_id,
+            // Signed apart from the count, which is 0 both for a cancel and when left out:
+            // without it the 2 requests would carry the same signature.
+            num_candidates_set: self.num_candidates.is_some(),
             // `as u64` is safe on every target dipper builds for (all 64-bit);
             // `usize` is at most 64 bits on those platforms. The cast would
             // truncate on a hypothetical 128-bit target but no such build
             // exists today.
             num_candidates: self.num_candidates.unwrap_or(0) as u64,
+            signed_at: self.signed_at,
         }
     }
 }
@@ -90,7 +97,9 @@ thegraph_core::alloy::sol! {
     struct SetIndexingTargetCandidatesSol {
         bytes32 deployment_id;
         uint64 chain_id;
+        bool num_candidates_set;
         uint64 num_candidates;
+        uint64 signed_at;
     }
 }
 
@@ -173,5 +182,53 @@ impl<'de> serde::Deserialize<'de> for IndexingRequestStatus {
             IndexingRequestStatus::Unknown
         };
         Ok(status)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use thegraph_core::{
+        alloy::{primitives::B256, sol_types::SolStruct},
+        deployment_id,
+        signed_message::ToSolStruct,
+    };
+
+    use super::SetIndexingTargetCandidates;
+    use crate::admin::eip712_domain;
+
+    /// The hash an operator signs for a request, on the dipper serving `protocol_chain`.
+    fn signing_hash(protocol_chain: u64, num_candidates: Option<usize>, signed_at: u64) -> B256 {
+        SetIndexingTargetCandidates {
+            deployment_id: deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv"),
+            chain_id: 1,
+            num_candidates,
+            signed_at,
+        }
+        .to_sol_struct()
+        .eip712_signing_hash(&eip712_domain(protocol_chain))
+    }
+
+    #[test]
+    fn a_cancel_and_a_count_left_out_are_signed_differently() {
+        assert_ne!(
+            signing_hash(42161, Some(0), 7),
+            signing_hash(42161, None, 7)
+        );
+    }
+
+    #[test]
+    fn the_same_request_is_signed_differently_at_another_time() {
+        assert_ne!(
+            signing_hash(42161, Some(3), 7),
+            signing_hash(42161, Some(3), 8)
+        );
+    }
+
+    #[test]
+    fn the_same_request_is_signed_differently_for_another_network() {
+        assert_ne!(
+            signing_hash(42161, Some(3), 7),
+            signing_hash(421_614, Some(3), 7)
+        );
     }
 }

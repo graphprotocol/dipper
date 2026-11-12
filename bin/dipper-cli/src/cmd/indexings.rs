@@ -124,7 +124,7 @@ pub async fn status(conf: Config, matches: &clap::ArgMatches) -> Result<()> {
 pub async fn set_target(conf: Config, matches: &clap::ArgMatches) -> Result<()> {
     let rpc_client = client::new(&conf.server_url);
     let signer = signer::new_private_key_eip712_signer(&conf.signing_key);
-    let signer_eip712_domain = signer::eip712_domain();
+    let signer_eip712_domain = signer::eip712_domain(protocol_chain_id(&conf)?);
 
     let request_deployment_id = match matches.get_one::<SubgraphIdOrDeploymentId>("SUBGRAPH") {
         // ID is a Deployment ID
@@ -159,6 +159,7 @@ pub async fn set_target(conf: Config, matches: &clap::ArgMatches) -> Result<()> 
             deployment_id: *request_deployment_id,
             chain_id: request_chain_id,
             num_candidates,
+            signed_at: dipper_core::time::now_secs(),
         },
     )
     .map_err(|err| anyhow::anyhow!("Failed to sign RPC request: {err}"))?;
@@ -181,6 +182,17 @@ pub async fn set_target(conf: Config, matches: &clap::ArgMatches) -> Result<()> 
     }
 
     Ok(())
+}
+
+/// The chain to sign a request for. There is no default to fall back on: a dipper refuses a
+/// request signed for any chain but the one it serves, so a guess would only be refused.
+fn protocol_chain_id(conf: &Config) -> anyhow::Result<ChainId> {
+    conf.protocol_chain_id.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Missing the chain the DIPs contracts are on: pass --protocol-chain-id or set \
+             DIPS_PROTOCOL_CHAIN_ID (42161 for Arbitrum One, 421614 for Arbitrum Sepolia)"
+        )
+    })
 }
 
 /// Create the `indexings` DIPs indexing requests admin command
@@ -225,6 +237,9 @@ pub(super) fn cmd() -> Command {
                         .required(false),
                     arg!(--"num-candidates" <N> "Target number of indexers to assign (0 cancels). Defaults to server maximum.")
                         .value_parser(value_parser!(usize))
+                        .required(false),
+                    arg!(--"protocol-chain-id" <ID> "The chain the DIPs contracts are on, which the request is signed for: 42161 for Arbitrum One, 421614 for Arbitrum Sepolia (env DIPS_PROTOCOL_CHAIN_ID)")
+                        .value_parser(value_parser!(ChainId))
                         .required(false),
                 ]),
         ])
@@ -322,6 +337,28 @@ mod tests {
 
         assert_eq!(matches.get_one::<String>("chain-name"), None);
         assert_eq!(matches.get_one::<ChainId>("chain-id"), None);
+    }
+
+    #[test]
+    fn test_set_target_candidates_signs_for_the_protocol_chain_it_is_given() {
+        let matches = parse_set_target(&["--protocol-chain-id", "421614"]).unwrap();
+        let (_, matches) = matches.subcommand().unwrap();
+
+        let conf = common::load_conf(matches).unwrap();
+
+        assert_eq!(protocol_chain_id(&conf).unwrap(), 421_614);
+    }
+
+    #[test]
+    fn test_set_target_candidates_asks_for_a_missing_protocol_chain() {
+        let matches = parse_set_target(&[]).unwrap();
+        let (_, matches) = matches.subcommand().unwrap();
+        let conf = common::load_conf(matches).unwrap();
+
+        let err = protocol_chain_id(&conf).unwrap_err().to_string();
+
+        assert!(err.contains("--protocol-chain-id"), "{err}");
+        assert!(err.contains("DIPS_PROTOCOL_CHAIN_ID"), "{err}");
     }
 
     #[test]

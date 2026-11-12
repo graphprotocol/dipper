@@ -28,6 +28,8 @@ spec:
           image: ghcr.io/graphprotocol/dipper-service:v0.2.10 # x-release-please-version
           args:
             - /config/config.json
+          # Dipper logs at info unless RUST_LOG is set, for example to `dipper_service=debug,info`.
+          # Left unset here, as an env entry would override a level an environment supplies.
           ports:
             - name: admin-rpc
               containerPort: 8545
