@@ -121,6 +121,9 @@ pub async fn main() -> anyhow::Result<()> {
     if let Err(err) = conf.validate_chain_listener() {
         anyhow::bail!("invalid chain listener config: {err}");
     }
+    if let Err(err) = conf.validate_expiration_and_reassignment() {
+        anyhow::bail!("invalid config: {err}");
+    }
     // 1 line for each background service that will not run, so none is off unnoticed.
     for off in conf.background_services_off() {
         off.log();

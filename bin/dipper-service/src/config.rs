@@ -107,10 +107,12 @@ pub struct Config {
     /// The indexer gRPC client configuration (for sending RCA proposals)
     #[serde(default)]
     pub indexer_client: IndexerClientConfig,
-    /// The reassignment service configuration
+    /// The reassignment service configuration. Startup refuses a config without this section:
+    /// `{}` runs the service with its defaults and `{"enabled": false}` turns it off.
     #[serde(default)]
     pub reassignment: Option<ReassignmentConfig>,
-    /// The expiration service configuration (marks stale Created agreements as Expired)
+    /// The expiration service configuration (marks stale Created agreements as Expired). Startup
+    /// refuses a config without this section, as for `reassignment`.
     #[serde(default)]
     pub expiration: Option<ExpirationConfig>,
     /// The chain listener service configuration (monitors on-chain events)
@@ -160,10 +162,12 @@ pub struct Config {
 pub enum OffNoticeLevel {
     /// An opt-in service that was left out, which is normal.
     Debug,
-    /// A service its own config section turns off.
+    /// An opt-in service its own config section turns off.
     Info,
-    /// A service whose absence leaves dipper without a safeguard, with nothing in the config to
-    /// show that anyone chose to give it up. `event` tags the line for the Slack alerts.
+    /// A service whose absence leaves dipper without a safeguard: an opt-in one left off with
+    /// nothing in the config to show that anyone chose that, or one dipper is meant to run with
+    /// (the chain listener, expiration, reassignment) turned off in its section. `event` tags
+    /// the line for the Slack alerts.
     Warn { event: &'static str },
 }
 
@@ -211,6 +215,23 @@ impl Config {
         }
     }
 
+    /// Refuses a config that leaves the expiration or the reassignment service out without
+    /// saying so. Without expiry an unanswered offer keeps its place for ever, and without
+    /// reassignment a request left short of indexers is never topped up, so each may only be off
+    /// when the config says so.
+    pub fn validate_expiration_and_reassignment(&self) -> Result<(), String> {
+        for (section, switch, _, consequence) in self.background_services() {
+            if STATED_SECTIONS.contains(&section) && matches!(switch, Switch::Missing) {
+                return Err(format!(
+                    "the config has no {section} section, and without the {section} service \
+                     {consequence}. Add \"{section}\": {{}} to run it with its defaults, or \
+                     \"{section}\": {{\"enabled\": false}} to run without it"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// The background services that will not run, for startup to report.
     pub fn background_services_off(&self) -> Vec<ServiceOff> {
         let mut off = Vec::new();
@@ -230,19 +251,26 @@ impl Config {
             });
         }
         for (section, switch, event, consequence) in self.background_services() {
-            // A section left out says nothing about whether anyone chose it, so a safety service
-            // left off that way is a warning, alerted on under its own event.
-            let unannounced = event.map_or(OffNoticeLevel::Debug, |event| OffNoticeLevel::Warn {
+            // A warning, alerted on under the service's own event, for a safety service that is
+            // off; the escrow reconciler has no event, so its notice stays in the debug logs.
+            let alerted = event.map_or(OffNoticeLevel::Debug, |event| OffNoticeLevel::Warn {
                 event,
             });
             let (level, message) = match switch {
                 Switch::On => continue,
+                // Turning off a service dipper is meant to run with is the operator's to choose,
+                // but it is alerted on like the listener's; turning off an opt-in one is not.
                 Switch::Off => (
-                    OffNoticeLevel::Info,
+                    if STATED_SECTIONS.contains(&section) {
+                        alerted
+                    } else {
+                        OffNoticeLevel::Info
+                    },
                     format!("{section} is turned off in its config section: {consequence}"),
                 ),
+                // Left out, a setting or a section says nothing about whether anyone chose it.
                 Switch::LeftOut => (
-                    unannounced,
+                    alerted,
                     format!(
                         "{section} is off because its config section leaves out \"enabled\", \
                          which defaults to false: {consequence}; add \"enabled\": true to the \
@@ -250,7 +278,7 @@ impl Config {
                     ),
                 ),
                 Switch::Missing => (
-                    unannounced,
+                    alerted,
                     format!(
                         "{section} is off because the config has no {section} section: \
                          {consequence}; add the section with \"enabled\": true to run it"
@@ -287,15 +315,13 @@ impl Config {
                 "expiration",
                 on_unless_off(self.expiration.as_ref().map(|c| c.enabled)),
                 Some("expiration_off"),
-                "offers no indexer accepts by their deadline are never marked expired, so their \
-                 requests get no replacement indexers",
+                EXPIRATION_OFF_MEANS,
             ),
             (
                 "reassignment",
                 on_unless_off(self.reassignment.as_ref().map(|c| c.enabled)),
                 Some("reassignment_off"),
-                "requests left short of indexers are not topped up, and the daily reassessment of \
-                 open requests does not run",
+                REASSIGNMENT_OFF_MEANS,
             ),
             (
                 "liveness_checker",
@@ -331,6 +357,21 @@ enum Switch {
     /// It runs.
     On,
 }
+
+/// The sections, besides the chain listener's, that a config must have: their services run by
+/// default, so startup refuses a config that leaves one out and alerts when one is turned off.
+/// Both rules read this list, so a section added here gets both.
+const STATED_SECTIONS: [&str; 2] = ["expiration", "reassignment"];
+
+/// What running without the expiration service means.
+const EXPIRATION_OFF_MEANS: &str = "offers no indexer accepts by their deadline are never marked \
+                                    expired: their requests get no replacement indexers, and \
+                                    they keep counting as offers in flight, so new offers stop \
+                                    once the in-flight limits are reached";
+
+/// What running without the reassignment service means.
+const REASSIGNMENT_OFF_MEANS: &str = "requests left short of indexers are not topped up, and the \
+                                      daily reassessment of open requests does not run";
 
 /// What to add to the config to run the chain listener.
 const RUN_CHAIN_LISTENER: &str = r#""chain_listener": {"subgraph_endpoint": "<URL of the indexing-payments subgraph, usually the same as indexer_urls.subgraph_endpoint>"}"#;
@@ -559,9 +600,9 @@ impl Default for IndexerClientConfig {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReassignmentConfig {
-    /// Whether the reassignment service runs (default: true). This default only applies once the
-    /// section exists: without a `reassignment` section it does not run, so there is no daily
-    /// reassessment of open requests and no hourly top-up of short ones. A request is then only
+    /// Whether the reassignment service runs (default: true). Startup refuses a config with no
+    /// `reassignment` section, so only `false` here turns it off. Then there is no daily
+    /// reassessment of open requests and no hourly top-up of short ones: a request is only
     /// re-checked when something else queues it, such as a target change or an expired offer,
     /// even 1 whose last reassessment was dropped during an IISA outage.
     #[serde(default = "default_reassignment_enabled")]
@@ -655,9 +696,9 @@ impl Default for ReassignmentConfig {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExpirationConfig {
-    /// Whether the expiration service runs (default: true). This default only applies once the
-    /// section exists: without an `expiration` section it does not run. Nothing else marks an
-    /// offer expired, so a lapsed offer stays created for ever and keeps counting as an offer in
+    /// Whether the expiration service runs (default: true). Startup refuses a config with no
+    /// `expiration` section, so only `false` here turns it off. Nothing else marks an offer
+    /// expired, so a lapsed offer then stays created for ever and keeps counting as an offer in
     /// flight, whatever its deadline: with the default caps an indexer gets no more offers once it
     /// has 5 and nobody does once there are 100, and no replacement is picked for a lapsed offer.
     #[serde(default = "default_expiration_enabled")]
@@ -3080,6 +3121,7 @@ mod tests {
         let config = example_config_edited(|_| {});
 
         assert!(config.validate_chain_listener().is_ok());
+        assert!(config.validate_expiration_and_reassignment().is_ok());
         let listener = config.chain_listener.as_ref().expect("the example has one");
         assert_eq!(
             listener.running_endpoint(),
@@ -3195,6 +3237,94 @@ mod tests {
             .expect_err("a listener with nothing to poll must be refused");
 
         assert!(err.contains("subgraph_endpoint"), "{err}");
+    }
+
+    /// Without expiry an unanswered offer keeps its place for ever, and without reassignment a
+    /// request left short of indexers is never topped up, so leaving either section out must
+    /// stop startup rather than run with the service silently off.
+    #[test]
+    fn a_config_without_an_expiration_or_reassignment_section_is_refused() {
+        for section in ["expiration", "reassignment"] {
+            let config = example_config_edited(|config| remove_sections(config, &[section]));
+
+            let err = config
+                .validate_expiration_and_reassignment()
+                .expect_err("a config that leaves the section out must be refused");
+
+            assert!(err.contains(&format!("no {section} section")), "{err}");
+            assert!(!err.contains("  "), "the error reads as 1 sentence: {err}");
+            assert!(
+                err.contains(&format!(r#""{section}": {{}}"#)),
+                "the error says what to add to run it: {err}"
+            );
+            assert!(
+                err.contains(&format!(r#""{section}": {{"enabled": false}}"#)),
+                "the error says what to add to run without it: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_expiration_or_reassignment_section_runs_the_service() {
+        let config = example_config_edited(|config| {
+            config["expiration"] = serde_json::json!({});
+            config["reassignment"] = serde_json::json!({});
+        });
+
+        assert!(config.validate_expiration_and_reassignment().is_ok());
+        assert!(config.expiration.as_ref().is_some_and(|c| c.enabled));
+        assert!(config.reassignment.as_ref().is_some_and(|c| c.enabled));
+        assert!(
+            services_off(&config)
+                .iter()
+                .all(|(section, _)| !["expiration", "reassignment"].contains(section)),
+            "a running service is not reported as off"
+        );
+    }
+
+    /// Turning either service off is the operator's to choose, but it leaves requests without
+    /// replacement indexers, so the choice is reported as a warning that is alerted on.
+    #[test]
+    fn expiration_or_reassignment_switched_off_explicitly_is_accepted_and_alerted_on() {
+        let config = example_config_edited(|config| {
+            config["expiration"] = serde_json::json!({"enabled": false});
+            config["reassignment"] = serde_json::json!({"enabled": false});
+        });
+
+        assert!(config.validate_expiration_and_reassignment().is_ok());
+        let expiry_off = config
+            .background_services_off()
+            .into_iter()
+            .find(|off| off.section == "expiration")
+            .expect("expiry turned off is reported");
+        for meaning in ["no replacement indexers", "new offers stop"] {
+            assert!(
+                expiry_off.message.contains(meaning),
+                "the warning says what being off means: {}",
+                expiry_off.message
+            );
+        }
+        let reported: Vec<_> = services_off(&config)
+            .into_iter()
+            .filter(|(section, _)| ["expiration", "reassignment"].contains(section))
+            .collect();
+        assert_eq!(
+            reported,
+            [
+                (
+                    "expiration",
+                    OffNoticeLevel::Warn {
+                        event: "expiration_off"
+                    }
+                ),
+                (
+                    "reassignment",
+                    OffNoticeLevel::Warn {
+                        event: "reassignment_off"
+                    }
+                ),
+            ]
+        );
     }
 
     /// A section that leaves `enabled` out leaves an opt-in service off by its default, not by
@@ -3384,7 +3514,23 @@ mod tests {
         }
         assert_eq!(
             services_off(&turned_off),
-            SECTIONS.map(|section| (section, OffNoticeLevel::Info))
+            [
+                (
+                    "expiration",
+                    OffNoticeLevel::Warn {
+                        event: "expiration_off"
+                    }
+                ),
+                (
+                    "reassignment",
+                    OffNoticeLevel::Warn {
+                        event: "reassignment_off"
+                    }
+                ),
+                ("liveness_checker", OffNoticeLevel::Info),
+                ("dips_info_watcher", OffNoticeLevel::Info),
+                ("escrow_reconciler", OffNoticeLevel::Info),
+            ]
         );
     }
 
