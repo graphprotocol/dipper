@@ -373,7 +373,9 @@ const STATED_SECTIONS: [&str; 2] = ["expiration", "reassignment"];
 
 /// What running without the expiration service means.
 const EXPIRATION_OFF_MEANS: &str = "offers no indexer accepts by their deadline are never marked \
-                                    expired, so their requests get no replacement indexers";
+                                    expired: their requests get no replacement indexers, and \
+                                    they keep counting as offers in flight, so new offers stop \
+                                    once the in-flight limits are reached";
 
 /// What running without the reassignment service means.
 const REASSIGNMENT_OFF_MEANS: &str = "requests left short of indexers are not topped up, and the \
@@ -3298,6 +3300,18 @@ mod tests {
         });
 
         assert!(config.validate_expiration_and_reassignment().is_ok());
+        let expiry_off = config
+            .background_services_off()
+            .into_iter()
+            .find(|off| off.section == "expiration")
+            .expect("expiry turned off is reported");
+        for meaning in ["no replacement indexers", "new offers stop"] {
+            assert!(
+                expiry_off.message.contains(meaning),
+                "the warning says what being off means: {}",
+                expiry_off.message
+            );
+        }
         let reported: Vec<_> = services_off(&config)
             .into_iter()
             .filter(|(section, _)| ["expiration", "reassignment"].contains(section))
