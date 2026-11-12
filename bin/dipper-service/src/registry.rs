@@ -32,7 +32,8 @@ pub use self::{
     dips_info::{DipsInfoChecks, DipsInfoRegistry},
     indexer_denylist::IndexerDenylistRegistry,
     indexing_request::{
-        IndexingRequest, IndexingRequestRegistry, SetTargetOutcome, Status as IndexingRequestStatus,
+        IndexingRequest, IndexingRequestRegistry, RequestOrderRegistry, SetTargetOutcome,
+        Status as IndexingRequestStatus,
     },
     pending_cancellation::{PendingCancellation, PendingCancellationRegistry},
     result::{Error, Result},
@@ -138,6 +139,26 @@ impl RegistryProvider {
         Self {
             inner: PgRegistry::new(db),
         }
+    }
+}
+
+#[async_trait]
+impl RequestOrderRegistry for RegistryProvider {
+    async fn accept_request_signed_at(
+        &self,
+        requested_by: Address,
+        deployment_id: DeploymentId,
+        deployment_chain_id: ChainId,
+        signed_at: u64,
+    ) -> RegistryResult<bool> {
+        let signed_at = i64::try_from(signed_at).map_err(|_| Error::TooLarge {
+            field: "signed_at",
+            value: usize::try_from(signed_at).unwrap_or(usize::MAX),
+        })?;
+        Ok(self
+            .inner
+            .accept_request_signed_at(requested_by, deployment_id, deployment_chain_id, signed_at)
+            .await?)
     }
 }
 

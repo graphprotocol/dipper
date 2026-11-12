@@ -42,6 +42,7 @@ where
             registry: ctx.registry.clone(),
             worker: ctx.worker.clone(),
             max_candidates: ctx.max_candidates,
+            clock: dipper_core::time::now_secs,
             subgraph_indexing_agreements_events_emitter: ctx
                 .subgraph_indexing_agreements_events_emitter
                 .clone(),
