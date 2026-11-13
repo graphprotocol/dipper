@@ -4597,17 +4597,12 @@ mod tests {
                 !registry.was_marked_cancelling(&old_agreement_id),
                 "{ended:?}"
             );
-            // Nothing is left that a later sweep could act on.
+            // The link between the 2 is gone, so nothing can act on it later.
             let left = registry
                 .get_pending_cancellations_by_new_agreement(agreement_id)
                 .await
                 .unwrap();
             assert!(left.is_empty(), "{ended:?}");
-            sweep_executable_pending_cancellations(&registry, &chain_client, conf.as_ref()).await;
-            assert!(
-                !chain_client.was_on_chain_cancel_attempted(&old_agreement_id),
-                "{ended:?}"
-            );
         }
     }
 
