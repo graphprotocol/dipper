@@ -2,7 +2,9 @@ use std::str::FromStr;
 
 use clap::{Command, arg, command, value_parser};
 use dipper_core::ids::IndexingRequestId;
-use dipper_rpc::admin::indexing_requests::SetIndexingTargetCandidates;
+use dipper_rpc::admin::indexing_requests::{
+    DEFAULT_PAGE_SIZE, IndexingRequestStatus, SetIndexingTargetCandidates,
+};
 use thegraph_core::{DeploymentId, SubgraphId, alloy::primitives::ChainId, signed_message};
 use url::Url;
 use uuid::Uuid;
@@ -27,7 +29,7 @@ pub(super) async fn run(matches: &clap::ArgMatches) -> Result<()> {
             let conf = common::load_conf(matches)?;
             tracing::debug!("Configuration loaded: {:?}", conf);
 
-            list(conf).await
+            list(conf, matches).await
         }
         Some(("status", matches)) => {
             let conf = common::load_conf(matches)?;
@@ -47,25 +49,121 @@ pub(super) async fn run(matches: &clap::ArgMatches) -> Result<()> {
 
 /// The `indexings list` command
 ///
-/// This function lists all registered indexing requests.
-///
-/// This function calls the `get_all_indexing_requests` RPC method on the DIPs gateway server.
-// TODO(post-mvp): Add support for pagination
-pub async fn list(conf: Config) -> Result<()> {
+/// Prints the registered indexing requests as 1 JSON array, in the order they were created, so
+/// one can use `jq` to explore the output. The server hands them over a page at a time through
+/// its `get_all_indexing_requests` RPC method, and each page is printed as it arrives, so a long
+/// list never has to fit in 1 reply or in memory.
+pub async fn list(conf: Config, matches: &clap::ArgMatches) -> Result<()> {
     let rpc_client = client::new(&conf.server_url);
-    let res = rpc_client
-        .get_all_indexing_requests()
-        .await
-        .map_err(|err| anyhow::anyhow!("Failed to list indexing requests: {err}"))?;
+    let status = matches.get_one::<IndexingRequestStatus>("status").copied();
+    let mut paging = Paging::new(matches.get_one::<u64>("limit").copied());
+    let mut array = JsonArray::default();
 
-    // Print the result as pretty JSON so one can use `jq` to explore the output
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&res)
-            .map_err(|err| anyhow::anyhow!("Failed to serialize indexing requests: {err}"))?
-    );
+    while let Some(after) = paging.start() {
+        let page = rpc_client
+            .get_all_indexing_requests(after, paging.ask(), status)
+            .await
+            .map_err(|err| anyhow::anyhow!("Failed to list indexing requests: {err}"))?;
+        let requests = paging.take(page.requests, page.next)?;
+        print!("{}", array.items(&requests)?);
+    }
+    println!("{}", array.end());
 
     Ok(())
+}
+
+/// Walks a listing that the server hands over a page at a time: where each page starts, how
+/// many requests to ask for, and when to stop.
+struct Paging {
+    /// The id the next page starts after. `Some(None)` is the first page, `None` no more pages.
+    start: Option<Option<IndexingRequestId>>,
+    /// How many more requests the caller wants, when they set a limit.
+    left: Option<u64>,
+}
+
+impl Paging {
+    /// A listing of every request, or of the first `most` of them.
+    fn new(most: Option<u64>) -> Self {
+        Self {
+            start: Some(None),
+            left: most,
+        }
+    }
+
+    /// The id the next page starts after, or `None` once the listing is complete.
+    fn start(&self) -> Option<Option<IndexingRequestId>> {
+        self.start
+    }
+
+    /// How many requests to ask the server for. With no limit the server's own page size
+    /// applies, and with one no page asks for more than is still wanted.
+    fn ask(&self) -> Option<u32> {
+        let left = self.left?.min(u64::from(DEFAULT_PAGE_SIZE));
+        Some(u32::try_from(left).unwrap_or(DEFAULT_PAGE_SIZE))
+    }
+
+    /// Take a page and where the server says the next one starts, and return the requests to
+    /// print. A page can be empty and still have a next one, as the server leaves out any
+    /// request it can't read.
+    fn take<T>(&mut self, mut items: Vec<T>, next: Option<IndexingRequestId>) -> Result<Vec<T>> {
+        if let Some(left) = self.left {
+            items.truncate(usize::try_from(left).unwrap_or(usize::MAX));
+            self.left = Some(left.saturating_sub(items.len() as u64));
+        }
+        // Without this a server that kept answering with the same page would never let go.
+        if next.is_some() && Some(next) == self.start {
+            return Err(anyhow::anyhow!(
+                "Failed to list indexing requests: the server returned a page that does not \
+                 move on from the one before"
+            )
+            .into());
+        }
+        self.start = match next {
+            Some(next) if self.left != Some(0) => Some(Some(next)),
+            _ => None,
+        };
+        Ok(items)
+    }
+}
+
+/// Writes values as 1 pretty JSON array a few at a time, in the layout
+/// `serde_json::to_string_pretty` gives a whole list.
+#[derive(Default)]
+struct JsonArray {
+    /// Whether any value has been written yet.
+    started: bool,
+}
+
+impl JsonArray {
+    /// The text that adds `items` to the array.
+    fn items<T: serde::Serialize>(&mut self, items: &[T]) -> Result<String> {
+        let mut text = String::new();
+        for item in items {
+            let json = serde_json::to_string_pretty(item)
+                .map_err(|err| anyhow::anyhow!("Failed to serialize indexing requests: {err}"))?;
+            text.push_str(if self.started { ",\n" } else { "[\n" });
+            self.started = true;
+            text.push_str("  ");
+            text.push_str(&json.replace('\n', "\n  "));
+        }
+        Ok(text)
+    }
+
+    /// The text that closes the array.
+    fn end(&self) -> &'static str {
+        if self.started { "\n]" } else { "[]" }
+    }
+}
+
+/// Parses the status to list requests by.
+fn parse_status(s: &str) -> std::result::Result<IndexingRequestStatus, anyhow::Error> {
+    match s.to_ascii_lowercase().as_str() {
+        "open" => Ok(IndexingRequestStatus::Open),
+        "canceled" | "cancelled" => Ok(IndexingRequestStatus::Canceled),
+        _ => Err(anyhow::anyhow!(
+            "Invalid status '{s}': expected open or canceled"
+        )),
+    }
 }
 
 /// The `indexings status` command
@@ -214,7 +312,15 @@ pub(super) fn cmd() -> Command {
         .subcommands(&[
             command!("list")
                 .alias("ls")
-                .about("List all indexing requests"),
+                .about("List indexing requests, oldest first")
+                .args([
+                    arg!(--status <STATUS> "Only list requests in this status: open or canceled")
+                        .value_parser(parse_status)
+                        .required(false),
+                    arg!(--limit <N> "Stop after this many requests")
+                        .value_parser(value_parser!(u64).range(1..))
+                        .required(false),
+                ]),
             command!("status")
                 .about("Get an indexing request status")
                 .arg(
@@ -328,6 +434,142 @@ mod tests {
             "QmQ5w3LqJdBGZvHNYTWq7np2B1qbBQMpHP77ZKQPzGVTrg",
         ];
         cmd().try_get_matches_from(base.into_iter().chain(args.iter().copied()))
+    }
+
+    /// Parse `indexings list` followed by `args`.
+    fn parse_list(args: &[&str]) -> std::result::Result<clap::ArgMatches, clap::Error> {
+        let base = ["indexings", "--server-url", "http://localhost:9000", "list"];
+        cmd().try_get_matches_from(base.into_iter().chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn list_takes_a_status_and_a_limit_and_needs_neither() {
+        let matches = parse_list(&[]).unwrap();
+        let (_, matches) = matches.subcommand().unwrap();
+        assert_eq!(matches.get_one::<IndexingRequestStatus>("status"), None);
+        assert_eq!(matches.get_one::<u64>("limit"), None);
+
+        for (word, status) in [
+            ("open", IndexingRequestStatus::Open),
+            ("OPEN", IndexingRequestStatus::Open),
+            ("canceled", IndexingRequestStatus::Canceled),
+            ("cancelled", IndexingRequestStatus::Canceled),
+        ] {
+            let matches = parse_list(&["--status", word, "--limit", "25"]).unwrap();
+            let (_, matches) = matches.subcommand().unwrap();
+            assert_eq!(
+                matches.get_one::<IndexingRequestStatus>("status"),
+                Some(&status),
+                "{word}"
+            );
+            assert_eq!(matches.get_one::<u64>("limit"), Some(&25));
+        }
+    }
+
+    #[test]
+    fn list_refuses_a_status_it_does_not_know_and_a_limit_of_0() {
+        assert!(parse_list(&["--status", "pending"]).is_err());
+        assert!(parse_list(&["--limit", "0"]).is_err());
+    }
+
+    /// A CLI from before paging reads the reply as a bare list. It has to fail on a page, not
+    /// take the first page for the whole list.
+    #[test]
+    fn a_page_of_requests_does_not_read_as_the_bare_list_it_replaced() {
+        use dipper_rpc::admin::indexing_requests::{IndexingRequest, IndexingRequestsPage};
+        let page = IndexingRequestsPage {
+            requests: Vec::new(),
+            next: None,
+        };
+        let reply = serde_json::to_value(&page).unwrap();
+
+        assert_eq!(reply, serde_json::json!({ "requests": [], "next": null }));
+        assert!(serde_json::from_value::<Vec<IndexingRequest>>(reply).is_err());
+    }
+
+    /// `count` ids, in the order they were made.
+    fn ids(count: usize) -> Vec<IndexingRequestId> {
+        (0..count).map(|_| IndexingRequestId::new()).collect()
+    }
+
+    #[test]
+    fn a_listing_with_no_limit_follows_the_pages_to_the_last() {
+        let ids = ids(2);
+        let mut paging = Paging::new(None);
+
+        assert_eq!(paging.start(), Some(None));
+        // The server picks the page size.
+        assert_eq!(paging.ask(), None);
+        assert_eq!(paging.take(vec![1, 2], Some(ids[0])).unwrap(), [1, 2]);
+
+        assert_eq!(paging.start(), Some(Some(ids[0])));
+        // An empty page with a next one is carried on from, not taken as the end.
+        assert!(
+            paging
+                .take(Vec::<i32>::new(), Some(ids[1]))
+                .unwrap()
+                .is_empty()
+        );
+
+        assert_eq!(paging.start(), Some(Some(ids[1])));
+        assert_eq!(paging.take(vec![3], None).unwrap(), [3]);
+
+        assert_eq!(paging.start(), None);
+    }
+
+    #[test]
+    fn a_listing_with_a_limit_asks_for_no_more_than_is_left_and_stops_there() {
+        let ids = ids(3);
+        let mut paging = Paging::new(Some(2_500));
+
+        assert_eq!(paging.ask(), Some(1_000));
+        assert_eq!(
+            paging.take(vec![0; 1_000], Some(ids[0])).unwrap().len(),
+            1_000
+        );
+        assert_eq!(paging.ask(), Some(1_000));
+        assert_eq!(
+            paging.take(vec![0; 1_000], Some(ids[1])).unwrap().len(),
+            1_000
+        );
+        assert_eq!(paging.ask(), Some(500));
+        // A server that sends more than was asked for still can't push past the limit, and the
+        // listing ends though another page is on offer.
+        assert_eq!(paging.take(vec![0; 700], Some(ids[2])).unwrap().len(), 500);
+
+        assert_eq!(paging.start(), None);
+    }
+
+    #[test]
+    fn a_listing_stops_with_an_error_when_the_server_repeats_a_page() {
+        let ids = ids(1);
+        let mut paging = Paging::new(None);
+        paging.take(vec![1], Some(ids[0])).unwrap();
+
+        let err = paging.take(vec![1], Some(ids[0])).unwrap_err();
+
+        assert!(err.to_string().contains("does not move on"), "{err}");
+    }
+
+    #[test]
+    fn requests_printed_a_page_at_a_time_read_as_the_whole_list_printed_at_once() {
+        let request = |n: u32| serde_json::json!({ "id": n, "status": "OPEN", "tags": [n, n] });
+        for pages in [
+            vec![],
+            vec![vec![]],
+            vec![vec![request(1)]],
+            vec![vec![request(1), request(2)], vec![], vec![request(3)]],
+        ] {
+            let mut array = JsonArray::default();
+            let mut printed = String::new();
+            for page in &pages {
+                printed.push_str(&array.items(page).unwrap());
+            }
+            printed.push_str(array.end());
+
+            let all: Vec<_> = pages.iter().flatten().collect();
+            assert_eq!(printed, serde_json::to_string_pretty(&all).unwrap());
+        }
     }
 
     #[test]

@@ -33,8 +33,8 @@ pub use self::{
     dips_info::{DipsInfoChecks, DipsInfoRegistry},
     indexer_denylist::IndexerDenylistRegistry,
     indexing_request::{
-        IndexingRequest, IndexingRequestRegistry, RequestOrderRegistry, SetTargetOutcome,
-        Status as IndexingRequestStatus,
+        IndexingRequest, IndexingRequestRegistry, RequestOrderRegistry, RequestsPage,
+        SetTargetOutcome, Status as IndexingRequestStatus,
     },
     pending_cancellation::{PendingCancellation, PendingCancellationRegistry},
     result::{Error, Result},
@@ -189,15 +189,18 @@ impl IndexingRequestRegistry for RegistryProvider {
             .map(Into::into)
     }
 
-    async fn get_all_indexing_requests(&self) -> RegistryResult<Vec<IndexingRequest>> {
-        Ok(self
-            .inner
-            .get_all_indexing_requests()
-            .await?
-            .into_iter()
-            .map(IndexingRequest::try_from)
-            .filter_map(filter_map_with_logging)
-            .collect())
+    async fn get_indexing_requests_page(
+        &self,
+        after: Option<IndexingRequestId>,
+        status: Option<IndexingRequestStatus>,
+        limit: u32,
+    ) -> RegistryResult<RequestsPage> {
+        let page = indexing_request::read_page(limit, |rows| {
+            self.inner
+                .get_indexing_requests_page(after, status.map(Into::into), rows)
+        })
+        .await?;
+        Ok(page)
     }
 
     async fn get_indexing_request_by_id(

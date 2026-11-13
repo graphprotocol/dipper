@@ -32,8 +32,14 @@ pub trait IndexingRequestRegistry {
         num_candidates: usize,
     ) -> RegistryResult<SetTargetOutcome>;
 
-    /// Get all indexing requests.
-    async fn get_all_indexing_requests(&self) -> RegistryResult<Vec<IndexingRequest>>;
+    /// Get a page of indexing requests in the order they were created: up to `limit` of those
+    /// that come after `after`, and only those in `status` when one is given.
+    async fn get_indexing_requests_page(
+        &self,
+        after: Option<IndexingRequestId>,
+        status: Option<Status>,
+        limit: u32,
+    ) -> RegistryResult<RequestsPage>;
 
     /// Get the indexing request by ID.
     async fn get_indexing_request_by_id(
@@ -145,6 +151,55 @@ pub enum SetTargetOutcome {
     NoOpAlreadyEmpty,
 }
 
+/// A page of indexing requests, and where the next page starts.
+#[derive(Debug, Clone, Default)]
+pub struct RequestsPage {
+    /// The requests on this page, in the order they were created.
+    pub requests: Vec<IndexingRequest>,
+    /// The id to pass as `after` for the next page. `None` when this is the last page.
+    pub next: Option<IndexingRequestId>,
+}
+
+/// Read a page of `limit` indexing requests with `read`, which is given how many rows to read
+/// and returns them in id order.
+///
+/// It reads 1 row more than the page, to learn whether another page follows. Where the next page
+/// starts is settled from the rows as read, before any is dropped for failing to convert, so a
+/// row dipper can't read never ends a listing early.
+pub(super) async fn read_page<F, Fut, E>(limit: u32, read: F) -> Result<RequestsPage, E>
+where
+    F: FnOnce(i64) -> Fut,
+    Fut: Future<Output = Result<Vec<dipper_pgregistry::IndexingRequest>, E>>,
+{
+    let rows = read(i64::from(limit) + 1).await?;
+    let (rows, next) = cut_page(rows, limit, |row| row.id);
+    Ok(RequestsPage {
+        requests: rows
+            .into_iter()
+            .map(IndexingRequest::try_from)
+            .filter_map(super::filter_map_with_logging)
+            .collect(),
+        next,
+    })
+}
+
+/// Cut rows that were read 1 past the page size down to the page, and give the id the next
+/// page starts after when that extra row was there.
+fn cut_page<T>(
+    rows: Vec<T>,
+    limit: u32,
+    id: impl Fn(&T) -> IndexingRequestId,
+) -> (Vec<T>, Option<IndexingRequestId>) {
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    let mut rows = rows;
+    if rows.len() <= limit {
+        return (rows, None);
+    }
+    rows.truncate(limit);
+    let next = rows.last().map(id);
+    (rows, next)
+}
+
 /// An Indexing Request represents the request for indexing services initiated by the customer.
 ///
 /// The [`IndexingRequest`] is as a Record Data Structure.
@@ -231,6 +286,15 @@ impl TryFrom<dipper_pgregistry::IndexingRequest> for IndexingRequest {
     }
 }
 
+impl From<Status> for dipper_pgregistry::IndexingRequestStatus {
+    fn from(value: Status) -> Self {
+        match value {
+            Status::Open => dipper_pgregistry::IndexingRequestStatus::Open,
+            Status::Canceled => dipper_pgregistry::IndexingRequestStatus::Canceled,
+        }
+    }
+}
+
 impl TryFrom<dipper_pgregistry::IndexingRequestStatus> for Status {
     type Error = anyhow::Error;
 
@@ -263,5 +327,78 @@ impl From<dipper_pgregistry::IndexingRequestSetTargetOutcome> for SetTargetOutco
             Pg::Canceled { id } => SetTargetOutcome::Canceled { id },
             Pg::NoOpAlreadyEmpty => SetTargetOutcome::NoOpAlreadyEmpty,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `count` ids, in the order they were made.
+    fn ids(count: usize) -> Vec<IndexingRequestId> {
+        (0..count).map(|_| IndexingRequestId::new()).collect()
+    }
+
+    fn stored(
+        status: dipper_pgregistry::IndexingRequestStatus,
+    ) -> dipper_pgregistry::IndexingRequest {
+        dipper_pgregistry::IndexingRequest {
+            id: IndexingRequestId::new(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+            status,
+            requested_by: Address::ZERO,
+            deployment_id: thegraph_core::deployment_id!(
+                "QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv"
+            ),
+            deployment_chain_id: 1,
+            num_candidates: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_page_is_read_1_row_past_its_size_and_a_row_that_fails_to_convert_does_not_end_it() {
+        use dipper_pgregistry::IndexingRequestStatus::{Open, Unknown};
+        // 4 stored requests. Dipper can't read the 2nd, which is in no status it knows.
+        let table = [stored(Open), stored(Unknown), stored(Open), stored(Open)];
+        let rows_read = std::cell::Cell::new(0);
+
+        let page = read_page(2, |rows| {
+            rows_read.set(rows);
+            let rows = table.iter().take(3).cloned().collect();
+            async move { Ok::<_, std::convert::Infallible>(rows) }
+        })
+        .await
+        .unwrap();
+
+        // 1 past the page of 2, or there would be no telling that more follow.
+        assert_eq!(rows_read.get(), 3);
+        // The unreadable request is left out of the page, yet the next page starts after it:
+        // counting only the rows that converted would make this look like the last page.
+        let ids: Vec<_> = page.requests.iter().map(|request| request.id).collect();
+        assert_eq!(ids, [table[0].id]);
+        assert_eq!(page.next, Some(table[1].id));
+    }
+
+    #[test]
+    fn rows_that_fit_the_page_are_the_last_page() {
+        for count in [0, 1, 3] {
+            let rows = ids(count);
+
+            let (page, next) = cut_page(rows.clone(), 3, |id| *id);
+
+            assert_eq!(page, rows, "{count} rows");
+            assert_eq!(next, None, "{count} rows");
+        }
+    }
+
+    #[test]
+    fn a_row_past_the_page_is_dropped_and_the_next_page_starts_after_the_last_row_kept() {
+        let rows = ids(4);
+
+        let (page, next) = cut_page(rows.clone(), 3, |id| *id);
+
+        assert_eq!(page, rows[..3]);
+        assert_eq!(next, Some(rows[2]));
     }
 }

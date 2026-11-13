@@ -1489,7 +1489,12 @@ mod tests {
         ) -> RegistryResult<crate::registry::SetTargetOutcome> {
             unimplemented!()
         }
-        async fn get_all_indexing_requests(&self) -> RegistryResult<Vec<IndexingRequest>> {
+        async fn get_indexing_requests_page(
+            &self,
+            _after: Option<IndexingRequestId>,
+            _status: Option<crate::registry::IndexingRequestStatus>,
+            _limit: u32,
+        ) -> crate::registry::Result<crate::registry::RequestsPage> {
             unimplemented!()
         }
         async fn get_indexing_request_by_id(

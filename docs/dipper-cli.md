@@ -184,6 +184,24 @@ dipper-cli indexings --env-file .env.injected <subcommand>
 rm .env.injected
 ```
 
+## Listing indexing requests
+
+`indexings list` prints the indexing requests dipper holds as 1 JSON array, oldest first. Dipper hands them over a page at a time and the CLI follows the pages for you, printing each as it arrives, so the list can be piped to `jq` however long it is.
+
+```bash
+# Every request
+dipper-cli indexings list
+
+# Only the requests that are still open, or only the cancelled ones
+dipper-cli indexings list --status open
+dipper-cli indexings list --status canceled
+
+# The 50 oldest requests
+dipper-cli indexings list --limit 50
+```
+
+The CLI and dipper must be from the same release for this command: a CLI from before paging fails to read the reply of a dipper that pages, and says so, instead of showing a partial list.
+
 ## Development
 
 This section provides information for developers who want to contribute to the Dipper CLI module.
