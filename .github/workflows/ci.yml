@@ -113,7 +113,7 @@ jobs:
             sudo apt-get update
             sudo apt-get install -y postgresql-17
             test -x /usr/lib/postgresql/17/bin/initdb
-            echo "/usr/lib/postgresql/17/bin" >> $GITHUB_PATH
+            echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
 
       - name: Integration tests (in-tree)
         uses: LNSD/sops-exec-action@6da1fbca63459d9796097496d5f5e6233555b31a # v1
