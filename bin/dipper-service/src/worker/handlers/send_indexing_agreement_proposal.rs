@@ -7,7 +7,7 @@ use url::Url;
 
 use crate::{
     config::DEFAULT_MAX_CANDIDATES,
-    indexer_rpc_client::IndexerClient,
+    indexer_rpc_client::{DIPS_GRPC_PORT, IndexerClient},
     registry::{
         AgreementRegistry, IndexingAgreementStatus, IndexingRequestRegistry,
         PendingCancellationRegistry,
@@ -66,10 +66,11 @@ where
     W: WorkerQueue,
     C: IndexerClient,
 {
-    // TODO: THIS IS A HACK
+    // The registered URL names the port the indexer answers queries on, and offers go to a
+    // separate listener, so keep its host and scheme and swap in the offer port.
     let indexer_url = {
         let mut url = indexer_url.clone();
-        url.set_port(Some(7602)).unwrap();
+        url.set_port(Some(DIPS_GRPC_PORT)).unwrap();
         url
     };
 
@@ -1420,5 +1421,75 @@ mod tests {
         assert!(registry_state.lock().unwrap().marked_rejected.is_empty());
         assert!(registry_state.lock().unwrap().marked_failed.is_empty());
         assert!(queue_state.lock().unwrap().reassess_calls.is_empty());
+    }
+
+    /// An indexer client that accepts every offer and keeps the address each one was sent to.
+    struct RecordingIndexerClient {
+        sent_to: Arc<Mutex<Vec<Url>>>,
+    }
+
+    #[async_trait]
+    impl IndexerClient for RecordingIndexerClient {
+        async fn send_indexing_agreement_proposal(
+            &self,
+            indexer: &Url,
+            _indexing_agreement_id: IndexingAgreementId,
+            _terms: IndexingAgreementTerms,
+            _nonce_uuid: uuid::Uuid,
+        ) -> Result<SubmitAgreementProposalResponse, DipsError> {
+            self.sent_to.lock().unwrap().push(indexer.clone());
+            Ok(SubmitAgreementProposalResponse {
+                outcome: Some(Outcome::Accepted(Accepted {})),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn an_offer_goes_to_the_offer_port_whatever_port_the_registered_url_names() {
+        for (registered, expected) in [
+            (
+                "https://indexer.example.com/",
+                "https://indexer.example.com:7602/",
+            ),
+            (
+                "https://indexer.example.com:8443/",
+                "https://indexer.example.com:7602/",
+            ),
+            (
+                "http://indexer.example.com:7600/",
+                "http://indexer.example.com:7602/",
+            ),
+        ] {
+            let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+            let request_id = IndexingRequestId::new();
+            let registry_state = Arc::new(Mutex::new(MockRegistryState {
+                agreement: Some(make_test_agreement(
+                    agreement_id,
+                    IndexingAgreementStatus::Created,
+                )),
+                request: Some(make_test_request(request_id)),
+                ..Default::default()
+            }));
+            let sent_to = Arc::new(Mutex::new(Vec::new()));
+            let ctx = Ctx {
+                registry: MockRegistry::new(registry_state),
+                queue: MockQueue::new(Arc::new(Mutex::new(MockQueueState::default()))),
+                indexer_client: RecordingIndexerClient {
+                    sent_to: sent_to.clone(),
+                },
+            };
+            let message = Message {
+                indexer_url: registered.parse().unwrap(),
+                agreement_id,
+                indexing_request_id: request_id,
+                deployment_id: deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv"),
+                deployment_chain_id: 1,
+            };
+
+            handle(ctx, &message).await.unwrap();
+
+            let sent_to: Vec<String> = sent_to.lock().unwrap().iter().map(Url::to_string).collect();
+            assert_eq!(sent_to, [expected], "registered as {registered}");
+        }
     }
 }

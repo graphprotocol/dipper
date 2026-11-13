@@ -56,6 +56,14 @@ pub enum DipsError {
     NotPublicAddress(Refused),
 }
 
+/// The port indexers receive offers on.
+///
+/// An indexer registers a single URL, its query address, and indexer-rs serves offers on a
+/// separate listener, so nothing on chain names the offer port. Both sides use this number
+/// instead: indexer-rs listens on it and dipper sends every offer to it, whatever port the
+/// registered URL carries.
+pub const DIPS_GRPC_PORT: u16 = 7602;
+
 /// Indexer client's DIPs trait
 #[async_trait]
 pub trait IndexerClient {
