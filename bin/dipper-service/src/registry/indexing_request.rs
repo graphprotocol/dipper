@@ -151,9 +151,6 @@ pub enum SetTargetOutcome {
     NoOpAlreadyEmpty,
 }
 
-/// An Indexing Request represents the request for indexing services initiated by the customer.
-///
-/// The [`IndexingRequest`] is as a Record Data Structure.
 /// A page of indexing requests, and where the next page starts.
 #[derive(Debug, Clone, Default)]
 pub struct RequestsPage {
@@ -203,6 +200,9 @@ fn cut_page<T>(
     (rows, next)
 }
 
+/// An Indexing Request represents the request for indexing services initiated by the customer.
+///
+/// The [`IndexingRequest`] is as a Record Data Structure.
 #[derive(Debug, Clone)]
 pub struct IndexingRequest {
     /// The unique identifier of the request.
