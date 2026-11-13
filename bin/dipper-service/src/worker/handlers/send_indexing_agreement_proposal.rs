@@ -627,8 +627,13 @@ mod tests {
             })
         }
 
-        async fn get_all_indexing_requests(&self) -> crate::registry::Result<Vec<IndexingRequest>> {
-            Ok(vec![])
+        async fn get_indexing_requests_page(
+            &self,
+            _after: Option<IndexingRequestId>,
+            _status: Option<crate::registry::IndexingRequestStatus>,
+            _limit: u32,
+        ) -> crate::registry::Result<crate::registry::RequestsPage> {
+            Ok(crate::registry::RequestsPage::default())
         }
 
         async fn get_indexing_request_by_id(

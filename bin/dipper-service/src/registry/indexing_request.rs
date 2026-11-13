@@ -32,8 +32,14 @@ pub trait IndexingRequestRegistry {
         num_candidates: usize,
     ) -> RegistryResult<SetTargetOutcome>;
 
-    /// Get all indexing requests.
-    async fn get_all_indexing_requests(&self) -> RegistryResult<Vec<IndexingRequest>>;
+    /// Get a page of indexing requests in the order they were created: up to `limit` of those
+    /// that come after `after`, and only those in `status` when one is given.
+    async fn get_indexing_requests_page(
+        &self,
+        after: Option<IndexingRequestId>,
+        status: Option<Status>,
+        limit: u32,
+    ) -> RegistryResult<RequestsPage>;
 
     /// Get the indexing request by ID.
     async fn get_indexing_request_by_id(
@@ -148,6 +154,32 @@ pub enum SetTargetOutcome {
 /// An Indexing Request represents the request for indexing services initiated by the customer.
 ///
 /// The [`IndexingRequest`] is as a Record Data Structure.
+/// A page of indexing requests, and where the next page starts.
+#[derive(Debug, Clone, Default)]
+pub struct RequestsPage {
+    /// The requests on this page, in the order they were created.
+    pub requests: Vec<IndexingRequest>,
+    /// The id to pass as `after` for the next page. `None` when this is the last page.
+    pub next: Option<IndexingRequestId>,
+}
+
+/// Cut rows that were fetched 1 past the page size down to the page, and give the id the next
+/// page starts after when that extra row was there.
+pub(super) fn cut_page<T>(
+    rows: Vec<T>,
+    limit: u32,
+    id: impl Fn(&T) -> IndexingRequestId,
+) -> (Vec<T>, Option<IndexingRequestId>) {
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    let mut rows = rows;
+    if rows.len() <= limit {
+        return (rows, None);
+    }
+    rows.truncate(limit);
+    let next = rows.last().map(id);
+    (rows, next)
+}
+
 #[derive(Debug, Clone)]
 pub struct IndexingRequest {
     /// The unique identifier of the request.
@@ -231,6 +263,15 @@ impl TryFrom<dipper_pgregistry::IndexingRequest> for IndexingRequest {
     }
 }
 
+impl From<Status> for dipper_pgregistry::IndexingRequestStatus {
+    fn from(value: Status) -> Self {
+        match value {
+            Status::Open => dipper_pgregistry::IndexingRequestStatus::Open,
+            Status::Canceled => dipper_pgregistry::IndexingRequestStatus::Canceled,
+        }
+    }
+}
+
 impl TryFrom<dipper_pgregistry::IndexingRequestStatus> for Status {
     type Error = anyhow::Error;
 
@@ -263,5 +304,37 @@ impl From<dipper_pgregistry::IndexingRequestSetTargetOutcome> for SetTargetOutco
             Pg::Canceled { id } => SetTargetOutcome::Canceled { id },
             Pg::NoOpAlreadyEmpty => SetTargetOutcome::NoOpAlreadyEmpty,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `count` ids, in the order they were made.
+    fn ids(count: usize) -> Vec<IndexingRequestId> {
+        (0..count).map(|_| IndexingRequestId::new()).collect()
+    }
+
+    #[test]
+    fn rows_that_fit_the_page_are_the_last_page() {
+        for count in [0, 1, 3] {
+            let rows = ids(count);
+
+            let (page, next) = cut_page(rows.clone(), 3, |id| *id);
+
+            assert_eq!(page, rows, "{count} rows");
+            assert_eq!(next, None, "{count} rows");
+        }
+    }
+
+    #[test]
+    fn a_row_past_the_page_is_dropped_and_the_next_page_starts_after_the_last_row_kept() {
+        let rows = ids(4);
+
+        let (page, next) = cut_page(rows.clone(), 3, |id| *id);
+
+        assert_eq!(page, rows[..3]);
+        assert_eq!(next, Some(rows[2]));
     }
 }

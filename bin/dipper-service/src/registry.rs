@@ -33,8 +33,8 @@ pub use self::{
     dips_info::{DipsInfoChecks, DipsInfoRegistry},
     indexer_denylist::IndexerDenylistRegistry,
     indexing_request::{
-        IndexingRequest, IndexingRequestRegistry, RequestOrderRegistry, SetTargetOutcome,
-        Status as IndexingRequestStatus,
+        IndexingRequest, IndexingRequestRegistry, RequestOrderRegistry, RequestsPage,
+        SetTargetOutcome, Status as IndexingRequestStatus,
     },
     pending_cancellation::{PendingCancellation, PendingCancellationRegistry},
     result::{Error, Result},
@@ -189,15 +189,28 @@ impl IndexingRequestRegistry for RegistryProvider {
             .map(Into::into)
     }
 
-    async fn get_all_indexing_requests(&self) -> RegistryResult<Vec<IndexingRequest>> {
-        Ok(self
+    async fn get_indexing_requests_page(
+        &self,
+        after: Option<IndexingRequestId>,
+        status: Option<IndexingRequestStatus>,
+        limit: u32,
+    ) -> RegistryResult<RequestsPage> {
+        // 1 row more than the page, to learn whether another page follows. The next page's start
+        // is taken before any row is dropped for failing to convert, so a dropped row can't end
+        // the listing early.
+        let rows = self
             .inner
-            .get_all_indexing_requests()
-            .await?
-            .into_iter()
-            .map(IndexingRequest::try_from)
-            .filter_map(filter_map_with_logging)
-            .collect())
+            .get_indexing_requests_page(after, status.map(Into::into), i64::from(limit) + 1)
+            .await?;
+        let (rows, next) = indexing_request::cut_page(rows, limit, |row| row.id);
+        Ok(RequestsPage {
+            requests: rows
+                .into_iter()
+                .map(IndexingRequest::try_from)
+                .filter_map(filter_map_with_logging)
+                .collect(),
+            next,
+        })
     }
 
     async fn get_indexing_request_by_id(

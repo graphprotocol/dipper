@@ -492,7 +492,17 @@ impl PgRegistry {
         Ok(result.rows_affected() == 1)
     }
 
-    pub async fn get_all_indexing_requests(&self) -> Result<Vec<IndexingRequest>, Error> {
+    /// Up to `limit` indexing requests with an id above `after`, in id order, which is the order
+    /// they were created in, as ids are time-ordered. `status` keeps only those in that status.
+    ///
+    /// With no `after` the page starts at the first request: every id is above the all-zero one.
+    pub async fn get_indexing_requests_page(
+        &self,
+        after: Option<IndexingRequestId>,
+        status: Option<IndexingRequestStatus>,
+        limit: i64,
+    ) -> Result<Vec<IndexingRequest>, Error> {
+        let after = after.unwrap_or_else(|| uuid::Uuid::nil().into());
         sqlx::query_as(
             r#"
             SELECT
@@ -505,8 +515,15 @@ impl PgRegistry {
                 deployment_chain_id,
                 num_candidates
             FROM dipper_reg_indexing_requests
+            WHERE id > $1
+              AND ($2::int IS NULL OR status = $2)
+            ORDER BY id
+            LIMIT $3
             "#,
         )
+        .bind(after)
+        .bind(status)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await
         .map_err(Into::into)

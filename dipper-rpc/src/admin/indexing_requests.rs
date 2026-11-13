@@ -9,12 +9,31 @@ use time::OffsetDateTime;
 
 use super::message::SignedMessage;
 
+/// The number of _indexing requests_ a page holds when the caller names no `limit`.
+pub const DEFAULT_PAGE_SIZE: u32 = 1_000;
+
+/// The most _indexing requests_ a page can hold. A larger `limit` is cut down to this.
+pub const MAX_PAGE_SIZE: u32 = 5_000;
+
 /// The _indexing requests_ RPC methods
 #[rpc(server, client)]
 pub trait IndexingRequestsRpc {
-    /// Get all _indexing requests_
-    #[method(name = "get_all_indexing_requests")]
-    async fn get_all_indexing_requests(&self) -> RpcResult<Vec<IndexingRequest>>;
+    /// Get a page of _indexing requests_, in the order they were created.
+    ///
+    /// Every input is optional. `limit` is the most requests to return: [`DEFAULT_PAGE_SIZE`]
+    /// when left out, and never more than [`MAX_PAGE_SIZE`]. `after` is the `next` of the page
+    /// before, to carry on from where that page ended. `status` keeps only the requests in that
+    /// status, `OPEN` or `CANCELED`.
+    ///
+    /// The reply is never the whole table. It once was, and a table grown past the size a reply
+    /// may have would then have made every call fail.
+    #[method(name = "get_all_indexing_requests", param_kind = map)]
+    async fn get_all_indexing_requests(
+        &self,
+        after: Option<IndexingRequestId>,
+        limit: Option<u32>,
+        status: Option<IndexingRequestStatus>,
+    ) -> RpcResult<IndexingRequestsPage>;
 
     /// Get _indexing request_ by ID.
     ///
@@ -101,6 +120,15 @@ thegraph_core::alloy::sol! {
         uint64 num_candidates;
         uint64 signed_at;
     }
+}
+
+/// A page of _indexing requests_, in the order they were created.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct IndexingRequestsPage {
+    /// The requests on this page.
+    pub requests: Vec<IndexingRequest>,
+    /// The `after` to ask for the next page with. Absent on the last page.
+    pub next: Option<IndexingRequestId>,
 }
 
 /// The _indexing request_ response entity

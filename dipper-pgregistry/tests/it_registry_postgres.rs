@@ -330,20 +330,54 @@ async fn accept_request_signed_at_keeps_each_key_apart() {
 }
 
 #[tokio::test]
-async fn get_all_indexing_requests() {
+async fn indexing_requests_are_read_a_page_at_a_time_in_the_order_they_were_created() {
     //* Given
     let (db, _temp_db) = temp_registry_db().await;
     run_fixture(&db, include_str!("fixtures/0001_indexing_requests.sql"))
         .await
         .expect("Failed to run fixture");
     let registry = PgRegistry::new(db);
-
-    //* When
-    let indexing_requests = registry.get_all_indexing_requests().await;
+    // The fixture's 3 requests, oldest first: open, cancelled, and one in no known status.
+    let ids: Vec<IndexingRequestId> = [
+        "019300ce-4751-780e-b58c-bf696b67eb23",
+        "01930105-d664-79ad-8535-5b82b0ad1aab",
+        "01930108-5942-7515-bd5e-2cba9c7027b7",
+    ]
+    .into_iter()
+    .map(|id| id.parse::<uuid::Uuid>().expect("a fixture id").into())
+    .collect();
+    let page =
+        |after: Option<IndexingRequestId>, status: Option<IndexingRequestStatus>, limit: i64| {
+            let registry = &registry;
+            async move {
+                let requests = registry
+                    .get_indexing_requests_page(after, status, limit)
+                    .await
+                    .expect("Failed to get a page of indexing requests");
+                requests.into_iter().map(|r| r.id).collect::<Vec<_>>()
+            }
+        };
 
     //* Then
-    let indexing_requests = indexing_requests.expect("Failed to get all indexing requests");
-    assert_eq!(indexing_requests.len(), 3);
+    // The first page starts at the oldest request and holds no more than was asked for.
+    assert_eq!(page(None, None, 2).await, ids[..2]);
+    // A page starts after the id it is given, and the last page is short.
+    assert_eq!(page(Some(ids[1]), None, 2).await, ids[2..]);
+    assert!(page(Some(ids[2]), None, 2).await.is_empty());
+    // A status keeps only the requests in it.
+    assert_eq!(
+        page(None, Some(IndexingRequestStatus::Open), 10).await,
+        ids[..1]
+    );
+    assert_eq!(
+        page(None, Some(IndexingRequestStatus::Canceled), 10).await,
+        ids[1..2]
+    );
+    assert!(
+        page(Some(ids[0]), Some(IndexingRequestStatus::Open), 10)
+            .await
+            .is_empty()
+    );
 }
 
 #[tokio::test]

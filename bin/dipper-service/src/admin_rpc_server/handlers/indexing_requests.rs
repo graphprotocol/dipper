@@ -6,8 +6,8 @@ use dipper_producer::{events::SubgraphIndexingAgreementEventsProducer, proto};
 use dipper_rpc::admin::{
     SignedMessage,
     indexing_requests::{
-        IndexingRequest, IndexingRequestStatus, IndexingRequestsRpcServer,
-        SetIndexingTargetCandidates,
+        DEFAULT_PAGE_SIZE, IndexingRequest, IndexingRequestStatus, IndexingRequestsPage,
+        IndexingRequestsRpcServer, MAX_PAGE_SIZE, SetIndexingTargetCandidates,
     },
 };
 use jsonrpsee::{core::RpcResult, types::ErrorObject};
@@ -67,12 +67,52 @@ where
     R: IndexingRequestRegistry + RequestOrderRegistry + Clone + Send + Sync + 'static,
     W: WorkerQueue + Clone + Send + Sync + 'static,
 {
-    async fn get_all_indexing_requests(&self) -> RpcResult<Vec<IndexingRequest>> {
-        handle_list_result(
-            self.registry.get_all_indexing_requests().await,
-            "Failed to get all indexing requests",
-            into_indexing_request,
-        )
+    async fn get_all_indexing_requests(
+        &self,
+        after: Option<IndexingRequestId>,
+        limit: Option<u32>,
+        status: Option<IndexingRequestStatus>,
+    ) -> RpcResult<IndexingRequestsPage> {
+        let limit = match limit {
+            None => DEFAULT_PAGE_SIZE,
+            Some(0) => {
+                return Err(ErrorObject::borrowed(400, "limit must be at least 1", None));
+            }
+            // Capped, not refused, so a caller asking for "as many as you allow" gets a page.
+            Some(limit) => limit.min(MAX_PAGE_SIZE),
+        };
+        let status = match status {
+            None => None,
+            Some(IndexingRequestStatus::Open) => Some(IndexingRequestRecordStatus::Open),
+            Some(IndexingRequestStatus::Canceled) => Some(IndexingRequestRecordStatus::Canceled),
+            // Any text that is not a status reads as `Unknown`. No stored request is in it, so
+            // answering would return an empty page that looks like "none match".
+            Some(IndexingRequestStatus::Unknown) => {
+                return Err(ErrorObject::borrowed(
+                    400,
+                    "status must be OPEN or CANCELED",
+                    None,
+                ));
+            }
+        };
+        match self
+            .registry
+            .get_indexing_requests_page(after, status, limit)
+            .await
+        {
+            Ok(page) => Ok(IndexingRequestsPage {
+                requests: page
+                    .requests
+                    .into_iter()
+                    .map(into_indexing_request)
+                    .collect(),
+                next: page.next,
+            }),
+            Err(err) => {
+                tracing::error!(error = ?err, "Failed to get a page of indexing requests");
+                Err(ErrorObject::borrowed(503, "Service unavailable", None))
+            }
+        }
     }
 
     async fn get_indexing_request_by_id(
@@ -367,7 +407,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        registry::Result as RegistryResult,
+        registry::{RequestsPage, Result as RegistryResult},
         test_support::{CapturedEvent, CapturingEventsProducer},
         worker::queue::JobId,
     };
@@ -398,7 +438,17 @@ mod tests {
         accepted_counts: Arc<std::sync::Mutex<Vec<usize>>>,
         /// The newest signing time accepted so far, kept the way the database keeps it.
         newest_signed_at: Arc<std::sync::Mutex<Option<u64>>>,
+        /// The page every listing returns.
+        page: RequestsPage,
+        /// What each listing asked for: where to start, which status, how many.
+        pages_asked: Arc<std::sync::Mutex<Vec<PageAsked>>>,
     }
+
+    type PageAsked = (
+        Option<IndexingRequestId>,
+        Option<IndexingRequestRecordStatus>,
+        u32,
+    );
 
     #[async_trait]
     impl RequestOrderRegistry for MockRegistry {
@@ -431,8 +481,17 @@ mod tests {
             Ok(self.outcome.clone())
         }
 
-        async fn get_all_indexing_requests(&self) -> RegistryResult<Vec<IndexingRequestRecord>> {
-            unimplemented!()
+        async fn get_indexing_requests_page(
+            &self,
+            after: Option<IndexingRequestId>,
+            status: Option<IndexingRequestRecordStatus>,
+            limit: u32,
+        ) -> RegistryResult<RequestsPage> {
+            self.pages_asked
+                .lock()
+                .unwrap()
+                .push((after, status, limit));
+            Ok(self.page.clone())
         }
 
         async fn get_indexing_request_by_id(
@@ -614,6 +673,8 @@ mod tests {
                 outcome,
                 accepted_counts: Arc::default(),
                 newest_signed_at: Arc::default(),
+                page: RequestsPage::default(),
+                pages_asked: Arc::default(),
             },
             worker: MockWorker,
             max_candidates: 10,
@@ -622,6 +683,108 @@ mod tests {
         };
 
         (RpcServerImpl(ctx), events)
+    }
+
+    /// A server for the listing tests, which no signature or outcome matters to.
+    fn listing_server() -> RpcServerImpl<MockRegistry, MockWorker> {
+        let outcome = SetTargetOutcome::Inserted {
+            id: IndexingRequestId::new(),
+        };
+        server(Address::ZERO, outcome).0
+    }
+
+    fn stored_request(id: IndexingRequestId) -> IndexingRequestRecord {
+        IndexingRequestRecord {
+            id,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            updated_at: time::OffsetDateTime::UNIX_EPOCH,
+            status: IndexingRequestRecordStatus::Open,
+            requested_by: Address::ZERO,
+            deployment_id: deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv"),
+            deployment_chain_id: DEPLOYMENT_CHAIN_ID,
+            num_candidates: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_listing_is_1_page_by_default_and_never_larger_than_the_cap() {
+        for (asked, read) in [
+            (None, 1_000),
+            (Some(1), 1),
+            (Some(5_000), 5_000),
+            (Some(5_001), 5_000),
+            (Some(u32::MAX), 5_000),
+        ] {
+            let server = listing_server();
+
+            server
+                .get_all_indexing_requests(None, asked, None)
+                .await
+                .unwrap();
+
+            let pages_asked = server.registry.pages_asked.lock().unwrap().clone();
+            assert_eq!(pages_asked, [(None, None, read)], "asked for {asked:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_listing_of_0_requests_is_refused() {
+        let server = listing_server();
+
+        let err = server
+            .get_all_indexing_requests(None, Some(0), None)
+            .await
+            .err()
+            .expect("a page of 0 requests should be refused");
+
+        assert_eq!(err.code(), 400, "{err:?}");
+        assert!(err.message().contains("limit"), "{err:?}");
+        assert!(server.registry.pages_asked.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_listing_by_a_status_that_is_neither_open_nor_cancelled_is_refused() {
+        // Any text that is not a status reads as `Unknown`, which no stored request is in, so
+        // answering it would return an empty list that looks like "none match".
+        let server = listing_server();
+
+        let err = server
+            .get_all_indexing_requests(None, None, Some(IndexingRequestStatus::Unknown))
+            .await
+            .err()
+            .expect("an unknown status should be refused");
+
+        assert_eq!(err.code(), 400, "{err:?}");
+        assert!(err.message().contains("status"), "{err:?}");
+        assert!(server.registry.pages_asked.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_listing_passes_on_where_to_start_and_the_status_and_returns_the_page() {
+        let (first, second, start) = (
+            IndexingRequestId::new(),
+            IndexingRequestId::new(),
+            IndexingRequestId::new(),
+        );
+        let mut server = listing_server();
+        server.0.registry.page = RequestsPage {
+            requests: vec![stored_request(first), stored_request(second)],
+            next: Some(second),
+        };
+
+        let page = server
+            .get_all_indexing_requests(Some(start), Some(2), Some(IndexingRequestStatus::Canceled))
+            .await
+            .unwrap();
+
+        let pages_asked = server.registry.pages_asked.lock().unwrap().clone();
+        assert_eq!(
+            pages_asked,
+            [(Some(start), Some(IndexingRequestRecordStatus::Canceled), 2)]
+        );
+        let ids: Vec<_> = page.requests.iter().map(|request| request.id).collect();
+        assert_eq!(ids, [first, second]);
+        assert_eq!(page.next, Some(second));
     }
 
     #[tokio::test]
