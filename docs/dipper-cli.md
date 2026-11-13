@@ -58,6 +58,13 @@ export DIPS_SERVER_URL=https://admin.dips.example.com
 dipper-cli init keygen --output .env.unencrypted
 ```
 
+On Kubernetes, dipper's network policy (`k8s/network-policy.yaml`) refuses connections from other pods, so an ingress or load balancer in front of the admin port cannot reach it. Forward the port to your machine instead and point the CLI at it:
+
+```bash
+kubectl -n <namespace> port-forward deploy/dipper 8545:8545
+export DIPS_SERVER_URL=http://localhost:8545
+```
+
 #### .env File
 
 You can use a `.env` file to store the configuration of the `indexings` and `agreements` commands. They look for a `.env` file in the current directory only, never in the directories above it, and also take a custom path with the `--env-file` flag. A file named that way is read instead of the one in the current directory, so a setting it leaves out, such as a private `DIPS_IPFS_URL` kept only in the other file, falls back to your shell or to the default, not to that file:
