@@ -1,0 +1,19 @@
+# Refuses connections to dipper from other pods. The admin port's read calls need no signature,
+# so any pod that could reach it could read every request and agreement. Kubernetes never
+# blocks a pod's own node or its localhost, so the kubelet's probes and `kubectl port-forward`
+# still work, and so does a host-network pod on dipper's node, which counts as the node. It
+# takes effect only on a cluster that enforces network policies. Outgoing traffic is left
+# open, as the README explains.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: dipper-deny-ingress
+  labels:
+    app: dipper
+spec:
+  podSelector:
+    matchLabels:
+      app: dipper
+  # Ingress with no rules listed: connections from other pods are refused.
+  policyTypes:
+    - Ingress
