@@ -32,13 +32,17 @@ jobs:
       - name: Summary
         run: |
           if [ "${{ steps.sync.outputs.drift }}" == "true" ]; then
-            echo "### Manifest Auto-Synced" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "- **Previous version:** ${{ steps.sync.outputs.manifest-version }}" >> $GITHUB_STEP_SUMMARY
-            echo "- **Latest tag:** ${{ steps.sync.outputs.latest-version }}" >> $GITHUB_STEP_SUMMARY
-            echo "- **Action:** Manifest updated automatically" >> $GITHUB_STEP_SUMMARY
+            {
+              echo "### Manifest Auto-Synced"
+              echo ""
+              echo "- **Previous version:** ${{ steps.sync.outputs.manifest-version }}"
+              echo "- **Latest tag:** ${{ steps.sync.outputs.latest-version }}"
+              echo "- **Action:** Manifest updated automatically"
+            } >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "### Manifest In Sync" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "No action needed. Manifest matches latest tag." >> $GITHUB_STEP_SUMMARY
+            {
+              echo "### Manifest In Sync"
+              echo ""
+              echo "No action needed. Manifest matches latest tag."
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
