@@ -24,6 +24,10 @@ reason = "libsqlite3-sys is only reachable through sqlx's SQLite driver. Dipper 
 id = "RUSTSEC-2023-0071"
 reason = "rsa is only reachable through sqlx's MySQL driver. Dipper uses Postgres and does not build it."
 
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0538"
+reason = "quinn-udp is only reachable through reqwest's HTTP/3 support, which dipper does not build."
+
 # Built, with no fixed release dipper can take until the libraries that pull them in move on.
 # These 3 are real flaws in code dipper runs, so each entry lapses on the date given and the
 # scan fails again until someone reads it afresh and either removes it or moves the date.
