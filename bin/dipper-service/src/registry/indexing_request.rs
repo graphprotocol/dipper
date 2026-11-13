@@ -163,9 +163,32 @@ pub struct RequestsPage {
     pub next: Option<IndexingRequestId>,
 }
 
-/// Cut rows that were fetched 1 past the page size down to the page, and give the id the next
+/// Read a page of `limit` indexing requests with `read`, which is given how many rows to read
+/// and returns them in id order.
+///
+/// It reads 1 row more than the page, to learn whether another page follows. Where the next page
+/// starts is settled from the rows as read, before any is dropped for failing to convert, so a
+/// row dipper can't read never ends a listing early.
+pub(super) async fn read_page<F, Fut, E>(limit: u32, read: F) -> Result<RequestsPage, E>
+where
+    F: FnOnce(i64) -> Fut,
+    Fut: Future<Output = Result<Vec<dipper_pgregistry::IndexingRequest>, E>>,
+{
+    let rows = read(i64::from(limit) + 1).await?;
+    let (rows, next) = cut_page(rows, limit, |row| row.id);
+    Ok(RequestsPage {
+        requests: rows
+            .into_iter()
+            .map(IndexingRequest::try_from)
+            .filter_map(super::filter_map_with_logging)
+            .collect(),
+        next,
+    })
+}
+
+/// Cut rows that were read 1 past the page size down to the page, and give the id the next
 /// page starts after when that extra row was there.
-pub(super) fn cut_page<T>(
+fn cut_page<T>(
     rows: Vec<T>,
     limit: u32,
     id: impl Fn(&T) -> IndexingRequestId,
@@ -314,6 +337,47 @@ mod tests {
     /// `count` ids, in the order they were made.
     fn ids(count: usize) -> Vec<IndexingRequestId> {
         (0..count).map(|_| IndexingRequestId::new()).collect()
+    }
+
+    fn stored(
+        status: dipper_pgregistry::IndexingRequestStatus,
+    ) -> dipper_pgregistry::IndexingRequest {
+        dipper_pgregistry::IndexingRequest {
+            id: IndexingRequestId::new(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+            status,
+            requested_by: Address::ZERO,
+            deployment_id: thegraph_core::deployment_id!(
+                "QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv"
+            ),
+            deployment_chain_id: 1,
+            num_candidates: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_page_is_read_1_row_past_its_size_and_a_row_that_fails_to_convert_does_not_end_it() {
+        use dipper_pgregistry::IndexingRequestStatus::{Open, Unknown};
+        // 4 stored requests. Dipper can't read the 2nd, which is in no status it knows.
+        let table = [stored(Open), stored(Unknown), stored(Open), stored(Open)];
+        let rows_read = std::cell::Cell::new(0);
+
+        let page = read_page(2, |rows| {
+            rows_read.set(rows);
+            let rows = table.iter().take(3).cloned().collect();
+            async move { Ok::<_, std::convert::Infallible>(rows) }
+        })
+        .await
+        .unwrap();
+
+        // 1 past the page of 2, or there would be no telling that more follow.
+        assert_eq!(rows_read.get(), 3);
+        // The unreadable request is left out of the page, yet the next page starts after it:
+        // counting only the rows that converted would make this look like the last page.
+        let ids: Vec<_> = page.requests.iter().map(|request| request.id).collect();
+        assert_eq!(ids, [table[0].id]);
+        assert_eq!(page.next, Some(table[1].id));
     }
 
     #[test]

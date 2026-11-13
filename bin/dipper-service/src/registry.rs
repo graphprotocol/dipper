@@ -195,22 +195,12 @@ impl IndexingRequestRegistry for RegistryProvider {
         status: Option<IndexingRequestStatus>,
         limit: u32,
     ) -> RegistryResult<RequestsPage> {
-        // 1 row more than the page, to learn whether another page follows. The next page's start
-        // is taken before any row is dropped for failing to convert, so a dropped row can't end
-        // the listing early.
-        let rows = self
-            .inner
-            .get_indexing_requests_page(after, status.map(Into::into), i64::from(limit) + 1)
-            .await?;
-        let (rows, next) = indexing_request::cut_page(rows, limit, |row| row.id);
-        Ok(RequestsPage {
-            requests: rows
-                .into_iter()
-                .map(IndexingRequest::try_from)
-                .filter_map(filter_map_with_logging)
-                .collect(),
-            next,
+        let page = indexing_request::read_page(limit, |rows| {
+            self.inner
+                .get_indexing_requests_page(after, status.map(Into::into), rows)
         })
+        .await?;
+        Ok(page)
     }
 
     async fn get_indexing_request_by_id(
