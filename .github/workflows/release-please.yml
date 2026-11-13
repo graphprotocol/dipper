@@ -59,9 +59,19 @@ jobs:
       # A tag pushed with the workflow token starts no workflow, so a release's tag never ran
       # build.yml and no image carried the version that k8s/deployment.yaml names. Starting a
       # workflow by hand is the exception GitHub allows, and on the tag it adds that image tag.
+      # It runs even if the release step failed after creating the release, since a rerun finds
+      # the release made and starts nothing. If this step still fails, start the build by hand:
+      # gh workflow run build.yml --repo graphprotocol/dipper --ref <tag>
       - name: Build the release's images
-        if: steps.release.outputs.release_created == 'true'
+        if: always() && steps.release.outputs.release_created == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.release.outputs.tag_name }}
-        run: gh workflow run build.yml --repo "${{ github.repository }}" --ref "$TAG"
+        run: |
+          for attempt in 1 2 3; do
+            gh workflow run build.yml --repo "${{ github.repository }}" --ref "$TAG" && exit 0
+            echo "::warning::Could not start the image build for $TAG (attempt $attempt of 3)"
+            sleep 10
+          done
+          echo "::error::Could not start the image build for $TAG; run: gh workflow run build.yml --ref $TAG"
+          exit 1
