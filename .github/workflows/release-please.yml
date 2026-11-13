@@ -1,6 +1,8 @@
 # Manages automated releases via release-please. On main branch pushes, first syncs
 # the release manifest with git tags (via sync-manifest action), then creates/updates
-# a Release PR with CHANGELOG and version bumps. Merging the Release PR triggers build.yml.
+# a Release PR with CHANGELOG and version bumps. Merging the Release PR pushes to main,
+# which builds the `sha-` and `latest` images, and tags the release, after which this
+# workflow starts build.yml on the tag to publish the images under the version as well.
 
 name: Release Please
 
@@ -12,6 +14,8 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  # To start build.yml on a new release's tag.
+  actions: write
 
 jobs:
   # First, sync manifest with actual tags to prevent drift
@@ -49,4 +53,15 @@ jobs:
           fi
 
       - uses: google-github-actions/release-please-action@v4
+        id: release
         if: steps.check-sync.outputs.skip != 'true'
+
+      # A tag pushed with the workflow token starts no workflow, so a release's tag never ran
+      # build.yml and no image carried the version that k8s/deployment.yaml names. Starting a
+      # workflow by hand is the exception GitHub allows, and on the tag it adds that image tag.
+      - name: Build the release's images
+        if: steps.release.outputs.release_created == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag_name }}
+        run: gh workflow run build.yml --repo "${{ github.repository }}" --ref "$TAG"

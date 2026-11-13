@@ -127,12 +127,18 @@ jobs:
         uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
         with:
           images: ${{ env.IMAGE }}
+          # `latest` follows main only. A release's tag is built after main's push of the
+          # same commit, and main may have moved on by then.
+          flavor: |
+            latest=false
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=tag
-            # Forced on so workflow_dispatch from a non-default branch (no `latest`,
-            # no tag ref) still yields a populated meta.outputs.version for Inspect.
-            type=sha,enable=true
+            # On for every run but a tag's, so workflow_dispatch from a non-default branch
+            # (no `latest`, no tag ref) still yields a populated meta.outputs.version for
+            # Inspect. Off for a tag: main's push already published this commit's `sha-`
+            # tag, and a rebuild would point it at a new digest.
+            type=sha,enable=${{ !startsWith(github.ref, 'refs/tags/') }}
 
       # Glob `*` expands to digest-named files written by the build job's Export digest step.
       - name: Create manifest list and push
