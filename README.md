@@ -82,7 +82,7 @@ Once accepted, fees accrue continuously: elapsed seconds multiplied by your toke
 
 ## Staying selected
 
-Once a day, 1 hour after IISA refreshes its scores, dipper re-checks every open indexing request at least 1 day old against the latest ranking. Every hour it also re-checks the requests its last check left short of indexers, when an indexer that could take an offer is free. Growth and replacement are gentle by design: new agreements are offered before old ones are cancelled, so an outgoing indexer keeps serving until its replacement has accepted, and a request whose target count drops to 0 simply has every agreement cancelled.
+Once a day, 1 hour after IISA refreshes its scores, dipper re-checks every open indexing request at least 1 day old against the latest ranking. Every hour it also re-checks the requests its last check left short of indexers, when an indexer that could take an offer is free. Growth and replacement are gentle by design: new agreements are offered before old ones are cancelled, so an outgoing indexer keeps serving until its replacement has accepted (and stays on if that replacement has already been cancelled by the time dipper sees the acceptance), and a request whose target count drops to 0 simply has every agreement cancelled.
 
 When an offer fails, dipper temporarily stops offering that indexer new work. How long depends on what happened:
 

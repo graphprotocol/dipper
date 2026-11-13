@@ -12,17 +12,21 @@
 //! | Local status       | Remote state        | Action                                                                 |
 //! |--------------------|---------------------|------------------------------------------------------------------------|
 //! | Created            | Accepted            | mark AcceptedOnChain, run pending cancellations                         |
-//! | Created            | CanceledBy*         | mark AcceptedOnChain, run pending cancellations, then mark canceled    |
+//! | Created            | CanceledBy*         | mark AcceptedOnChain, then canceled; drop its pending cancellations    |
 //! | AcceptedOnChain    | Accepted            | no-op                                                                  |
 //! | AcceptedOnChain    | CanceledBy*         | mark canceled (requester vs indexer from the CanceledBy* state)        |
 //! | Expired            | Accepted            | mark AcceptedOnChain (recovery), run pending cancellations              |
-//! | Expired            | CanceledBy*         | recover to AcceptedOnChain, run pending cancellations, then cancel     |
+//! | Expired            | CanceledBy*         | recover to AcceptedOnChain, then cancel; drop its pending cancellations |
 //! | Rejected           | Accepted            | queue a chain check, which reopens its cancel if live (adversarial path) |
 //! | CanceledByRequester | Accepted           | queue a chain check, which reopens its cancel if live                  |
 //! | Canceled*          | *                   | no-op (terminal)                                                       |
 //!
 //! Recording an indexer's cancel also queues a reassessment of its request, which nothing else
 //! would refill before the daily pass.
+//!
+//! Pending cancellations are the agreements a new one was offered to replace. They are run once
+//! the new agreement is accepted, and dropped when the poll that shows it accepted also shows it
+//! cancelled, so the request keeps the agreements it had.
 //!
 //! ## Data Source
 //!
@@ -1216,7 +1220,8 @@ where
         .copied()
         .context("applying the change returned no outcome for the agreement")?;
     // The change is applied, as when a page's finalize fails; the pending cancellation sweep
-    // finishes what this leaves.
+    // finishes what this leaves. It leaves alone the rows of a replacement that has already
+    // ended, which nothing acts on.
     // A fresh listing for each change: the retry applies them 1 at a time, so a reassessment
     // listed as waiting for one could start before the next is applied.
     if let Err(err) = finalize_reconciliation(
@@ -1568,9 +1573,10 @@ async fn record_accept_of_cancelling<R: AgreementRegistry + Sync>(
         .context("failed to record the on-chain accept of an agreement being cancelled")
 }
 
-/// Log the transition that landed, fan out the linked pending cancellations on a fresh accept, and
-/// queue a reassessment of the request on an indexer's cancel. Every path that applies a change,
-/// from a page or from the retry of set-aside changes, finishes here, so none can miss a step.
+/// Log the transition that landed, fan out the linked pending cancellations on a fresh accept
+/// (or drop them when the same change also cancelled the agreement), and queue a reassessment of
+/// the request on an indexer's cancel. Every path that applies a change, from a page or from the
+/// retry of set-aside changes, finishes here, so none can miss a step.
 #[expect(
     clippy::cognitive_complexity,
     reason = "predates this lint; fix when next touched"
@@ -1632,10 +1638,12 @@ where
         // authoritative emitter and will announce it durably.
     }
 
-    // Gated on `did_accept` so it only fires on a fresh AcceptedOnChain
-    // write — repeating it on a CAS no-op would re-enqueue work that
-    // already ran in a prior poll.
-    let fanned_out = if outcome.did_accept {
+    // Only on a fresh accept, as repeating it on a no-op would redo work a prior poll already
+    // did. An accept that lands together with its cancel replaces nothing, so its pending
+    // cancellations are dropped, not run.
+    let fanned_out = if outcome.did_accept && outcome.did_cancel {
+        keep_agreements_of_an_ended_replacement(&prep.agreement.id, registry).await
+    } else if outcome.did_accept {
         execute_pending_cancellations(&prep.agreement.id, registry, chain_client, config).await
     } else {
         Ok(())
@@ -1856,6 +1864,37 @@ where
     )
     .await?;
     Ok(queued)
+}
+
+/// Drop the pending cancellations of an agreement that 1 poll showed accepted and already
+/// cancelled, without running them. The agreements it was to replace stay as they are, since
+/// cancelling them now would leave the request with neither. Nothing else would clear the rows:
+/// the sweep only takes those of an agreement that is still accepted.
+async fn keep_agreements_of_an_ended_replacement<R>(
+    agreement_id: &IndexingAgreementId,
+    registry: &R,
+) -> anyhow::Result<()>
+where
+    R: PendingCancellationRegistry + Sync,
+{
+    let kept = registry
+        .get_pending_cancellations_by_new_agreement(*agreement_id)
+        .await?;
+    if kept.is_empty() {
+        return Ok(());
+    }
+    registry
+        .delete_pending_cancellations_by_new_agreement(*agreement_id)
+        .await?;
+    for cancellation in &kept {
+        tracing::info!(
+            new_agreement_id = %agreement_id,
+            old_agreement_id = %cancellation.old_agreement_id,
+            "Replacement was accepted and cancelled before dipper saw it; keeping the agreement \
+             it was to replace"
+        );
+    }
+    Ok(())
 }
 
 /// Execute pending cancellations linked to a newly-accepted agreement.
@@ -4483,43 +4522,89 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reconcile_applies_accept_then_cancel_in_one_snapshot() {
-        // Transient case: dipper polls after both the accept and cancel
-        // landed on-chain. Local is still Created, remote is CanceledByPayer.
-        // We should run the acceptance-side bookkeeping (pending cancellations)
-        // AND mark the agreement as CanceledByRequester.
+    async fn test_reconcile_cancels_the_replaced_agreement_once_its_replacement_is_accepted() {
         let registry = MockRegistry::new();
         let chain_client = live_chain();
         let agreement_id = IndexingAgreementId::from_bytes(rand::random());
         let old_agreement_id = IndexingAgreementId::from_bytes(rand::random());
-        let signer_address: Address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            .parse()
-            .unwrap();
 
         registry.add_agreement(agreement_id, IndexingAgreementStatus::Created);
         registry.add_agreement(old_agreement_id, IndexingAgreementStatus::AcceptedOnChain);
         registry.add_pending_cancellation(agreement_id, old_agreement_id);
 
-        let snapshot = make_snapshot(
-            agreement_id,
-            AgreementState::CanceledByPayer,
-            signer_address,
-        );
-        let result = reconcile_agreement(
+        let snapshot = make_snapshot(agreement_id, AgreementState::Accepted, Address::ZERO);
+        reconcile_agreement(
             &snapshot,
             &registry,
             &chain_client,
             test_agreement_conf().as_ref(),
         )
-        .await;
+        .await
+        .unwrap();
 
-        assert!(result.is_ok());
-        // Accepted-side bookkeeping ran
         assert!(registry.was_marked_accepted_on_chain(&agreement_id));
-        assert!(registry.was_marked_canceled_by_requester(&old_agreement_id));
+        assert!(chain_client.was_on_chain_cancel_attempted(&old_agreement_id));
         assert!(registry.was_pending_cancellation_deleted(&agreement_id, &old_agreement_id));
-        // Cancellation applied on top
-        assert!(registry.was_marked_canceled_by_requester(&agreement_id));
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_accept_then_cancel_in_one_snapshot_keeps_the_replaced_agreement() {
+        // 1 poll shows a replacement accepted and already cancelled, by the payer or by its
+        // indexer. Both are recorded, but the agreement it was to replace is left running:
+        // cancelling that one too would leave the request with neither.
+        for (ended, by_indexer) in [
+            (AgreementState::CanceledByPayer, false),
+            (AgreementState::CanceledByServiceProvider, true),
+        ] {
+            let registry = MockRegistry::new();
+            let chain_client = live_chain();
+            let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+            let old_agreement_id = IndexingAgreementId::from_bytes(rand::random());
+            let canceler: Address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .parse()
+                .unwrap();
+            let conf = test_agreement_conf();
+
+            registry.add_agreement(agreement_id, IndexingAgreementStatus::Created);
+            registry.add_agreement(old_agreement_id, IndexingAgreementStatus::AcceptedOnChain);
+            registry.add_pending_cancellation(agreement_id, old_agreement_id);
+
+            let snapshot = make_snapshot(agreement_id, ended, canceler);
+            reconcile_agreement(&snapshot, &registry, &chain_client, conf.as_ref())
+                .await
+                .unwrap();
+
+            // The replacement's accept and its cancel are both on record.
+            assert!(
+                registry.was_marked_accepted_on_chain(&agreement_id),
+                "{ended:?}"
+            );
+            assert_eq!(
+                registry.was_marked_canceled_by_indexer(&agreement_id),
+                by_indexer,
+                "{ended:?}"
+            );
+            assert_eq!(
+                registry.was_marked_canceled_by_requester(&agreement_id),
+                !by_indexer,
+                "{ended:?}"
+            );
+            // The agreement it was to replace is untouched, on chain and in the registry.
+            assert!(
+                !chain_client.was_on_chain_cancel_attempted(&old_agreement_id),
+                "{ended:?}"
+            );
+            assert!(
+                !registry.was_marked_cancelling(&old_agreement_id),
+                "{ended:?}"
+            );
+            // The link between the 2 is gone, so nothing can act on it later.
+            let left = registry
+                .get_pending_cancellations_by_new_agreement(agreement_id)
+                .await
+                .unwrap();
+            assert!(left.is_empty(), "{ended:?}");
+        }
     }
 
     // -- execute_pending_cancellations tests --
