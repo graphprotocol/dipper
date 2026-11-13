@@ -1220,7 +1220,8 @@ where
         .copied()
         .context("applying the change returned no outcome for the agreement")?;
     // The change is applied, as when a page's finalize fails; the pending cancellation sweep
-    // finishes what this leaves.
+    // finishes what this leaves. It leaves alone the rows of a replacement that has already
+    // ended, which nothing acts on.
     // A fresh listing for each change: the retry applies them 1 at a time, so a reassessment
     // listed as waiting for one could start before the next is applied.
     if let Err(err) = finalize_reconciliation(
