@@ -1866,7 +1866,7 @@ where
     Ok(queued)
 }
 
-/// Drop the pending cancellations of an agreement that one poll showed accepted and already
+/// Drop the pending cancellations of an agreement that 1 poll showed accepted and already
 /// cancelled, without running them. The agreements it was to replace stay as they are, since
 /// cancelling them now would leave the request with neither. Nothing else would clear the rows:
 /// the sweep only takes those of an agreement that is still accepted.
@@ -4549,7 +4549,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reconcile_accept_then_cancel_in_one_snapshot_keeps_the_replaced_agreement() {
-        // One poll shows a replacement accepted and already cancelled, by the payer or by its
+        // 1 poll shows a replacement accepted and already cancelled, by the payer or by its
         // indexer. Both are recorded, but the agreement it was to replace is left running:
         // cancelling that one too would leave the request with neither.
         for (ended, by_indexer) in [
