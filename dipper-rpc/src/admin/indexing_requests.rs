@@ -25,8 +25,11 @@ pub trait IndexingRequestsRpc {
     /// before, to carry on from where that page ended. `status` keeps only the requests in that
     /// status, `OPEN` or `CANCELED`.
     ///
-    /// The reply is never the whole table. It once was, and a table grown past the size a reply
-    /// may have would then have made every call fail.
+    /// Only a `next` of `null` ends a listing. A page can hold fewer requests than `limit`, or
+    /// none, and still have a `next`, as a request dipper can't read is left out of its page.
+    ///
+    /// The reply never holds more than a page. It once held every request, and a list grown past
+    /// the size a reply may have would then have made every call fail.
     #[method(name = "get_all_indexing_requests", param_kind = map)]
     async fn get_all_indexing_requests(
         &self,
@@ -127,7 +130,7 @@ thegraph_core::alloy::sol! {
 pub struct IndexingRequestsPage {
     /// The requests on this page.
     pub requests: Vec<IndexingRequest>,
-    /// The `after` to ask for the next page with. Absent on the last page.
+    /// The `after` to ask for the next page with. `null` on the last page.
     pub next: Option<IndexingRequestId>,
 }
 
