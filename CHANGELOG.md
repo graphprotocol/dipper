@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.3.0](https://github.com/graphprotocol/dipper/compare/v0.2.11...v0.3.0) (2026-11-13)
+
+
+### ⚠ BREAKING CHANGES
+
+* **admin:** page the list of indexing requests ([#832](https://github.com/graphprotocol/dipper/issues/832))
+
+### Added
+
+* **admin:** page the list of indexing requests ([#832](https://github.com/graphprotocol/dipper/issues/832)) ([1d84829](https://github.com/graphprotocol/dipper/commit/1d84829883dd29d937e267f455a4786de4b76122))
+
+
+### Fixed
+
+* **ci:** publish a version-tagged image for each release ([#834](https://github.com/graphprotocol/dipper/issues/834)) ([a9e2385](https://github.com/graphprotocol/dipper/commit/a9e2385d961b2527078b8915fadbf7fea1c56639))
+* **k8s:** refuse connections to dipper from other pods ([#835](https://github.com/graphprotocol/dipper/issues/835)) ([bb20ded](https://github.com/graphprotocol/dipper/commit/bb20ded4b5dabb71c62c5bc6d742f49ec119ef1e))
+* **listener:** keep an indexer whose replacement already ended ([#831](https://github.com/graphprotocol/dipper/issues/831)) ([058f1b1](https://github.com/graphprotocol/dipper/commit/058f1b1c25424269411f3f8f8945f2ceeb8bf743))
+* **liveness:** count a status reply without data as unreachable ([#828](https://github.com/graphprotocol/dipper/issues/828)) ([4f30d77](https://github.com/graphprotocol/dipper/commit/4f30d77d9eecf381b3a502225b08620dee7d4690))
+* **startup:** refuse configs without expiry or reassignment ([#827](https://github.com/graphprotocol/dipper/issues/827)) ([a5b55e6](https://github.com/graphprotocol/dipper/commit/a5b55e603dbb666f2875b87421079570a80b2eab))
+
+
+### Changed
+
+* **deps:** update quinn-udp past its receive loop advisory ([#833](https://github.com/graphprotocol/dipper/issues/833)) ([d36d30e](https://github.com/graphprotocol/dipper/commit/d36d30e2172246b6b188878f5aaca58987d8a279))
+* **worker:** name the port indexers receive offers on ([#830](https://github.com/graphprotocol/dipper/issues/830)) ([05ed9f2](https://github.com/graphprotocol/dipper/commit/05ed9f2c8fa936f7574e3e856a35f5c590dac8b5))
+
 ## [0.2.11](https://github.com/graphprotocol/dipper/compare/v0.2.10...v0.2.11) (2026-11-12)
 
 
