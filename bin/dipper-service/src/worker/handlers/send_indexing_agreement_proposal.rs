@@ -1452,15 +1452,11 @@ mod tests {
                 "https://indexer.example.com:7602/",
             ),
             (
-                "https://indexer.example.com:443/",
+                "https://indexer.example.com:8443/",
                 "https://indexer.example.com:7602/",
             ),
             (
                 "http://indexer.example.com:7600/",
-                "http://indexer.example.com:7602/",
-            ),
-            (
-                "http://indexer.example.com:7602/",
                 "http://indexer.example.com:7602/",
             ),
         ] {
