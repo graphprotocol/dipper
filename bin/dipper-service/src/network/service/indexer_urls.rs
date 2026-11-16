@@ -119,14 +119,20 @@ pub(in crate::network) async fn fetch_snapshot(
         }
 
         let response = builder.send().await.map_err(|err| {
-            anyhow::anyhow!("failed to query indexers page: {}", err.without_url())
+            anyhow::anyhow!(
+                "failed to query indexers page: {}",
+                crate::log_text::with_causes(&err.without_url())
+            )
         })?;
         let status = response.status();
         if !status.is_success() {
             anyhow::bail!("indexers page request failed: HTTP {status}");
         }
         let response: PageResponse = response.json().await.map_err(|err| {
-            anyhow::anyhow!("failed to decode indexers page: {}", err.without_url())
+            anyhow::anyhow!(
+                "failed to decode indexers page: {}",
+                crate::log_text::with_causes(&err.without_url())
+            )
         })?;
 
         let Some(data) = response.data else {

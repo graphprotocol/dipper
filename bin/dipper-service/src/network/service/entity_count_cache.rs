@@ -196,14 +196,20 @@ async fn fetch_page(
         builder = builder.bearer_auth(key);
     }
     let response = builder.send().await.map_err(|err| {
-        anyhow::anyhow!("failed to query entity counts page: {}", err.without_url())
+        anyhow::anyhow!(
+            "failed to query entity counts page: {}",
+            crate::log_text::with_causes(&err.without_url())
+        )
     })?;
     let status = response.status();
     if !status.is_success() {
         anyhow::bail!("entity counts page request failed: HTTP {status}");
     }
     response.json().await.map_err(|err| {
-        anyhow::anyhow!("failed to decode entity counts page: {}", err.without_url())
+        anyhow::anyhow!(
+            "failed to decode entity counts page: {}",
+            crate::log_text::with_causes(&err.without_url())
+        )
     })
 }
 

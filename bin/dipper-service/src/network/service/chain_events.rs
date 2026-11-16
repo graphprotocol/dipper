@@ -43,6 +43,8 @@ use serde::Deserialize;
 use thegraph_core::alloy::primitives::Address;
 use url::Url;
 
+use crate::log_text::with_causes;
+
 /// State of an agreement as recorded by the subgraph. Mirrors the
 /// `AgreementState` enum in the indexing-payments-subgraph schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -401,9 +403,9 @@ impl SubgraphEventSource {
         let response = request.send().await.map_err(|e| {
             let e = e.without_url();
             if e.is_timeout() || e.is_connect() || e.is_request() {
-                ChainEventError::Transient(format!("Network error: {}", e))
+                ChainEventError::Transient(format!("Network error: {}", with_causes(&e)))
             } else {
-                ChainEventError::Permanent(format!("Request error: {}", e))
+                ChainEventError::Permanent(format!("Request error: {}", with_causes(&e)))
             }
         })?;
 
@@ -440,7 +442,10 @@ impl SubgraphEventSource {
         }
 
         let graphql_response: GraphQLResponse<T> = response.json().await.map_err(|e| {
-            ChainEventError::Permanent(format!("Failed to parse response: {}", e.without_url()))
+            ChainEventError::Permanent(format!(
+                "Failed to parse response: {}",
+                with_causes(&e.without_url())
+            ))
         })?;
 
         if let Some(errors) = graphql_response.errors {
@@ -1421,6 +1426,20 @@ mod tests {
         let result = query_meta(&source).await;
 
         assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_dropped_connection_error_names_its_cause() {
+        let source = event_source_at(serve_connections(vec![None]), 0);
+
+        let err = query_meta(&source)
+            .await
+            .expect_err("a dropped connection must fail the query");
+
+        assert!(
+            err.to_string().to_lowercase().contains("connection"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
