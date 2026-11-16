@@ -29,9 +29,45 @@ pub(crate) fn shortened(error: &impl std::fmt::Display) -> String {
     }
 }
 
+/// `err` and each error behind it, so a log says why a request failed and not only that it did: an
+/// HTTP client's own text for a dropped connection is just "error sending request".
+pub(crate) fn with_causes(err: &(dyn std::error::Error + 'static)) -> String {
+    std::iter::successors(Some(err), |err| err.source())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An error with its text and the error behind it, if any.
+    #[derive(Debug)]
+    struct Failed(&'static str, Option<Box<Failed>>);
+
+    impl std::fmt::Display for Failed {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for Failed {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_deref().map(|cause| cause as _)
+        }
+    }
+
+    #[test]
+    fn an_error_is_logged_with_each_cause_behind_it() {
+        let closed = Failed("connection closed before message completed", None);
+        let err = Failed("error sending request", Some(Box::new(closed)));
+
+        assert_eq!(
+            with_causes(&err),
+            "error sending request: connection closed before message completed"
+        );
+    }
 
     #[test]
     fn a_short_text_is_quoted_whole() {
