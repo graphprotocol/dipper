@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/graphprotocol/dipper/compare/v0.3.0...v0.3.1) (2026-11-16)
+
+
+### Fixed
+
+* **listener:** retry dropped subgraph requests and log why ([#836](https://github.com/graphprotocol/dipper/issues/836)) ([814a730](https://github.com/graphprotocol/dipper/commit/814a73032c21241ac3ac4b27cf55b36e64300871))
+
 ## [0.3.0](https://github.com/graphprotocol/dipper/compare/v0.2.11...v0.3.0) (2026-11-13)
 
 
