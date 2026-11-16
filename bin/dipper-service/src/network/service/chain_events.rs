@@ -396,9 +396,11 @@ impl SubgraphEventSource {
         }
 
         // The HTTP client names the URL in a failed request, and a gateway URL can carry the key.
+        // A request sent with no answer, as on a kept-open connection the server just closed, is
+        // retried at once on a fresh connection.
         let response = request.send().await.map_err(|e| {
             let e = e.without_url();
-            if e.is_timeout() || e.is_connect() {
+            if e.is_timeout() || e.is_connect() || e.is_request() {
                 ChainEventError::Transient(format!("Network error: {}", e))
             } else {
                 ChainEventError::Permanent(format!("Request error: {}", e))
@@ -1383,6 +1385,42 @@ mod tests {
             .expect_err("a refused connection must fail the query");
 
         assert!(!err.to_string().contains("secret-key"), "{err}");
+    }
+
+    /// Serves 1 connection per answer in turn. `None` reads the request and closes the connection
+    /// without replying, as a server does when it drops a kept-open connection just as it is reused.
+    fn serve_connections(answers: Vec<Option<&'static str>>) -> Url {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        std::thread::spawn(move || {
+            for answer in answers {
+                let (mut socket, _) = listener.accept().unwrap();
+                let _ = socket.read(&mut [0u8; 4096]);
+                if let Some(body) = answer {
+                    let head = "HTTP/1.1 200 OK\r\ncontent-type: application/json";
+                    write!(
+                        socket,
+                        "{head}\r\ncontent-length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap();
+                }
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn test_dropped_connection_is_retried() {
+        let meta = r#"{"data":{"_meta":{"block":{"number":1}}}}"#;
+        let source = event_source_at(serve_connections(vec![None, Some(meta)]), 3);
+
+        let result = query_meta(&source).await;
+
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[tokio::test]
