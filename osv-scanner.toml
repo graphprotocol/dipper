@@ -46,6 +46,10 @@ reason = "lru 0.16 backs alloy's provider caches. Only a key whose drop code pan
 # Notices that a crate is no longer maintained: no known flaw, but no fixes to come either.
 
 [[IgnoredVulns]]
+id = "RUSTSEC-2026-0543"
+reason = "chrono is unmaintained. Dipper uses it to put the time on each agreement event it sends, and rskafka, the Kafka client, uses it too."
+
+[[IgnoredVulns]]
 id = "RUSTSEC-2026-0105"
 reason = "core2 is unmaintained and yanked. It comes in through the IPFS client in indexer-rs."
 
