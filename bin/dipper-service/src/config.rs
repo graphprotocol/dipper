@@ -1644,8 +1644,12 @@ fn default_fallback_max_grt_per_30_days() -> f64 {
         .fold(0.0, f64::max)
 }
 
+/// The minimum GRT per billion entities per 30 days that indexer-rs suggests, on every chain.
+const INDEXER_RS_MIN_GRT_PER_BILLION_ENTITIES_PER_30_DAYS: f64 = 200.0;
+
+/// Default per-entity ceiling: the same multiple of the indexer-rs minimum as the base ceilings.
 fn default_max_grt_per_billion_entities_per_30_days() -> f64 {
-    2000.0
+    INDEXER_RS_MIN_GRT_PER_BILLION_ENTITIES_PER_30_DAYS * PAYMENT_CEILING_MULTIPLIER
 }
 
 /// Default per-agreement payment ceiling (GRT per 30 days).
@@ -2821,6 +2825,24 @@ mod tests {
             dips["fallback_max_grt_per_30_days"].as_f64(),
             Some(default_fallback_max_grt_per_30_days())
         );
+        assert_eq!(
+            dips["max_grt_per_billion_entities_per_30_days"].as_f64(),
+            Some(default_max_grt_per_billion_entities_per_30_days())
+        );
+    }
+
+    /// For a subgraph with many entities the per-entity part is most of what an agreement
+    /// pays, so its ceiling is the same multiple of the published minimum as the base one.
+    #[test]
+    fn the_default_per_entity_ceiling_is_4_times_the_published_minimum() {
+        let conf = dips_conf_with_default_prices();
+
+        assert_eq!(conf.max_grt_per_billion_entities_per_30_days, 800.0);
+        assert_eq!(
+            conf.max_grt_per_billion_entities_per_30_days,
+            INDEXER_RS_MIN_GRT_PER_BILLION_ENTITIES_PER_30_DAYS * PAYMENT_CEILING_MULTIPLIER
+        );
+        assert_eq!(conf.validate(), Ok(()));
     }
 
     /// The README tells indexers how far above the published minimum they may price before
@@ -2828,11 +2850,20 @@ mod tests {
     #[test]
     fn the_readme_tells_indexers_the_multiplier_dipper_uses() {
         let readme = include_str!("../../../README.md");
-        let rule = format!(
-            "Asking more than {PAYMENT_CEILING_MULTIPLIER} times the published minimum for a chain"
-        );
+        let rules = [
+            format!(
+                "Asking more than {PAYMENT_CEILING_MULTIPLIER} times the published minimum for a \
+                 chain"
+            ),
+            format!(
+                "more than {PAYMENT_CEILING_MULTIPLIER} times the published minimum per billion \
+                 entities"
+            ),
+        ];
 
-        assert!(readme.contains(&rule), "the README does not say: {rule}");
+        for rule in rules {
+            assert!(readme.contains(&rule), "the README does not say: {rule}");
+        }
     }
 
     /// Stale `max_initial_tokens` and `max_ongoing_tokens_per_second` keys
