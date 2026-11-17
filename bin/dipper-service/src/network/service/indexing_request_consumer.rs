@@ -67,6 +67,9 @@ const STALLED_EVENT: &str = "studio_request_consumer_stalled";
 /// The `event` tag of the alert for a stored offset moved past records nobody read.
 const OFFSET_JUMPED_EVENT: &str = "studio_request_offset_jumped";
 
+/// The `event` tag of the alert for a Studio request dropped because dipper can't read it.
+const DROPPED_EVENT: &str = "studio_request_dropped";
+
 /// Handle for controlling the indexing request consumer lifecycle
 #[derive(Clone)]
 pub struct Handle {
@@ -513,15 +516,8 @@ async fn partition_loop<C, R, W>(
             }
             let offset = record.offset;
             match decode_propose(record.value.as_deref(), &expected_network) {
-                Err(reason) => {
-                    tracing::warn!(
-                        topic,
-                        partition,
-                        offset,
-                        reason,
-                        key = ?record.key.as_deref().map(String::from_utf8_lossy),
-                        "skipping unprocessable indexing request record"
-                    );
+                Err(skip) => {
+                    log_skipped_record(skip, &topic, partition, offset, record.key.as_deref());
                 }
                 Ok(target) => {
                     tracing::debug!(
@@ -972,51 +968,87 @@ struct ProposedTarget {
     num_candidates: usize,
 }
 
+/// Why a record is passed over for good.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Skip {
+    /// Its envelope names another protocol network, so it is not this dipper's to apply.
+    OtherNetwork,
+    /// A request this dipper should have applied and can't read; the text says why.
+    Unreadable(&'static str),
+}
+
+/// Logs a record that is passed over for good. Studio gets no reply, so one this dipper
+/// should have applied raises an alert that says why it could not.
+fn log_skipped_record(skip: Skip, topic: &str, partition: i32, offset: i64, key: Option<&[u8]>) {
+    let key = key.map(String::from_utf8_lossy);
+    match skip {
+        Skip::OtherNetwork => tracing::warn!(
+            topic,
+            partition,
+            offset,
+            ?key,
+            "Skipped a Studio indexing request for a different protocol network"
+        ),
+        Skip::Unreadable(reason) => tracing::error!(
+            event = DROPPED_EVENT,
+            topic,
+            partition,
+            offset,
+            ?key,
+            "Dropped a Studio indexing request dipper can't apply: {reason}"
+        ),
+    }
+}
+
 /// Decode a record value into a propose target, or the reason to skip it.
 /// Unknown event types are tolerated by design: Studio may add types before
 /// the dipper learns them, and they must not wedge the partition.
-fn decode_propose(
-    value: Option<&[u8]>,
-    expected_network: &str,
-) -> Result<ProposedTarget, &'static str> {
+fn decode_propose(value: Option<&[u8]>, expected_network: &str) -> Result<ProposedTarget, Skip> {
     let Some(value) = value else {
-        return Err("empty record value");
+        return Err(Skip::Unreadable("empty record value"));
     };
 
     let event = match studio::SubgraphIndexingRequestEvent::decode(value) {
         Ok(event) => event,
-        Err(_) => return Err("undecodable protobuf"),
+        Err(_) => return Err(Skip::Unreadable("undecodable protobuf")),
     };
+
+    // Before the type: another network's record is not this dipper's, whatever its type.
+    if event.the_graph_network_caip2id != expected_network {
+        return Err(Skip::OtherNetwork);
+    }
 
     match event.event_type.as_str() {
         EVENT_TYPE_PROPOSE => {}
-        EVENT_TYPE_TERMINATE => return Err("terminate event (cancellation is a propose with 0)"),
-        _ => return Err("unknown event type"),
-    }
-
-    if event.the_graph_network_caip2id != expected_network {
-        return Err("event is for a different protocol network");
+        EVENT_TYPE_TERMINATE => {
+            return Err(Skip::Unreadable(
+                "terminate event (cancellation is a propose with 0)",
+            ));
+        }
+        _ => return Err(Skip::Unreadable("unknown event type")),
     }
 
     let Some(studio::subgraph_indexing_request_event::Payload::SubgraphIndexingRequestPropose(
         propose,
     )) = event.payload
     else {
-        return Err("propose event without a propose payload");
+        return Err(Skip::Unreadable("propose event without a propose payload"));
     };
 
     let Ok(deployment_id) = event.subgraph_deployment_qm_hash.parse::<DeploymentId>() else {
-        return Err("invalid subgraph deployment hash");
+        return Err(Skip::Unreadable("invalid subgraph deployment hash"));
     };
 
     let Some(deployment_chain_id) = parse_eip155_caip2(&propose.indexed_network_caip2id) else {
         // The field is the dipper's addition to Studio's schema; until Studio
-        // sends it, every message lands here and this warn is the signal.
-        return Err("missing or invalid indexed network caip2 id");
+        // sends it, every message lands here and is alerted on.
+        return Err(Skip::Unreadable(
+            "missing or invalid indexed network caip2 id",
+        ));
     };
 
     let Ok(num_candidates) = usize::try_from(propose.indexing_agreements_requested) else {
-        return Err("negative indexing agreements requested");
+        return Err(Skip::Unreadable("negative indexing agreements requested"));
     };
 
     Ok(ProposedTarget {
@@ -1133,7 +1165,7 @@ mod tests {
     fn rejects_an_empty_record_value() {
         assert_eq!(
             decode_propose(None, "eip155:42161"),
-            Err("empty record value")
+            Err(Skip::Unreadable("empty record value"))
         );
     }
 
@@ -1143,7 +1175,7 @@ mod tests {
         let garbage = [0xFF, 0xFF, 0xFF];
         assert_eq!(
             decode_propose(Some(&garbage), "eip155:42161"),
-            Err("undecodable protobuf")
+            Err(Skip::Unreadable("undecodable protobuf"))
         );
     }
 
@@ -1158,7 +1190,7 @@ mod tests {
         );
         assert_eq!(
             decode_propose(Some(&bytes), "eip155:42161"),
-            Err("unknown event type")
+            Err(Skip::Unreadable("unknown event type"))
         );
     }
 
@@ -1167,7 +1199,7 @@ mod tests {
         let bytes = encode_propose(EVENT_TYPE_TERMINATE, "eip155:42161", QM_HASH, "eip155:1", 3);
         assert!(matches!(
             decode_propose(Some(&bytes), "eip155:42161"),
-            Err(reason) if reason.contains("terminate")
+            Err(Skip::Unreadable(reason)) if reason.contains("terminate")
         ));
     }
 
@@ -1176,8 +1208,22 @@ mod tests {
         let bytes = encode_propose(EVENT_TYPE_PROPOSE, "eip155:421614", QM_HASH, "eip155:1", 3);
         assert_eq!(
             decode_propose(Some(&bytes), "eip155:42161"),
-            Err("event is for a different protocol network")
+            Err(Skip::OtherNetwork)
         );
+    }
+
+    /// Another network's dipper answers for its own records, whatever their type, so none of
+    /// them is counted as one this dipper failed to read.
+    #[test]
+    fn an_event_of_any_type_for_another_network_is_not_this_dippers() {
+        for event_type in [EVENT_TYPE_TERMINATE, "subgraph.indexing.something.new"] {
+            let bytes = encode_propose(event_type, "eip155:421614", QM_HASH, "eip155:1", 3);
+            assert_eq!(
+                decode_propose(Some(&bytes), "eip155:42161"),
+                Err(Skip::OtherNetwork),
+                "{event_type}"
+            );
+        }
     }
 
     #[test]
@@ -1193,7 +1239,7 @@ mod tests {
         };
         assert_eq!(
             decode_propose(Some(&event.encode_to_vec()), "eip155:42161"),
-            Err("propose event without a propose payload")
+            Err(Skip::Unreadable("propose event without a propose payload"))
         );
     }
 
@@ -1208,7 +1254,7 @@ mod tests {
         );
         assert_eq!(
             decode_propose(Some(&bytes), "eip155:42161"),
-            Err("invalid subgraph deployment hash")
+            Err(Skip::Unreadable("invalid subgraph deployment hash"))
         );
     }
 
@@ -1218,7 +1264,9 @@ mod tests {
         let bytes = encode_propose(EVENT_TYPE_PROPOSE, "eip155:42161", QM_HASH, "", 3);
         assert_eq!(
             decode_propose(Some(&bytes), "eip155:42161"),
-            Err("missing or invalid indexed network caip2 id")
+            Err(Skip::Unreadable(
+                "missing or invalid indexed network caip2 id"
+            ))
         );
     }
 
@@ -1228,7 +1276,9 @@ mod tests {
             let bytes = encode_propose(EVENT_TYPE_PROPOSE, "eip155:42161", QM_HASH, indexed, 3);
             assert_eq!(
                 decode_propose(Some(&bytes), "eip155:42161"),
-                Err("missing or invalid indexed network caip2 id"),
+                Err(Skip::Unreadable(
+                    "missing or invalid indexed network caip2 id"
+                )),
                 "indexed network {indexed:?} should be rejected"
             );
         }
@@ -1239,7 +1289,7 @@ mod tests {
         let bytes = encode_propose(EVENT_TYPE_PROPOSE, "eip155:42161", QM_HASH, "eip155:1", -1);
         assert_eq!(
             decode_propose(Some(&bytes), "eip155:42161"),
-            Err("negative indexing agreements requested")
+            Err(Skip::Unreadable("negative indexing agreements requested"))
         );
     }
 
@@ -2093,6 +2143,59 @@ mod tests {
         assert!(registry.calls().is_empty());
     }
 
+    // -------- records dropped for good --------
+
+    /// Studio gets no reply to a record dipper drops, so each one it should have applied is
+    /// alerted on. One for another protocol network's dipper is not this one's to act on.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_record_is_alerted_on_unless_it_is_for_another_network() {
+        let record = |offset, value| FetchedRecord {
+            offset,
+            key: Some(b"eip155:42161/QmUzRg/request".to_vec()),
+            value: Some(value),
+        };
+        let propose =
+            |network, indexed| encode_propose(EVENT_TYPE_PROPOSE, network, QM_HASH, indexed, 3);
+        let records = vec![
+            record(0, propose("eip155:421614", "eip155:1")),
+            record(1, propose("eip155:42161", "")),
+            record(2, vec![0xFF, 0xFF, 0xFF]),
+            record(3, propose("eip155:42161", "solana:mainnet")),
+        ];
+        let registry = MockRegistry::scripted(vec![]);
+        registry.offsets.lock().expect("poisoned").push(0);
+        let worker = MockWorker::new();
+        let source = ScriptedSource::new(vec![Ok((records, 4))]);
+        let asked = Arc::clone(&source.asked);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let logs = logged(run_until(
+            partition_loop_over(
+                source,
+                &registry,
+                &worker,
+                Arc::new(SkipChainCheck),
+                shutdown_rx,
+            ),
+            &shutdown_tx,
+            || asked.lock().expect("poisoned").len() == 2,
+        ))
+        .await;
+
+        assert_eq!(alerts(&logs, DROPPED_EVENT), 3, "{logs}");
+        let alert_lines: Vec<&str> = logs
+            .lines()
+            .filter(|line| line.contains(DROPPED_EVENT))
+            .collect();
+        assert!(alert_lines[0].contains("missing or invalid indexed network"));
+        assert!(alert_lines[0].contains("offset=1"), "{}", alert_lines[0]);
+        assert!(alert_lines[1].contains("undecodable protobuf"));
+        assert!(alert_lines[2].contains("offset=3"), "{}", alert_lines[2]);
+        assert!(logs.contains("different protocol network"), "{logs}");
+        assert!(registry.calls().is_empty(), "none of them is applied");
+        assert_eq!(registry.stored_offsets(), [0, 1, 2, 3, 4]);
+    }
+
     // -------- offsets out of range --------
 
     /// The broker's answer to a fetch from an offset outside what it retains.
@@ -2197,6 +2300,7 @@ mod tests {
             "studio_request_chain_refused",
             STALLED_EVENT,
             OFFSET_JUMPED_EVENT,
+            DROPPED_EVENT,
         ] {
             assert!(defaults.iter().any(|default| default == event), "{event}");
         }
