@@ -60,7 +60,8 @@ const PARTITION_METADATA_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 /// a deploy takes over soon after the old one lets go.
 const LOCK_RETRY: Duration = Duration::from_secs(2);
 
-/// How often the holder of the lock checks that the connection it lives on still answers.
+/// How often the holder of the lock checks that the connection it lives on still answers,
+/// from the moment the lock is taken until it is given up, so the connection is never idle.
 const LOCK_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Bound on 1 call on the lock's connection: a database that takes longer has not given the
@@ -348,15 +349,14 @@ where
     R: Clone + Send + Sync + 'static,
     W: WorkerQueue + Clone + Send + Sync + 'static,
 {
-    let Some(partitions) = first_partitions(consumer, rx_stop).await else {
-        tracing::info!("indexing request consumer asked to stop before it had connected");
-        return Ended::Stopped;
+    let mut held = HeldLock::new(lock);
+    let partitions = match first_partitions(consumer, rx_stop, &mut held).await {
+        Ok(partitions) => partitions,
+        Err(ended) => return ended,
     };
-    // The wait for the brokers can be a long one, and the lock may have gone in the meantime.
-    match held_or_stopped(lock, rx_stop).await {
-        None => return Ended::Stopped,
-        Some(false) => return Ended::LockLost,
-        Some(true) => {}
+    // Checked once more, so that nothing is read on a check that is seconds old.
+    if let Some(ended) = held.lost_or_stopped(rx_stop).await {
+        return ended;
     }
     tracing::info!(
         topic,
@@ -367,11 +367,58 @@ where
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut tasks = partition_loops(ctx, consumer, partitions, &shutdown_rx);
-    let ended = partition_loops_ended(rx_stop, &mut tasks, consumer, topic, lock).await;
+    let ended = partition_loops_ended(rx_stop, &mut tasks, consumer, topic, &mut held).await;
 
     let _ = shutdown_tx.send(true);
-    while tasks.join_next().await.is_some() {}
+    partition_loops_joined(&mut tasks, &mut held).await;
     ended
+}
+
+/// The lock while this dipper holds it: the connection it lives on, and the timer of the
+/// checks that speak on that connection every `LOCK_CHECK_INTERVAL`, the first at once.
+struct HeldLock<'a> {
+    connection: &'a mut dyn LockConnection,
+    check: tokio::time::Interval,
+}
+
+impl<'a> HeldLock<'a> {
+    fn new(connection: &'a mut dyn LockConnection) -> Self {
+        let mut check = tokio::time::interval(LOCK_CHECK_INTERVAL);
+        check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        Self { connection, check }
+    }
+
+    /// Completes when the next check is due.
+    async fn check_due(&mut self) {
+        self.check.tick().await;
+    }
+
+    /// 1 check: why the reading has to end, or `None` while the lock is still held.
+    async fn lost_or_stopped(&mut self, rx_stop: &mut mpsc::Receiver<()>) -> Option<Ended> {
+        match held_or_stopped(self.connection, rx_stop).await {
+            None => Some(Ended::Stopped),
+            Some(false) => Some(Ended::LockLost),
+            Some(true) => None,
+        }
+    }
+}
+
+/// Waits for the partition loops to end once they are told to. A loop finishes the request it
+/// is applying first, and the lock is kept until it has, so its connection is still spoken on.
+async fn partition_loops_joined(tasks: &mut JoinSet<()>, held: &mut HeldLock<'_>) {
+    let joined = async { while tasks.join_next().await.is_some() {} };
+    // Run beside the wait and not inside it, so a database that does not answer delays nothing.
+    let spoken_on = async {
+        loop {
+            held.check_due().await;
+            // The answer changes nothing here: the loops are stopping whatever it is.
+            let _ = tokio::time::timeout(LOCK_CALL_TIMEOUT, held.connection.is_alive()).await;
+        }
+    };
+    tokio::select! {
+        () = joined => {}
+        () = spoken_on => {}
+    }
 }
 
 /// Waits until this dipper holds the lock for `topic`, on a connection of its own. `None` if
@@ -511,14 +558,21 @@ where
 }
 
 /// The topic's partitions, once the first connect gets through: brokers that are down or a
-/// topic that is not there yet are waited for, however long. `None` if asked to stop first.
+/// topic that is not there yet are waited for, however long, and the lock is checked all the
+/// while. `Err` with the reason if the wait has to end before the connect.
 async fn first_partitions<C: TopicSource>(
     consumer: &Reconnecting<C>,
     rx_stop: &mut mpsc::Receiver<()>,
-) -> Option<Vec<i32>> {
-    tokio::select! {
-        _ = rx_stop.recv() => None,
-        first = consumer.connected() => Some(first.partitions()),
+    held: &mut HeldLock<'_>,
+) -> Result<Vec<i32>, Ended> {
+    loop {
+        tokio::select! {
+            _ = rx_stop.recv() => return Err(Ended::Stopped),
+            first = consumer.connected() => return Ok(first.partitions()),
+            () = held.check_due() => if let Some(ended) = held.lost_or_stopped(rx_stop).await {
+                return Err(ended);
+            },
+        }
     }
 }
 
@@ -530,20 +584,16 @@ async fn partition_loops_ended<C: TopicSource>(
     tasks: &mut JoinSet<()>,
     consumer: &Reconnecting<C>,
     topic: &str,
-    lock: &mut dyn LockConnection,
+    held: &mut HeldLock<'_>,
 ) -> Ended {
     let serving = tasks.len();
     let mut metadata_check = tokio::time::interval(PARTITION_METADATA_CHECK_INTERVAL);
     metadata_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut lock_check = tokio::time::interval(LOCK_CHECK_INTERVAL);
-    lock_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             _ = rx_stop.recv() => return Ended::Stopped,
-            _ = lock_check.tick() => match held_or_stopped(lock, rx_stop).await {
-                None => return Ended::Stopped,
-                Some(false) => return Ended::LockLost,
-                Some(true) => {}
+            () = held.check_due() => if let Some(ended) = held.lost_or_stopped(rx_stop).await {
+                return ended;
             },
             joined = tasks.join_next() => return Ended::Fault(match joined {
                 Some(Ok(())) => anyhow::anyhow!(
@@ -1645,6 +1695,8 @@ mod tests {
         offsets: Arc<Mutex<Vec<i64>>>,
         /// The lock that lets 1 dipper at a time read the topic; free unless a test says so.
         lock: Arc<MockLock>,
+        /// How long the database takes over each change to a request.
+        apply_takes: Duration,
     }
 
     impl MockRegistry {
@@ -1655,6 +1707,7 @@ mod tests {
                 calls: Arc::new(Mutex::new(Vec::new())),
                 offsets: Arc::default(),
                 lock: Arc::default(),
+                apply_takes: Duration::ZERO,
             }
         }
 
@@ -1686,6 +1739,7 @@ mod tests {
                 deployment_chain_id,
                 num_candidates,
             ));
+            tokio::time::sleep(self.apply_takes).await;
             let mut script = self.script.lock().expect("poisoned");
             match if script.is_empty() {
                 None
@@ -1785,11 +1839,27 @@ mod tests {
         events: Mutex<Vec<&'static str>>,
         /// The key each connection was opened for.
         keys: Mutex<Vec<i64>>,
+        /// When the database was asked something on a connection, a try or a check.
+        spoken: Mutex<Vec<tokio::time::Instant>>,
     }
 
     impl MockLock {
         fn note(&self, event: &'static str) {
             self.events.lock().expect("poisoned").push(event);
+        }
+
+        fn spoken_on(&self) {
+            let now = tokio::time::Instant::now();
+            self.spoken.lock().expect("poisoned").push(now);
+        }
+
+        /// The longest the database went without being asked anything, from the first time
+        /// it was to now. A database told to end idle sessions ends one that is silent too long.
+        fn longest_silence(&self) -> Duration {
+            let mut spoken = self.spoken.lock().expect("poisoned").clone();
+            spoken.push(tokio::time::Instant::now());
+            let gaps = spoken.windows(2).map(|pair| pair[1] - pair[0]);
+            gaps.max().unwrap_or_default()
         }
 
         fn events(&self) -> Vec<&'static str> {
@@ -1807,6 +1877,7 @@ mod tests {
     impl LockConnection for MockLockConnection {
         async fn try_lock(&mut self) -> RegistryResult<bool> {
             use std::sync::atomic::Ordering::SeqCst;
+            self.0.spoken_on();
             if self.0.held_elsewhere.load(SeqCst) {
                 self.0.note("refused");
                 return Ok(false);
@@ -1835,6 +1906,7 @@ mod tests {
 
         async fn is_alive(&mut self) -> bool {
             use std::sync::atomic::Ordering::SeqCst;
+            self.0.spoken_on();
             if self.0.check_hangs.swap(false, SeqCst) {
                 self.0.note("check hung");
                 return std::future::pending().await;
@@ -3473,6 +3545,122 @@ mod tests {
                 "closed"
             ]
         );
+    }
+
+    /// The lock is taken before the brokers are reached, and they can be down for hours. A
+    /// connection left silent that long is one a network drops, or a database ends as idle.
+    #[tokio::test(start_paused = true)]
+    async fn the_lock_is_checked_all_through_a_broker_outage_and_the_reading_after_it() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (registry, stored) = registry_for_a_request();
+        let lock = Arc::clone(&registry.lock);
+        let worker = MockWorker::new();
+        let (tx_stop, rx_stop) = mpsc::channel(1);
+        let brokers_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let up = Arc::clone(&brokers_up);
+        let found = move |_| {
+            Some(if up.load(SeqCst) {
+                Ok(topic_with_a_request())
+            } else {
+                Err(ConsumerError::Timeout)
+            })
+        };
+        let an_outage_then_reading = async {
+            tokio::time::sleep(Duration::from_secs(600)).await;
+            brokers_up.store(true, SeqCst);
+            tokio::time::timeout(Duration::from_secs(120), an_offset_is_stored(stored))
+                .await
+                .expect("the request is read within 2 minutes of the brokers' return");
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        };
+
+        let ended = serve_until(
+            serve_over(found, &registry, &worker, rx_stop),
+            tx_stop,
+            an_outage_then_reading,
+        )
+        .await;
+
+        assert!(matches!(ended, Some(Ok(()))), "{ended:?}");
+        let silence = lock.longest_silence();
+        assert!(
+            silence <= LOCK_CHECK_INTERVAL,
+            "the lock's connection went {silence:?} without a word"
+        );
+    }
+
+    /// A lock lost while the brokers are down is found out then, and taken again, so that
+    /// the brokers' return does not find this dipper locked out by its own dead connection.
+    #[tokio::test(start_paused = true)]
+    async fn a_lock_lost_while_the_brokers_are_down_is_noticed_and_taken_again() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (registry, _) = registry_for_a_request();
+        let lock = Arc::clone(&registry.lock);
+        let worker = MockWorker::new();
+        let (tx_stop, rx_stop) = mpsc::channel(1);
+        let lost_a_minute_in = async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            lock.script(&[Try::Refused, Try::Refused]);
+            lock.lost.store(true, SeqCst);
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        };
+
+        let ended = serve_until(
+            serve_over(
+                |_| Some(Err(ConsumerError::Timeout)),
+                &registry,
+                &worker,
+                rx_stop,
+            ),
+            tx_stop,
+            lost_a_minute_in,
+        )
+        .await;
+
+        assert!(matches!(ended, Some(Ok(()))), "{ended:?}");
+        assert_eq!(
+            registry.lock.events(),
+            ["locked", "closed", "refused", "refused", "locked", "closed"],
+            "the lost connection is closed and the lock taken again, all before any broker answers"
+        );
+    }
+
+    /// A stop does not cut short a request that is being applied, and the lock is given up
+    /// only once that is done. Until then its connection must not fall silent either.
+    #[tokio::test(start_paused = true)]
+    async fn the_lock_is_checked_until_a_stopping_loop_has_finished_its_request() {
+        let (mut registry, _) = registry_for_a_request();
+        registry.apply_takes = Duration::from_secs(20);
+        let lock = Arc::clone(&registry.lock);
+        let worker = MockWorker::new();
+        let (tx_stop, rx_stop) = mpsc::channel(1);
+        let service = serve_over(
+            |_| Some(Ok(topic_with_a_request())),
+            &registry,
+            &worker,
+            rx_stop,
+        );
+        tokio::pin!(service);
+
+        // The stop arrives 1 second into an apply that takes 20.
+        tokio::select! {
+            ended = &mut service => panic!("the service ended by itself: {ended:?}"),
+            () = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+        let asked_to_stop = tokio::time::Instant::now();
+        tx_stop.send(()).await.expect("the service is running");
+        let ended = tokio::time::timeout(Duration::from_secs(60), &mut service).await;
+
+        assert!(matches!(ended, Ok(Ok(()))), "{ended:?}");
+        assert_eq!(registry.stored_offsets(), [1], "the request was finished");
+        let stopping = asked_to_stop.elapsed();
+        assert!(stopping >= Duration::from_secs(15), "{stopping:?}");
+        let silence = lock.longest_silence();
+        assert!(
+            silence <= LOCK_CHECK_INTERVAL,
+            "the lock's connection went {silence:?} without a word"
+        );
+        assert_eq!(lock.events(), ["locked", "offset read", "closed"]);
     }
 
     /// The check on the lock runs every few seconds for as long as dipper does, so a stop
