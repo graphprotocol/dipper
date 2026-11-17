@@ -15,10 +15,11 @@ pub const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 /// since an IPFS endpoint can carry credentials in it.
 #[derive(Debug, thiserror::Error)]
 pub enum ManifestFetchError {
-    /// IPFS answered, but with no manifest: unknown or malformed CIDs get a 4xx.
+    /// IPFS searched and has no manifest for this deployment: it answered 404.
     #[error("IPFS has no subgraph manifest for this deployment (HTTP {0})")]
     NotFound(u16),
-    /// IPFS could not be reached, failed, or did not answer in time.
+    /// IPFS could not be reached, failed, did not answer in time, or turned the request away
+    /// with a status that says nothing about the manifest, such as 401, 403 or 429.
     #[error("IPFS did not return the subgraph manifest")]
     Unreachable(#[source] reqwest::Error),
     #[error("the subgraph manifest is larger than {MAX_MANIFEST_BYTES} bytes")]
@@ -63,9 +64,11 @@ pub async fn fetch_manifest(
         .await
         .map_err(unreachable)?;
     let status = response.status();
-    if status.is_client_error() {
+    if status == reqwest::StatusCode::NOT_FOUND {
         return Err(ManifestFetchError::NotFound(status.as_u16()));
     }
+    // Any other 4xx (a rate limit, a refused credential) is retried like an outage: calling it
+    // final would drop a request Studio sent over Kafka, which nobody is there to send again.
     response = response.error_for_status().map_err(unreachable)?;
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(unreachable)? {
@@ -252,6 +255,17 @@ mod tests {
         );
         assert!(!missing.is_transient());
         assert!(failing.is_transient(), "{failing:?}");
+    }
+
+    /// Only a 404 says IPFS looked and has no manifest. A refusal or a rate limit says nothing
+    /// about the manifest, so the same read may pass later.
+    #[tokio::test]
+    async fn test_fetch_manifest_treats_only_a_404_as_final() {
+        for status in [400, 401, 403, 408, 429] {
+            let err = fetch_from(ResponseTemplate::new(status)).await.unwrap_err();
+
+            assert!(err.is_transient(), "HTTP {status}: {err:?}");
+        }
     }
 
     #[tokio::test]

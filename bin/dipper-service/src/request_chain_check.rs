@@ -303,6 +303,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_ipfs_that_refuses_or_rate_limits_is_worth_retrying() {
+        for status in [401, 403, 408, 429] {
+            let server = MockServer::start().await;
+            serve_manifest(&server, ResponseTemplate::new(status), 1).await;
+
+            let err = check_against(&server)
+                .check(&deployment_id!(DEPLOYMENT), 421614)
+                .await
+                .unwrap_err();
+
+            assert!(err.is_transient(), "HTTP {status}: {err:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn a_slow_ipfs_is_worth_retrying() {
         let server = MockServer::start().await;
         let slow = ResponseTemplate::new(200)
