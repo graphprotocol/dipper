@@ -709,7 +709,6 @@ pub async fn main() -> anyhow::Result<()> {
                 worker_queue: worker_handle.queue().clone(),
                 events: subgraph_indexing_agreements_events_emitter.clone(),
                 protocol_chain_id: chain_id,
-                max_candidates: DEFAULT_MAX_CANDIDATES,
                 chain_check: Arc::clone(&request_chain_check),
                 config: consumer_conf.clone(),
             };
