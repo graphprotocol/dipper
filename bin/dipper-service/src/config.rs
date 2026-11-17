@@ -2973,6 +2973,7 @@ mod tests {
             "A read that fails is tried again after 1 minute",
             "adds a chain above the highest minimum in use or below a tenth of the lowest",
             "these 3 rules do not protect the first read after a start",
+            "a chain it lists later leaves the fallback and gets 4 times its minimum",
         ];
 
         for rule in rules {
