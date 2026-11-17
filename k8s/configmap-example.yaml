@@ -30,17 +30,17 @@ data:
         "pricing_table": {},
         "max_agreement_grt_per_30_days": 20000,
         "max_grt_per_30_days": {
-          "arbitrum-one": 4500,
-          "matic": 3000,
-          "avalanche": 2250,
-          "bsc": 2000,
-          "base": 800,
-          "mainnet": 450,
-          "optimism": 300,
-          "base-sepolia": 150,
-          "sepolia": 50
+          "arbitrum-one": 1800,
+          "matic": 1200,
+          "avalanche": 900,
+          "bsc": 800,
+          "base": 320,
+          "mainnet": 180,
+          "optimism": 120,
+          "base-sepolia": 60,
+          "sepolia": 20
         },
-        "fallback_max_grt_per_30_days": 4500,
+        "fallback_max_grt_per_30_days": 1800,
         "max_grt_per_billion_entities_per_30_days": 2000,
         "non_accepting_test_interval_minutes": 60
       },
