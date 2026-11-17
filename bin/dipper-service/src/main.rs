@@ -378,6 +378,13 @@ pub async fn main() -> anyhow::Result<()> {
 
     let additional_networks = Arc::new(conf.additional_networks);
 
+    // Logged here and not with the other start-up notes, since it takes the chains' names.
+    let chain_name =
+        |chain| worker::resolve_chain_name(chain, &networks_registry, &additional_networks);
+    for note in worker::table_prices_above_ceilings(&agreement_conf, &pricing_table, chain_name) {
+        tracing::warn!("{note}");
+    }
+
     // Application services
 
     //- The chain client (for on-chain transactions). Required: presence validated above.
