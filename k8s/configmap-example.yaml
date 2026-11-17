@@ -29,7 +29,7 @@ data:
         "deadline_seconds": 600,
         "pricing_table": {},
         "max_agreement_grt_per_30_days": 20000,
-        "max_grt_per_billion_entities_per_30_days": 2000,
+        "max_grt_per_billion_entities_per_30_days": 800,
         "non_accepting_test_interval_minutes": 60
       },
       "admin_rpc": {
