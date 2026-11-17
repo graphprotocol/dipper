@@ -177,13 +177,20 @@ impl Ctx {
             Err(refusal) => {
                 // Tagged for an alert only when one is due; logged every time.
                 let event = alerted.due_for_refusal().then_some(REFUSED_EVENT);
+                let way_out = if refusal.is_against_table_in_use() {
+                    "If the published prices are right, restart dipper, which takes the \
+                     published table as it starts, or set max_grt_per_30_days and \
+                     fallback_max_grt_per_30_days in the config"
+                } else {
+                    "A restart does not get past this: the file has to be put right in \
+                     indexer-rs, or the ceilings set in the config with max_grt_per_30_days \
+                     and fallback_max_grt_per_30_days"
+                };
                 tracing::error!(
                     event,
                     url = %without_secrets(&self.url),
                     "Dipper refused the minimum prices it fetched from indexer-rs: {refusal}. \
-                     Its default price ceilings stay on {}. If the published prices are \
-                     right, set max_grt_per_30_days and fallback_max_grt_per_30_days in the \
-                     config, or release a dipper whose built-in prices are close to them",
+                     Its default price ceilings stay on {}. {way_out}",
                     self.table_in_use()
                 );
             }
@@ -569,8 +576,10 @@ mod tests {
             ]))
         }
         let ceilings = default_ceilings();
+        let script: Vec<fn() -> Fetched> = vec![unchanged, mainnet_100_times_up];
 
-        let (_, logs) = served(&ceilings, 6 * HOUR, vec![mainnet_100_times_up], HOUR).await;
+        // The table fetched at 6 hours is held to the one taken at start.
+        let (_, logs) = served(&ceilings, 6 * HOUR, script, 7 * HOUR).await;
 
         assert_eq!(*ceilings.minimums(), built_in());
         assert_eq!(ceilings.for_chain("mainnet"), 180.0);
@@ -580,6 +589,28 @@ mod tests {
             logs.contains("it moves the minimum for mainnet from 45 to 4500"),
             "the alert says why: {logs}"
         );
+        assert!(
+            logs.contains("restart dipper, which takes the published table as it starts"),
+            "and the way out: {logs}"
+        );
+    }
+
+    /// A dipper that restarts is back on the table built into its release. The published
+    /// one may be far from that by then, and is what dipper was on before it restarted.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_table_after_a_start_is_taken_however_far_from_the_built_in_one() {
+        fn sepolia_12_times_up_and_no_mainnet() -> Fetched {
+            Ok(published(&[("arbitrum-one", 450.0), ("sepolia", 60.0)]))
+        }
+        let ceilings = default_ceilings();
+        let script: Vec<fn() -> Fetched> = vec![sepolia_12_times_up_and_no_mainnet];
+
+        let (_, logs) = served(&ceilings, 6 * HOUR, script, HOUR).await;
+
+        assert_eq!(alerts(&logs, REFUSED_EVENT), 0, "{logs}");
+        assert_eq!(ceilings.for_chain("sepolia"), 240.0);
+        assert_eq!(ceilings.for_chain("mainnet"), 1_800.0, "the fallback");
+        assert!(logs.contains("mainnet from 180 to 1800"), "{logs}");
     }
 
     #[tokio::test(start_paused = true)]
@@ -597,6 +628,10 @@ mod tests {
         assert!(
             logs.contains("stay on the minimum prices built into this release"),
             "it says which table is in use: {logs}"
+        );
+        assert!(
+            logs.contains("A restart does not get past this"),
+            "and that the file itself is at fault: {logs}"
         );
     }
 
@@ -726,7 +761,7 @@ mod tests {
     async fn a_failure_that_goes_on_is_alerted_on_every_10_minutes_at_most() {
         let minute = Duration::from_secs(60);
         fn refused() -> Fetched {
-            Ok(published(&[("arbitrum-one", 450.0)]))
+            Ok(published(&[("arbitrum-one", 0.0)]))
         }
 
         // Stopped between 2 fetches, so that the count does not hang on which comes first.

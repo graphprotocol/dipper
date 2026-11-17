@@ -3,7 +3,7 @@
 //! default, a multiple of the minimum price indexer-rs suggests for the chain.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, PoisonError, RwLock},
 };
 
@@ -87,18 +87,23 @@ impl BasePriceCeilings {
         self.chains.is_none() || self.fallback.is_none()
     }
 
-    /// Takes `fetched` as the suggested minimums in use, if it passes every check against
-    /// the ones in use now, and says which ceilings that changed.
+    /// Takes `fetched` as the suggested minimums in use, if it passes every check, and says
+    /// which ceilings that changed. A table fetched earlier is one of the checks. The table
+    /// dipper starts on is not: it only stands in until the first one is fetched.
     pub fn follow(
         &self,
         fetched: Minimums,
         max_agreement_grt_per_30_days: f64,
     ) -> Result<Vec<CeilingChange>, Refusal> {
         let mut in_use = self.in_use.write().unwrap_or_else(PoisonError::into_inner);
-        checked(&fetched, &in_use.minimums, max_agreement_grt_per_30_days)?;
-        // No chain is ever dropped, so the fetched table names every chain that can change.
-        let changes = fetched
-            .keys()
+        checked(&fetched, max_agreement_grt_per_30_days)?;
+        if in_use.fetched_at.is_some() {
+            checked_against(&fetched, &in_use.minimums)?;
+        }
+        // The first table may leave out a chain the built-in one has, which then changes too.
+        let chains: BTreeSet<&String> = in_use.minimums.keys().chain(fetched.keys()).collect();
+        let changes = chains
+            .into_iter()
             .filter_map(|chain| {
                 let old = self.ceiling_over(chain, &in_use.minimums);
                 let new = self.ceiling_over(chain, &fetched);
@@ -155,8 +160,16 @@ pub struct CeilingChange {
     pub new: f64,
 }
 
-/// The most a suggested minimum may move, up or down, between the table in use and the next.
+/// The most a suggested minimum may move, up or down, between 1 fetched table and the next.
 pub const MAX_CHANGE_FACTOR: f64 = 10.0;
+
+impl Refusal {
+    /// Whether the table was refused for how it differs from the one fetched before it.
+    /// A dipper that restarts has no such table, and so takes the same table.
+    pub fn is_against_table_in_use(&self) -> bool {
+        matches!(self, Self::ChainDropped { .. } | Self::MovedTooFar { .. })
+    }
+}
 
 /// Why a table of suggested minimums is not taken, and the one in use is kept.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -231,12 +244,8 @@ impl<'de> serde::Deserialize<'de> for ChainMinimums {
     }
 }
 
-/// Checks a table against the one in use and the most an agreement may pay.
-fn checked(
-    fetched: &Minimums,
-    in_use: &Minimums,
-    max_agreement_grt_per_30_days: f64,
-) -> Result<(), Refusal> {
+/// Checks a table by itself and against the most an agreement may pay.
+fn checked(fetched: &Minimums, max_agreement_grt_per_30_days: f64) -> Result<(), Refusal> {
     if fetched.is_empty() {
         return Err(Refusal::Empty);
     }
@@ -245,20 +254,6 @@ fn checked(
             return Err(Refusal::NotPositive {
                 chain: chain.clone(),
                 value: *minimum,
-            });
-        }
-    }
-    for (chain, from) in in_use {
-        let Some(to) = fetched.get(chain).copied() else {
-            return Err(Refusal::ChainDropped {
-                chain: chain.clone(),
-            });
-        };
-        if to > from * MAX_CHANGE_FACTOR || to < from / MAX_CHANGE_FACTOR {
-            return Err(Refusal::MovedTooFar {
-                chain: chain.clone(),
-                from: *from,
-                to,
             });
         }
     }
@@ -273,6 +268,26 @@ fn checked(
                 minimum: *minimum,
                 ceiling,
                 cap: max_agreement_grt_per_30_days,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Checks a table against the one fetched before it: it may not drop a chain, nor move a
+/// minimum by more than [`MAX_CHANGE_FACTOR`] times.
+fn checked_against(fetched: &Minimums, in_use: &Minimums) -> Result<(), Refusal> {
+    for (chain, from) in in_use {
+        let Some(to) = fetched.get(chain).copied() else {
+            return Err(Refusal::ChainDropped {
+                chain: chain.clone(),
+            });
+        };
+        if to > from * MAX_CHANGE_FACTOR || to < from / MAX_CHANGE_FACTOR {
+            return Err(Refusal::MovedTooFar {
+                chain: chain.clone(),
+                from: *from,
+                to,
             });
         }
     }
@@ -364,10 +379,7 @@ mod tests {
 
     #[test]
     fn refuses_an_empty_table() {
-        assert_eq!(
-            checked(&Minimums::new(), &in_use(), CAP),
-            Err(Refusal::Empty)
-        );
+        assert_eq!(checked(&Minimums::new(), CAP), Err(Refusal::Empty));
     }
 
     #[test]
@@ -376,7 +388,7 @@ mod tests {
             let mut fetched = in_use();
             fetched.insert("mainnet".to_string(), value);
 
-            let refused = checked(&fetched, &in_use(), CAP);
+            let refused = checked(&fetched, CAP);
 
             assert!(
                 matches!(&refused, Err(Refusal::NotPositive { chain, .. }) if chain == "mainnet"),
@@ -391,7 +403,7 @@ mod tests {
         fetched.remove("sepolia");
 
         assert_eq!(
-            checked(&fetched, &in_use(), CAP),
+            checked_against(&fetched, &in_use()),
             Err(Refusal::ChainDropped {
                 chain: "sepolia".to_string()
             })
@@ -410,7 +422,7 @@ mod tests {
             let mut fetched = in_use();
             fetched.insert("mainnet".to_string(), to);
 
-            let outcome = checked(&fetched, &in_use(), CAP);
+            let outcome = checked_against(&fetched, &in_use());
 
             let moved_too_far = Err(Refusal::MovedTooFar {
                 chain: "mainnet".to_string(),
@@ -428,9 +440,9 @@ mod tests {
         let mut fetched = in_use();
         fetched.insert("arbitrum-one".to_string(), 500.0);
 
-        assert_eq!(checked(&fetched, &in_use(), 2_000.0), Ok(()), "at the cap");
+        assert_eq!(checked(&fetched, 2_000.0), Ok(()), "at the cap");
         assert_eq!(
-            checked(&fetched, &in_use(), 1_999.0),
+            checked(&fetched, 1_999.0),
             Err(Refusal::AboveAgreementCap {
                 chain: "arbitrum-one".to_string(),
                 minimum: 500.0,
@@ -446,7 +458,8 @@ mod tests {
         fetched.insert("base".to_string(), 80.0);
         fetched.insert("mainnet".to_string(), 60.0);
 
-        assert_eq!(checked(&fetched, &in_use(), CAP), Ok(()));
+        assert_eq!(checked(&fetched, CAP), Ok(()));
+        assert_eq!(checked_against(&fetched, &in_use()), Ok(()));
     }
 
     #[test]
@@ -503,9 +516,59 @@ mod tests {
         assert!(fetched_at >= before, "{fetched_at} is before {before}");
     }
 
+    /// The table built into the release only stands in until one is fetched. A dipper that
+    /// restarts has to take the table it was on before, however far from the release's.
+    #[test]
+    fn the_first_table_after_a_start_is_not_held_to_the_built_in_one() {
+        let ceilings = BasePriceCeilings::new(None, None, in_use());
+        // 12 times the built-in figure for sepolia, and no mainnet.
+        let published = minimums(&[("arbitrum-one", 450.0), ("sepolia", 60.0)]);
+
+        let changes = ceilings
+            .follow(published.clone(), CAP)
+            .expect("the first table is taken");
+
+        assert_eq!(*ceilings.minimums(), published);
+        let change = |chain: &str, old, new| CeilingChange {
+            chain: Some(chain.to_string()),
+            old,
+            new,
+        };
+        assert_eq!(
+            changes,
+            [
+                // A chain the table no longer lists moves to the fallback.
+                change("mainnet", 180.0, 1_800.0),
+                change("sepolia", 20.0, 240.0),
+            ]
+        );
+    }
+
+    /// What a table has to be by itself is asked of the first one too.
+    #[test]
+    fn the_first_table_after_a_start_is_held_to_the_rules_that_need_no_other_table() {
+        let ceilings = BasePriceCeilings::new(None, None, in_use());
+        let above_the_cap = minimums(&[("arbitrum-one", 5_001.0)]);
+        let not_positive = minimums(&[("arbitrum-one", 0.0)]);
+
+        assert_eq!(ceilings.follow(Minimums::new(), CAP), Err(Refusal::Empty));
+        for (table, rule) in [(above_the_cap, "the cap"), (not_positive, "positive")] {
+            let refused = ceilings.follow(table, CAP);
+            assert!(
+                matches!(
+                    refused,
+                    Err(Refusal::AboveAgreementCap { .. } | Refusal::NotPositive { .. })
+                ),
+                "{rule}: {refused:?}"
+            );
+        }
+        assert_eq!(*ceilings.minimums(), in_use());
+    }
+
     #[test]
     fn a_table_that_is_refused_leaves_the_one_in_use() {
         let ceilings = BasePriceCeilings::new(None, None, in_use());
+        ceilings.follow(in_use(), CAP).expect("the first table");
         let mut fetched = in_use();
         fetched.insert("mainnet".to_string(), 4_500.0);
 

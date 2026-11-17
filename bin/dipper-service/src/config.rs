@@ -1685,7 +1685,7 @@ fn default_deadline_seconds() -> u64 {
 
 /// The minimum GRT per 30 days indexer-rs suggests for each chain of the initial DIPs rollout.
 /// Only the starting value: dipper fetches the table indexer-rs publishes and follows it. This
-/// copy is held until a fetched table is taken, and is what the first one is checked against.
+/// copy stands in until a fetched table is taken, and that first one is not held to it.
 const INDEXER_RS_MIN_GRT_PER_30_DAYS: &[(&str, f64)] = &[
     ("arbitrum-one", 450.0),
     ("matic", 300.0),
@@ -2971,6 +2971,7 @@ mod tests {
         let rules = [
             "each start begins on the minimums built into its release",
             "A read that fails is tried again after 1 minute",
+            "these 2 rules do not protect the first read after a start",
         ];
 
         for rule in rules {
