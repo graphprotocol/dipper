@@ -1,6 +1,6 @@
-//! Applies a set-indexing-target request end to end: the registry upsert, the
-//! request-received lifecycle event, and the follow-up reassessment job. Both
-//! front doors share it: the admin RPC handler and the Kafka request consumer.
+//! Applies a set-indexing-target request end to end: the chain check, then the registry upsert,
+//! the request-received lifecycle event, and the follow-up reassessment job. Both front doors
+//! share it: the admin RPC handler and the Kafka request consumer.
 
 use std::sync::Arc;
 
@@ -32,7 +32,11 @@ pub struct SetIndexingTarget {
     pub priority: JobPriority,
 }
 
-/// Errors from applying a set-indexing-target request. Every variant is
+/// A request that passed [`check_chain`]. Nothing else builds one, so no front door can apply
+/// a request it has not checked.
+pub struct ChainChecked(SetIndexingTarget);
+
+/// Errors from checking or applying a set-indexing-target request. Every variant is
 /// already logged with full context when returned.
 #[derive(Debug, thiserror::Error)]
 pub enum ApplyError {
@@ -63,23 +67,23 @@ pub enum ApplyError {
 
 /// Refuses a request for indexers whose chain is not the one its subgraph manifest
 /// indexes. A cancel is let through, so a request stored under the wrong chain can
-/// still be closed.
-async fn check_chain(
+/// still be closed. Changes nothing, so a front door can run its own last checks after it.
+pub async fn check_chain(
     chain_check: &dyn RequestChainCheck,
-    request: &SetIndexingTarget,
-) -> Result<(), ApplyError> {
+    request: SetIndexingTarget,
+) -> Result<ChainChecked, ApplyError> {
     let SetIndexingTarget {
         requested_by,
         deployment_id,
         deployment_chain_id,
         num_candidates,
         ..
-    } = *request;
+    } = request;
     if num_candidates == 0 {
-        return Ok(());
+        return Ok(ChainChecked(request));
     }
     let Err(err) = chain_check.check(&deployment_id, deployment_chain_id).await else {
-        return Ok(());
+        return Ok(ChainChecked(request));
     };
     if err.is_transient() {
         tracing::error!(
@@ -113,15 +117,13 @@ pub async fn apply_set_indexing_target<R, W>(
     registry: &R,
     worker: &W,
     events: &Arc<dyn SubgraphIndexingAgreementEventsProducer>,
-    chain_check: &dyn RequestChainCheck,
     the_graph_network: ChainId,
-    request: SetIndexingTarget,
+    ChainChecked(request): ChainChecked,
 ) -> Result<Option<IndexingRequestId>, ApplyError>
 where
     R: IndexingRequestRegistry + Send + Sync,
     W: WorkerQueue + Send + Sync,
 {
-    check_chain(chain_check, &request).await?;
     let SetIndexingTarget {
         requested_by,
         deployment_id,

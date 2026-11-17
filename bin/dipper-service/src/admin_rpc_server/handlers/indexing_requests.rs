@@ -21,7 +21,7 @@ use crate::{
         IndexingRequestStatus as IndexingRequestRecordStatus, RequestOrderRegistry,
     },
     request_chain_check::RequestChainCheck,
-    set_indexing_target::{ApplyError, SetIndexingTarget, apply_set_indexing_target},
+    set_indexing_target::{ApplyError, SetIndexingTarget, apply_set_indexing_target, check_chain},
     signing::eip712::Eip712Signer,
     worker::service::{JobPriority, WorkerQueue},
 };
@@ -217,9 +217,22 @@ where
             ));
         }
 
-        // Last of this handler's own checks, so a request one of them refuses leaves no mark
-        // behind that would block the operator's next one. The chain check still follows, in
-        // `apply_set_indexing_target`.
+        let request = check_chain(
+            self.request_chain_check.as_ref(),
+            SetIndexingTarget {
+                requested_by,
+                deployment_id,
+                deployment_chain_id: chain_id,
+                num_candidates,
+                // Interactive: a caller is waiting on this set-target result.
+                priority: JobPriority::Interactive,
+            },
+        )
+        .await
+        .map_err(into_rpc_error)?;
+
+        // Last of the checks, so a request refused for any other reason leaves no mark behind
+        // that would block the operator's next one.
         match self
             .registry
             .accept_request_signed_at(requested_by, deployment_id, chain_id, signed_at)
@@ -253,29 +266,26 @@ where
             &self.registry,
             &self.worker,
             &self.subgraph_indexing_agreements_events_emitter,
-            self.request_chain_check.as_ref(),
             self.signer.chain_id(),
-            SetIndexingTarget {
-                requested_by,
-                deployment_id,
-                deployment_chain_id: chain_id,
-                num_candidates,
-                // Interactive: a caller is waiting on this set-target result.
-                priority: JobPriority::Interactive,
-            },
+            request,
         )
         .await
-        .map_err(|err| match err {
-            // The caller sees why, so it can resend with the manifest's chain.
-            ApplyError::WrongChain(err) => ErrorObject::owned(400, err.to_string(), None::<()>),
-            ApplyError::ChainCheckUnavailable(err) => {
-                ErrorObject::owned(503, err.to_string(), None::<()>)
-            }
-            ApplyError::Registry(_) => ErrorObject::borrowed(503, "Service unavailable", None),
-            ApplyError::QueueReassess { .. } => {
-                ErrorObject::borrowed(500, "Internal server error", None)
-            }
-        })
+        .map_err(into_rpc_error)
+    }
+}
+
+/// What the caller is told when its request was refused or could not be applied.
+fn into_rpc_error(err: ApplyError) -> ErrorObject<'static> {
+    match err {
+        // The caller sees why, so it can resend with the manifest's chain.
+        ApplyError::WrongChain(err) => ErrorObject::owned(400, err.to_string(), None::<()>),
+        ApplyError::ChainCheckUnavailable(err) => {
+            ErrorObject::owned(503, err.to_string(), None::<()>)
+        }
+        ApplyError::Registry(_) => ErrorObject::borrowed(503, "Service unavailable", None),
+        ApplyError::QueueReassess { .. } => {
+            ErrorObject::borrowed(500, "Internal server error", None)
+        }
     }
 }
 
@@ -324,7 +334,7 @@ mod tests {
     use super::*;
     use crate::{
         registry::{RequestsPage, Result as RegistryResult, SetTargetOutcome},
-        request_chain_check::SkipChainCheck,
+        request_chain_check::{ChainCheckError, SkipChainCheck},
         test_support::{CapturedEvent, CapturingEventsProducer, RefusingChainCheck},
         worker::queue::JobId,
     };
@@ -1220,6 +1230,56 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err.code(), 503);
+    }
+
+    /// A chain check that can't read the manifest the first time it is asked, and passes after.
+    #[derive(Default)]
+    struct UnreadableOnce {
+        asked: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl RequestChainCheck for UnreadableOnce {
+        async fn check(&self, _: &DeploymentId, _: ChainId) -> Result<(), ChainCheckError> {
+            if self.asked.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err(ChainCheckError::Unavailable("IPFS is down".to_string()))
+            }
+        }
+    }
+
+    /// A request the chain check turns away leaves no trace: the same signed request is
+    /// accepted once the manifest can be read, not refused as one already accepted.
+    #[tokio::test]
+    async fn an_unreadable_manifest_does_not_block_the_same_request_later() {
+        let deployment = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
+        let signer = PrivateKeySigner::random();
+        let sign = || {
+            signed_for(
+                SIGNER_CHAIN_ID,
+                &signer,
+                deployment,
+                DEPLOYMENT_CHAIN_ID,
+                Some(3),
+                NOW,
+            )
+        };
+        let (server, _events) = server_with_check(
+            signer.address(),
+            SetTargetOutcome::Inserted {
+                id: IndexingRequestId::new(),
+            },
+            Arc::new(UnreadableOnce::default()),
+        );
+        let while_unreadable = server.set_indexing_target_candidates(sign()).await;
+
+        let result = server.set_indexing_target_candidates(sign()).await;
+
+        let err = while_unreadable.expect_err("refused while the manifest can't be read");
+        assert_eq!(err.code(), 503, "{err:?}");
+        assert!(result.is_ok(), "handler returned an error: {result:?}");
+        assert_eq!(accepted_counts(&server), vec![3]);
     }
 
     #[tokio::test]

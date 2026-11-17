@@ -24,7 +24,7 @@ use crate::{
     config::IndexingRequestConsumerConfig,
     registry::IndexingRequestRegistry,
     request_chain_check::{ChainCheckError, RequestChainCheck},
-    set_indexing_target::{ApplyError, SetIndexingTarget, apply_set_indexing_target},
+    set_indexing_target::{ApplyError, SetIndexingTarget, apply_set_indexing_target, check_chain},
     worker::service::{JobPriority, WorkerQueue},
 };
 
@@ -577,22 +577,27 @@ where
     };
 
     let queue_retry_id = loop {
-        let result = apply_set_indexing_target(
-            registry,
-            worker_queue,
-            events,
-            chain_check,
-            protocol_chain_id,
-            SetIndexingTarget {
-                requested_by,
-                deployment_id: target.deployment_id,
-                deployment_chain_id: target.deployment_chain_id,
-                num_candidates,
-                // Interactive: a developer just asked for this in Studio.
-                priority: JobPriority::Interactive,
-            },
-        )
-        .await;
+        let request = SetIndexingTarget {
+            requested_by,
+            deployment_id: target.deployment_id,
+            deployment_chain_id: target.deployment_chain_id,
+            num_candidates,
+            // Interactive: a developer just asked for this in Studio.
+            priority: JobPriority::Interactive,
+        };
+        let result = match check_chain(chain_check, request).await {
+            Ok(request) => {
+                apply_set_indexing_target(
+                    registry,
+                    worker_queue,
+                    events,
+                    protocol_chain_id,
+                    request,
+                )
+                .await
+            }
+            Err(err) => Err(err),
+        };
 
         match result {
             Ok(_) => return true,
