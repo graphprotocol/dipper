@@ -897,7 +897,7 @@ where
     R: IndexingRequestRegistry + Send + Sync,
     W: WorkerQueue + Send + Sync,
 {
-    let num_candidates = clamped_count(target, partition, offset);
+    let num_candidates = target.num_candidates;
     let mut retries = Retries {
         partition,
         offset,
@@ -968,23 +968,6 @@ where
 
 /// The step named in the log when the reassessment job that follows a write can't be queued.
 const QUEUING_ITS_JOB: &str = "queuing its reassessment job";
-
-/// The count a record asks for, held to the limit the admin RPC refuses above, so a developer
-/// may ask for as many through Studio as through the RPC. A record can't be answered, so a
-/// larger count is cut to the limit with a warning. 0 passes untouched: it is the cancel shape.
-fn clamped_count(target: &ProposedTarget, partition: i32, offset: i64) -> usize {
-    if target.num_candidates <= MAX_NUM_CANDIDATES {
-        return target.num_candidates;
-    }
-    tracing::warn!(
-        partition,
-        offset,
-        requested = target.num_candidates,
-        max_candidates = MAX_NUM_CANDIDATES,
-        "clamping the requested indexer count to the most a request may ask for"
-    );
-    MAX_NUM_CANDIDATES
-}
 
 /// 1 attempt at a record: its chain check, then the apply. `None` if a stop came during the
 /// check, which only reads and can take the whole IPFS timeout for 1 manifest. The apply is
@@ -1074,6 +1057,8 @@ enum Skip {
     OtherNetwork,
     /// A request this dipper should have applied and can't read; the text says why.
     Unreadable(&'static str),
+    /// It asks for this many indexers, more than a request may: the admin RPC refuses the same.
+    TooManyIndexers(usize),
 }
 
 /// Logs a record that is passed over for good. Studio gets no reply, so one this dipper
@@ -1095,6 +1080,15 @@ fn log_skipped_record(skip: Skip, topic: &str, partition: i32, offset: i64, key:
             offset,
             ?key,
             "Dropped a Studio indexing request dipper can't apply: {reason}"
+        ),
+        Skip::TooManyIndexers(asked) => tracing::error!(
+            event = DROPPED_EVENT,
+            topic,
+            partition,
+            offset,
+            ?key,
+            "Dropped a Studio indexing request that asks for {asked} indexers: a request may ask \
+             for at most {MAX_NUM_CANDIDATES}, and nothing was changed"
         ),
     }
 }
@@ -1149,6 +1143,11 @@ fn decode_propose(value: Option<&[u8]>, expected_network: &str) -> Result<Propos
     let Ok(num_candidates) = usize::try_from(propose.indexing_agreements_requested) else {
         return Err(Skip::Unreadable("negative indexing agreements requested"));
     };
+    // Dropped, not cut to the limit: each indexer is paid, so a bad count must not become the
+    // most agreements a request can buy. Studio refuses such a count before it sends one.
+    if num_candidates > MAX_NUM_CANDIDATES {
+        return Err(Skip::TooManyIndexers(num_candidates));
+    }
 
     Ok(ProposedTarget {
         event_id: event.event_id,
@@ -1784,50 +1783,25 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn an_oversized_count_is_clamped_to_the_most_a_request_may_ask_for() {
-        let registry = MockRegistry::returning(SetTargetOutcome::Inserted {
-            id: IndexingRequestId::new(),
-        });
-        let worker = MockWorker::new();
-
-        let (applied, _) = run_apply(&registry, &worker, 5_000_000).await;
-
-        assert!(applied);
-        assert_eq!(
-            registry.calls()[0].3,
-            MAX_NUM_CANDIDATES,
-            "the registry must see the clamped count, not the wire value"
-        );
-        assert_eq!(worker.reassessments()[0].3, MAX_NUM_CANDIDATES);
-    }
-
     /// Studio and the admin RPC are 2 doors to the same request, so both let a developer ask
     /// for the same number of indexers: up to 100, the count the RPC refuses anything above.
-    #[tokio::test]
-    async fn a_studio_request_may_ask_for_as_many_indexers_as_an_rpc_request() {
-        let inserted = || {
-            Some(SetTargetOutcome::Inserted {
-                id: IndexingRequestId::new(),
-            })
+    #[test]
+    fn a_studio_request_may_ask_for_as_many_indexers_as_an_rpc_request() {
+        let asking_for = |count| {
+            let bytes = encode_propose(
+                EVENT_TYPE_PROPOSE,
+                "eip155:42161",
+                QM_HASH,
+                "eip155:1",
+                count,
+            );
+            decode_propose(Some(&bytes), "eip155:42161").map(|target| target.num_candidates)
         };
-        let registry = MockRegistry::scripted(vec![inserted(), inserted()]);
-        let worker = MockWorker::new();
-        let limit = MAX_NUM_CANDIDATES;
 
-        let at_the_limit = logged(async {
-            run_apply(&registry, &worker, limit).await;
-        })
-        .await;
-        let above_it = logged(async {
-            run_apply(&registry, &worker, limit + 1).await;
-        })
-        .await;
-
-        let asked: Vec<usize> = registry.calls().iter().map(|call| call.3).collect();
-        assert_eq!(asked, [100, 100], "100 as asked, and 101 cut to 100");
-        assert!(!at_the_limit.contains("clamping"), "{at_the_limit}");
-        assert!(above_it.contains("clamping"), "{above_it}");
+        assert_eq!(asking_for(100), Ok(MAX_NUM_CANDIDATES));
+        assert_eq!(asking_for(101), Err(Skip::TooManyIndexers(101)));
+        assert_eq!(asking_for(5_000_000), Err(Skip::TooManyIndexers(5_000_000)));
+        assert_eq!(asking_for(0), Ok(0), "a cancel is not a count to refuse");
     }
 
     #[tokio::test]
@@ -2380,6 +2354,71 @@ mod tests {
         assert!(logs.contains("different protocol network"), "{logs}");
         assert!(registry.calls().is_empty(), "none of them is applied");
         assert_eq!(registry.stored_offsets(), [0, 1, 2, 3, 4]);
+    }
+
+    /// The admin RPC refuses a request for more indexers than the limit and changes nothing.
+    /// A record can't be refused, so the same request from Studio is dropped and alerted on:
+    /// cutting it to the limit would turn a bad count into the most agreements a request can buy.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_for_more_indexers_than_the_limit_is_dropped_not_cut_to_it() {
+        let record = |offset, count| FetchedRecord {
+            offset,
+            key: Some(b"eip155:42161/QmUzRg/request".to_vec()),
+            value: Some(encode_propose(
+                EVENT_TYPE_PROPOSE,
+                "eip155:42161",
+                QM_HASH,
+                "eip155:1",
+                count,
+            )),
+        };
+        let records = vec![record(0, 100), record(1, 101), record(2, i32::MAX)];
+        // An answer for each, so that a record wrongly let through shows as applied.
+        let inserted = || {
+            Some(SetTargetOutcome::Inserted {
+                id: IndexingRequestId::new(),
+            })
+        };
+        let registry = MockRegistry::scripted(vec![inserted(), inserted(), inserted()]);
+        registry.offsets.lock().expect("poisoned").push(0);
+        let worker = MockWorker::new();
+        let source = ScriptedSource::new(vec![Ok((records, 3))]);
+        let asked = Arc::clone(&source.asked);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let logs = logged(run_until(
+            partition_loop_over(
+                source,
+                &registry,
+                &worker,
+                Arc::new(SkipChainCheck),
+                shutdown_rx,
+            ),
+            &shutdown_tx,
+            || asked.lock().expect("poisoned").len() == 2,
+        ))
+        .await;
+
+        let applied: Vec<usize> = registry.calls().iter().map(|call| call.3).collect();
+        assert_eq!(
+            applied,
+            [100],
+            "the limit itself is applied, nothing above it"
+        );
+        assert_eq!(alerts(&logs, DROPPED_EVENT), 2, "{logs}");
+        let alert_lines: Vec<&str> = logs
+            .lines()
+            .filter(|line| line.contains(DROPPED_EVENT))
+            .collect();
+        assert!(alert_lines[0].contains("offset=1"), "{}", alert_lines[0]);
+        assert!(
+            alert_lines[0].contains("101 indexers"),
+            "{}",
+            alert_lines[0]
+        );
+        assert!(alert_lines[0].contains("at most 100"), "{}", alert_lines[0]);
+        assert!(alert_lines[1].contains("2147483647 indexers"));
+        assert_eq!(registry.stored_offsets(), [0, 1, 2, 3], "each is passed");
     }
 
     // -------- offsets out of range --------
