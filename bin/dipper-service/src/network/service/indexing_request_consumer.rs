@@ -71,6 +71,24 @@ const LOCK_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long giving the lock up may take, within the 5 seconds dipper allows a service to stop.
 const LOCK_RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// The application name of the lock's database session, to find it by in `pg_stat_activity`.
+const LOCK_SESSION_NAME: &str = "dipper-studio-request-consumer-lock";
+
+/// How long the lock's session may sit idle before the database ends it and frees the lock.
+/// It bounds how long a dipper that vanished without closing its connection keeps the lock,
+/// where the database would otherwise believe in that session until TCP gives up on it.
+const LOCK_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+// The longest a holder that is well goes between 2 checks reaching the database: 1 interval, a
+// slow answer to the check before, and a partition count read in the way. A timeout of less
+// than twice that would have the database end sessions of dippers that are only slow.
+const _: () = assert!(
+    LOCK_IDLE_TIMEOUT.as_secs()
+        >= 2 * (LOCK_CHECK_INTERVAL.as_secs()
+            + LOCK_CALL_TIMEOUT.as_secs()
+            + PARTITION_METADATA_CHECK_TIMEOUT.as_secs())
+);
+
 /// How long the same record, fetch or connect may be retried before it is alerted on.
 const STALL_ALERT_AFTER: Duration = Duration::from_secs(10 * 60);
 
@@ -128,10 +146,13 @@ pub trait KafkaConsumerOffsetRegistry {
 /// later request for the same deployment.
 #[async_trait]
 pub trait ConsumerLock {
-    /// Opens a database connection of its own to take the lock `key` on.
+    /// Opens a database connection of its own to take the lock `key` on, listed by the
+    /// database under `name` and ended by it once idle for `idle_timeout`.
     async fn consumer_lock_connection(
         &self,
         key: i64,
+        name: &str,
+        idle_timeout: Duration,
     ) -> Result<Box<dyn LockConnection>, crate::registry::Error>;
 }
 
@@ -140,6 +161,10 @@ pub trait ConsumerLock {
 /// many clients would hand the lock to others, or keep it after this dipper has gone.
 #[async_trait]
 pub trait LockConnection: Send {
+    /// What the database said if it would not end this connection once idle, as one older
+    /// than Postgres 14 will not. The lock is held on it all the same.
+    fn idle_timeout_refused(&self) -> Option<&str>;
+
     /// Tries to take the lock without waiting; `false` while another connection holds it.
     async fn try_lock(&mut self) -> Result<bool, crate::registry::Error>;
 
@@ -436,13 +461,21 @@ async fn lock_taken<L: ConsumerLock>(
             _ = rx_stop.recv() => return None,
             tried = try_lock(registry, key, &mut connection) => tried,
         };
+        if let Some(refusal) = connection.as_ref().and_then(|c| c.idle_timeout_refused()) {
+            wait.has_no_idle_timeout(refusal);
+        }
         match tried {
             Ok(true) => {
                 tracing::info!(topic, "holding the lock to read Studio's indexing requests");
                 return connection;
             }
-            Ok(false) => wait.goes_on("another dipper holds it"),
-            Err(error) => wait.goes_on(&format!("the database could not be asked ({error})")),
+            // All a refusal says is that some session holds the lock, not that a dipper does.
+            Ok(false) => wait.goes_on(format_args!(
+                "another database session holds it, which is either a dipper that is still \
+                 running or one that has gone and whose session the database has not ended yet \
+                 (in pg_stat_activity both have the application_name '{LOCK_SESSION_NAME}')"
+            )),
+            Err(error) => wait.goes_on(format_args!("the database could not be asked ({error})")),
         }
         tokio::select! {
             _ = rx_stop.recv() => return None,
@@ -461,7 +494,11 @@ async fn try_lock<L: ConsumerLock>(
     let attempt = async {
         let connection = match connection {
             Some(connection) => connection,
-            None => connection.insert(registry.consumer_lock_connection(key).await?),
+            None => {
+                let opening =
+                    registry.consumer_lock_connection(key, LOCK_SESSION_NAME, LOCK_IDLE_TIMEOUT);
+                connection.insert(opening.await?)
+            }
         };
         connection.try_lock().await
     };
@@ -478,17 +515,34 @@ async fn try_lock<L: ConsumerLock>(
 #[derive(Default)]
 struct LockWait {
     logged: bool,
+    warned_of_no_idle_timeout: bool,
     stall: Stall,
 }
 
 impl LockWait {
+    /// Warns, once in a wait, that the database would not put the idle timeout on the lock's
+    /// session. The lock still works, as it did before there was a timeout to ask for.
+    fn has_no_idle_timeout(&mut self, refusal: &str) {
+        if self.warned_of_no_idle_timeout {
+            return;
+        }
+        self.warned_of_no_idle_timeout = true;
+        tracing::warn!(
+            refusal,
+            "The database would not take an idle timeout for the session that holds the Studio \
+             indexing request consumer's lock; the setting needs Postgres 14 or later. A dipper \
+             that vanishes without closing its connection will keep the lock until the database \
+             gives up on that connection by itself, which can take hours"
+        );
+    }
+
     /// Notes 1 more try that did not get the lock. A wait is normal while a deploy replaces
     /// the pod that holds it, so it is alerted on only once it has lasted far longer than that.
-    fn goes_on(&mut self, why: &str) {
+    fn goes_on(&mut self, why: impl std::fmt::Display) {
         if !self.logged {
             self.logged = true;
             tracing::info!(
-                why,
+                %why,
                 "waiting for the lock that lets 1 dipper at a time read Studio's indexing requests"
             );
         }
@@ -1841,6 +1895,10 @@ mod tests {
         keys: Mutex<Vec<i64>>,
         /// When the database was asked something on a connection, a try or a check.
         spoken: Mutex<Vec<tokio::time::Instant>>,
+        /// The name and the idle timeout each connection was opened with.
+        sessions: Mutex<Vec<(String, Duration)>>,
+        /// While set the database refuses the idle timeout, as one older than Postgres 14 does.
+        no_idle_timeout: std::sync::atomic::AtomicBool,
     }
 
     impl MockLock {
@@ -1875,6 +1933,13 @@ mod tests {
 
     #[async_trait]
     impl LockConnection for MockLockConnection {
+        fn idle_timeout_refused(&self) -> Option<&str> {
+            let refused = &self.0.no_idle_timeout;
+            refused
+                .load(std::sync::atomic::Ordering::SeqCst)
+                .then_some("unrecognized configuration parameter")
+        }
+
         async fn try_lock(&mut self) -> RegistryResult<bool> {
             use std::sync::atomic::Ordering::SeqCst;
             self.0.spoken_on();
@@ -1924,8 +1989,12 @@ mod tests {
         async fn consumer_lock_connection(
             &self,
             key: i64,
+            name: &str,
+            idle_timeout: Duration,
         ) -> RegistryResult<Box<dyn LockConnection>> {
             self.lock.keys.lock().expect("poisoned").push(key);
+            let session = (name.to_string(), idle_timeout);
+            self.lock.sessions.lock().expect("poisoned").push(session);
             Ok(Box::new(MockLockConnection(Arc::clone(&self.lock))))
         }
     }
@@ -3434,7 +3503,15 @@ mod tests {
             2,
             "at 10 and 20 minutes: {logs}"
         );
-        assert!(logs.contains("another dipper holds"), "{logs}");
+        assert!(
+            !logs.contains("another dipper holds"),
+            "a refused lock does not say who holds it: {logs}"
+        );
+        assert!(logs.contains("another database session holds it"), "{logs}");
+        assert!(
+            logs.contains(LOCK_SESSION_NAME),
+            "it says what to look for in the database: {logs}"
+        );
     }
 
     /// The lock lives on 1 database connection. When that connection is lost the lock is too,
@@ -3661,6 +3738,93 @@ mod tests {
             "the lock's connection went {silence:?} without a word"
         );
         assert_eq!(lock.events(), ["locked", "offset read", "closed"]);
+    }
+
+    /// A dipper that vanishes without closing its connection leaves a session the database
+    /// goes on believing in, lock and all. So the database is told to end the session once it
+    /// goes quiet: soon enough to free the lock, and never while the holder is only waiting.
+    #[tokio::test(start_paused = true)]
+    async fn the_database_is_told_to_end_a_lock_session_that_goes_quiet() {
+        let (registry, stored) = registry_for_a_request();
+        let lock = Arc::clone(&registry.lock);
+        let worker = MockWorker::new();
+        let (tx_stop, rx_stop) = mpsc::channel(1);
+        let reading_for_10_minutes = async {
+            an_offset_is_stored(stored).await;
+            tokio::time::sleep(Duration::from_secs(600)).await;
+        };
+
+        let ended = serve_until(
+            serve_over(
+                |_| Some(Ok(topic_with_a_request())),
+                &registry,
+                &worker,
+                rx_stop,
+            ),
+            tx_stop,
+            reading_for_10_minutes,
+        )
+        .await;
+
+        assert!(matches!(ended, Some(Ok(()))), "{ended:?}");
+        let sessions = lock.sessions.lock().expect("poisoned").clone();
+        let [(name, idle_timeout)] = sessions.as_slice() else {
+            panic!("1 connection is opened: {sessions:?}");
+        };
+        assert_eq!(name, LOCK_SESSION_NAME);
+        let silence = lock.longest_silence();
+        assert!(
+            *idle_timeout >= 3 * silence,
+            "a holder that is well goes {silence:?} without a word, and its session would be \
+             ended after {idle_timeout:?}"
+        );
+        assert!(
+            *idle_timeout <= Duration::from_secs(60),
+            "a holder that has gone would keep the lock for {idle_timeout:?}"
+        );
+    }
+
+    /// The idle timeout came with Postgres 14. An older database refuses it, and the lock
+    /// must still work there as it did before, with a warning that it has no such bound.
+    #[tokio::test(start_paused = true)]
+    async fn a_database_that_cannot_end_idle_sessions_still_gives_the_lock_and_is_warned_on() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (registry, stored) = registry_for_a_request();
+        registry.lock.script(&[Try::Refused, Try::Refused]);
+        registry.lock.no_idle_timeout.store(true, SeqCst);
+        let worker = MockWorker::new();
+        let (tx_stop, rx_stop) = mpsc::channel(1);
+        let mut ended = None;
+
+        let logs = logged(async {
+            ended = serve_until(
+                serve_over(
+                    |_| Some(Ok(topic_with_a_request())),
+                    &registry,
+                    &worker,
+                    rx_stop,
+                ),
+                tx_stop,
+                an_offset_is_stored(stored),
+            )
+            .await;
+        })
+        .await;
+
+        assert!(matches!(ended, Some(Ok(()))), "{ended:?}");
+        assert_eq!(
+            registry.lock.events(),
+            ["refused", "refused", "locked", "offset read", "closed"]
+        );
+        assert_eq!(
+            logs.matches("would not take an idle timeout").count(),
+            1,
+            "warned about once, not at each of the 3 tries: {logs}"
+        );
+        assert!(
+            logs.contains("unrecognized configuration parameter") && logs.contains("Postgres 14"),
+            "the warning says why: {logs}"
+        );
     }
 
     /// The check on the lock runs every few seconds for as long as dipper does, so a stop
