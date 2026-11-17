@@ -155,12 +155,9 @@ where
             ));
         }
 
-        // Partition loops only return on shutdown, so one finishing early means
-        // it panicked or hit a bug; tear the service down so the process
-        // restarts instead of consuming a partial set of partitions. The
-        // metadata timer notices a topic growing partitions: new partitions
-        // would otherwise be consumed by nobody, silently losing requests, so
-        // that also restarts the service to pick up the full layout.
+        // A partition loop only returns on shutdown, so one ending early panicked or hit a bug:
+        // tear the service down to restart with every partition. The metadata timer does the
+        // same when the topic grows, as nobody would read the new partitions and requests are lost.
         let serving = tasks.len();
         let mut metadata_check = tokio::time::interval(PARTITION_METADATA_CHECK_INTERVAL);
         metadata_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -288,12 +285,9 @@ fn reconnecting(first: KafkaConsumer, kafka: KafkaConsumerConfig) -> Reconnectin
     })
 }
 
-/// Consumes one partition sequentially: fetch from the persisted offset, apply
-/// each record, then persist the offset past it. Delivery is at-least-once;
-/// redelivering an open request's count is a registry no-op, though a replay
-/// reaching back past a cancellation briefly re-opens it until the cancel
-/// replays too, which is why re-anchoring below never rewinds further than
-/// the broker forces it to.
+/// Consumes one partition in order: fetch from the stored offset, apply each record, store the
+/// offset past it. Delivery is at-least-once: replaying a count is a no-op, but a replay past a
+/// cancellation re-opens it until the cancel replays, so re-anchoring rewinds no more than forced.
 #[expect(
     clippy::cognitive_complexity,
     clippy::too_many_arguments,
@@ -367,13 +361,11 @@ async fn partition_loop<R, W>(
         let (records, high_watermark) = match fetch {
             Ok((records, high_watermark)) => (records, high_watermark),
             Err(err) if err.is_offset_out_of_range() => {
-                // The broker refuses a cursor outside its retained range: below
-                // the log start when retention deleted records, or above the
-                // log end when the topic was recreated or truncated. Clamp to
-                // the nearest live edge; always rewinding to earliest would
-                // replay the whole retained topic in the truncation case.
-                // Both edges through 1 client, so a rebuild between them can't mix up 2 clusters.
+                // The cursor is outside the broker's retained range: below the log start after
+                // retention, or above the log end after a recreate or truncation. Clamp to the
+                // nearer edge; rewinding to earliest would replay the whole topic when truncated.
                 let range = match with_consumer(&consumer, &mut shutdown_rx, |c| async move {
+                    // Both edges through 1 client, so a rebuild between them can't mix 2 clusters.
                     let earliest = c.offset(partition, OffsetAt::Earliest).await?;
                     let latest = c.offset(partition, OffsetAt::Latest).await?;
                     Ok((earliest, latest))
@@ -536,12 +528,9 @@ async fn sleep_or_shutdown(shutdown_rx: &mut watch::Receiver<bool>, delay: Durat
     }
 }
 
-/// Apply a decoded propose until it fully takes effect, returning `false` if
-/// shutdown was requested first. A registry failure or an unreadable manifest
-/// retries the whole apply (nothing was committed), and a wrong chain skips the
-/// record; a queue failure retries only the job push, because
-/// the row change is already committed and re-running the apply would land on
-/// the registry's no-op path and silently drop the reassessment.
+/// Apply a decoded propose until it takes effect; `false` if shutdown came first. A registry
+/// failure or unreadable manifest retries the whole apply, and a wrong chain skips the record. A
+/// queue failure retries only the job push: a re-apply would be a no-op and drop the reassessment.
 #[allow(clippy::too_many_arguments)]
 async fn apply_target_with_retries<R, W>(
     registry: &R,
