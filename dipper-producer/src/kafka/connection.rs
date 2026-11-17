@@ -28,19 +28,40 @@ pub(crate) async fn connect(opts: ConnectOptions<'_>) -> Result<Client, Connecti
     }
 
     let mut builder = ClientBuilder::new(opts.brokers.to_vec());
-
-    if let Some(mechanism_str) = opts.sasl_mechanism {
-        let mechanism: SaslMechanism = mechanism_str.parse()?;
-        let sasl_config = build_sasl_config(mechanism, opts.sasl_username, opts.sasl_password)?;
+    let (sasl_config, tls_config) = security(&opts)?;
+    if let Some(sasl_config) = sasl_config {
         builder = builder.sasl_config(sasl_config);
     }
-
-    if opts.tls_enabled {
-        let tls_config = build_tls_config(opts.tls_ca_cert_path)?;
+    if let Some(tls_config) = tls_config {
         builder = builder.tls_config(tls_config);
     }
 
     builder.build().await.map_err(ConnectionError::Connection)
+}
+
+/// Whether [`connect`] would accept the SASL and TLS settings, found without connecting, so a
+/// config can be refused when it is loaded.
+pub(crate) fn check_security(opts: &ConnectOptions<'_>) -> Result<(), ConnectionError> {
+    security(opts).map(|_| ())
+}
+
+/// The SASL and TLS setup `opts` asks for, each `None` when it asks for none.
+fn security(
+    opts: &ConnectOptions<'_>,
+) -> Result<(Option<SaslConfig>, Option<Arc<ClientConfig>>), ConnectionError> {
+    let sasl_config = match opts.sasl_mechanism {
+        Some(mechanism) => Some(build_sasl_config(
+            mechanism.parse()?,
+            opts.sasl_username,
+            opts.sasl_password,
+        )?),
+        None => None,
+    };
+    let tls_config = match opts.tls_enabled {
+        true => Some(build_tls_config(opts.tls_ca_cert_path)?),
+        false => None,
+    };
+    Ok((sasl_config, tls_config))
 }
 
 /// Builds SASL configuration from the provided mechanism and credentials.

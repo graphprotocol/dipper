@@ -45,6 +45,53 @@ pub struct KafkaConsumerConfig {
     pub connect_timeout_secs: u64,
 }
 
+/// Why a consumer config can never connect, found without contacting a broker.
+#[derive(Debug, thiserror::Error)]
+pub enum ConsumerConfigError {
+    /// No topic is named
+    #[error("topic must not be empty")]
+    EmptyTopic,
+
+    /// Credentials are given with no mechanism to send them with
+    #[error(
+        "sasl_username or sasl_password is set without sasl_mechanism, so it would not be sent"
+    )]
+    SaslMechanismMissing,
+
+    /// The SASL or TLS settings are ones a connect refuses
+    #[error(transparent)]
+    Connection(#[from] ConnectionError),
+}
+
+impl KafkaConsumerConfig {
+    /// Checks the settings that can be judged without a broker. A connect refuses the same
+    /// ones, but only once the consumer runs, where the refusal is retried like an outage.
+    pub fn validate(&self) -> Result<(), ConsumerConfigError> {
+        if self.topic.trim().is_empty() {
+            return Err(ConsumerConfigError::EmptyTopic);
+        }
+        // A connect only looks at the credentials once a mechanism is named, so without one
+        // it would go ahead unauthenticated and be turned away by a broker that wants them.
+        let credentials = self.sasl_username.is_some() || self.sasl_password.is_some();
+        if self.sasl_mechanism.is_none() && credentials {
+            return Err(ConsumerConfigError::SaslMechanismMissing);
+        }
+        connection::check_security(&self.connect_options())?;
+        Ok(())
+    }
+
+    fn connect_options(&self) -> ConnectOptions<'_> {
+        ConnectOptions {
+            brokers: &self.brokers,
+            sasl_mechanism: self.sasl_mechanism.as_deref(),
+            sasl_username: self.sasl_username.as_deref(),
+            sasl_password: self.sasl_password.as_deref(),
+            tls_enabled: self.tls_enabled,
+            tls_ca_cert_path: self.tls_ca_cert_path.as_deref(),
+        }
+    }
+}
+
 /// Default number of seconds allowed for connect and topic discovery.
 pub fn default_connect_timeout_secs() -> u64 {
     60
@@ -101,15 +148,7 @@ impl KafkaConsumer {
     }
 
     async fn connect_inner(config: &KafkaConsumerConfig) -> Result<Self, ConsumerError> {
-        let client = connection::connect(ConnectOptions {
-            brokers: &config.brokers,
-            sasl_mechanism: config.sasl_mechanism.as_deref(),
-            sasl_username: config.sasl_username.as_deref(),
-            sasl_password: config.sasl_password.as_deref(),
-            tls_enabled: config.tls_enabled,
-            tls_ca_cert_path: config.tls_ca_cert_path.as_deref(),
-        })
-        .await?;
+        let client = connection::connect(config.connect_options()).await?;
 
         let partitions = discover_partitions(&client, &config.topic).await?;
 
@@ -294,6 +333,102 @@ impl ConsumerError {
 mod tests {
     use super::*;
     use crate::kafka::CallError;
+
+    /// A config for 1 local broker and topic `t`, with `settings` laid over it.
+    fn config(settings: serde_json::Value) -> KafkaConsumerConfig {
+        let mut config = serde_json::json!({ "brokers": ["localhost:9092"], "topic": "t" });
+        for (name, value) in settings.as_object().expect("settings are an object") {
+            config[name] = value.clone();
+        }
+        serde_json::from_value(config).expect("a config that parses")
+    }
+
+    #[test]
+    fn a_config_that_can_connect_passes() {
+        let plain = config(serde_json::json!({}));
+        let secured = config(serde_json::json!({
+            "sasl_mechanism": "scram-sha-256",
+            "sasl_username": "dipper",
+            "sasl_password": "secret",
+            "tls_enabled": true,
+        }));
+
+        assert!(plain.validate().is_ok());
+        assert!(secured.validate().is_ok());
+    }
+
+    #[test]
+    fn a_sasl_setting_no_connect_would_accept_is_refused() {
+        let unknown = config(serde_json::json!({ "sasl_mechanism": "SCRAM" }));
+        let no_password = config(serde_json::json!({
+            "sasl_mechanism": "PLAIN",
+            "sasl_username": "dipper",
+        }));
+        let no_username = config(serde_json::json!({
+            "sasl_mechanism": "PLAIN",
+            "sasl_password": "secret",
+        }));
+        let no_mechanism = config(serde_json::json!({
+            "sasl_username": "dipper",
+            "sasl_password": "secret",
+        }));
+
+        assert!(matches!(
+            unknown.validate(),
+            Err(ConsumerConfigError::Connection(
+                ConnectionError::UnsupportedSaslMechanism(mechanism)
+            )) if mechanism == "SCRAM"
+        ));
+        assert!(matches!(
+            no_password.validate(),
+            Err(ConsumerConfigError::Connection(
+                ConnectionError::MissingSaslPassword
+            ))
+        ));
+        assert!(matches!(
+            no_username.validate(),
+            Err(ConsumerConfigError::Connection(
+                ConnectionError::MissingSaslUsername
+            ))
+        ));
+        assert!(matches!(
+            no_mechanism.validate(),
+            Err(ConsumerConfigError::SaslMechanismMissing)
+        ));
+    }
+
+    #[test]
+    fn a_ca_file_that_cannot_be_read_is_refused_when_tls_is_on() {
+        let missing = "/no/such/folder/ca.pem";
+        let with_tls = config(serde_json::json!({
+            "tls_enabled": true,
+            "tls_ca_cert_path": missing,
+        }));
+        let without_tls = config(serde_json::json!({ "tls_ca_cert_path": missing }));
+
+        assert!(matches!(
+            with_tls.validate(),
+            Err(ConsumerConfigError::Connection(
+                ConnectionError::TlsCaCert { .. }
+            ))
+        ));
+        assert!(
+            without_tls.validate().is_ok(),
+            "a connect without TLS never opens the file"
+        );
+    }
+
+    #[test]
+    fn an_empty_topic_is_refused() {
+        for topic in ["", "  "] {
+            let config = config(serde_json::json!({ "topic": topic }));
+
+            assert!(
+                matches!(config.validate(), Err(ConsumerConfigError::EmptyTopic)),
+                "topic {topic:?}"
+            );
+        }
+    }
 
     #[test]
     fn only_failures_to_reach_the_brokers_count_as_unreachable() {

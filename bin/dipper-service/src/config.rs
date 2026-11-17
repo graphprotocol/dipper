@@ -2215,6 +2215,12 @@ impl IndexingRequestConsumerConfig {
                 "indexing_request_consumer.kafka.brokers must list at least 1 broker".to_string(),
             );
         }
+        if let Err(err) = self.kafka.validate() {
+            return Err(format!(
+                "indexing_request_consumer.kafka: {}",
+                crate::log_text::with_causes(&err)
+            ));
+        }
         // 0 makes every connect time out instantly, so startup would fail with
         // a message blaming the broker instead of the config typo.
         if self.kafka.connect_timeout_secs == 0 {
@@ -2308,6 +2314,48 @@ mod tests {
                 .unwrap_err()
                 .contains("fetch_max_bytes")
         );
+    }
+
+    /// A Kafka setting no connect would accept fails at start, even while the consumer is off.
+    /// Found only on the day it is switched on, it would be retried like a broker outage.
+    #[test]
+    fn consumer_kafka_settings_that_can_never_connect_are_refused_while_off() {
+        let refusal = |kafka: serde_json::Value| {
+            consumer_config(serde_json::json!({
+                "enabled": false,
+                "kafka": kafka,
+                "requested_by": "0x8f8c426f956876325b1e037c6eae9b189952994c",
+            }))
+            .validate()
+            .expect_err("a config that can never connect is refused")
+        };
+
+        let mechanism = refusal(serde_json::json!({
+            "brokers": ["localhost:9092"], "topic": "t", "sasl_mechanism": "SCRAM",
+        }));
+        let password = refusal(serde_json::json!({
+            "brokers": ["localhost:9092"], "topic": "t",
+            "sasl_mechanism": "PLAIN", "sasl_username": "dipper",
+        }));
+        let ca_file = refusal(serde_json::json!({
+            "brokers": ["localhost:9092"], "topic": "t",
+            "tls_enabled": true, "tls_ca_cert_path": "/no/such/folder/ca.pem",
+        }));
+        let topic = refusal(serde_json::json!({ "brokers": ["localhost:9092"], "topic": "" }));
+
+        assert!(
+            mechanism.contains("unsupported SASL mechanism 'SCRAM'"),
+            "{mechanism}"
+        );
+        assert!(password.contains("sasl_password is required"), "{password}");
+        assert!(ca_file.contains("/no/such/folder/ca.pem"), "{ca_file}");
+        assert!(topic.contains("topic must not be empty"), "{topic}");
+        for refused in [mechanism, password, ca_file, topic] {
+            assert!(
+                refused.starts_with("indexing_request_consumer.kafka: "),
+                "{refused}"
+            );
+        }
     }
 
     #[test]
