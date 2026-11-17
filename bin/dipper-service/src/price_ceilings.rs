@@ -263,7 +263,7 @@ pub fn default_ceiling(minimum: f64) -> f64 {
     minimum * PAYMENT_CEILING_MULTIPLIER
 }
 
-/// The default ceiling for a chain with no suggested minimum: the highest default chain ceiling.
+/// The default ceiling for a chain the minimums do not list: the highest default chain ceiling.
 pub fn default_fallback_ceiling(minimums: &Minimums) -> f64 {
     minimums
         .values()

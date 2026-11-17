@@ -2953,6 +2953,14 @@ mod tests {
             !readme.contains("the published minimum for a chain"),
             "only the chains indexer-rs lists are held to a multiple of their own minimum"
         );
+        assert!(
+            !readme.contains("no suggested minimum"),
+            "a chain missing from the file may still have a minimum published elsewhere"
+        );
+        assert!(
+            readme.contains("The per-entity ceiling is not in that file"),
+            "the README does not tell operators which ceiling stays put"
+        );
     }
 
     /// Stale `max_initial_tokens` and `max_ongoing_tokens_per_second` keys
