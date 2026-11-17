@@ -483,6 +483,7 @@ impl Default for AlertsConfig {
                 "liveness_abandonment_paused",
                 "studio_request_chain_refused",
                 "studio_request_consumer_stalled",
+                "studio_request_offset_jumped",
                 "iisa_request_rejected",
                 "dips_info_missing",
                 "dips_info_checks_paused",

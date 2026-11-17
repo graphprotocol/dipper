@@ -64,6 +64,9 @@ const STALL_ALERT_AFTER: Duration = Duration::from_secs(10 * 60);
 /// The `event` tag of the alert for a consumer that keeps retrying the same step.
 const STALLED_EVENT: &str = "studio_request_consumer_stalled";
 
+/// The `event` tag of the alert for a stored offset moved past records nobody read.
+const OFFSET_JUMPED_EVENT: &str = "studio_request_offset_jumped";
+
 /// Handle for controlling the indexing request consumer lifecycle
 #[derive(Clone)]
 pub struct Handle {
@@ -436,44 +439,52 @@ async fn partition_loop<C, R, W>(
                 (records, high_watermark)
             }
             Err(err) if err.is_offset_out_of_range() => {
-                // The cursor is outside the broker's retained range: below the log start after
-                // retention, or above the log end after a recreate or truncation. Clamp to the
-                // nearer edge; rewinding to earliest would replay the whole topic when truncated.
-                let range = match with_consumer(&consumer, &mut shutdown_rx, |c| async move {
+                // The broker calls the offset out of range: behind the log start after retention,
+                // or past its end after a recreate or truncation. Move to the nearer edge, since
+                // rewinding to the earliest would replay the whole topic when truncated.
+                let Some(range) = with_consumer(&consumer, &mut shutdown_rx, |c| async move {
                     // Both edges through 1 client, so a rebuild between them can't mix 2 clusters.
                     let earliest = c.offset(partition, OffsetAt::Earliest).await?;
                     let latest = c.offset(partition, OffsetAt::Latest).await?;
                     Ok((earliest, latest))
                 })
                 .await
-                {
-                    None => return,
-                    Some(Ok(range)) => Some(range),
-                    Some(Err(err)) => {
+                else {
+                    return;
+                };
+                let moved = match range {
+                    Ok((earliest, latest)) => {
+                        let moved = re_anchor(next_offset, earliest, latest);
+                        if let Some(to) = moved {
+                            alert_offset_jump(partition, next_offset, to, (earliest, latest));
+                        } else {
+                            tracing::warn!(
+                                partition,
+                                next_offset,
+                                earliest,
+                                latest,
+                                "the broker refused an offset inside the range it reports; \
+                                 fetching from it again"
+                            );
+                            let at = Some(next_offset);
+                            note_failure(&mut stall, partition, at, "fetching records", &err);
+                        }
+                        moved
+                    }
+                    Err(err) => {
                         tracing::error!(partition, error = %err, "failed to query the retained offset range");
                         let (step, at) = ("reading the partition's retained offsets", next_offset);
                         note_failure(&mut stall, partition, Some(at), step, &err);
                         None
                     }
                 };
-                match range {
-                    Some((earliest, latest)) => {
-                        let re_anchored = if next_offset < earliest {
-                            earliest
-                        } else {
-                            latest
-                        };
-                        tracing::warn!(
-                            partition,
-                            stale_offset = next_offset,
-                            earliest,
-                            latest,
-                            re_anchored,
-                            "consumer offset fell outside the broker's retained range; re-anchoring"
-                        );
-                        next_offset = re_anchored;
+                match moved {
+                    Some(to) => {
+                        next_offset = to;
                         persist_offset(&registry, &topic, partition, next_offset).await;
                     }
+                    // Nothing to move to yet, so wait: a broker that keeps answering this way
+                    // would otherwise be asked again at once, for ever.
                     None => {
                         if sleep_or_shutdown(&mut shutdown_rx, RETRY_BACKOFF).await {
                             return;
@@ -561,6 +572,39 @@ async fn partition_loop<C, R, W>(
             }
         }
     }
+}
+
+/// Where to move an offset the broker called out of range: the nearer edge of what it retains,
+/// or `None` when the offset is inside that range after all and must stay where it is.
+fn re_anchor(next_offset: i64, earliest: i64, latest: i64) -> Option<i64> {
+    if next_offset < earliest {
+        Some(earliest)
+    } else if next_offset > latest {
+        Some(latest)
+    } else {
+        None
+    }
+}
+
+/// Raise an alert for a stored offset moved to an edge of what the broker retains. The records
+/// passed over were never read, so a request among them was never applied, and Studio is not told.
+fn alert_offset_jump(partition: i32, from: i64, to: i64, (earliest, latest): (i64, i64)) {
+    let why = if to > from {
+        "the broker no longer retains the records in between"
+    } else {
+        "the log now ends before it, as it does after the topic is recreated, and records \
+         already in the new log are not read"
+    };
+    tracing::error!(
+        event = OFFSET_JUMPED_EVENT,
+        partition,
+        stale_offset = from,
+        re_anchored = to,
+        earliest,
+        latest,
+        "The Studio indexing request consumer's offset was moved: {why}. A request passed \
+         over this way is never applied"
+    );
 }
 
 /// Persist consumer progress. Failure is logged but does not halt consumption:
@@ -2049,6 +2093,96 @@ mod tests {
         assert!(registry.calls().is_empty());
     }
 
+    // -------- offsets out of range --------
+
+    /// The broker's answer to a fetch from an offset outside what it retains.
+    fn out_of_range() -> Fetch {
+        use rskafka::client::error::{Error, ProtocolError, RequestContext};
+        Err(ConsumerError::Fetch(Error::ServerError {
+            protocol_error: ProtocolError::OffsetOutOfRange,
+            error_message: None,
+            request: RequestContext::Topic("t".to_string()),
+            response: None,
+            is_virtual: false,
+        }))
+    }
+
+    /// Runs the loop from `stored`, over a partition retaining `earliest..latest` that answers
+    /// `fetches`, for 1 minute. Returns the offsets fetched from, the registry and the logs.
+    async fn run_from_offset(
+        stored: i64,
+        (earliest, latest): (i64, i64),
+        fetches: Vec<Fetch>,
+    ) -> (Vec<i64>, MockRegistry, String) {
+        let registry = MockRegistry::returning(SetTargetOutcome::Inserted {
+            id: IndexingRequestId::new(),
+        });
+        registry.offsets.lock().expect("poisoned").push(stored);
+        let worker = MockWorker::new();
+        let mut source = ScriptedSource::new(fetches);
+        (source.earliest, source.latest) = (earliest, latest);
+        let asked = Arc::clone(&source.asked);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let started = Instant::now();
+
+        let logs = logged(run_until(
+            partition_loop_over(
+                source,
+                &registry,
+                &worker,
+                Arc::new(SkipChainCheck),
+                shutdown_rx,
+            ),
+            &shutdown_tx,
+            || started.elapsed() > Duration::from_secs(60),
+        ))
+        .await;
+
+        let asked = asked.lock().expect("poisoned").clone();
+        (asked, registry, logs)
+    }
+
+    #[test]
+    fn an_offset_is_only_moved_when_it_is_outside_what_the_broker_retains() {
+        assert_eq!(re_anchor(5, 40, 100), Some(40), "behind the start");
+        assert_eq!(re_anchor(5_000, 0, 20), Some(20), "past the end");
+        assert_eq!(re_anchor(50, 0, 100), None, "inside the range");
+        assert_eq!(
+            re_anchor(100, 0, 100),
+            None,
+            "at the end, with nothing to skip"
+        );
+        assert_eq!(re_anchor(0, 0, 0), None, "an empty log");
+    }
+
+    /// A broker can call an offset out of range and then report a range that holds it. Moving
+    /// to the end of that range would skip records nobody read.
+    #[tokio::test(start_paused = true)]
+    async fn an_offset_the_broker_refuses_yet_still_retains_is_fetched_again() {
+        let (asked, registry, logs) =
+            run_from_offset(50, (0, 100), vec![out_of_range(), batch(50, &[3])]).await;
+
+        assert_eq!(asked, [50, 50, 51], "{logs}");
+        assert_eq!(registry.calls().len(), 1, "the record at 50 is applied");
+        assert_eq!(registry.stored_offsets(), [50, 51]);
+        assert_eq!(alerts(&logs, OFFSET_JUMPED_EVENT), 0, "{logs}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_offset_moved_to_an_edge_of_the_log_is_alerted_on() {
+        let (past_the_end, registry, moved_back) =
+            run_from_offset(5_000, (0, 20), vec![out_of_range()]).await;
+        assert_eq!(past_the_end, [5_000, 20]);
+        assert_eq!(registry.stored_offsets(), [5_000, 20]);
+        assert_eq!(alerts(&moved_back, OFFSET_JUMPED_EVENT), 1, "{moved_back}");
+
+        let (behind_the_start, registry, moved_on) =
+            run_from_offset(5, (40, 100), vec![out_of_range()]).await;
+        assert_eq!(behind_the_start, [5, 40]);
+        assert_eq!(registry.stored_offsets(), [5, 40]);
+        assert_eq!(alerts(&moved_on, OFFSET_JUMPED_EVENT), 1, "{moved_on}");
+    }
+
     // -------- stalls --------
 
     fn alerts(logs: &str, event: &str) -> usize {
@@ -2059,7 +2193,11 @@ mod tests {
     fn the_consumers_alert_tags_are_alerted_on_by_default() {
         let defaults = crate::config::AlertsConfig::default().events;
 
-        for event in ["studio_request_chain_refused", STALLED_EVENT] {
+        for event in [
+            "studio_request_chain_refused",
+            STALLED_EVENT,
+            OFFSET_JUMPED_EVENT,
+        ] {
             assert!(defaults.iter().any(|default| default == event), "{event}");
         }
     }
