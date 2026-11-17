@@ -26,7 +26,7 @@ use tokio::{
 };
 
 use crate::{
-    config::IndexingRequestConsumerConfig,
+    config::{IndexingRequestConsumerConfig, MAX_NUM_CANDIDATES},
     log_text::with_causes,
     registry::IndexingRequestRegistry,
     request_chain_check::{ChainCheckError, RequestChainCheck},
@@ -253,10 +253,6 @@ pub struct Ctx<R, W> {
     /// The protocol network chain id (signer chain id), for validating the
     /// envelope's network and stamping emitted lifecycle events
     pub protocol_chain_id: ChainId,
-    /// Ceiling on the indexer count a consumed request may ask for; larger counts are clamped
-    /// with a warning. Kafka records carry no signature, so this door is held to a lower count
-    /// than the signed admin RPC, which refuses anything above `MAX_NUM_CANDIDATES`.
-    pub max_candidates: usize,
     /// Refuses requests whose chain is not their subgraph manifest's
     pub chain_check: Arc<dyn RequestChainCheck>,
     /// Service configuration
@@ -506,7 +502,6 @@ where
             ctx.worker_queue.clone(),
             Arc::clone(&ctx.events),
             ctx.protocol_chain_id,
-            ctx.max_candidates,
             Arc::clone(&ctx.chain_check),
             ctx.config.clone(),
             shutdown_rx.clone(),
@@ -662,7 +657,6 @@ async fn partition_loop<C, R, W>(
     worker_queue: W,
     events: Arc<dyn SubgraphIndexingAgreementEventsProducer>,
     protocol_chain_id: ChainId,
-    max_candidates: usize,
     chain_check: Arc<dyn RequestChainCheck>,
     config: IndexingRequestConsumerConfig,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -832,7 +826,6 @@ async fn partition_loop<C, R, W>(
                         chain_check.as_ref(),
                         protocol_chain_id,
                         config.requested_by,
-                        max_candidates,
                         &target,
                         partition,
                         offset,
@@ -1126,7 +1119,6 @@ async fn apply_target_with_retries<R, W>(
     chain_check: &dyn RequestChainCheck,
     protocol_chain_id: ChainId,
     requested_by: Address,
-    max_candidates: usize,
     target: &ProposedTarget,
     partition: i32,
     offset: i64,
@@ -1136,7 +1128,7 @@ where
     R: IndexingRequestRegistry + Send + Sync,
     W: WorkerQueue + Send + Sync,
 {
-    let num_candidates = clamped_count(target, max_candidates, partition, offset);
+    let num_candidates = clamped_count(target, partition, offset);
     let mut retries = Retries {
         partition,
         offset,
@@ -1208,26 +1200,21 @@ where
 /// The step named in the log when the reassessment job that follows a write can't be queued.
 const QUEUING_ITS_JOB: &str = "queuing its reassessment job";
 
-/// The count a record asks for, held to `max_candidates`: this door has no signature to vouch
-/// for the sender, so an absurd target must not reach indexer selection as sent. 0 passes
-/// through untouched, since it is the cancellation shape.
-fn clamped_count(
-    target: &ProposedTarget,
-    max_candidates: usize,
-    partition: i32,
-    offset: i64,
-) -> usize {
-    if target.num_candidates <= max_candidates {
+/// The count a record asks for, held to the limit the admin RPC refuses above, so a developer
+/// may ask for as many through Studio as through the RPC. A record can't be answered, so a
+/// larger count is cut to the limit with a warning. 0 passes untouched: it is the cancel shape.
+fn clamped_count(target: &ProposedTarget, partition: i32, offset: i64) -> usize {
+    if target.num_candidates <= MAX_NUM_CANDIDATES {
         return target.num_candidates;
     }
     tracing::warn!(
         partition,
         offset,
         requested = target.num_candidates,
-        max_candidates,
-        "clamping the requested indexer count to the configured maximum"
+        max_candidates = MAX_NUM_CANDIDATES,
+        "clamping the requested indexer count to the most a request may ask for"
     );
-    max_candidates
+    MAX_NUM_CANDIDATES
 }
 
 /// 1 attempt at a record: its chain check, then the apply. `None` if a stop came during the
@@ -1431,9 +1418,6 @@ mod tests {
     const INDEXED_CHAIN_ID: ChainId = 1;
 
     const QM_HASH: &str = "QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv";
-
-    /// Ceiling on requested indexer counts in these tests.
-    const TEST_MAX_CANDIDATES: usize = 10;
 
     fn requester() -> Address {
         "0x8f8c426f956876325b1e037c6eae9b189952994c"
@@ -1995,7 +1979,6 @@ mod tests {
             chain_check,
             PROTOCOL_CHAIN_ID,
             requester(),
-            TEST_MAX_CANDIDATES,
             &target,
             0,
             0,
@@ -2136,7 +2119,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_oversized_count_is_clamped_to_the_configured_maximum() {
+    async fn an_oversized_count_is_clamped_to_the_most_a_request_may_ask_for() {
         let registry = MockRegistry::returning(SetTargetOutcome::Inserted {
             id: IndexingRequestId::new(),
         });
@@ -2147,10 +2130,38 @@ mod tests {
         assert!(applied);
         assert_eq!(
             registry.calls()[0].3,
-            TEST_MAX_CANDIDATES,
+            MAX_NUM_CANDIDATES,
             "the registry must see the clamped count, not the wire value"
         );
-        assert_eq!(worker.reassessments()[0].3, TEST_MAX_CANDIDATES);
+        assert_eq!(worker.reassessments()[0].3, MAX_NUM_CANDIDATES);
+    }
+
+    /// Studio and the admin RPC are 2 doors to the same request, so both let a developer ask
+    /// for the same number of indexers: up to 100, the count the RPC refuses anything above.
+    #[tokio::test]
+    async fn a_studio_request_may_ask_for_as_many_indexers_as_an_rpc_request() {
+        let inserted = || {
+            Some(SetTargetOutcome::Inserted {
+                id: IndexingRequestId::new(),
+            })
+        };
+        let registry = MockRegistry::scripted(vec![inserted(), inserted()]);
+        let worker = MockWorker::new();
+        let limit = MAX_NUM_CANDIDATES;
+
+        let at_the_limit = logged(async {
+            run_apply(&registry, &worker, limit).await;
+        })
+        .await;
+        let above_it = logged(async {
+            run_apply(&registry, &worker, limit + 1).await;
+        })
+        .await;
+
+        let asked: Vec<usize> = registry.calls().iter().map(|call| call.3).collect();
+        assert_eq!(asked, [100, 100], "100 as asked, and 101 cut to 100");
+        assert!(!at_the_limit.contains("clamping"), "{at_the_limit}");
+        assert!(above_it.contains("clamping"), "{above_it}");
     }
 
     #[tokio::test]
@@ -2179,7 +2190,6 @@ mod tests {
             &SkipChainCheck,
             PROTOCOL_CHAIN_ID,
             requester(),
-            TEST_MAX_CANDIDATES,
             &target,
             0,
             0,
@@ -2248,7 +2258,6 @@ mod tests {
             &check,
             PROTOCOL_CHAIN_ID,
             requester(),
-            TEST_MAX_CANDIDATES,
             &target,
             0,
             0,
@@ -2395,7 +2404,6 @@ mod tests {
             worker.clone(),
             Arc::new(CapturingEventsProducer::new()),
             PROTOCOL_CHAIN_ID,
-            TEST_MAX_CANDIDATES,
             chain_check,
             test_config(),
             shutdown_rx,
@@ -2636,7 +2644,6 @@ mod tests {
             &NeverAnswers,
             PROTOCOL_CHAIN_ID,
             requester(),
-            TEST_MAX_CANDIDATES,
             &target,
             0,
             0,
@@ -2867,7 +2874,6 @@ mod tests {
                 chain_check,
                 PROTOCOL_CHAIN_ID,
                 requester(),
-                TEST_MAX_CANDIDATES,
                 &target,
                 4,
                 17,
@@ -3008,7 +3014,6 @@ mod tests {
             worker_queue: worker.clone(),
             events: Arc::new(CapturingEventsProducer::new()),
             protocol_chain_id: PROTOCOL_CHAIN_ID,
-            max_candidates: TEST_MAX_CANDIDATES,
             chain_check: Arc::new(SkipChainCheck),
             config: test_config(),
         };
@@ -3665,7 +3670,6 @@ mod tests {
                 worker_queue: worker,
                 events,
                 protocol_chain_id: 42161,
-                max_candidates: 10,
                 chain_check: Arc::new(SkipChainCheck),
                 config: consumer_config.clone(),
             });
