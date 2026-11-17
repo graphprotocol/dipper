@@ -735,7 +735,7 @@ async fn stop_requested(shutdown_rx: &mut watch::Receiver<bool>) {
 
 /// Apply a decoded propose until it takes effect; `false` if shutdown came first. A registry
 /// failure or unreadable manifest retries the whole apply, and a wrong chain skips the record. A
-/// queue failure retries only the job push: a re-apply would be a no-op and drop the reassessment.
+/// queue failure retries only the job push: a cancel applied again finds nothing and queues none.
 #[allow(clippy::too_many_arguments)]
 async fn apply_target_with_retries<R, W>(
     registry: &R,
@@ -768,6 +768,8 @@ where
             num_candidates,
             // Interactive: a developer just asked for this in Studio.
             priority: JobPriority::Interactive,
+            // A record can be delivered twice, and the 1st delivery may have lost its job.
+            reassess_unchanged: true,
         };
         let Some(result) = check_and_apply(
             registry,
@@ -1503,17 +1505,21 @@ mod tests {
         }
     }
 
+    /// A record delivered twice lands on the no-op path the 2nd time. Queuing its job again
+    /// repairs one lost between the 1st delivery's write and its push.
     #[tokio::test]
-    async fn a_noop_outcome_applies_without_events_or_reassessment() {
-        let registry = MockRegistry::returning(SetTargetOutcome::NoOp {
-            id: IndexingRequestId::new(),
-        });
+    async fn a_noop_outcome_queues_the_reassessment_again_without_events() {
+        let id = IndexingRequestId::new();
+        let registry = MockRegistry::returning(SetTargetOutcome::NoOp { id });
         let worker = MockWorker::new();
 
         let (applied, events) = run_apply(&registry, &worker, 3).await;
 
         assert!(applied);
-        assert!(worker.reassessments().is_empty(), "no-op must not reassess");
+        assert_eq!(
+            worker.reassessments(),
+            [(id, deployment_id!(QM_HASH), INDEXED_CHAIN_ID, 3)]
+        );
         assert!(events.is_empty(), "no-op must not emit events");
     }
 
@@ -1562,8 +1568,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_queue_failure_retries_only_the_push_never_the_registry() {
-        // If the retry re-ran the registry call, the outcome would be a no-op
-        // and the reassessment job would be silently lost.
+        // The write is done, so only the push is repeated. A cancel written again would find
+        // nothing to cancel and lose its job.
         let registry = MockRegistry::returning(SetTargetOutcome::Inserted {
             id: IndexingRequestId::new(),
         });

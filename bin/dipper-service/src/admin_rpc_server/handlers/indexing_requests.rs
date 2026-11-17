@@ -226,6 +226,7 @@ where
                 num_candidates,
                 // Interactive: a caller is waiting on this set-target result.
                 priority: JobPriority::Interactive,
+                reassess_unchanged: false,
             },
         )
         .await
@@ -451,10 +452,12 @@ mod tests {
         }
     }
 
-    /// A worker that accepts `reassess_indexing_request` and returns a default
+    /// A worker that accepts `reassess_indexing_request`, counts it and returns a default
     /// `JobId`. All other queue methods are unused by this path.
-    #[derive(Clone)]
-    struct MockWorker;
+    #[derive(Clone, Default)]
+    struct MockWorker {
+        reassessments: Arc<std::sync::atomic::AtomicUsize>,
+    }
 
     #[async_trait]
     impl WorkerQueue for MockWorker {
@@ -478,6 +481,8 @@ mod tests {
             _num_candidates: usize,
             _priority: crate::worker::queue::JobPriority,
         ) -> anyhow::Result<JobId> {
+            self.reassessments
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(JobId::default())
         }
 
@@ -625,7 +630,7 @@ mod tests {
                 page: RequestsPage::default(),
                 pages_asked: Arc::default(),
             },
-            worker: MockWorker,
+            worker: MockWorker::default(),
             max_candidates: 10,
             clock,
             subgraph_indexing_agreements_events_emitter: Arc::new(events.clone()),
@@ -791,6 +796,36 @@ mod tests {
             id: IndexingRequestId::new(),
         })
         .await;
+    }
+
+    /// The RPC queues a job only for a request that changed something. The Kafka consumer also
+    /// queues one for a request that changed nothing, since its records can arrive twice.
+    #[tokio::test]
+    async fn a_request_that_changes_nothing_queues_no_reassessment() {
+        let deployment = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
+        let queued = |server: &RpcServerImpl<MockRegistry, MockWorker>| {
+            server
+                .worker
+                .reassessments
+                .load(std::sync::atomic::Ordering::SeqCst)
+        };
+        let id = IndexingRequestId::new();
+        let (signer, request) = signed_request(deployment, DEPLOYMENT_CHAIN_ID, Some(5));
+        let (unchanged, _events) = server(signer.address(), SetTargetOutcome::NoOp { id });
+        let (signer, other_request) = signed_request(deployment, DEPLOYMENT_CHAIN_ID, Some(5));
+        let (inserted, _events) = server(signer.address(), SetTargetOutcome::Inserted { id });
+
+        unchanged
+            .set_indexing_target_candidates(request)
+            .await
+            .expect("accepted");
+        inserted
+            .set_indexing_target_candidates(other_request)
+            .await
+            .expect("accepted");
+
+        assert_eq!(queued(&unchanged), 0);
+        assert_eq!(queued(&inserted), 1);
     }
 
     #[tokio::test]

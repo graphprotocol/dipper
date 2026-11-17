@@ -30,6 +30,9 @@ pub struct SetIndexingTarget {
     pub num_candidates: usize,
     /// Priority for the follow-up reassessment job.
     pub priority: JobPriority,
+    /// Queue that job even when the stored count already matches. For the Kafka consumer, whose
+    /// records can arrive twice: the 2nd delivery then repairs a job lost after the 1st's write.
+    pub reassess_unchanged: bool,
 }
 
 /// A request that passed [`check_chain`]. Nothing else builds one, so no front door can apply
@@ -54,9 +57,9 @@ pub enum ApplyError {
     #[error("failed to set indexing target candidates")]
     Registry(#[source] crate::registry::Error),
 
-    /// The row change is committed but the reassessment job was not queued.
-    /// Retry the queue push itself, not the whole apply: a repeated apply
-    /// lands on the registry's no-op path and never queues the job.
+    /// The row change is committed but the reassessment job was not queued. Retry the queue
+    /// push itself, not the whole apply: a repeated cancel finds nothing to cancel and queues
+    /// no job, and nor does any repeat that leaves `reassess_unchanged` off.
     #[error("failed to queue reassessment for indexing request {id}")]
     QueueReassess {
         id: IndexingRequestId,
@@ -104,8 +107,8 @@ pub async fn check_chain(
     Err(ApplyError::WrongChain(err))
 }
 
-/// Upserts the indexing request, emits the request-received lifecycle event on
-/// a genuinely new request, and queues reassessment when the row changed.
+/// Upserts the indexing request, emits the request-received lifecycle event on a genuinely
+/// new request, and queues reassessment when the row changed or `reassess_unchanged` is set.
 /// Returns the request id, or `None` when there was nothing to act on.
 #[expect(
     clippy::cast_possible_truncation,
@@ -130,6 +133,7 @@ where
         deployment_chain_id,
         num_candidates,
         priority,
+        reassess_unchanged,
     } = request;
 
     let outcome = match registry
@@ -193,7 +197,9 @@ where
                 indexing_request_id = %id,
                 "Set target candidates is a no-op (count unchanged)"
             );
-            (Some(id), None)
+            // The job reads the request's current target, so running it again changes nothing
+            // that is already in place.
+            (Some(id), reassess_unchanged.then_some(num_candidates))
         }
         SetTargetOutcome::Canceled { id } => {
             tracing::info!(
