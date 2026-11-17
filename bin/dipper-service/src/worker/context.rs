@@ -122,7 +122,7 @@ pub struct Ctx<Q, R, C, I, T> {
     /// Global reassess lock (see `ReassessLock`).
     pub reassess_lock: ReassessLock,
 
-    /// Suppresses the network-wide unresponsive exclusion during a dipper-side outage.
+    /// Suppresses a chain's unresponsive exclusion during a dipper-side outage.
     pub unresponsive_breaker: Arc<UnresponsiveBreaker>,
 
     /// Short-TTL cache of IISA's DIPs-accepting set (the breaker's denominator).

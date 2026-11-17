@@ -18,6 +18,7 @@ pub struct SelectionContext {
     ///
     /// Used to exclude indexers with pending work from new assignments.
     /// Key: Deployment ID, Value: List of indexer IDs working on that deployment.
+    /// IISA reads only the indexers, so they reach it once each, under the selected deployment.
     pub pending_agreements: HashMap<DeploymentId, Vec<IndexerId>>,
 
     /// Indexer IDs that should be excluded from selection entirely.
@@ -33,6 +34,7 @@ pub struct SelectionContext {
     ///
     /// Unlike the denylist, IISA leaves an indexer already in the group in place.
     /// Key: Deployment ID, Value: those indexers' IDs.
+    /// Only the selected deployment's entry reaches IISA, the only one it reads.
     pub declined_indexers: HashMap<DeploymentId, Vec<IndexerId>>,
 
     /// Chain ID of the deployment (e.g., "arbitrum-one").

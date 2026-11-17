@@ -30,10 +30,22 @@ pub enum Message {
     /// proposal terms.
     ///
     /// Runs after `send_indexing_agreement_proposal` receives an Accept
-    /// response: posts the RCA via `RecurringCollector.offer()` so the
+    /// response: posts the RCA through the RecurringAgreementManager so the
     /// contract has the offer hash when the indexer-agent later calls
     /// `acceptIndexingAgreement` on-chain.
     ///
     /// See [`SubmitOffer`] for more details.
     SubmitOffer(SubmitOffer),
+}
+
+impl Message {
+    /// The job's kind, named as in the copy of the job the queue stores.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::ReassessIndexingRequest(_) => "ReassessIndexingRequest",
+            Self::SendIndexingAgreementProposal(_) => "SendIndexingAgreementProposal",
+            Self::CancelRejectedAgreementOnChain(_) => "CancelRejectedAgreementOnChain",
+            Self::SubmitOffer(_) => "SubmitOffer",
+        }
+    }
 }

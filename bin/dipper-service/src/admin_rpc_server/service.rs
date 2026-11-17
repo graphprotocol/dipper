@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 
 use super::handlers::{IndexingAgreementsCtx, IndexingRequestsCtx, rpc_handlers};
 use crate::{
-    registry::{AgreementRegistry, IndexingRequestRegistry},
+    registry::{AgreementRegistry, IndexingRequestRegistry, RequestOrderRegistry},
     worker::service::WorkerQueue,
 };
 
@@ -42,7 +42,13 @@ impl Handle {
 /// Create a new gateway operator API server.
 pub fn new<S, R, W>(conf: Config, ctx: S) -> (Handle, impl Future<Output = anyhow::Result<()>>)
 where
-    R: IndexingRequestRegistry + AgreementRegistry + Clone + Send + Sync + 'static,
+    R: IndexingRequestRegistry
+        + RequestOrderRegistry
+        + AgreementRegistry
+        + Clone
+        + Send
+        + Sync
+        + 'static,
     W: WorkerQueue + Clone + Send + Sync + 'static,
     IndexingRequestsCtx<R, W>: FromState<S>,
     IndexingAgreementsCtx<R>: FromState<S>,

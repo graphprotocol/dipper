@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-pub use dipper_pgmq::{JobBuilder, JobGuard, JobId, JobPriority, PgQueue, PgQueueListener};
+pub use dipper_pgmq::{
+    JobBuilder, JobGuard, JobId, JobPriority, PgQueue, PgQueueListener, RetryOutcome,
+};
 use sqlx::PgPool;
 
 /// A message queue.

@@ -176,6 +176,7 @@ fn spawn_service(server: &MockServer) -> (Handle, IndexerId, Url) {
             endpoint: server.uri().parse().unwrap(),
             api_key: None,
             update_interval: Duration::from_millis(50),
+            addresses: crate::indexer_addresses::AddressRule::PublicOnly,
         },
         init,
     );

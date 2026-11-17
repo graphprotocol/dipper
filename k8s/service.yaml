@@ -13,7 +13,3 @@ spec:
       port: 8545
       targetPort: admin-rpc
       protocol: TCP
-    - name: indexer-rpc
-      port: 50051
-      targetPort: indexer-rpc
-      protocol: TCP

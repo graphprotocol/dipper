@@ -35,9 +35,14 @@ impl std::fmt::Debug for JobId {
     }
 }
 
+/// Stored as the column's own `UUID`, so reading it back doesn't rest on matching type names.
 impl sqlx::Type<Postgres> for JobId {
     fn type_info() -> sqlx::postgres::PgTypeInfo {
-        sqlx::postgres::PgTypeInfo::with_name("UUID")
+        <Uuid as sqlx::Type<Postgres>>::type_info()
+    }
+
+    fn compatible(ty: &sqlx::postgres::PgTypeInfo) -> bool {
+        <Uuid as sqlx::Type<Postgres>>::compatible(ty)
     }
 }
 

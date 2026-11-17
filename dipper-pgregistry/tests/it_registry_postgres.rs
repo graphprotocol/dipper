@@ -6,7 +6,7 @@ use dipper_core::ids::{IndexingAgreementId, IndexingRequestId};
 use dipper_pgregistry::{
     CancelKind, EndCorrection, Error, IndexingAgreementStatus, IndexingAgreementTerms,
     IndexingRequestStatus, NewAgreementParams, PgRegistry, ReconciliationAudit, ReconciliationItem,
-    RecordedEnd, WithheldIndexers,
+    RecordedEnd, SetAsideChange, WithheldIndexers,
 };
 use fake::{Fake, Faker};
 use pgtemp::PgTempDB;
@@ -259,20 +259,145 @@ async fn set_indexing_target_candidates_reinsert_after_cancel() {
 }
 
 #[tokio::test]
-async fn get_all_indexing_requests() {
+async fn accept_request_signed_at_refuses_a_request_no_newer_than_the_newest() {
+    //* Given
+    let requested_by = FakeAlloy.fake();
+    let deployment_id = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
+    let deployment_chain_id = Faker.fake::<ChainId>();
+
+    let (db, _temp_db) = temp_registry_db().await;
+    let registry = PgRegistry::new(db);
+    let accept = |signed_at| {
+        registry.accept_request_signed_at(
+            requested_by,
+            deployment_id,
+            deployment_chain_id,
+            signed_at,
+        )
+    };
+
+    //* When
+    let first = accept(1_000).await.expect("first request failed");
+    let older = accept(999).await.expect("older request failed");
+    let same = accept(1_000).await.expect("same-time request failed");
+    let newer = accept(1_001).await.expect("newer request failed");
+    let first_again = accept(1_000).await.expect("replayed request failed");
+
+    //* Then
+    assert!(first, "the first request for a key is recorded");
+    assert!(!older, "a request older than the newest is refused");
+    assert!(!same, "a request signed at the newest time is refused");
+    assert!(newer, "a newer request is recorded");
+    assert!(
+        !first_again,
+        "the first request is refused once a newer one is in"
+    );
+}
+
+#[tokio::test]
+async fn accept_request_signed_at_keeps_each_key_apart() {
+    //* Given
+    let requested_by = FakeAlloy.fake();
+    let other_requester = FakeAlloy.fake();
+    let deployment_id = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
+    let other_deployment = deployment_id!("QmQ5w3LqJdBGZvHNYTWq7np2B1qbBQMpHP77ZKQPzGVTrg");
+
+    let (db, _temp_db) = temp_registry_db().await;
+    let registry = PgRegistry::new(db);
+    registry
+        .accept_request_signed_at(requested_by, deployment_id, 1, 1_000)
+        .await
+        .expect("seed request failed");
+
+    //* When: older requests that differ in the requester, the deployment or the chain
+    let by_other_requester = registry
+        .accept_request_signed_at(other_requester, deployment_id, 1, 500)
+        .await
+        .expect("other requester failed");
+    let for_other_deployment = registry
+        .accept_request_signed_at(requested_by, other_deployment, 1, 500)
+        .await
+        .expect("other deployment failed");
+    let on_other_chain = registry
+        .accept_request_signed_at(requested_by, deployment_id, 2, 500)
+        .await
+        .expect("other chain failed");
+
+    //* Then
+    assert!(by_other_requester);
+    assert!(for_other_deployment);
+    assert!(on_other_chain);
+}
+
+#[tokio::test]
+async fn indexing_requests_are_read_a_page_at_a_time_in_the_order_they_were_created() {
     //* Given
     let (db, _temp_db) = temp_registry_db().await;
     run_fixture(&db, include_str!("fixtures/0001_indexing_requests.sql"))
         .await
         .expect("Failed to run fixture");
+    // A request with an older id, stored last. Rows read in the order they were stored would
+    // put it last, so only sorting by id puts it first.
+    run_fixture(
+        &db,
+        r#"
+        INSERT INTO dipper_reg_indexing_requests
+            (id, created_at, updated_at, status, requested_by, deployment_id, deployment_chain_id)
+        VALUES ('01000000-0000-7000-8000-000000000000'::uuid,
+                timezone('UTC', now()),
+                timezone('UTC', now()),
+                1, -- IndexingRequestStatus::Canceled
+                '\x442a24985444cdc6a4db9503d354918d27b5ea97'::bytea,
+                'QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv',
+                '\x000000000000a4b1'::bytea);
+        "#,
+    )
+    .await
+    .expect("Failed to insert the older request");
     let registry = PgRegistry::new(db);
-
-    //* When
-    let indexing_requests = registry.get_all_indexing_requests().await;
+    // Oldest first: the request stored last, then the fixture's 3, which are open, cancelled,
+    // and in no known status.
+    let ids: Vec<IndexingRequestId> = [
+        "01000000-0000-7000-8000-000000000000",
+        "019300ce-4751-780e-b58c-bf696b67eb23",
+        "01930105-d664-79ad-8535-5b82b0ad1aab",
+        "01930108-5942-7515-bd5e-2cba9c7027b7",
+    ]
+    .into_iter()
+    .map(|id| id.parse::<uuid::Uuid>().expect("a fixture id").into())
+    .collect();
+    let page =
+        |after: Option<IndexingRequestId>, status: Option<IndexingRequestStatus>, limit: i64| {
+            let registry = &registry;
+            async move {
+                let requests = registry
+                    .get_indexing_requests_page(after, status, limit)
+                    .await
+                    .expect("Failed to get a page of indexing requests");
+                requests.into_iter().map(|r| r.id).collect::<Vec<_>>()
+            }
+        };
 
     //* Then
-    let indexing_requests = indexing_requests.expect("Failed to get all indexing requests");
-    assert_eq!(indexing_requests.len(), 3);
+    // The first page starts at the oldest request and holds no more than was asked for.
+    assert_eq!(page(None, None, 3).await, ids[..3]);
+    // A page starts after the id it is given, and the last page is short.
+    assert_eq!(page(Some(ids[2]), None, 3).await, ids[3..]);
+    assert!(page(Some(ids[3]), None, 3).await.is_empty());
+    // A status keeps only the requests in it.
+    assert_eq!(
+        page(None, Some(IndexingRequestStatus::Open), 10).await,
+        ids[1..2]
+    );
+    assert_eq!(
+        page(None, Some(IndexingRequestStatus::Canceled), 10).await,
+        [ids[0], ids[2]]
+    );
+    assert!(
+        page(Some(ids[1]), Some(IndexingRequestStatus::Open), 10)
+            .await
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -1832,6 +1957,123 @@ async fn update_chain_listener_state_upserts_existing() {
         Some(1700001000),
         "Timestamp should be updated"
     );
+}
+
+#[tokio::test]
+async fn set_aside_changes_are_listed_longest_set_aside_first_until_deleted() {
+    //* Given
+    let (db, _temp_db) = temp_registry_db().await;
+    let registry = PgRegistry::new(db);
+    let early = IndexingAgreementId::from_bytes([0xbb; 16]);
+    let later = IndexingAgreementId::from_bytes([0xaa; 16]);
+    let last = IndexingAgreementId::from_bytes([0xcc; 16]);
+    registry
+        .record_set_aside_changes(&[SetAsideChange {
+            agreement_id: early,
+            block: 10,
+        }])
+        .await
+        .expect("Failed to record the first change");
+    registry
+        .record_set_aside_changes(&[
+            SetAsideChange {
+                agreement_id: later,
+                block: 20,
+            },
+            SetAsideChange {
+                agreement_id: last,
+                block: 30,
+            },
+        ])
+        .await
+        .expect("Failed to record the later changes");
+
+    //* When
+    let listed = registry
+        .get_set_aside_changes()
+        .await
+        .expect("Failed to list set-aside changes");
+    registry
+        .delete_set_aside_changes(&[early, last])
+        .await
+        .expect("Failed to delete set-aside changes");
+    let after = registry
+        .get_set_aside_changes()
+        .await
+        .expect("Failed to list set-aside changes");
+
+    //* Then
+    assert_eq!(
+        listed,
+        vec![
+            SetAsideChange {
+                agreement_id: early,
+                block: 10,
+            },
+            SetAsideChange {
+                agreement_id: later,
+                block: 20,
+            },
+            SetAsideChange {
+                agreement_id: last,
+                block: 30,
+            },
+        ],
+        "the first set aside comes first, though its id sorts after the next"
+    );
+    assert_eq!(
+        after,
+        vec![SetAsideChange {
+            agreement_id: later,
+            block: 20,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn a_change_set_aside_again_keeps_the_later_block() {
+    //* Given
+    let (db, _temp_db) = temp_registry_db().await;
+    let registry = PgRegistry::new(db);
+    let agreement_id = IndexingAgreementId::from_bytes([0xaa; 16]);
+    let change_at = |block| SetAsideChange {
+        agreement_id,
+        block,
+    };
+    registry
+        .record_set_aside_changes(&[change_at(20)])
+        .await
+        .expect("Failed to record the change");
+
+    //* When
+    registry
+        .record_set_aside_changes(&[change_at(10)])
+        .await
+        .expect("Failed to record an earlier block");
+    let after_earlier = registry
+        .get_set_aside_changes()
+        .await
+        .expect("Failed to list set-aside changes");
+    registry
+        .record_set_aside_changes(&[change_at(30), change_at(40)])
+        .await
+        .expect("Failed to record later blocks");
+    let after_later = registry
+        .get_set_aside_changes()
+        .await
+        .expect("Failed to list set-aside changes");
+    registry
+        .record_set_aside_changes(&[])
+        .await
+        .expect("Recording nothing should not error");
+    registry
+        .delete_set_aside_changes(&[])
+        .await
+        .expect("Deleting nothing should not error");
+
+    //* Then
+    assert_eq!(after_earlier, vec![change_at(20)]);
+    assert_eq!(after_later, vec![change_at(40)]);
 }
 
 // =============================================================================

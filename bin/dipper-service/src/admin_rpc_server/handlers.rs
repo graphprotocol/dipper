@@ -5,7 +5,7 @@ use dipper_rpc::admin::{
 use jsonrpsee::RpcModule;
 
 use crate::{
-    registry::{AgreementRegistry, IndexingRequestRegistry},
+    registry::{AgreementRegistry, IndexingRequestRegistry, RequestOrderRegistry},
     worker::service::WorkerQueue,
 };
 
@@ -25,7 +25,13 @@ pub use self::{
 )]
 pub(super) fn rpc_handlers<S, R, W>(ctx: S) -> RpcModule<S>
 where
-    R: IndexingRequestRegistry + AgreementRegistry + Clone + Send + Sync + 'static,
+    R: IndexingRequestRegistry
+        + RequestOrderRegistry
+        + AgreementRegistry
+        + Clone
+        + Send
+        + Sync
+        + 'static,
     W: WorkerQueue + Clone + Send + Sync + 'static,
     IndexingRequestsCtx<R, W>: FromState<S>,
     IndexingAgreementsCtx<R>: FromState<S>,

@@ -28,7 +28,8 @@
 //! - Block height decreased (resync) → also reset `last_progress_at`
 //! - Block height unchanged → check elapsed time against threshold
 //! - Indexer unreachable → treat as no progress (threshold check still applies)
-//! - Deployment missing from response → treat as no progress
+//! - Reply without a list of statuses (a GraphQL error, say) → the indexer counts as unreachable
+//! - Deployment missing from the list of statuses → treat as no progress
 //!
 //! When at least `unreachable_trip_fraction` of the indexers checked in a cycle can't be
 //! reached, the fault is likely dipper's own, so no agreement is abandoned for unreachability
@@ -55,10 +56,12 @@ use time::OffsetDateTime;
 use tokio::{sync::mpsc, time::MissedTickBehavior};
 use url::Url;
 
+use super::indexer_reply;
 use crate::{
     cancel_dispatch::{CancelReason, CancelStarted},
     chain_client::ChainClient,
     config::LivenessCheckerConfig,
+    indexer_addresses::{AddressRule, Refused},
     network::provider::NetworkProviderService,
     registry::{
         AgreementRegistry, IndexingAgreement, IndexingRequestRegistry, IndexingRequestStatus,
@@ -98,6 +101,8 @@ pub struct Ctx<R, W, C> {
     pub agreement_conf: Arc<crate::config::IndexingAgreementConfig>,
     /// Service configuration.
     pub config: LivenessCheckerConfig,
+    /// The addresses dipper may call indexers at.
+    pub addresses: AddressRule,
 }
 
 /// Create a new liveness checker service.
@@ -124,6 +129,7 @@ where
         network,
         agreement_conf,
         config,
+        addresses,
     } = ctx;
 
     let service = async move {
@@ -141,10 +147,7 @@ where
         const DB_UPDATE_TIMEOUT: Duration = Duration::from_secs(10);
         const QUEUE_PUSH_TIMEOUT: Duration = Duration::from_secs(10);
 
-        let http_client = reqwest::Client::builder()
-            .timeout(config.request_timeout)
-            .build()
-            .map_err(|e| anyhow::anyhow!("failed to build HTTP client: {e}"))?;
+        let http_client = http_client(&config, addresses)?;
         let mut uncancellable = Uncancellable::default();
         let mut breaker = UnreachableBreaker::default();
 
@@ -257,6 +260,18 @@ where
     (Handle { tx_stop }, service)
 }
 
+/// The HTTP client the checker asks indexers with.
+fn http_client(
+    config: &LivenessCheckerConfig,
+    addresses: AddressRule,
+) -> anyhow::Result<reqwest::Client> {
+    addresses
+        .http_client()
+        .timeout(config.request_timeout)
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build HTTP client: {e}"))
+}
+
 /// Group agreements by indexer ID for batched status queries.
 fn group_by_indexer_id(
     agreements: Vec<IndexingAgreement>,
@@ -292,7 +307,8 @@ fn tolerance_duration(
 enum Probe {
     /// It answered, with the latest block it reports for each deployment asked about.
     Reached(HashMap<String, Option<u64>>),
-    /// It could not be asked: its status call failed, or it is missing from the network registry.
+    /// It gave no answer to act on: its status call failed, its reply had no list of statuses, or
+    /// it is missing from the network registry.
     Unreachable,
 }
 
@@ -334,7 +350,7 @@ async fn probe_indexer(
             tracing::warn!(
                 indexer_id = %indexer_id,
                 indexer_url = %indexer.url,
-                error = %err,
+                error = %crate::log_text::shortened(&err),
                 "failed to query indexer status, treating as unreachable"
             );
             Probe::Unreachable
@@ -399,8 +415,9 @@ pub(super) const UNREACHABLE_CLEAR_CYCLES: u32 = 3;
 const UNREACHABLE_ALERT_REPEAT: time::Duration = time::Duration::hours(6);
 
 /// Stops agreements being abandoned for unreachability while so many indexers can't be reached
-/// at once that the fault is likely dipper's own (its network, or the network registry), which
-/// would hand every deployment to new indexers and bar the current ones for weeks.
+/// at once that the fault is likely dipper's own (its network, the network registry, or a status
+/// query that indexers reject), which would hand every deployment to new indexers and bar the
+/// current ones for weeks.
 #[derive(Default)]
 struct UnreachableBreaker {
     /// When the current trip began; `None` while clear.
@@ -517,9 +534,10 @@ impl UnreachableBreaker {
                 checked,
                 held_hours,
                 max_hold_days = max_hold.whole_days(),
-                "Too many indexers unreachable at once: a fault on dipper's side (its network or \
-                 the network registry), or that many really gone; not abandoning agreements for \
-                 unreachability while it lasts, for up to max_hold_days"
+                "Too many indexers unreachable at once: a fault on dipper's side (its network, the \
+                 network registry, or a status query that indexers reject), or that many really \
+                 gone; not abandoning agreements for unreachability while it lasts, for up to \
+                 max_hold_days"
             );
         } else if trips {
             tracing::warn!(
@@ -1114,13 +1132,27 @@ pub(crate) fn decide_liveness_action(
     }
 }
 
+/// The longest status reply that is read in answer to a question about `deployments`
+/// deployments. A real one is about 100 bytes for each, so 1 KiB each, on top of 64 KiB, leaves
+/// room to spare. The limit follows the question because parsing a reply can take about 16
+/// times its length in memory, which 1 limit large enough for every indexer would allow any
+/// indexer to use.
+fn status_reply_limit_bytes(deployments: usize) -> usize {
+    const BASE: usize = 64 * 1024;
+    const FOR_EACH_DEPLOYMENT: usize = 1024;
+    BASE.saturating_add(deployments.saturating_mul(FOR_EACH_DEPLOYMENT))
+}
+
 /// Query a single indexer's status endpoint for sync progress.
 ///
-/// Returns a map of deployment ID (IPFS hash string) to the latest block height,
-/// or `None` if the deployment is not found in the response.
+/// Returns a map of deployment ID (IPFS hash string) to the latest block height, which is `None`
+/// when the reply lists the deployment without a block. A deployment the reply leaves out is not
+/// in the map.
 ///
-/// Returns an error only when the HTTP call itself fails (network error, timeout,
-/// non-2xx response). GraphQL-level errors are logged and treated as empty results.
+/// Returns an error when the HTTP call fails (network error, timeout, non-2xx response), the
+/// reply is not JSON or is over the size limit, or it has no list of statuses, as when the
+/// indexer's graph-node rejects the query. Such a reply says nothing about the indexer's
+/// progress, so it is not read as an empty answer.
 async fn query_indexer_status(
     client: &reqwest::Client,
     indexer_url: &Url,
@@ -1143,30 +1175,44 @@ async fn query_indexer_status(
 
     let body = serde_json::json!({ "query": query });
 
+    // A refused address leads the error, so its log line can't be read as a network fault.
     let response = client
         .post(status_url)
         .json(&body)
         .send()
-        .await?
+        .await
+        .map_err(|err| match Refused::behind(&err).map(ToString::to_string) {
+            Some(refused) => anyhow::Error::new(err).context(refused),
+            None => err.into(),
+        })?
         .error_for_status()?;
 
-    let json: serde_json::Value = response.json().await?;
+    let limit = status_reply_limit_bytes(deployment_ids.len());
+    let reply = indexer_reply::read_body(response, limit).await?;
+    let json: serde_json::Value = serde_json::from_slice(&reply)?;
 
     let mut result: HashMap<String, Option<u64>> = HashMap::new();
 
-    let statuses = match json
+    let Some(statuses) = json
         .get("data")
         .and_then(|d| d.get("indexingStatuses"))
         .and_then(|s| s.as_array())
-    {
-        Some(arr) => arr,
-        None => {
-            tracing::debug!(
-                indexer_url = %indexer_url,
-                "indexingStatuses not present in response"
-            );
-            return Ok(result);
-        }
+    else {
+        // The indexer wrote this text, so it is quoted, escaped and cut short before it is logged.
+        let said = json
+            .get("errors")
+            .and_then(|errors| errors.as_array())
+            .and_then(|errors| errors.first())
+            .and_then(|error| error.get("message"))
+            .and_then(|message| message.as_str())
+            .map(|message| {
+                format!(
+                    ": its first error says {}",
+                    crate::log_text::untrusted(message)
+                )
+            })
+            .unwrap_or_default();
+        anyhow::bail!("the reply has no list of indexing statuses{said}");
     };
 
     for status in statuses {
@@ -1217,11 +1263,13 @@ mod tests {
     use super::{
         Checker, HeldSpan, LivenessAction, Probe, Uncancellable, UnreachableBreaker,
         UnreachablePolicy, cancel_and_reassess, decide_liveness_action, group_by_indexer_id,
-        record_progress, replace_abandoned, tolerance_duration, unreachable_trips,
+        probe_indexer, query_indexer_status, record_progress, replace_abandoned,
+        status_reply_limit_bytes, tolerance_duration, unreachable_trips,
     };
     use crate::{
         chain_client::{AgreementOnChain, ChainClient, ChainClientError},
         config::LivenessCheckerConfig,
+        indexer_addresses::AddressRule,
         registry::{
             AgreementFeeRate, IndexingAgreement, IndexingAgreementStatus, IndexingAgreementTerms,
             IndexingAgreementTermsMetadata, IndexingRequest, IndexingRequestRegistry,
@@ -1441,7 +1489,12 @@ mod tests {
         ) -> RegistryResult<crate::registry::SetTargetOutcome> {
             unimplemented!()
         }
-        async fn get_all_indexing_requests(&self) -> RegistryResult<Vec<IndexingRequest>> {
+        async fn get_indexing_requests_page(
+            &self,
+            _after: Option<IndexingRequestId>,
+            _status: Option<crate::registry::IndexingRequestStatus>,
+            _limit: u32,
+        ) -> crate::registry::Result<crate::registry::RequestsPage> {
             unimplemented!()
         }
         async fn get_indexing_request_by_id(
@@ -1705,10 +1758,109 @@ mod tests {
         assert_eq!(groups[&indexer_b].len(), 1);
     }
 
+    /// An indexer whose server reports its status, with `localhost`, which resolves only to
+    /// addresses on this machine, in its URL.
+    async fn status_by_name() -> (wiremock::MockServer, Url) {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/status"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"data": {"indexingStatuses": []}})),
+            )
+            .mount(&server)
+            .await;
+        let url = format!("http://localhost:{}/", server.address().port());
+        (server, url.parse().unwrap())
+    }
+
+    #[tokio::test]
+    async fn an_indexer_whose_name_resolves_only_to_addresses_that_are_not_public_is_unreachable() {
+        //* Given
+        let (server, url) = status_by_name().await;
+        let indexer_id: IndexerId = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            .parse()
+            .unwrap();
+        let network = crate::network::provider::NetworkProviderService::new(
+            crate::network::service::indexer_urls::Handle::for_test(
+                std::collections::BTreeMap::from([(indexer_id, url)]),
+            ),
+        );
+        let client =
+            super::http_client(&LivenessCheckerConfig::default(), AddressRule::PublicOnly).unwrap();
+
+        //* When
+        let logs = logged(async {
+            let probe = super::probe_indexer(&network, &client, &indexer_id, &[]).await;
+            assert!(matches!(probe, Probe::Unreachable));
+        })
+        .await;
+
+        //* Then the log line says the address was refused
+        assert!(
+            logs.contains("error=refused localhost: it resolves only to addresses that are not"),
+            "{logs}"
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn with_private_addresses_allowed_an_indexer_on_this_machine_is_asked_by_name() {
+        //* Given
+        let (_server, url) = status_by_name().await;
+        let client =
+            super::http_client(&LivenessCheckerConfig::default(), AddressRule::Any).unwrap();
+
+        //* When
+        let heights = super::query_indexer_status(&client, &url, &[]).await;
+
+        //* Then
+        assert!(heights.unwrap().is_empty());
+    }
+
+    /// The indexer's own address is judged when its URL is read from the subgraph, not here, so a
+    /// server on this machine can stand in for an indexer at a public address.
+    #[tokio::test]
+    async fn an_indexer_cannot_redirect_the_status_query_to_an_address_that_is_not_public() {
+        //* Given an internal service, and an indexer that redirects its status query there
+        let internal = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&internal)
+            .await;
+        let indexer = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/status"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(307)
+                    .insert_header("Location", format!("{}/admin", internal.uri()).as_str()),
+            )
+            .mount(&indexer)
+            .await;
+        let url: Url = format!("{}/", indexer.uri()).parse().unwrap();
+        let client =
+            super::http_client(&LivenessCheckerConfig::default(), AddressRule::PublicOnly).unwrap();
+
+        //* When
+        let heights = super::query_indexer_status(&client, &url, &[]).await;
+
+        //* Then
+        let calls = internal.received_requests().await.unwrap();
+        assert!(
+            calls.is_empty(),
+            "dipper followed the redirect and called {}",
+            calls[0].url
+        );
+        let err = heights.unwrap_err().to_string();
+        assert!(
+            err.starts_with("refused 127.0.0.1: not a public address"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn test_default_config() {
         let config = LivenessCheckerConfig::default();
-        assert!(!config.enabled); // off by default
+        assert!(!config.is_enabled()); // off by default
         assert_eq!(config.interval, std::time::Duration::from_secs(300));
         assert_eq!(config.max_tolerance_days, 4);
         assert_eq!(config.request_timeout, std::time::Duration::from_secs(10));
@@ -2564,5 +2716,192 @@ mod tests {
         let updates = calls.progress_updates.lock().unwrap();
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0], (agr_id, 12345));
+    }
+
+    #[tokio::test]
+    async fn a_status_reply_over_the_size_limit_is_not_read() {
+        //* Given a well-formed status reply, padded past the limit
+        let server = wiremock::MockServer::start().await;
+        let padding = "x".repeat(status_reply_limit_bytes(0));
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/status"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_string(format!(
+                    r#"{{"data": {{"indexingStatuses": []}}, "note": "{padding}"}}"#
+                )),
+            )
+            .mount(&server)
+            .await;
+        let url: Url = format!("{}/", server.uri()).parse().unwrap();
+
+        //* When
+        let answer = query_indexer_status(&reqwest::Client::new(), &url, &[]).await;
+
+        //* Then
+        let why = answer.expect_err("a reply over the limit must not be read");
+        assert!(why.to_string().contains("longer than the limit"), "{why}");
+    }
+    #[tokio::test]
+    async fn the_status_reply_limit_follows_the_number_of_deployments_asked_about() {
+        //* Given a real-sized reply about 2,000 deployments
+        let ids: Vec<String> = (0..2_000).map(|n| format!("Qm{n:044}")).collect();
+        let statuses: Vec<String> = ids
+            .iter()
+            .map(|id| {
+                format!(
+                    r#"{{"subgraph": "{id}", "chains": [{{"latestBlock": {{"number": "123456789"}}}}]}}"#
+                )
+            })
+            .collect();
+        let reply = format!(
+            r#"{{"data": {{"indexingStatuses": [{}]}}}}"#,
+            statuses.join(", ")
+        );
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/status"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(reply))
+            .mount(&server)
+            .await;
+        let url: Url = format!("{}/", server.uri()).parse().unwrap();
+        let client = reqwest::Client::new();
+
+        //* When it answers a question about all 2,000, and then a question about 1
+        let asked_about_all = query_indexer_status(&client, &url, &ids).await;
+        let asked_about_1 = query_indexer_status(&client, &url, &ids[..1]).await;
+
+        //* Then
+        assert_eq!(asked_about_all.unwrap().len(), 2_000);
+        let Err(why) = asked_about_1 else {
+            panic!("a reply about 2,000 deployments was read in answer to a question about 1");
+        };
+        assert!(why.to_string().contains("longer than the limit"), "{why}");
+    }
+
+    /// An indexer whose `/status` answers `reply`.
+    async fn status_answering(reply: serde_json::Value) -> (wiremock::MockServer, Url) {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/status"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(reply))
+            .mount(&server)
+            .await;
+        let url = format!("{}/", server.uri()).parse().unwrap();
+        (server, url)
+    }
+
+    /// A reply with no list of statuses is what a graph-node sends when it rejects the query. It
+    /// says nothing about the indexer's progress, and the query is dipper's, so it must not be
+    /// read as "asked, and indexing none of these deployments".
+    #[tokio::test]
+    async fn a_status_reply_without_the_list_of_statuses_is_an_error_not_an_answer() {
+        for reply in [
+            serde_json::json!({"errors": [{"message": "Unknown field indexingStatuses"}]}),
+            serde_json::json!({"data": null, "errors": [{"message": "query too large"}]}),
+            serde_json::json!({"data": {"indexingStatuses": null}}),
+            serde_json::json!({"data": {}}),
+        ] {
+            let (_server, url) = status_answering(reply.clone()).await;
+
+            let answer = query_indexer_status(&reqwest::Client::new(), &url, &[]).await;
+
+            let why = answer.expect_err("a reply with no list of statuses is not an answer");
+            assert!(
+                why.to_string().contains("no list of indexing statuses"),
+                "{reply}: {why}"
+            );
+        }
+    }
+
+    /// A list that leaves a deployment out is still an answer: the indexer was asked and is not
+    /// indexing it.
+    #[tokio::test]
+    async fn a_status_reply_with_an_empty_list_is_still_an_answer() {
+        let (_server, url) =
+            status_answering(serde_json::json!({"data": {"indexingStatuses": []}})).await;
+
+        let answer = query_indexer_status(&reqwest::Client::new(), &url, &[]).await;
+
+        assert!(answer.expect("an empty list is an answer").is_empty());
+    }
+
+    /// The probe reports such an indexer as unreachable, which is what the hold on abandoning
+    /// agreements counts when most indexers fail at once; "no progress" is not counted by it.
+    #[tokio::test]
+    async fn an_indexer_that_answers_without_the_list_of_statuses_counts_as_unreachable() {
+        //* Given an indexer whose graph-node rejects the query, with an error it wrote itself
+        let (_server, url) = status_answering(serde_json::json!({
+            "errors": [{"message": "rejected\n2026-01-01T00:00:00.000000Z ERROR dipper: forged"}]
+        }))
+        .await;
+        let indexer_id: IndexerId = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            .parse()
+            .unwrap();
+        let network = crate::network::provider::NetworkProviderService::new(
+            crate::network::service::indexer_urls::Handle::for_test(
+                std::collections::BTreeMap::from([(indexer_id, url)]),
+            ),
+        );
+
+        //* When
+        let logs = logged(async {
+            let probe = probe_indexer(&network, &reqwest::Client::new(), &indexer_id, &[]).await;
+            assert!(matches!(probe, Probe::Unreachable));
+        })
+        .await;
+
+        //* Then the warning says why and quotes the indexer's error, escaped, so that its text
+        //* can't start a log line of its own
+        assert!(logs.contains("treating as unreachable"), "{logs}");
+        assert!(logs.contains("no list of indexing statuses"), "{logs}");
+        assert!(
+            logs.contains(r#"its first error says "rejected\n2026-01-01T00:00:00.000000Z ERROR"#),
+            "{logs}"
+        );
+        assert!(
+            !logs.contains("\n2026-01-01T00:00:00.000000Z ERROR dipper: forged"),
+            "{logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_huge_status_line_from_an_indexer_is_cut_short_in_the_log() {
+        //* Given an indexer whose server answers with a status line of 100,000 characters
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request).await;
+            let reply = format!(
+                "HTTP/1.1 500 {}\r\nContent-Length: 0\r\n\r\n",
+                "x".repeat(100_000)
+            );
+            let _ = socket.write_all(reply.as_bytes()).await;
+        });
+        let indexer_id: IndexerId = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            .parse()
+            .unwrap();
+        let url: Url = format!("http://{address}/").parse().unwrap();
+        let network = crate::network::provider::NetworkProviderService::new(
+            crate::network::service::indexer_urls::Handle::for_test(
+                std::collections::BTreeMap::from([(indexer_id, url)]),
+            ),
+        );
+
+        //* When
+        let logs = logged(async {
+            let probe = probe_indexer(&network, &reqwest::Client::new(), &indexer_id, &[]).await;
+            assert!(matches!(probe, Probe::Unreachable));
+        })
+        .await;
+
+        //* Then
+        assert!(
+            logs.contains("failed to query indexer status"),
+            "{logs:.500}"
+        );
+        assert!(logs.len() < 5_000, "logged {} bytes", logs.len());
     }
 }

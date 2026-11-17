@@ -7,7 +7,7 @@ use url::Url;
 
 use crate::{
     config::DEFAULT_MAX_CANDIDATES,
-    indexer_rpc_client::IndexerClient,
+    indexer_rpc_client::{DIPS_GRPC_PORT, IndexerClient},
     registry::{
         AgreementRegistry, IndexingAgreementStatus, IndexingRequestRegistry,
         PendingCancellationRegistry,
@@ -66,10 +66,11 @@ where
     W: WorkerQueue,
     C: IndexerClient,
 {
-    // TODO: THIS IS A HACK
+    // The registered URL names the port the indexer answers queries on, and offers go to a
+    // separate listener, so keep its host and scheme and swap in the offer port.
     let indexer_url = {
         let mut url = indexer_url.clone();
-        url.set_port(Some(7602)).unwrap();
+        url.set_port(Some(DIPS_GRPC_PORT)).unwrap();
         url
     };
 
@@ -193,7 +194,7 @@ where
                     old_status = %IndexingAgreementStatus::Created,
                     new_status = %IndexingAgreementStatus::Rejected,
                     reason = %format_args!("rejected_{rejection_reason_str}"),
-                    detail = %rejected.detail,
+                    detail = %crate::log_text::untrusted(&rejected.detail),
                     "agreement state transition"
                 );
                 // Mark as Rejected and reassess. The indexer may still accept on-chain,
@@ -626,8 +627,13 @@ mod tests {
             })
         }
 
-        async fn get_all_indexing_requests(&self) -> crate::registry::Result<Vec<IndexingRequest>> {
-            Ok(vec![])
+        async fn get_indexing_requests_page(
+            &self,
+            _after: Option<IndexingRequestId>,
+            _status: Option<crate::registry::IndexingRequestStatus>,
+            _limit: u32,
+        ) -> crate::registry::Result<crate::registry::RequestsPage> {
+            Ok(crate::registry::RequestsPage::default())
         }
 
         async fn get_indexing_request_by_id(
@@ -766,6 +772,7 @@ mod tests {
         RejectUnknownReason,
         NoOutcome,
         RejectCapacityExceeded,
+        RejectWithDetail(String),
         Fail,
     }
 
@@ -821,6 +828,12 @@ mod tests {
                 response: MockResponse::Fail,
             }
         }
+
+        fn rejecting_with_detail(detail: &str) -> Self {
+            Self {
+                response: MockResponse::RejectWithDetail(detail.to_string()),
+            }
+        }
     }
 
     #[async_trait]
@@ -832,7 +845,7 @@ mod tests {
             _terms: IndexingAgreementTerms,
             _nonce_uuid: uuid::Uuid,
         ) -> Result<SubmitAgreementProposalResponse, DipsError> {
-            match self.response {
+            match &self.response {
                 MockResponse::Accept => Ok(SubmitAgreementProposalResponse {
                     outcome: Some(Outcome::Accepted(Accepted {})),
                 }),
@@ -866,6 +879,12 @@ mod tests {
                     outcome: Some(Outcome::Rejected(Rejected {
                         reason: RejectReason::CapacityExceeded as i32,
                         detail: String::new(),
+                    })),
+                }),
+                MockResponse::RejectWithDetail(detail) => Ok(SubmitAgreementProposalResponse {
+                    outcome: Some(Outcome::Rejected(Rejected {
+                        reason: RejectReason::PriceTooLow as i32,
+                        detail: detail.clone(),
                     })),
                 }),
                 MockResponse::Fail => Err(DipsError::ConnectionError(
@@ -1028,6 +1047,60 @@ mod tests {
         let qstate = queue_state.lock().unwrap();
         assert_eq!(qstate.reassess_calls.len(), 1);
         assert_eq!(qstate.reassess_calls[0].0, request_id);
+    }
+
+    /// What dipper logs while an indexer rejects a proposal with `detail` as its free text.
+    async fn logged_rejecting_with_detail(detail: &str) -> String {
+        let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+        let request_id = IndexingRequestId::new();
+        let registry_state = Arc::new(Mutex::new(MockRegistryState {
+            agreement: Some(make_test_agreement(
+                agreement_id,
+                IndexingAgreementStatus::Created,
+            )),
+            request: Some(make_test_request(request_id)),
+            ..Default::default()
+        }));
+        let ctx = Ctx {
+            registry: MockRegistry::new(registry_state),
+            queue: MockQueue::new(Arc::new(Mutex::new(MockQueueState::default()))),
+            indexer_client: MockIndexerClient::rejecting_with_detail(detail),
+        };
+        let message = Message {
+            indexer_url: "https://indexer.example.com".parse().unwrap(),
+            agreement_id,
+            indexing_request_id: request_id,
+            deployment_id: deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv"),
+            deployment_chain_id: 1,
+        };
+        crate::test_support::logged(async {
+            assert!(handle(ctx, &message).await.is_ok());
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_line_break_in_a_rejection_detail_cannot_start_a_fake_log_line() {
+        //* Given a rejection whose free text holds a line break, then text made to look like a
+        //* log line
+        let forged = "2026-11-10T00:00:00.000000Z ERROR dipper_service: funds are lost";
+
+        //* When
+        let logs = logged_rejecting_with_detail(&format!("price too low\n{forged}")).await;
+
+        //* Then the forged text stays inside the line that reports the rejection
+        assert!(logs.contains("rejected_"), "{logs}");
+        assert!(!logs.lines().any(|line| line.starts_with(forged)), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn a_huge_rejection_detail_is_cut_short_in_the_log() {
+        //* When
+        let logs = logged_rejecting_with_detail(&"x".repeat(1_000_000)).await;
+
+        //* Then
+        assert!(logs.contains("rejected_"), "{logs:.300}");
+        assert!(logs.len() < 5_000, "logged {} bytes", logs.len());
     }
 
     #[tokio::test]
@@ -1353,5 +1426,75 @@ mod tests {
         assert!(registry_state.lock().unwrap().marked_rejected.is_empty());
         assert!(registry_state.lock().unwrap().marked_failed.is_empty());
         assert!(queue_state.lock().unwrap().reassess_calls.is_empty());
+    }
+
+    /// An indexer client that accepts every offer and keeps the address each one was sent to.
+    struct RecordingIndexerClient {
+        sent_to: Arc<Mutex<Vec<Url>>>,
+    }
+
+    #[async_trait]
+    impl IndexerClient for RecordingIndexerClient {
+        async fn send_indexing_agreement_proposal(
+            &self,
+            indexer: &Url,
+            _indexing_agreement_id: IndexingAgreementId,
+            _terms: IndexingAgreementTerms,
+            _nonce_uuid: uuid::Uuid,
+        ) -> Result<SubmitAgreementProposalResponse, DipsError> {
+            self.sent_to.lock().unwrap().push(indexer.clone());
+            Ok(SubmitAgreementProposalResponse {
+                outcome: Some(Outcome::Accepted(Accepted {})),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn an_offer_goes_to_the_offer_port_whatever_port_the_registered_url_names() {
+        for (registered, expected) in [
+            (
+                "https://indexer.example.com/",
+                "https://indexer.example.com:7602/",
+            ),
+            (
+                "https://indexer.example.com:8443/",
+                "https://indexer.example.com:7602/",
+            ),
+            (
+                "http://indexer.example.com:7600/",
+                "http://indexer.example.com:7602/",
+            ),
+        ] {
+            let agreement_id = IndexingAgreementId::from_bytes(rand::random());
+            let request_id = IndexingRequestId::new();
+            let registry_state = Arc::new(Mutex::new(MockRegistryState {
+                agreement: Some(make_test_agreement(
+                    agreement_id,
+                    IndexingAgreementStatus::Created,
+                )),
+                request: Some(make_test_request(request_id)),
+                ..Default::default()
+            }));
+            let sent_to = Arc::new(Mutex::new(Vec::new()));
+            let ctx = Ctx {
+                registry: MockRegistry::new(registry_state),
+                queue: MockQueue::new(Arc::new(Mutex::new(MockQueueState::default()))),
+                indexer_client: RecordingIndexerClient {
+                    sent_to: sent_to.clone(),
+                },
+            };
+            let message = Message {
+                indexer_url: registered.parse().unwrap(),
+                agreement_id,
+                indexing_request_id: request_id,
+                deployment_id: deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv"),
+                deployment_chain_id: 1,
+            };
+
+            handle(ctx, &message).await.unwrap();
+
+            let sent_to: Vec<String> = sent_to.lock().unwrap().iter().map(Url::to_string).collect();
+            assert_eq!(sent_to, [expected], "registered as {registered}");
+        }
     }
 }

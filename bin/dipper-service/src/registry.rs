@@ -6,6 +6,7 @@ mod indexer_denylist;
 mod indexing_request;
 mod pending_cancellation;
 mod result;
+mod set_aside_change;
 
 use async_trait::async_trait;
 use dipper_core::ids::{IndexingAgreementId, IndexingRequestId};
@@ -32,10 +33,12 @@ pub use self::{
     dips_info::{DipsInfoChecks, DipsInfoRegistry},
     indexer_denylist::IndexerDenylistRegistry,
     indexing_request::{
-        IndexingRequest, IndexingRequestRegistry, SetTargetOutcome, Status as IndexingRequestStatus,
+        IndexingRequest, IndexingRequestRegistry, RequestOrderRegistry, RequestsPage,
+        SetTargetOutcome, Status as IndexingRequestStatus,
     },
     pending_cancellation::{PendingCancellation, PendingCancellationRegistry},
     result::{Error, Result},
+    set_aside_change::{SetAsideChange, SetAsideChangeRegistry},
 };
 
 impl From<NewAgreementParams> for dipper_pgregistry::NewAgreementParams {
@@ -142,6 +145,26 @@ impl RegistryProvider {
 }
 
 #[async_trait]
+impl RequestOrderRegistry for RegistryProvider {
+    async fn accept_request_signed_at(
+        &self,
+        requested_by: Address,
+        deployment_id: DeploymentId,
+        deployment_chain_id: ChainId,
+        signed_at: u64,
+    ) -> RegistryResult<bool> {
+        let signed_at = i64::try_from(signed_at).map_err(|_| Error::TooLarge {
+            field: "signed_at",
+            value: usize::try_from(signed_at).unwrap_or(usize::MAX),
+        })?;
+        Ok(self
+            .inner
+            .accept_request_signed_at(requested_by, deployment_id, deployment_chain_id, signed_at)
+            .await?)
+    }
+}
+
+#[async_trait]
 impl IndexingRequestRegistry for RegistryProvider {
     async fn set_indexing_target_candidates(
         &self,
@@ -166,15 +189,18 @@ impl IndexingRequestRegistry for RegistryProvider {
             .map(Into::into)
     }
 
-    async fn get_all_indexing_requests(&self) -> RegistryResult<Vec<IndexingRequest>> {
-        Ok(self
-            .inner
-            .get_all_indexing_requests()
-            .await?
-            .into_iter()
-            .map(IndexingRequest::try_from)
-            .filter_map(filter_map_with_logging)
-            .collect())
+    async fn get_indexing_requests_page(
+        &self,
+        after: Option<IndexingRequestId>,
+        status: Option<IndexingRequestStatus>,
+        limit: u32,
+    ) -> RegistryResult<RequestsPage> {
+        let page = indexing_request::read_page(limit, |rows| {
+            self.inner
+                .get_indexing_requests_page(after, status.map(Into::into), rows)
+        })
+        .await?;
+        Ok(page)
     }
 
     async fn get_indexing_request_by_id(
@@ -991,6 +1017,44 @@ impl PendingCancellationRegistry for RegistryProvider {
     ) -> RegistryResult<Vec<IndexingAgreementId>> {
         self.inner
             .list_executable_pending_cancellations(limit)
+            .await
+            .map_err(Into::into)
+    }
+}
+
+#[async_trait]
+impl SetAsideChangeRegistry for RegistryProvider {
+    async fn record_set_aside_changes(&self, changes: &[SetAsideChange]) -> RegistryResult<()> {
+        let pg_changes: Vec<dipper_pgregistry::SetAsideChange> = changes
+            .iter()
+            .map(|change| dipper_pgregistry::SetAsideChange {
+                agreement_id: change.agreement_id,
+                block: change.block,
+            })
+            .collect();
+        self.inner
+            .record_set_aside_changes(&pg_changes)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn get_set_aside_changes(&self) -> RegistryResult<Vec<SetAsideChange>> {
+        let rows = self.inner.get_set_aside_changes().await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| SetAsideChange {
+                agreement_id: row.agreement_id,
+                block: row.block,
+            })
+            .collect())
+    }
+
+    async fn delete_set_aside_changes(
+        &self,
+        agreement_ids: &[IndexingAgreementId],
+    ) -> RegistryResult<()> {
+        self.inner
+            .delete_set_aside_changes(agreement_ids)
             .await
             .map_err(Into::into)
     }

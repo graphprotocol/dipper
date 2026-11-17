@@ -49,6 +49,14 @@ pub struct ChainListenerStateRow {
     pub last_processed_block_timestamp: Option<u64>,
 }
 
+/// An on-chain change to an agreement the chain listener set aside after it kept failing to apply:
+/// the agreement, and the block the change was seen at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetAsideChange {
+    pub agreement_id: IndexingAgreementId,
+    pub block: u64,
+}
+
 /// Which party cancelled an agreement, for the atomic reconciliation
 /// transition written by `apply_reconciliation`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -452,7 +460,49 @@ impl PgRegistry {
         Ok(outcome)
     }
 
-    pub async fn get_all_indexing_requests(&self) -> Result<Vec<IndexingRequest>, Error> {
+    /// Record `signed_at` (seconds since the Unix epoch) as the newest signing time accepted for
+    /// the key `(requested_by, deployment_id, deployment_chain_id)`. Returns `false`, recording
+    /// nothing, when a request signed at or after it was already recorded for that key.
+    ///
+    /// The check and the write are 1 statement, so of 2 requests racing for the same key the
+    /// older can never be recorded after the newer.
+    pub async fn accept_request_signed_at(
+        &self,
+        requested_by: Address,
+        deployment_id: DeploymentId,
+        deployment_chain_id: ChainId,
+        signed_at: i64,
+    ) -> Result<bool, Error> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO dipper_reg_request_signing_times
+                (requested_by, deployment_id, deployment_chain_id, newest_signed_at)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (requested_by, deployment_id, deployment_chain_id)
+            DO UPDATE SET newest_signed_at = EXCLUDED.newest_signed_at
+            WHERE dipper_reg_request_signing_times.newest_signed_at < EXCLUDED.newest_signed_at
+            "#,
+        )
+        .bind(PgAddress(requested_by))
+        .bind(PgDeploymentId(deployment_id))
+        .bind(PgU64(deployment_chain_id))
+        .bind(signed_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Up to `limit` indexing requests with an id above `after`, in id order, which is the order
+    /// they were created in, as ids are time-ordered. `status` keeps only those in that status.
+    ///
+    /// With no `after` the page starts at the first request: every id is above the all-zero one.
+    pub async fn get_indexing_requests_page(
+        &self,
+        after: Option<IndexingRequestId>,
+        status: Option<IndexingRequestStatus>,
+        limit: i64,
+    ) -> Result<Vec<IndexingRequest>, Error> {
+        let after = after.unwrap_or_else(|| uuid::Uuid::nil().into());
         sqlx::query_as(
             r#"
             SELECT
@@ -465,8 +515,15 @@ impl PgRegistry {
                 deployment_chain_id,
                 num_candidates
             FROM dipper_reg_indexing_requests
+            WHERE id > $1
+              AND ($2::int IS NULL OR status = $2)
+            ORDER BY id
+            LIMIT $3
             "#,
         )
+        .bind(after)
+        .bind(status)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await
         .map_err(Into::into)
@@ -2658,6 +2715,77 @@ impl PgRegistry {
         .bind(last_processed_block as i64)
         .bind(last_processed_id)
         .bind(last_processed_block_timestamp.map(|t| t as i64))
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Record `changes` as set aside by the chain listener, to be tried again. An agreement
+    /// already recorded keeps when it was first set aside and the later of the 2 blocks.
+    pub async fn record_set_aside_changes(&self, changes: &[SetAsideChange]) -> Result<(), Error> {
+        let agreement_ids: Vec<IndexingAgreementId> =
+            changes.iter().map(|change| change.agreement_id).collect();
+        // Only a broken subgraph reports a block the column can't hold; the largest it can hold
+        // still waits for a state at least as recent.
+        let blocks: Vec<i64> = changes
+            .iter()
+            .map(|change| i64::try_from(change.block).unwrap_or(i64::MAX))
+            .collect();
+        sqlx::query(
+            r#"
+            INSERT INTO dipper_chain_listener_set_aside_changes (agreement_id, change_block)
+            SELECT agreement_id, max(change_block)
+            FROM unnest($1::bytea[], $2::bigint[]) AS t(agreement_id, change_block)
+            GROUP BY agreement_id
+            ON CONFLICT (agreement_id) DO UPDATE SET
+                change_block = GREATEST(
+                    dipper_chain_listener_set_aside_changes.change_block,
+                    EXCLUDED.change_block
+                )
+            "#,
+        )
+        .bind(&agreement_ids[..])
+        .bind(&blocks[..])
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get every change the chain listener set aside, the longest set aside first.
+    pub async fn get_set_aside_changes(&self) -> Result<Vec<SetAsideChange>, Error> {
+        let rows: Vec<(IndexingAgreementId, i64)> = sqlx::query_as(
+            r#"
+            SELECT agreement_id, change_block
+            FROM dipper_chain_listener_set_aside_changes
+            ORDER BY set_aside_at, agreement_id
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(agreement_id, block)| SetAsideChange {
+                agreement_id,
+                block: block.max(0).unsigned_abs(),
+            })
+            .collect())
+    }
+
+    /// Remove the set-aside changes to `agreement_ids`, once they applied or had nothing to apply.
+    pub async fn delete_set_aside_changes(
+        &self,
+        agreement_ids: &[IndexingAgreementId],
+    ) -> Result<(), Error> {
+        sqlx::query(
+            r#"
+            DELETE FROM dipper_chain_listener_set_aside_changes
+            WHERE agreement_id = ANY($1)
+            "#,
+        )
+        .bind(agreement_ids)
         .execute(&self.pool)
         .await?;
 

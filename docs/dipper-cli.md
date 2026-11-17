@@ -16,6 +16,7 @@ The Dipper Admin CLI supports multiple authentication mechanisms to securely man
 >    - Use environment-specific vaults (development, staging, production)
 >    - Regularly audit vault access permissions
 >    - Implement the principle of least privilege for key access
+>    - Use a different signing key for each dipper. A request is signed for the chain a dipper serves, so 2 dippers on the same chain that allow the same key would each accept a request sent to the other
 >
 > 2. **Secret Management**
 >    - Never commit actual signing keys to version control
@@ -43,8 +44,11 @@ All environment variables used by the CLI are prefixed with `DIPS_`. The main co
 - `DIPS_SERVER_URL`: The URL of the DIPs gateway server
 - `DIPS_SIGNING_KEY`: The secret key used to sign requests (in hex format)
 - `DIPS_IPFS_URL`: The IPFS API that subgraph manifests are read from (defaults to `https://ipfs.thegraph.com`)
+- `DIPS_PROTOCOL_CHAIN_ID`: The chain the DIPs contracts are on (42161 for Arbitrum One, 421614 for Arbitrum Sepolia). `indexings set-target-candidates` needs it, or `--protocol-chain-id`, because each request is signed for the dipper on that chain
 
-Environment variables take precedence over command-line arguments and can be used to avoid repeating common configuration:
+A dipper answers 403 to a request signed for another chain, and 401 to one signed more than 5 minutes before its own clock or more than 30 seconds ahead of it, so keep the clock of the machine running the CLI in sync. It answers 409 to a request signed no later than one it already accepted for the same deployment and chain, which is what a second request in the same second gets: send it again.
+
+A command-line flag takes precedence over the matching environment variable. Environment variables can be used to avoid repeating common configuration:
 
 ```bash
 # Set the server URL in the environment
@@ -54,17 +58,28 @@ export DIPS_SERVER_URL=https://admin.dips.example.com
 dipper-cli init keygen --output .env.unencrypted
 ```
 
-#### .env File
-
-You can use a `.env` file to store your configuration. The CLI will automatically look for a `.env` file in the current directory. You can also specify a custom path using the `--env-file` flag:
+On Kubernetes, dipper's network policy (`k8s/network-policy.yaml`) refuses connections from other pods, so an ingress or load balancer in front of the admin port cannot reach it. Forward the port to your machine instead and point the CLI at it:
 
 ```bash
-dipper-cli --env-file /path/to/.env <command>
+kubectl -n <namespace> port-forward deploy/dipper 8545:8545
+export DIPS_SERVER_URL=http://localhost:8545
 ```
+
+#### .env File
+
+You can use a `.env` file to store the configuration of the `indexings` and `agreements` commands. They look for a `.env` file in the current directory only, never in the directories above it, and also take a custom path with the `--env-file` flag. A file named that way is read instead of the one in the current directory, so a setting it leaves out, such as a private `DIPS_IPFS_URL` kept only in the other file, falls back to your shell or to the default, not to that file:
+
+```bash
+dipper-cli indexings --env-file /path/to/.env <subcommand>
+```
+
+Each setting comes from the first of these that sets it: a command-line flag, a variable already set in your shell, then the file. The CLI prints a warning, naming the setting but never its value, whenever a flag or a shell variable overrides a setting in the file, whether you named it with `--env-file` or the CLI found it in the current directory. It also warns when the server URL and the signing key come from different places, naming both, so a variable left exported in your shell cannot quietly send a command to a different server. A flag or variable that repeats the file's value, even written differently, such as a URL without its trailing slash, raises no warning.
+
+Only `DIPS_` settings are read from a file. Other variables in it are not passed on, so a proxy setting such as `HTTPS_PROXY`, which the manifest and networks registry downloads in `set-target-candidates` follow, has to be exported in your shell. The `init keygen` and `init placeholder` commands read no file at all: they take the server URL from `--server-url` or from `DIPS_SERVER_URL` in your shell.
 
 #### CLI Flags
 
-The CLI provides several flags for authentication:
+The `indexings` and `agreements` commands take these flags for authentication, before or after their subcommand; `init keygen` and `init placeholder` take only `--server-url`:
 
 - `--server-url <URL>`: Specify the DIPs gateway server URL
 - `--signing-key <KEY>`: Provide the signing key in hex format
@@ -84,7 +99,7 @@ export DIPS_SIGNING_KEY=$(op read "op://mainnet/dips/signing-key-1")
 dipper-cli <command>
 
 # Using CLI flags
-dipper-cli --signing-key "$(op read "op://mainnet/dips/signing-key-1")" <command>
+dipper-cli indexings --signing-key "$(op read "op://mainnet/dips/signing-key-1")" <subcommand>
 ```
 
 This approach is useful for:
@@ -103,10 +118,18 @@ DIPS_SERVER_URL=https://admin.dips.example.com
 DIPS_SIGNING_KEY={{ op://mainnet/dips/signing-key-1 }}
 ```
 
-2. Use `op inject` to inject the secrets:
+2. Use `op inject` to write a copy of the template with the secrets filled in, then point the CLI at that copy:
 ```bash
-op inject --in-file .env.template --out-file .env.injected -- dipper-cli --env-file .env.injected <command>
+op inject --in-file .env.template --out-file .env.injected
+dipper-cli indexings --env-file .env.injected <subcommand>
 ```
+
+3. The injected file holds the signing key in plain text, so delete it once you are done:
+```bash
+rm .env.injected
+```
+
+As with any `--env-file` file, a variable already set in your shell beats the one in `.env.injected`, and the CLI warns when it does; a `.env` file in the current directory is not read at all.
 
 This approach is beneficial when:
 - Managing multiple secrets
@@ -137,6 +160,7 @@ This command will:
 > [!IMPORTANT]
 > When saving to a file, the command will display a security warning about storing private keys in environment files. 
 > Consider using a secure credential manager instead.
+> On Linux and macOS the file is left readable and writable by your user only. If it replaces a file that others could read, a process that already had that file open can still read the new key, so write to a new file where that matters.
 
 ### Creating 1Password Templates
 
@@ -149,7 +173,7 @@ dipper-cli init placeholder op://mainnet/dips/signing-key-1 --server-url https:/
 
 This command will:
 1. Create a template configuration file with 1Password references
-2. Show instructions for using `op inject` to inject secrets at runtime
+2. Show instructions for using `op inject` to fill in the secret
 3. Save the template to the specified output file (defaults to `.env.template`)
 
 The generated template will contain the 1Password reference wrapped in double curly braces, which is the format required by `op inject`:
@@ -160,11 +184,30 @@ DIPS_SERVER_URL=https://admin.dips.example.com
 DIPS_SIGNING_KEY={{ op://mainnet/dips/signing-key-1 }}
 ```
 
-To use the generated template:
+To use the generated template, inject the secrets into a copy, run the command with it, then delete the copy, which holds the signing key in plain text:
 ```bash
-# Inject secrets and run a command
-op inject --in-file .env.template --out-file .env.injected -- dipper-cli --env-file .env.injected <command>
+op inject --in-file .env.template --out-file .env.injected
+dipper-cli indexings --env-file .env.injected <subcommand>
+rm .env.injected
 ```
+
+## Listing indexing requests
+
+`indexings list` prints the indexing requests dipper holds as 1 JSON array, oldest first. Dipper hands them over a page at a time and the CLI follows the pages for you, printing each as it arrives, so the list can be piped to `jq` however long it is.
+
+```bash
+# Every request
+dipper-cli indexings list
+
+# Only the requests that are still open, or only the cancelled ones
+dipper-cli indexings list --status open
+dipper-cli indexings list --status canceled
+
+# The 50 oldest requests
+dipper-cli indexings list --limit 50
+```
+
+The CLI and dipper must be from the same release for this command: a CLI from before paging fails to read the reply of a dipper that pages, and says so, instead of showing a partial list.
 
 ## Development
 
@@ -195,8 +238,8 @@ You can build and run the CLI directly using Cargo:
 cargo run --bin dipper-cli <command> [options]
 
 # Examples:
-cargo run --bin dipper-cli init --server-url https://admin.dips.example.com
-cargo run --bin dipper-cli --env-file .env indexings list
+cargo run --bin dipper-cli init keygen --server-url https://admin.dips.example.com
+cargo run --bin dipper-cli indexings --env-file .env list
 ```
 
 ### Debugging the CLI

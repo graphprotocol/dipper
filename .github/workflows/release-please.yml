@@ -1,6 +1,8 @@
 # Manages automated releases via release-please. On main branch pushes, first syncs
 # the release manifest with git tags (via sync-manifest action), then creates/updates
-# a Release PR with CHANGELOG and version bumps. Merging the Release PR triggers build.yml.
+# a Release PR with CHANGELOG and version bumps. Merging the Release PR pushes to main,
+# which builds the `sha-` and `latest` images, and tags the release, after which this
+# workflow starts build.yml on the tag to publish the images under the version as well.
 
 name: Release Please
 
@@ -12,6 +14,8 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  # To start build.yml on a new release's tag.
+  actions: write
 
 jobs:
   # First, sync manifest with actual tags to prevent drift
@@ -42,11 +46,32 @@ jobs:
         run: |
           SYNC_PR=$(gh pr list --repo ${{ github.repository }} --search "sync release-please manifest in:title" --state open --json number --jq '.[0].number' 2>/dev/null || echo "")
           if [ -n "$SYNC_PR" ]; then
-            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "::warning::Skipping release-please - manifest sync PR #$SYNC_PR is open. Merge it first."
           else
-            echo "skip=false" >> $GITHUB_OUTPUT
+            echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
       - uses: google-github-actions/release-please-action@v4
+        id: release
         if: steps.check-sync.outputs.skip != 'true'
+
+      # A tag pushed with the workflow token starts no workflow, so a release's tag never ran
+      # build.yml and no image carried the version that k8s/deployment.yaml names. Starting a
+      # workflow by hand is the exception GitHub allows, and on the tag it adds that image tag.
+      # It runs even if the release step failed after creating the release, since a rerun finds
+      # the release made and starts nothing. If this step still fails, start the build by hand:
+      # gh workflow run build.yml --repo graphprotocol/dipper --ref <tag>
+      - name: Build the release's images
+        if: always() && steps.release.outputs.release_created == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag_name }}
+        run: |
+          for attempt in 1 2 3; do
+            gh workflow run build.yml --repo "${{ github.repository }}" --ref "$TAG" && exit 0
+            echo "::warning::Could not start the image build for $TAG (attempt $attempt of 3)"
+            sleep 10
+          done
+          echo "::error::Could not start the image build for $TAG; run: gh workflow run build.yml --ref $TAG"
+          exit 1

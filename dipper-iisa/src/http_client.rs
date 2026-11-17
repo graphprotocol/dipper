@@ -10,7 +10,10 @@
 //! - Running the selection algorithm
 //! - Candidate filtering (internally, using its own scores data)
 
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::{BTreeSet, HashMap},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use rand::Rng;
@@ -399,28 +402,30 @@ impl HttpIisaClient {
         }
     }
 
-    /// Format pending agreements from context for the HTTP request.
+    /// Format pending agreements for the HTTP request as 1 entry, under the deployment being
+    /// selected for.
     ///
-    /// Returns `None` if the map is empty to skip serialization.
+    /// IISA pools the indexers of every entry into 1 set it will not pick and never reads which
+    /// deployment they were listed under, so each indexer is sent once rather than once for every
+    /// deployment it holds an agreement on, which grew the request with dipper's workload.
+    /// Returns `None` when there are no indexers, to skip serialization.
     fn format_pending_agreements(
+        deployment_id: DeploymentId,
         context: &SelectionContext,
     ) -> Option<HashMap<String, Vec<String>>> {
-        if context.pending_agreements.is_empty() {
-            None
-        } else {
-            Some(
-                context
-                    .pending_agreements
-                    .iter()
-                    .map(|(deployment_id, indexer_ids)| {
-                        (
-                            deployment_id.to_string(),
-                            indexer_ids.iter().map(|id| format!("{:#x}", id)).collect(),
-                        )
-                    })
-                    .collect(),
-            )
+        let indexers: BTreeSet<String> = context
+            .pending_agreements
+            .values()
+            .flatten()
+            .map(|id| format!("{:#x}", id))
+            .collect();
+        if indexers.is_empty() {
+            return None;
         }
+        Some(HashMap::from([(
+            deployment_id.to_string(),
+            indexers.into_iter().collect(),
+        )]))
     }
 
     /// Format indexer denylist from context as `blocklist` for the HTTP request.
@@ -458,28 +463,23 @@ impl HttpIisaClient {
         }
     }
 
-    /// Format declined indexers from context for the HTTP request.
+    /// Format the declined indexers of the deployment being selected for, for the HTTP request.
     ///
-    /// Returns `None` if the map is empty to skip serialization.
+    /// IISA reads only that deployment's entry, so the others are left out: sending them grew the
+    /// request with every deployment any indexer had recently declined. Returns `None` when the
+    /// entry is missing or empty, to skip serialization.
     fn format_declined_indexers(
+        deployment_id: DeploymentId,
         context: &SelectionContext,
     ) -> Option<HashMap<String, Vec<String>>> {
-        if context.declined_indexers.is_empty() {
-            None
-        } else {
-            Some(
-                context
-                    .declined_indexers
-                    .iter()
-                    .map(|(deployment_id, indexer_ids)| {
-                        (
-                            deployment_id.to_string(),
-                            indexer_ids.iter().map(|id| format!("{:#x}", id)).collect(),
-                        )
-                    })
-                    .collect(),
-            )
-        }
+        let indexer_ids = context
+            .declined_indexers
+            .get(&deployment_id)
+            .filter(|ids| !ids.is_empty())?;
+        Some(HashMap::from([(
+            deployment_id.to_string(),
+            indexer_ids.iter().map(|id| format!("{:#x}", id)).collect(),
+        )]))
     }
 }
 
@@ -498,10 +498,10 @@ impl CandidateSelection for HttpIisaClient {
         let request = SelectionRequest {
             deployment_id: deployment_id.to_string(),
             existing_indexers: Self::format_existing_indexers(context),
-            pending_agreements: Self::format_pending_agreements(context),
+            pending_agreements: Self::format_pending_agreements(deployment_id, context),
             num_candidates,
             blocklist: Self::format_blocklist(context),
-            declined_indexers: Self::format_declined_indexers(context),
+            declined_indexers: Self::format_declined_indexers(deployment_id, context),
             chain_id: context.chain_id.clone(),
             max_grt_per_30_days: context.max_grt_per_30_days,
             max_grt_per_billion_entities_per_30_days: context
@@ -680,7 +680,10 @@ mod tests {
     #[test]
     fn test_format_pending_agreements_empty() {
         let context = SelectionContext::default();
-        assert_eq!(HttpIisaClient::format_pending_agreements(&context), None);
+        assert_eq!(
+            HttpIisaClient::format_pending_agreements(numbered_deployment(0), &context),
+            None
+        );
     }
 
     #[test]
@@ -700,7 +703,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = HttpIisaClient::format_pending_agreements(&context);
+        let result = HttpIisaClient::format_pending_agreements(deployment_id, &context);
         assert!(result.is_some());
         let agreements = result.unwrap();
         assert_eq!(agreements.len(), 1);
@@ -748,7 +751,10 @@ mod tests {
     #[test]
     fn test_format_declined_indexers_empty() {
         let context = SelectionContext::default();
-        assert_eq!(HttpIisaClient::format_declined_indexers(&context), None);
+        assert_eq!(
+            HttpIisaClient::format_declined_indexers(numbered_deployment(0), &context),
+            None
+        );
     }
 
     #[test]
@@ -768,7 +774,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = HttpIisaClient::format_declined_indexers(&context);
+        let result = HttpIisaClient::format_declined_indexers(deployment_id, &context);
         assert!(result.is_some());
         let declined_map = result.unwrap();
         assert_eq!(declined_map.len(), 1);
@@ -778,6 +784,148 @@ mod tests {
             .unwrap();
         assert_eq!(indexers.len(), 1);
         assert_eq!(indexers[0], "0x1234567890123456789012345678901234567890");
+    }
+
+    /// The deployment numbered `n`, to make as many distinct ones as a test needs.
+    fn numbered_deployment(n: u32) -> DeploymentId {
+        format!("0x{n:064x}").parse().unwrap()
+    }
+
+    fn repeated_indexer(byte: u8) -> IndexerId {
+        IndexerId::from(thegraph_core::alloy::primitives::Address::repeat_byte(byte))
+    }
+
+    /// The body of the selection request `context` makes for `deployment_id`, byte for byte as
+    /// IISA gets it, since its size is what IISA limits.
+    async fn selection_request_body(
+        deployment_id: DeploymentId,
+        context: &SelectionContext,
+    ) -> Vec<u8> {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/select-indexers"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "deployment_id": deployment_id.to_string(),
+                "indexers": []
+            })))
+            .mount(&mock_server)
+            .await;
+        let config = HttpClientConfig {
+            max_retries: 0,
+            ..HttpClientConfig::default()
+        };
+        let client = HttpIisaClient::with_config(mock_server.uri(), config);
+
+        client
+            .select_indexers(deployment_id, 1, context)
+            .await
+            .expect("selection succeeds");
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "1 request sent");
+        requests[0].body.clone()
+    }
+
+    fn parsed(body: &[u8]) -> serde_json::Value {
+        serde_json::from_slice(body).unwrap()
+    }
+
+    /// IISA reads only the declines for the deployment it is selecting for, so declines on other
+    /// deployments must not reach it: they grew the request with every deployment any indexer
+    /// had recently turned down.
+    #[tokio::test]
+    async fn a_selection_request_carries_only_the_selected_deployments_declines() {
+        let selected = numbered_deployment(0);
+        let declined_here = vec![repeated_indexer(0x01), repeated_indexer(0x02)];
+        let mut declined: HashMap<DeploymentId, Vec<IndexerId>> = (1..=1_000)
+            .map(|n| (numbered_deployment(n), vec![repeated_indexer(0x03)]))
+            .collect();
+        declined.insert(selected, declined_here.clone());
+        let context = SelectionContext {
+            declined_indexers: declined,
+            ..Default::default()
+        };
+        let only_this_deployment = SelectionContext {
+            declined_indexers: HashMap::from([(selected, declined_here)]),
+            ..Default::default()
+        };
+
+        let body = selection_request_body(selected, &context).await;
+        let alone = selection_request_body(selected, &only_this_deployment).await;
+
+        assert_eq!(
+            body.len(),
+            alone.len(),
+            "declines on 1,000 other deployments grew the request"
+        );
+        assert_eq!(
+            parsed(&body)["declined_indexers"],
+            serde_json::json!({
+                selected.to_string(): [
+                    "0x0101010101010101010101010101010101010101",
+                    "0x0202020202020202020202020202020202020202",
+                ]
+            })
+        );
+        assert!(
+            body == alone,
+            "declines on 1,000 other deployments changed the request"
+        );
+    }
+
+    /// IISA pools the indexers of every pending entry into 1 set it will not pick, and never
+    /// looks at the deployments they are listed under, so that set is what has to arrive.
+    #[tokio::test]
+    async fn a_selection_request_carries_each_pending_indexer_once() {
+        let selected = numbered_deployment(0);
+        let member = repeated_indexer(0x01);
+        let other_member = repeated_indexer(0x02);
+        // Listed only under other deployments, as when its agreement here ended between
+        // dipper's 2 reads. IISA would not pick it, so it must still arrive.
+        let listed_elsewhere = repeated_indexer(0x03);
+        let mut pending: HashMap<DeploymentId, Vec<IndexerId>> = (1..=1_000)
+            .map(|n| {
+                (
+                    numbered_deployment(n),
+                    vec![member, other_member, listed_elsewhere],
+                )
+            })
+            .collect();
+        pending.insert(selected, vec![other_member, member]);
+        let context = SelectionContext {
+            pending_agreements: pending,
+            ..Default::default()
+        };
+        let only_this_deployment = SelectionContext {
+            pending_agreements: HashMap::from([(
+                selected,
+                vec![member, other_member, listed_elsewhere],
+            )]),
+            ..Default::default()
+        };
+
+        let body = selection_request_body(selected, &context).await;
+        let alone = selection_request_body(selected, &only_this_deployment).await;
+
+        assert_eq!(
+            body.len(),
+            alone.len(),
+            "pending agreements on 1,000 other deployments grew the request"
+        );
+        assert_eq!(
+            parsed(&body)["pending_agreements"],
+            serde_json::json!({
+                selected.to_string(): [
+                    "0x0101010101010101010101010101010101010101",
+                    "0x0202020202020202020202020202020202020202",
+                    "0x0303030303030303030303030303030303030303",
+                ]
+            })
+        );
+        assert!(
+            body == alone,
+            "pending agreements on 1,000 other deployments changed the request"
+        );
     }
 
     #[tokio::test]
