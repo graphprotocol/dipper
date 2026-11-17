@@ -2845,25 +2845,32 @@ mod tests {
         assert_eq!(conf.validate(), Ok(()));
     }
 
-    /// The README tells indexers how far above the published minimum they may price before
-    /// dipper stops selecting them, so it has to name the multiplier dipper uses.
+    /// The README tells indexers how far above the published minimums they may price before
+    /// dipper stops selecting them, so it has to state the rule dipper applies: the multiplier,
+    /// the chains it holds for, and the flat ceiling every other chain gets.
     #[test]
     fn the_readme_tells_indexers_the_multiplier_dipper_uses() {
         let readme = include_str!("../../../README.md");
         let rules = [
+            format!("the base ceiling is {PAYMENT_CEILING_MULTIPLIER} times that minimum"),
+            "every other chain shares 1 flat ceiling of 1,800 GRT per 30 days".to_string(),
             format!(
-                "Asking more than {PAYMENT_CEILING_MULTIPLIER} times the published minimum for a \
-                 chain"
+                "The per-entity ceiling is {PAYMENT_CEILING_MULTIPLIER} times the published \
+                 per-entity minimum"
             ),
-            format!(
-                "more than {PAYMENT_CEILING_MULTIPLIER} times the published minimum per billion \
-                 entities"
-            ),
+            "800 GRT per billion entities per 30 days".to_string(),
         ];
 
         for rule in rules {
             assert!(readme.contains(&rule), "the README does not say: {rule}");
         }
+        // The 2 figures spelt out above are the defaults.
+        assert_eq!(default_fallback_max_grt_per_30_days(), 1_800.0);
+        assert_eq!(default_max_grt_per_billion_entities_per_30_days(), 800.0);
+        assert!(
+            !readme.contains("the published minimum for a chain"),
+            "only the chains indexer-rs lists are held to a multiple of their own minimum"
+        );
     }
 
     /// Stale `max_initial_tokens` and `max_ongoing_tokens_per_second` keys
