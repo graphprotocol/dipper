@@ -7,6 +7,8 @@ use std::{
     sync::{Arc, PoisonError, RwLock},
 };
 
+use time::OffsetDateTime;
+
 use crate::config::PAYMENT_CEILING_MULTIPLIER;
 
 /// A suggested minimum base price for each chain, by chain name, in GRT per 30 days.
@@ -21,7 +23,15 @@ pub struct BasePriceCeilings {
     /// The operator's `fallback_max_grt_per_30_days`.
     fallback: Option<f64>,
     /// The suggested minimums the default ceilings are a multiple of.
-    minimums: RwLock<Arc<Minimums>>,
+    in_use: RwLock<InUse>,
+}
+
+/// The table of suggested minimums in use.
+#[derive(Debug)]
+struct InUse {
+    minimums: Arc<Minimums>,
+    /// When it was fetched, or `None` for the table dipper starts on, built into its release.
+    fetched_at: Option<OffsetDateTime>,
 }
 
 impl BasePriceCeilings {
@@ -32,10 +42,14 @@ impl BasePriceCeilings {
         fallback: Option<f64>,
         minimums: Minimums,
     ) -> Self {
+        let in_use = InUse {
+            minimums: Arc::new(minimums),
+            fetched_at: None,
+        };
         Self {
             chains,
             fallback,
-            minimums: RwLock::new(Arc::new(minimums)),
+            in_use: RwLock::new(in_use),
         }
     }
 
@@ -57,8 +71,15 @@ impl BasePriceCeilings {
 
     /// The suggested minimums in use.
     pub fn minimums(&self) -> Arc<Minimums> {
-        let minimums = self.minimums.read().unwrap_or_else(PoisonError::into_inner);
-        Arc::clone(&minimums)
+        let in_use = self.in_use.read().unwrap_or_else(PoisonError::into_inner);
+        Arc::clone(&in_use.minimums)
+    }
+
+    /// When the minimums in use were fetched, or `None` while they are still the ones dipper
+    /// started on.
+    pub fn fetched_at(&self) -> Option<OffsetDateTime> {
+        let in_use = self.in_use.read().unwrap_or_else(PoisonError::into_inner);
+        in_use.fetched_at
     }
 
     /// Whether a ceiling is left to its default, and so follows the suggested minimums.
@@ -73,16 +94,13 @@ impl BasePriceCeilings {
         fetched: Minimums,
         max_agreement_grt_per_30_days: f64,
     ) -> Result<Vec<CeilingChange>, Refusal> {
-        let mut in_use = self
-            .minimums
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
-        checked(&fetched, &in_use, max_agreement_grt_per_30_days)?;
+        let mut in_use = self.in_use.write().unwrap_or_else(PoisonError::into_inner);
+        checked(&fetched, &in_use.minimums, max_agreement_grt_per_30_days)?;
         // No chain is ever dropped, so the fetched table names every chain that can change.
         let changes = fetched
             .keys()
             .filter_map(|chain| {
-                let old = self.ceiling_over(chain, &in_use);
+                let old = self.ceiling_over(chain, &in_use.minimums);
                 let new = self.ceiling_over(chain, &fetched);
                 // With the operator's own chain ceilings, a chain only moves with the fallback.
                 (self.chains.is_none() && old != new).then(|| CeilingChange {
@@ -91,9 +109,12 @@ impl BasePriceCeilings {
                     new,
                 })
             })
-            .chain(self.fallback_change(&in_use, &fetched))
+            .chain(self.fallback_change(&in_use.minimums, &fetched))
             .collect();
-        *in_use = Arc::new(fetched);
+        *in_use = InUse {
+            minimums: Arc::new(fetched),
+            fetched_at: Some(OffsetDateTime::now_utc()),
+        };
         Ok(changes)
     }
 
@@ -463,6 +484,23 @@ mod tests {
                 change(None, 1_800.0, 2_000.0),
             ]
         );
+    }
+
+    /// The alerts name the table in use by when it was fetched, and tell the one dipper
+    /// started on from one it took since.
+    #[test]
+    fn the_table_in_use_is_known_as_built_in_until_one_is_taken() {
+        let ceilings = BasePriceCeilings::new(None, None, in_use());
+        assert_eq!(ceilings.fetched_at(), None);
+
+        let refused = ceilings.follow(Minimums::new(), CAP);
+        assert_eq!(refused, Err(Refusal::Empty));
+        assert_eq!(ceilings.fetched_at(), None, "a refused table is not in use");
+
+        let before = OffsetDateTime::now_utc();
+        ceilings.follow(in_use(), CAP).expect("the table is taken");
+        let fetched_at = ceilings.fetched_at().expect("a fetched table is in use");
+        assert!(fetched_at >= before, "{fetched_at} is before {before}");
     }
 
     #[test]

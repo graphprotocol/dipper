@@ -2963,6 +2963,21 @@ mod tests {
         );
     }
 
+    /// Operators learn from the README what moves the ceilings and when, so it has to state
+    /// the parts of that which are easy to get wrong after a restart or a change upstream.
+    #[test]
+    fn the_readme_tells_operators_when_the_ceilings_move() {
+        let readme = include_str!("../../../README.md");
+        let rules = [
+            "each start begins on the minimums built into its release",
+            "A read that fails is tried again after 1 minute",
+        ];
+
+        for rule in rules {
+            assert!(readme.contains(rule), "the README does not say: {rule}");
+        }
+    }
+
     /// Stale `max_initial_tokens` and `max_ongoing_tokens_per_second` keys
     /// from the pre-refactor config schema should fail deserialization
     /// rather than be silently ignored, so operators surface the migration

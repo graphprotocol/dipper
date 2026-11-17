@@ -1,9 +1,11 @@
 //! Keeps dipper's default price ceilings in step with the minimum prices indexer-rs suggests.
-//! The table is fetched at start and then on an interval. One that fails a check, or a fetch
-//! that fails, leaves the table in use where it is: nothing here ends dipper or holds it up.
+//! The table is fetched at start and then on an interval, or sooner after a fetch that failed.
+//! One that fails a check, or a fetch that fails, leaves the table in use where it is: nothing
+//! here ends dipper or holds it up.
 
 use std::{future::Future, sync::Arc, time::Duration};
 
+use time::format_description::well_known::Rfc3339;
 use tokio::{sync::mpsc, time::Instant};
 use url::Url;
 
@@ -14,6 +16,10 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The most a published table may weigh. The real one is under 2 KiB.
 const MAX_TABLE_BYTES: usize = 64 * 1024;
+
+/// How long after a fetch that failed the next one is made: twice as long for each failure
+/// in a row, and never longer than the interval between fetches.
+const FIRST_RETRY_AFTER: Duration = Duration::from_secs(60);
 
 /// How often a failure that goes on is alerted on again, however often the table is fetched.
 const ALERT_AGAIN_AFTER: Duration = Duration::from_secs(10 * 60);
@@ -114,41 +120,53 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<Vec<u8>, FetchFailure>>,
 {
-    // The first tick is immediate, so the table is fetched as dipper starts.
-    let mut ticker = tokio::time::interval(ctx.interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The table is fetched as dipper starts.
+    let mut next_fetch = Instant::now();
+    let mut retry_after = FIRST_RETRY_AFTER;
     let mut alerted = Alerted::default();
     loop {
         tokio::select! { biased;
             _ = rx_stop.recv() => return Ok(()),
-            _ = ticker.tick() => {}
+            () = tokio::time::sleep_until(next_fetch) => {}
         }
+        let started = Instant::now();
         // A stop wins over a fetch in flight: dropping it loses nothing but 1 read.
         let fetched = tokio::select! { biased;
             _ = rx_stop.recv() => return Ok(()),
             fetched = fetch() => fetched,
         };
-        ctx.settle(fetched, &mut alerted);
+        let wait = match fetched {
+            Ok(table) => {
+                ctx.settle(&table, &mut alerted);
+                retry_after = FIRST_RETRY_AFTER;
+                ctx.interval
+            }
+            Err(failure) => {
+                let wait = retry_after.min(ctx.interval);
+                retry_after = retry_after.saturating_mul(2);
+                ctx.note_fetch_failure(&failure, wait, &mut alerted);
+                wait
+            }
+        };
+        next_fetch = started + wait;
     }
 }
 
 impl Ctx {
-    /// Takes what 1 fetch brought: the table if it passes every check, and otherwise nothing,
+    /// Takes the table 1 fetch brought if it passes every check, and otherwise nothing,
     /// which leaves the table in use, and so every ceiling, as it was.
-    fn settle(&self, fetched: Result<Vec<u8>, FetchFailure>, alerted: &mut Alerted) {
-        let table = match fetched {
-            Ok(table) => table,
-            Err(failure) => return self.note_fetch_failure(&failure, alerted),
-        };
+    fn settle(&self, table: &[u8], alerted: &mut Alerted) {
         let above_before = (self.table_prices_above_ceilings)();
-        let taken = parse_minimums(&table).and_then(|minimums| {
+        // Only this task takes a table, so none is taken between this read and the take.
+        let first_since_start = self.ceilings.fetched_at().is_none();
+        let taken = parse_minimums(table).and_then(|minimums| {
             self.ceilings
                 .follow(minimums, self.max_agreement_grt_per_30_days)
         });
         match taken {
             Ok(changes) => {
                 *alerted = Alerted::default();
-                note_changes(&changes);
+                note_changes(&changes, first_since_start);
                 // Start-up warned of the table prices above a ceiling then, so this warns
                 // only of those a ceiling that moved has left above it.
                 let above = (self.table_prices_above_ceilings)();
@@ -163,31 +181,51 @@ impl Ctx {
                     event,
                     url = %without_secrets(&self.url),
                     "Dipper refused the minimum prices it fetched from indexer-rs: {refusal}. \
-                     Its default price ceilings stay as they were. If the published prices are \
+                     Its default price ceilings stay on {}. If the published prices are \
                      right, set max_grt_per_30_days and fallback_max_grt_per_30_days in the \
-                     config, or release a dipper whose built-in prices are close to them"
+                     config, or release a dipper whose built-in prices are close to them",
+                    self.table_in_use()
                 );
             }
         }
     }
 
-    fn note_fetch_failure(&self, failure: &FetchFailure, alerted: &mut Alerted) {
+    fn note_fetch_failure(
+        &self,
+        failure: &FetchFailure,
+        retry_in: Duration,
+        alerted: &mut Alerted,
+    ) {
         let event = alerted
             .due_for_fetch_failure()
             .then_some(FETCH_FAILED_EVENT);
         tracing::warn!(
             event,
             url = %without_secrets(&self.url),
-            retry_in_secs = self.interval.as_secs(),
+            retry_in_secs = retry_in.as_secs(),
             "Dipper could not fetch the minimum prices indexer-rs suggests: {failure}. Its \
-             default price ceilings stay as they were, on the last prices it fetched or, if it \
-             has fetched none since it started, on those built into this release"
+             default price ceilings stay on {}",
+            self.table_in_use()
         );
+    }
+
+    /// The table the default ceilings are worked out from, for a message about one that was
+    /// not taken: a restart puts dipper back on the built-in one until a fetch succeeds.
+    fn table_in_use(&self) -> String {
+        let Some(fetched_at) = self.ceilings.fetched_at() else {
+            return "the minimum prices built into this release, since it has taken no others \
+                    since it started"
+                .to_string();
+        };
+        let at = fetched_at.replace_nanosecond(0).unwrap_or(fetched_at);
+        let at = at.format(&Rfc3339).unwrap_or_else(|_| at.to_string());
+        format!("the minimum prices it fetched at {at}")
     }
 }
 
 /// Logs what a table that was taken changed: a line for each ceiling, and 1 alert for all.
-fn note_changes(changes: &[CeilingChange]) {
+/// The first table since dipper started replaces the built-in one, and the alert says so.
+fn note_changes(changes: &[CeilingChange], first_since_start: bool) {
     if changes.is_empty() {
         tracing::info!("fetched the minimum prices indexer-rs suggests; no price ceiling moved");
         return;
@@ -200,12 +238,24 @@ fn note_changes(changes: &[CeilingChange]) {
             "default price ceiling changed to follow indexer-rs"
         );
     }
+    let changes = describe(changes);
+    let what = if first_since_start {
+        format!(
+            "Since it started, dipper's default price ceilings follow the minimum prices \
+             indexer-rs suggests, which differ from the figures built into this release, in \
+             GRT per 30 days: {changes}. This is raised at each start while the 2 differ, and \
+             need not mean that indexer-rs changed a price just now"
+        )
+    } else {
+        format!(
+            "Dipper's default price ceilings changed to follow the minimum prices indexer-rs \
+             suggests, in GRT per 30 days: {changes}"
+        )
+    };
     tracing::warn!(
         event = CHANGED_EVENT,
-        "Dipper's default price ceilings changed to follow the minimum prices indexer-rs \
-         suggests, in GRT per 30 days: {}. An indexer asking more than its chain's ceiling is \
-         left out of selection, and loses an agreement it holds at the next reassessment",
-        describe(changes)
+        "{what}. An indexer asking more than its chain's ceiling is left out of selection, \
+         and loses an agreement it holds at the next reassessment"
     );
 }
 
@@ -283,6 +333,7 @@ mod tests {
         worker,
     };
 
+    const MINUTE: Duration = Duration::from_secs(60);
     const HOUR: Duration = Duration::from_secs(3_600);
 
     /// The table in use when each test starts, as if built into the release.
@@ -543,6 +594,10 @@ mod tests {
         assert_eq!(*ceilings.minimums(), built_in());
         assert_eq!(alerts(&logs, REFUSED_EVENT), 1, "{logs}");
         assert!(logs.contains("it cannot be read"), "{logs}");
+        assert!(
+            logs.contains("stay on the minimum prices built into this release"),
+            "it says which table is in use: {logs}"
+        );
     }
 
     /// Until indexer-rs publishes the file the address answers 404. Dipper then starts on
@@ -551,16 +606,16 @@ mod tests {
     async fn a_fetch_that_fails_at_start_leaves_the_built_in_table_and_is_alerted_on() {
         let ceilings = default_ceilings();
 
-        let (fetches, logs) = served(&ceilings, 6 * HOUR, vec![not_found], 13 * HOUR).await;
+        let (fetches, logs) = served(&ceilings, 6 * HOUR, vec![not_found], MINUTE / 2).await;
 
-        assert_eq!(fetches, 3, "it keeps asking, at 0, 6 and 12 hours");
+        assert_eq!(fetches, 1);
         assert_eq!(*ceilings.minimums(), built_in());
-        assert_eq!(
-            alerts(&logs, FETCH_FAILED_EVENT),
-            3,
-            "6 hours apart, each one is alerted on: {logs}"
-        );
+        assert_eq!(alerts(&logs, FETCH_FAILED_EVENT), 1, "{logs}");
         assert!(logs.contains("404 Not Found"), "{logs}");
+        assert!(
+            logs.contains("stay on the minimum prices built into this release"),
+            "it says which table is in use: {logs}"
+        );
         assert!(
             logs.contains("https://prices.example/table.json") && !logs.contains("secret"),
             "the address is named without its query: {logs}"
@@ -571,12 +626,98 @@ mod tests {
     async fn a_fetch_that_fails_later_keeps_the_last_table_that_was_taken() {
         let ceilings = default_ceilings();
 
-        let (_, logs) = served(&ceilings, 6 * HOUR, vec![raised, not_found], 13 * HOUR).await;
+        let lasting = 6 * HOUR + MINUTE / 2;
+        let (_, logs) = served(&ceilings, 6 * HOUR, vec![raised, not_found], lasting).await;
 
         assert_eq!(ceilings.for_chain("arbitrum-one"), 2_000.0);
         assert_eq!(ceilings.for_chain("mainnet"), 120.0);
         assert_eq!(alerts(&logs, CHANGED_EVENT), 1, "{logs}");
-        assert_eq!(alerts(&logs, FETCH_FAILED_EVENT), 2, "{logs}");
+        assert_eq!(alerts(&logs, FETCH_FAILED_EVENT), 1, "{logs}");
+        assert!(
+            logs.contains("stay on the minimum prices it fetched at 20"),
+            "it says which table is in use, by when it was fetched: {logs}"
+        );
+        assert!(
+            !logs.contains("stay on the minimum prices built into this release"),
+            "{logs}"
+        );
+    }
+
+    /// A fetch that fails is tried again after 1 minute, then 2, then 4, and not a whole
+    /// interval later. A table that is taken puts the fetches an interval apart again, and
+    /// the next failure starts again from 1 minute.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_fetch_is_tried_again_sooner_until_a_table_is_taken() {
+        let ceilings = default_ceilings();
+        let script: Vec<fn() -> Fetched> =
+            vec![not_found, not_found, not_found, unchanged, not_found];
+
+        // Fetches at 0, 1 and 3 minutes fail, the one at 7 minutes is taken, and those at
+        // 6 hours 7 and 6 hours 8 fail.
+        let lasting = 6 * HOUR + 9 * MINUTE + MINUTE / 2;
+        let (fetches, logs) = served(&ceilings, 6 * HOUR, script, lasting).await;
+
+        assert_eq!(fetches, 6, "{logs}");
+        for (wait, times) in [
+            ("retry_in_secs=60", 2),
+            ("retry_in_secs=120", 2),
+            ("retry_in_secs=240", 1),
+        ] {
+            assert_eq!(logs.matches(wait).count(), times, "{wait}: {logs}");
+        }
+    }
+
+    /// However long the failures go on, 2 fetches are never further apart than the interval.
+    #[tokio::test(start_paused = true)]
+    async fn the_wait_after_a_failed_fetch_is_never_longer_than_the_interval() {
+        let ceilings = default_ceilings();
+
+        // At 0, 1, 3 and 7 minutes, and from then every 5: at 12, 17, 22 and 27.
+        let lasting = 29 * MINUTE + MINUTE / 2;
+        let (fetches, _) = served(&ceilings, 5 * MINUTE, vec![not_found], lasting).await;
+
+        assert_eq!(fetches, 8);
+    }
+
+    /// The published file will not change by itself, so a table that is refused is not
+    /// fetched again before the interval is up.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_table_is_fetched_again_only_after_the_interval() {
+        fn a_web_page() -> Fetched {
+            Ok(b"<html>Sign in to continue</html>".to_vec())
+        }
+        let ceilings = default_ceilings();
+
+        let lasting = 6 * HOUR + MINUTE / 2;
+        let (fetches, _) = served(&ceilings, 6 * HOUR, vec![a_web_page], lasting).await;
+
+        assert_eq!(fetches, 2, "at 0 and at 6 hours");
+    }
+
+    /// A dipper that starts is on the figures built into its release until its first fetch.
+    /// Once indexer-rs has moved a price, every start therefore moves the ceilings. The
+    /// alert for that says it is the start, so it is not read as a change made upstream.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_change_after_a_start_is_alerted_on_as_a_start_up_message() {
+        fn raised_again() -> Fetched {
+            Ok(published(&[
+                ("arbitrum-one", 600.0),
+                ("mainnet", 30.0),
+                ("sepolia", 5.0),
+                ("base", 80.0),
+            ]))
+        }
+        let ceilings = default_ceilings();
+
+        let (_, logs) = served(&ceilings, 6 * HOUR, vec![raised, raised_again], 7 * HOUR).await;
+
+        assert_eq!(alerts(&logs, CHANGED_EVENT), 2, "{logs}");
+        let at_start = "differ from the figures built into this release, in GRT per 30 days: \
+                        arbitrum-one from 1800 to 2000";
+        assert_eq!(logs.matches(at_start).count(), 1, "the first: {logs}");
+        let upstream = "changed to follow the minimum prices indexer-rs suggests, in GRT per \
+                        30 days: arbitrum-one from 2000 to 2400";
+        assert_eq!(logs.matches(upstream).count(), 1, "the second: {logs}");
     }
 
     /// An operator may set a short interval. A fault that lasts must not then post an alert
