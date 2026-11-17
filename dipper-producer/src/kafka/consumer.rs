@@ -133,11 +133,9 @@ impl KafkaConsumer {
     /// Timeout for offset queries, which carry no server-side wait.
     const OFFSET_TIMEOUT: Duration = Duration::from_secs(30);
 
-    /// Connects to the brokers and binds to the configured topic. Partitions
-    /// are discovered from broker metadata, so there is no partition count to
-    /// configure; a topic the credentials cannot see is an error. The whole
-    /// sequence is bounded by `connect_timeout_secs`, since the underlying
-    /// client would otherwise retry an unreachable broker forever.
+    /// Connects to the brokers and binds to the topic, taking its partitions from broker
+    /// metadata; a topic the credentials cannot see is an error. Bounded by
+    /// `connect_timeout_secs`, since the client would otherwise retry a dead broker forever.
     pub async fn connect(config: &KafkaConsumerConfig) -> Result<Self, ConsumerError> {
         tokio::time::timeout(
             Duration::from_secs(config.connect_timeout_secs),
