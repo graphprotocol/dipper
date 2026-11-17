@@ -89,6 +89,57 @@ pub trait KafkaConsumerOffsetRegistry {
     ) -> Result<(), crate::registry::Error>;
 }
 
+/// One fetched record, reduced to what the consumer reads.
+struct FetchedRecord {
+    offset: i64,
+    key: Option<Vec<u8>>,
+    value: Option<Vec<u8>>,
+}
+
+/// What a partition loop asks of the broker client. [`KafkaConsumer`] is the real one; tests
+/// script their own, since the loop can't otherwise run without a broker.
+#[async_trait]
+trait PartitionSource: Send + Sync + 'static {
+    /// Records from `offset` on, and the partition's high watermark.
+    async fn fetch(
+        &self,
+        partition: i32,
+        offset: i64,
+        max_bytes: i32,
+        max_wait_ms: i32,
+    ) -> Result<(Vec<FetchedRecord>, i64), ConsumerError>;
+
+    /// The partition's earliest or latest offset.
+    async fn offset(&self, partition: i32, at: OffsetAt) -> Result<i64, ConsumerError>;
+}
+
+#[async_trait]
+impl PartitionSource for KafkaConsumer {
+    async fn fetch(
+        &self,
+        partition: i32,
+        offset: i64,
+        max_bytes: i32,
+        max_wait_ms: i32,
+    ) -> Result<(Vec<FetchedRecord>, i64), ConsumerError> {
+        let (records, high_watermark) =
+            KafkaConsumer::fetch(self, partition, offset, max_bytes, max_wait_ms).await?;
+        let records = records
+            .into_iter()
+            .map(|fetched| FetchedRecord {
+                offset: fetched.offset,
+                key: fetched.record.key,
+                value: fetched.record.value,
+            })
+            .collect();
+        Ok((records, high_watermark))
+    }
+
+    async fn offset(&self, partition: i32, at: OffsetAt) -> Result<i64, ConsumerError> {
+        KafkaConsumer::offset(self, partition, at).await
+    }
+}
+
 /// Context required by the indexing request consumer service
 pub struct Ctx<R, W> {
     /// Registry for indexing requests and consumer offsets
@@ -294,8 +345,8 @@ fn reconnecting(first: KafkaConsumer, kafka: KafkaConsumerConfig) -> Reconnectin
     clippy::too_many_lines,
     reason = "predates this lint; fix when next touched"
 )]
-async fn partition_loop<R, W>(
-    consumer: Reconnecting<KafkaConsumer>,
+async fn partition_loop<C, R, W>(
+    consumer: Reconnecting<C>,
     partition: i32,
     registry: R,
     worker_queue: W,
@@ -306,6 +357,7 @@ async fn partition_loop<R, W>(
     config: IndexingRequestConsumerConfig,
     mut shutdown_rx: watch::Receiver<bool>,
 ) where
+    C: PartitionSource,
     R: IndexingRequestRegistry + KafkaConsumerOffsetRegistry + Send + Sync,
     W: WorkerQueue + Send + Sync,
 {
@@ -415,16 +467,16 @@ async fn partition_loop<R, W>(
         };
 
         let records_was_empty = records.is_empty();
-        for record_and_offset in records {
-            let offset = record_and_offset.offset;
-            match decode_propose(record_and_offset.record.value.as_deref(), &expected_network) {
+        for record in records {
+            let offset = record.offset;
+            match decode_propose(record.value.as_deref(), &expected_network) {
                 Err(reason) => {
                     tracing::warn!(
                         topic,
                         partition,
                         offset,
                         reason,
-                        key = ?record_and_offset.record.key.as_deref().map(String::from_utf8_lossy),
+                        key = ?record.key.as_deref().map(String::from_utf8_lossy),
                         "skipping unprocessable indexing request record"
                     );
                 }
@@ -505,13 +557,14 @@ async fn persist_offset<R: KafkaConsumerOffsetRegistry>(
 /// Runs `call` on the current client, waiting while one is being connected, and reports whether it
 /// reached the brokers, so a client left dialling brokers that are gone gets rebuilt. Returns
 /// `None` if shutdown is requested first.
-async fn with_consumer<T, F, Fut>(
-    consumer: &Reconnecting<KafkaConsumer>,
+async fn with_consumer<C, T, F, Fut>(
+    consumer: &Reconnecting<C>,
     shutdown_rx: &mut watch::Receiver<bool>,
     call: F,
 ) -> Option<Result<T, ConsumerError>>
 where
-    F: FnOnce(Arc<KafkaConsumer>) -> Fut,
+    C: PartitionSource,
+    F: FnOnce(Arc<C>) -> Fut,
     Fut: Future<Output = Result<T, ConsumerError>>,
 {
     tokio::select! {
@@ -979,6 +1032,8 @@ mod tests {
     struct MockRegistry {
         script: Arc<Mutex<Vec<Option<SetTargetOutcome>>>>,
         calls: Arc<Mutex<Vec<SetTargetCall>>>,
+        /// Every consumer offset stored, in order; the last is the one a restart resumes from.
+        offsets: Arc<Mutex<Vec<i64>>>,
     }
 
     impl MockRegistry {
@@ -987,7 +1042,12 @@ mod tests {
             Self {
                 script: Arc::new(Mutex::new(script)),
                 calls: Arc::new(Mutex::new(Vec::new())),
+                offsets: Arc::default(),
             }
+        }
+
+        fn stored_offsets(&self) -> Vec<i64> {
+            self.offsets.lock().expect("poisoned").clone()
         }
 
         fn returning(outcome: SetTargetOutcome) -> Self {
@@ -1062,6 +1122,27 @@ mod tests {
             _batch_size: i64,
         ) -> RegistryResult<Vec<IndexingRequestRecord>> {
             unimplemented!()
+        }
+    }
+
+    #[async_trait]
+    impl KafkaConsumerOffsetRegistry for MockRegistry {
+        async fn get_kafka_consumer_offset(
+            &self,
+            _topic: &str,
+            _partition_id: i32,
+        ) -> RegistryResult<Option<i64>> {
+            Ok(self.stored_offsets().last().copied())
+        }
+
+        async fn set_kafka_consumer_offset(
+            &self,
+            _topic: &str,
+            _partition_id: i32,
+            next_offset: i64,
+        ) -> RegistryResult<()> {
+            self.offsets.lock().expect("poisoned").push(next_offset);
+            Ok(())
         }
     }
 
@@ -1459,6 +1540,163 @@ mod tests {
         assert!(applied);
         assert_eq!(check.calls(), 0);
         assert_eq!(registry.calls().len(), 1);
+    }
+
+    // -------- partition_loop --------
+
+    type Fetch = Result<(Vec<FetchedRecord>, i64), ConsumerError>;
+
+    /// A partition whose fetches are answered from a script, in order. Once the script runs
+    /// out a fetch waits for ever, like a partition with nothing new.
+    struct ScriptedSource {
+        fetches: Mutex<std::collections::VecDeque<Fetch>>,
+        /// The offset each fetch asked for.
+        asked: Arc<Mutex<Vec<i64>>>,
+        earliest: i64,
+        latest: i64,
+    }
+
+    impl ScriptedSource {
+        fn new(fetches: Vec<Fetch>) -> Self {
+            Self {
+                fetches: Mutex::new(fetches.into()),
+                asked: Arc::default(),
+                earliest: 0,
+                latest: 0,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl PartitionSource for ScriptedSource {
+        async fn fetch(
+            &self,
+            _partition: i32,
+            offset: i64,
+            _max_bytes: i32,
+            _max_wait_ms: i32,
+        ) -> Fetch {
+            self.asked.lock().expect("poisoned").push(offset);
+            let next = self.fetches.lock().expect("poisoned").pop_front();
+            match next {
+                Some(answer) => answer,
+                None => std::future::pending().await,
+            }
+        }
+
+        async fn offset(&self, _partition: i32, at: OffsetAt) -> Result<i64, ConsumerError> {
+            Ok(match at {
+                OffsetAt::Earliest => self.earliest,
+                _ => self.latest,
+            })
+        }
+    }
+
+    /// A fetch answered with 1 valid propose for each of `counts`, at offsets from `first` on.
+    fn batch(first: i64, counts: &[i32]) -> Fetch {
+        let records: Vec<FetchedRecord> = (first..)
+            .zip(counts)
+            .map(|(offset, count)| FetchedRecord {
+                offset,
+                key: None,
+                value: Some(encode_propose(
+                    EVENT_TYPE_PROPOSE,
+                    "eip155:42161",
+                    QM_HASH,
+                    "eip155:1",
+                    *count,
+                )),
+            })
+            .collect();
+        let high_watermark = records.last().map_or(first, |record| record.offset + 1);
+        Ok((records, high_watermark))
+    }
+
+    fn test_config() -> IndexingRequestConsumerConfig {
+        serde_json::from_value(serde_json::json!({
+            "kafka": { "brokers": ["localhost:9092"], "topic": "t" },
+            "requested_by": requester().to_string(),
+        }))
+        .expect("a valid consumer config")
+    }
+
+    /// The partition loop as the service runs it, for partition 0 of `source`.
+    fn partition_loop_over(
+        source: ScriptedSource,
+        registry: &MockRegistry,
+        worker: &MockWorker,
+        chain_check: Arc<dyn RequestChainCheck>,
+        shutdown_rx: watch::Receiver<bool>,
+    ) -> impl Future<Output = ()> {
+        let consumer =
+            Reconnecting::with_client("test", source, Duration::from_secs(1), || async {
+                Err::<ScriptedSource, &str>("these tests never rebuild the client")
+            });
+        partition_loop(
+            consumer,
+            0,
+            registry.clone(),
+            worker.clone(),
+            Arc::new(CapturingEventsProducer::new()),
+            PROTOCOL_CHAIN_ID,
+            TEST_MAX_CANDIDATES,
+            chain_check,
+            test_config(),
+            shutdown_rx,
+        )
+    }
+
+    /// Lets `run` work until `done`, then asks it to stop and waits for it to return.
+    async fn run_until(
+        run: impl Future<Output = ()>,
+        shutdown_tx: &watch::Sender<bool>,
+        done: impl Fn() -> bool,
+    ) {
+        let stop = async {
+            while !done() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let _ = shutdown_tx.send(true);
+        };
+        tokio::time::timeout(Duration::from_secs(600), async { tokio::join!(run, stop) })
+            .await
+            .expect("the partition loop stops once asked to");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_loop_applies_each_fetched_record_and_stores_the_offset_past_it() {
+        let registry = MockRegistry::scripted(vec![
+            Some(SetTargetOutcome::Inserted {
+                id: IndexingRequestId::new(),
+            }),
+            Some(SetTargetOutcome::Updated {
+                id: IndexingRequestId::new(),
+                new_num_candidates: 5,
+            }),
+        ]);
+        registry.offsets.lock().expect("poisoned").push(7);
+        let worker = MockWorker::new();
+        let source = ScriptedSource::new(vec![batch(7, &[3, 5])]);
+        let asked = Arc::clone(&source.asked);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        run_until(
+            partition_loop_over(
+                source,
+                &registry,
+                &worker,
+                Arc::new(SkipChainCheck),
+                shutdown_rx,
+            ),
+            &shutdown_tx,
+            || asked.lock().expect("poisoned").len() == 2,
+        )
+        .await;
+
+        let counts: Vec<usize> = registry.calls().iter().map(|call| call.3).collect();
+        assert_eq!(counts, [3, 5]);
+        assert_eq!(registry.stored_offsets(), [7, 8, 9]);
+        assert_eq!(*asked.lock().expect("poisoned"), [7, 9]);
     }
 
     // -------- Redpanda-backed service test --------
