@@ -482,6 +482,7 @@ impl Default for AlertsConfig {
                 "stale_agreement_uncancellable",
                 "liveness_abandonment_paused",
                 "studio_request_chain_refused",
+                "studio_request_consumer_stalled",
                 "iisa_request_rejected",
                 "dips_info_missing",
                 "dips_info_checks_paused",

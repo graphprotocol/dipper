@@ -2,7 +2,11 @@
 //! and applies each one as a set-indexing-target change, making the topic a
 //! second front door to the same path the admin RPC serves.
 
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use dipper_producer::{
@@ -18,10 +22,12 @@ use thegraph_core::{
 use tokio::{
     sync::{mpsc, watch},
     task::JoinSet,
+    time::Instant,
 };
 
 use crate::{
     config::IndexingRequestConsumerConfig,
+    log_text::with_causes,
     registry::IndexingRequestRegistry,
     request_chain_check::{ChainCheckError, RequestChainCheck},
     set_indexing_target::{ApplyError, SetIndexingTarget, apply_set_indexing_target, check_chain},
@@ -51,6 +57,12 @@ const PARTITION_METADATA_CHECK_INTERVAL: Duration = Duration::from_secs(300);
 /// Bound on one metadata re-read. Deliberately shorter than the 5-second stop
 /// cap, since the stop channel is not polled while the read is in flight.
 const PARTITION_METADATA_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long the same record, fetch or connect may be retried before it is alerted on.
+const STALL_ALERT_AFTER: Duration = Duration::from_secs(10 * 60);
+
+/// The `event` tag of the alert for a consumer that keeps retrying the same step.
+const STALLED_EVENT: &str = "studio_request_consumer_stalled";
 
 /// Handle for controlling the indexing request consumer lifecycle
 #[derive(Clone)]
@@ -318,19 +330,13 @@ fn reconnecting(first: KafkaConsumer, kafka: KafkaConsumerConfig) -> Reconnectin
     // `connect` enforces its own deadline, so each attempt allows a little longer and that
     // deadline's error is the one logged.
     let connect_timeout = Duration::from_secs(kafka.connect_timeout_secs.saturating_add(5));
+    let stall = Arc::new(Mutex::new(Stall::default()));
     Reconnecting::with_client("indexing requests", first, connect_timeout, move || {
         let kafka = kafka.clone();
+        let stall = Arc::clone(&stall);
         async move {
             let connected = KafkaConsumer::connect(&kafka).await;
-            // Retried like any other failure, since stopping dipper would also stop its offers,
-            // but no Studio request arrives until someone restores the topic.
-            if let Err(error @ ConsumerError::TopicNotFound { .. }) = &connected {
-                tracing::error!(
-                    %error,
-                    "the indexing request topic is gone from the brokers; no requests from \
-                     Studio arrive until it is back"
-                );
-            }
+            note_reconnect(&stall, &connected);
             connected
         }
     })
@@ -369,6 +375,7 @@ async fn partition_loop<C, R, W>(
     // Resume from the persisted offset; a partition never seen before starts at
     // the earliest available record so requests published before the consumer's
     // first deploy are not lost.
+    let mut stall = Stall::default();
     let mut next_offset = loop {
         if stopping(&shutdown_rx) {
             return;
@@ -377,6 +384,13 @@ async fn partition_loop<C, R, W>(
             Ok(restored) => restored,
             Err(err) => {
                 tracing::error!(partition, error = %err, "failed to load consumer offset, retrying");
+                note_failure(
+                    &mut stall,
+                    partition,
+                    None,
+                    "loading its stored offset",
+                    &err,
+                );
                 if sleep_or_shutdown(&mut shutdown_rx, RETRY_BACKOFF).await {
                     return;
                 }
@@ -394,6 +408,8 @@ async fn partition_loop<C, R, W>(
                 Some(Ok(earliest)) => break earliest,
                 Some(Err(err)) => {
                     tracing::error!(partition, error = %err, "failed to query earliest offset, retrying");
+                    let step = "reading the partition's earliest offset";
+                    note_failure(&mut stall, partition, None, step, &err);
                     if sleep_or_shutdown(&mut shutdown_rx, RETRY_BACKOFF).await {
                         return;
                     }
@@ -401,6 +417,7 @@ async fn partition_loop<C, R, W>(
             },
         }
     };
+    stall.cleared();
     tracing::debug!(partition, next_offset, "partition consumer resuming");
 
     loop {
@@ -414,7 +431,10 @@ async fn partition_loop<C, R, W>(
         };
 
         let (records, high_watermark) = match fetch {
-            Ok((records, high_watermark)) => (records, high_watermark),
+            Ok((records, high_watermark)) => {
+                stall.cleared();
+                (records, high_watermark)
+            }
             Err(err) if err.is_offset_out_of_range() => {
                 // The cursor is outside the broker's retained range: below the log start after
                 // retention, or above the log end after a recreate or truncation. Clamp to the
@@ -431,6 +451,8 @@ async fn partition_loop<C, R, W>(
                     Some(Ok(range)) => Some(range),
                     Some(Err(err)) => {
                         tracing::error!(partition, error = %err, "failed to query the retained offset range");
+                        let (step, at) = ("reading the partition's retained offsets", next_offset);
+                        note_failure(&mut stall, partition, Some(at), step, &err);
                         None
                     }
                 };
@@ -462,6 +484,8 @@ async fn partition_loop<C, R, W>(
             }
             Err(err) => {
                 tracing::error!(partition, error = %err, "fetch failed, backing off");
+                let at = Some(next_offset);
+                note_failure(&mut stall, partition, at, "fetching records", &err);
                 if sleep_or_shutdown(&mut shutdown_rx, RETRY_BACKOFF).await {
                     return;
                 }
@@ -591,6 +615,112 @@ async fn sleep_or_shutdown(shutdown_rx: &mut watch::Receiver<bool>, delay: Durat
     }
 }
 
+/// How long the consumer has been retrying 1 step, to say when that is worth an alert.
+#[derive(Default)]
+struct Stall(Option<(Instant, Instant)>);
+
+impl Stall {
+    /// Counts 1 more failure of the step. Returns how long it has been failing when an alert is
+    /// due: once that reaches [`STALL_ALERT_AFTER`], and again each time as long passes.
+    fn failed(&mut self) -> Option<Duration> {
+        let now = Instant::now();
+        let (since, alert_at) = self.0.get_or_insert((now, now + STALL_ALERT_AFTER));
+        if now < *alert_at {
+            return None;
+        }
+        *alert_at = now + STALL_ALERT_AFTER;
+        Some(now - *since)
+    }
+
+    /// The step got through, so the next failure starts a new count.
+    fn cleared(&mut self) {
+        self.0 = None;
+    }
+}
+
+/// Raise an alert for a partition that has made no progress for a while. Nothing behind the
+/// step it is stuck on is applied, cancels included, and Studio is never told.
+fn alert_stalled(
+    partition: i32,
+    offset: Option<i64>,
+    step: &str,
+    stalled_for: Duration,
+    error: &dyn std::fmt::Display,
+) {
+    tracing::error!(
+        event = STALLED_EVENT,
+        partition,
+        offset,
+        stalled_for_secs = stalled_for.as_secs(),
+        %error,
+        "The Studio indexing request consumer keeps failing at {step}; no later request on \
+         this partition is applied until it gets through"
+    );
+}
+
+/// Counts 1 more failed attempt at `step`, alerting once the step has failed for long enough.
+fn note_failure(
+    stall: &mut Stall,
+    partition: i32,
+    offset: Option<i64>,
+    step: &str,
+    error: &(dyn std::error::Error + 'static),
+) {
+    if let Some(stalled_for) = stall.failed() {
+        alert_stalled(partition, offset, step, stalled_for, &with_causes(error));
+    }
+}
+
+/// The retries of 1 record: where it sits, and how long it has been failing.
+struct Retries {
+    partition: i32,
+    offset: i64,
+    stall: Stall,
+}
+
+impl Retries {
+    /// Logs a failed attempt at `step`, and alerts once the record has been stuck long enough.
+    fn failed(&mut self, step: &str, error: &(dyn std::error::Error + 'static)) {
+        let (partition, offset) = (self.partition, self.offset);
+        tracing::error!(
+            partition,
+            offset,
+            error = with_causes(error),
+            "failed at {step} for a Studio indexing request, retrying"
+        );
+        note_failure(&mut self.stall, partition, Some(offset), step, error);
+    }
+}
+
+/// Notes what an attempt to connect again found, alerting once they have failed for long enough.
+fn note_reconnect<T>(stall: &Mutex<Stall>, connected: &Result<T, ConsumerError>) {
+    let mut stall = stall
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let error = match connected {
+        Ok(_) => return stall.cleared(),
+        Err(error) => error,
+    };
+    // Retried like any other failure, since stopping dipper would also stop its offers,
+    // but no Studio request arrives until someone restores the topic.
+    if let ConsumerError::TopicNotFound { .. } = error {
+        tracing::error!(
+            %error,
+            "the indexing request topic is gone from the brokers; no requests from \
+             Studio arrive until it is back"
+        );
+    }
+    if let Some(stalled_for) = stall.failed() {
+        tracing::error!(
+            event = STALLED_EVENT,
+            stalled_for_secs = stalled_for.as_secs(),
+            %error,
+            "The Studio indexing request consumer keeps failing to connect to the brokers; \
+             no request from Studio is applied until it can"
+        );
+    }
+}
+
 /// Whether the consumer was asked to stop. Reads the value, not the change to it: a change is
 /// reported to 1 wait only, so a loop that carried on after that wait would never stop.
 fn stopping(shutdown_rx: &watch::Receiver<bool>) -> bool {
@@ -624,22 +754,12 @@ where
     R: IndexingRequestRegistry + Send + Sync,
     W: WorkerQueue + Send + Sync,
 {
-    // Cap the count from the wire: this door has no signature to vouch for the
-    // sender, so an absurd target must not reach indexer selection unclamped.
-    // 0 passes through untouched, since it is the cancellation shape.
-    let num_candidates = if target.num_candidates > max_candidates {
-        tracing::warn!(
-            partition,
-            offset,
-            requested = target.num_candidates,
-            max_candidates,
-            "clamping the requested indexer count to the configured maximum"
-        );
-        max_candidates
-    } else {
-        target.num_candidates
+    let num_candidates = clamped_count(target, max_candidates, partition, offset);
+    let mut retries = Retries {
+        partition,
+        offset,
+        stall: Stall::default(),
     };
-
     let queue_retry_id = loop {
         let request = SetIndexingTarget {
             requested_by,
@@ -672,31 +792,57 @@ where
                 return true;
             }
             Err(err @ (ApplyError::Registry(_) | ApplyError::ChainCheckUnavailable(_))) => {
-                tracing::error!(
-                    partition,
-                    offset,
-                    error = %err,
-                    "failed to apply indexing request, retrying"
-                );
+                retries.failed("applying it", &err);
                 if sleep_or_shutdown(shutdown_rx, RETRY_BACKOFF).await {
                     return false;
                 }
             }
-            Err(ApplyError::QueueReassess { id, .. }) => break id,
+            Err(ApplyError::QueueReassess { id, source }) => {
+                retries.failed(QUEUING_ITS_JOB, source.as_ref());
+                break id;
+            }
         }
     };
 
     loop {
-        if sleep_or_shutdown(shutdown_rx, RETRY_BACKOFF).await {
-            // One last immediate attempt: the row change is already committed,
-            // so leaving without the job strands the request until the daily
-            // reassignment sweep next queues it.
-            return retry_reassess_push(worker_queue, queue_retry_id, num_candidates, target).await;
-        }
-        if retry_reassess_push(worker_queue, queue_retry_id, num_candidates, target).await {
+        // On a stop, 1 last immediate attempt: the row change is already committed, so leaving
+        // without the job strands the request until the daily reassignment sweep queues it.
+        let stopping = sleep_or_shutdown(shutdown_rx, RETRY_BACKOFF).await;
+        let Err(err) =
+            retry_reassess_push(worker_queue, queue_retry_id, num_candidates, target).await
+        else {
             return true;
+        };
+        retries.failed(QUEUING_ITS_JOB, err.as_ref());
+        if stopping {
+            return false;
         }
     }
+}
+
+/// The step named in the log when the reassessment job that follows a write can't be queued.
+const QUEUING_ITS_JOB: &str = "queuing its reassessment job";
+
+/// The count a record asks for, held to `max_candidates`: this door has no signature to vouch
+/// for the sender, so an absurd target must not reach indexer selection as sent. 0 passes
+/// through untouched, since it is the cancellation shape.
+fn clamped_count(
+    target: &ProposedTarget,
+    max_candidates: usize,
+    partition: i32,
+    offset: i64,
+) -> usize {
+    if target.num_candidates <= max_candidates {
+        return target.num_candidates;
+    }
+    tracing::warn!(
+        partition,
+        offset,
+        requested = target.num_candidates,
+        max_candidates,
+        "clamping the requested indexer count to the configured maximum"
+    );
+    max_candidates
 }
 
 /// 1 attempt at a record: its chain check, then the apply. `None` if a stop came during the
@@ -755,11 +901,11 @@ async fn retry_reassess_push<W>(
     id: dipper_core::ids::IndexingRequestId,
     num_candidates: usize,
     target: &ProposedTarget,
-) -> bool
+) -> anyhow::Result<()>
 where
     W: WorkerQueue + Send + Sync,
 {
-    match worker_queue
+    worker_queue
         .reassess_indexing_request(
             id,
             target.deployment_id,
@@ -768,17 +914,7 @@ where
             JobPriority::Interactive,
         )
         .await
-    {
-        Ok(_) => true,
-        Err(err) => {
-            tracing::error!(
-                indexing_request_id = %id,
-                error = ?err,
-                "retrying the reassessment job push"
-            );
-            false
-        }
-    }
+        .map(|_| ())
 }
 
 /// A validated propose event, reduced to what the registry call needs.
@@ -852,8 +988,6 @@ fn parse_eip155_caip2(value: &str) -> Option<ChainId> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
-
     use dipper_core::ids::{IndexingAgreementId, IndexingRequestId};
     use thegraph_core::{DeploymentId, deployment_id};
     use url::Url;
@@ -1609,6 +1743,9 @@ mod tests {
         asked: Arc<Mutex<Vec<i64>>>,
         earliest: i64,
         latest: i64,
+        /// Once the script runs out, answer every fetch with an error the broker would keep
+        /// giving, in place of waiting.
+        fails_after_script: bool,
     }
 
     impl ScriptedSource {
@@ -1618,6 +1755,7 @@ mod tests {
                 asked: Arc::default(),
                 earliest: 0,
                 latest: 0,
+                fails_after_script: false,
             }
         }
     }
@@ -1635,6 +1773,9 @@ mod tests {
             let next = self.fetches.lock().expect("poisoned").pop_front();
             match next {
                 Some(answer) => answer,
+                None if self.fails_after_script => Err(ConsumerError::Fetch(
+                    rskafka::client::error::Error::InvalidResponse("unreadable".to_string()),
+                )),
                 None => std::future::pending().await,
             }
         }
@@ -1713,9 +1854,11 @@ mod tests {
             }
             let _ = shutdown_tx.send(true);
         };
-        tokio::time::timeout(Duration::from_secs(600), async { tokio::join!(run, stop) })
-            .await
-            .expect("the partition loop stops once asked to");
+        tokio::time::timeout(Duration::from_secs(3_600), async {
+            tokio::join!(run, stop)
+        })
+        .await
+        .expect("the partition loop stops once asked to");
     }
 
     #[tokio::test(start_paused = true)]
@@ -1898,6 +2041,185 @@ mod tests {
 
         assert!(!applied, "unapplied, so the record is redelivered");
         assert!(registry.calls().is_empty());
+    }
+
+    // -------- stalls --------
+
+    fn alerts(logs: &str, event: &str) -> usize {
+        logs.matches(&format!(r#"event="{event}""#)).count()
+    }
+
+    #[test]
+    fn the_consumers_alert_tags_are_alerted_on_by_default() {
+        let defaults = crate::config::AlertsConfig::default().events;
+
+        for event in ["studio_request_chain_refused", STALLED_EVENT] {
+            assert!(defaults.iter().any(|default| default == event), "{event}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stall_is_due_an_alert_after_10_minutes_and_every_10_after() {
+        let mut stall = Stall::default();
+
+        assert_eq!(stall.failed(), None, "the 1st failure starts the count");
+        tokio::time::advance(STALL_ALERT_AFTER - Duration::from_secs(1)).await;
+        assert_eq!(stall.failed(), None);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(stall.failed(), Some(STALL_ALERT_AFTER));
+        assert_eq!(stall.failed(), None, "1 alert, not 1 for each retry");
+        tokio::time::advance(STALL_ALERT_AFTER).await;
+        assert_eq!(stall.failed(), Some(2 * STALL_ALERT_AFTER));
+
+        stall.cleared();
+        tokio::time::advance(STALL_ALERT_AFTER).await;
+        assert_eq!(
+            stall.failed(),
+            None,
+            "getting through starts the count again"
+        );
+    }
+
+    /// Runs `apply_target_with_retries` for the standard propose until a stop `stop_after` later,
+    /// returning what it logged.
+    async fn logs_of_apply_stopped_after(
+        registry: &MockRegistry,
+        worker: &MockWorker,
+        chain_check: &dyn RequestChainCheck,
+        stop_after: Duration,
+    ) -> String {
+        let events: Arc<dyn SubgraphIndexingAgreementEventsProducer> =
+            Arc::new(CapturingEventsProducer::new());
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let target = ProposedTarget {
+            event_id: "e".to_string(),
+            deployment_id: deployment_id!(QM_HASH),
+            deployment_chain_id: INDEXED_CHAIN_ID,
+            num_candidates: 3,
+        };
+        logged(async {
+            let apply = apply_target_with_retries(
+                registry,
+                worker,
+                &events,
+                chain_check,
+                PROTOCOL_CHAIN_ID,
+                requester(),
+                TEST_MAX_CANDIDATES,
+                &target,
+                4,
+                17,
+                &mut shutdown_rx,
+            );
+            let stop = async {
+                tokio::time::sleep(stop_after).await;
+                shutdown_tx.send(true).expect("send shutdown");
+            };
+            tokio::join!(apply, stop);
+        })
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_manifest_that_stays_unreadable_is_alerted_on_after_10_minutes() {
+        let registry = MockRegistry::scripted(vec![]);
+        let worker = MockWorker::new();
+        let check = RefusingChainCheck::unavailable();
+
+        let before = logs_of_apply_stopped_after(
+            &registry,
+            &worker,
+            &check,
+            STALL_ALERT_AFTER - Duration::from_secs(30),
+        )
+        .await;
+        let after = logs_of_apply_stopped_after(
+            &registry,
+            &worker,
+            &check,
+            STALL_ALERT_AFTER + Duration::from_secs(30),
+        )
+        .await;
+
+        assert_eq!(alerts(&before, STALLED_EVENT), 0, "{before}");
+        assert_eq!(alerts(&after, STALLED_EVENT), 1, "{after}");
+        assert!(
+            after.contains("IPFS is down"),
+            "the alert says why: {after}"
+        );
+        assert!(after.contains("offset=17"), "and which record: {after}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_job_push_that_keeps_failing_is_alerted_on_after_10_minutes() {
+        let registry = MockRegistry::returning(SetTargetOutcome::Inserted {
+            id: IndexingRequestId::new(),
+        });
+        let worker = MockWorker::failing_pushes(usize::MAX);
+
+        let logs = logs_of_apply_stopped_after(
+            &registry,
+            &worker,
+            &SkipChainCheck,
+            STALL_ALERT_AFTER + Duration::from_secs(30),
+        )
+        .await;
+
+        assert_eq!(alerts(&logs, STALLED_EVENT), 1, "{logs}");
+        assert!(logs.contains("scripted queue failure"), "{logs}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_fetch_that_keeps_failing_is_alerted_on_after_10_minutes() {
+        let registry = MockRegistry::scripted(vec![]);
+        registry.offsets.lock().expect("poisoned").push(0);
+        let worker = MockWorker::new();
+        let mut source = ScriptedSource::new(vec![]);
+        source.fails_after_script = true;
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let started = Instant::now();
+
+        let logs = logged(run_until(
+            partition_loop_over(
+                source,
+                &registry,
+                &worker,
+                Arc::new(SkipChainCheck),
+                shutdown_rx,
+            ),
+            &shutdown_tx,
+            || started.elapsed() > STALL_ALERT_AFTER + Duration::from_secs(30),
+        ))
+        .await;
+
+        assert_eq!(alerts(&logs, STALLED_EVENT), 1, "{logs}");
+        assert!(logs.contains("unreadable"), "the alert says why: {logs}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_topic_that_stays_gone_is_alerted_on_after_10_minutes() {
+        let stall = Mutex::new(Stall::default());
+        let gone = || {
+            Err::<(), _>(ConsumerError::TopicNotFound {
+                topic: "requests".to_string(),
+            })
+        };
+
+        let at_first = logged(async { note_reconnect(&stall, &gone()) }).await;
+        tokio::time::advance(STALL_ALERT_AFTER).await;
+        let later = logged(async { note_reconnect(&stall, &gone()) }).await;
+        note_reconnect(&stall, &Ok(()));
+        tokio::time::advance(STALL_ALERT_AFTER).await;
+        let after_reconnecting = logged(async { note_reconnect(&stall, &gone()) }).await;
+
+        assert!(at_first.contains("gone from the brokers"), "{at_first}");
+        assert_eq!(alerts(&at_first, STALLED_EVENT), 0, "{at_first}");
+        assert_eq!(alerts(&later, STALLED_EVENT), 1, "{later}");
+        assert_eq!(
+            alerts(&after_reconnecting, STALLED_EVENT),
+            0,
+            "{after_reconnecting}"
+        );
     }
 
     // -------- Redpanda-backed service test --------
