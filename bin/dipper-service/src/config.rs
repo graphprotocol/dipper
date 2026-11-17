@@ -506,6 +506,7 @@ impl Default for AlertsConfig {
                 "studio_request_consumer_stalled",
                 "studio_request_offset_jumped",
                 "studio_request_dropped",
+                "studio_request_consumer_not_connected",
                 "iisa_request_rejected",
                 "dips_info_missing",
                 "dips_info_checks_paused",
@@ -2200,8 +2201,9 @@ pub struct IndexingRequestConsumerConfig {
     #[serde(default)]
     pub enabled: bool,
 
-    /// Kafka connection settings and the topic Studio produces on. The topic
-    /// is required with no default; a wrong or missing name fails at startup.
+    /// Kafka connection settings and the topic Studio produces on. The topic has no default.
+    /// A wrong name, like brokers that are down, is alerted on while dipper runs on without
+    /// the consumer, which keeps trying; settings that can never connect are refused at start.
     pub kafka: KafkaConsumerConfig,
 
     /// The identity recorded as the requester on consumed requests, since

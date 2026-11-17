@@ -20,8 +20,8 @@ use super::connection::{self, ConnectOptions, ConnectionError};
 pub struct KafkaConsumerConfig {
     /// Kafka broker addresses.
     pub brokers: Vec<String>,
-    /// Kafka topic to consume. Deliberately has no default: a consumer pointed
-    /// at a missing or misnamed topic must fail at startup, not idle on nothing.
+    /// Kafka topic to consume. Deliberately has no default: a missing or misnamed topic fails
+    /// every connect with [`ConsumerError::TopicNotFound`], which a default name could hide.
     pub topic: String,
     /// SASL authentication mechanism (e.g., "PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512").
     #[serde(default)]
@@ -268,6 +268,10 @@ pub enum ConsumerError {
     /// The configured topic does not exist (or is not visible to the credentials)
     #[error("topic '{topic}' does not exist on the broker or is not visible to the credentials")]
     TopicNotFound { topic: String },
+
+    /// The brokers list the topic with no partitions, so there is nothing to read from yet
+    #[error("topic '{topic}' has no partitions on the broker yet")]
+    NoPartitions { topic: String },
 
     /// Failed to get partition client
     #[error("failed to get partition client")]
