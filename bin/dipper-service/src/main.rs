@@ -112,6 +112,9 @@ pub async fn main() -> anyhow::Result<()> {
     {
         anyhow::bail!("invalid indexing request consumer config: {err}");
     }
+    if let Some(warning) = conf.consumer_requester_warning() {
+        tracing::warn!("{warning}");
+    }
     if let Err(err) = conf.health.validate(conf.admin_rpc.listen_addr) {
         anyhow::bail!("invalid health config: {err}");
     }

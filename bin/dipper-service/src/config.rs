@@ -294,6 +294,27 @@ impl Config {
         Ok(())
     }
 
+    /// A warning for startup to log when the Kafka consumer records requests under an identity
+    /// the admin RPC would not accept. Requests are keyed by who asked, so the 2 doors would
+    /// keep separate requests for the same deployment.
+    pub fn consumer_requester_warning(&self) -> Option<String> {
+        let requested_by = self.indexing_request_consumer.as_ref()?.requested_by;
+        if self
+            .admin_rpc
+            .gateway_operator_allowlist
+            .contains(&requested_by)
+        {
+            return None;
+        }
+        Some(format!(
+            "indexing_request_consumer.requested_by ({requested_by}) is not in \
+             admin_rpc.gateway_operator_allowlist. Requests are stored under who asked, so a \
+             cancel from Kafka will not close a request opened over the admin RPC, and a request \
+             from Kafka will open a 2nd one for the same deployment. Set requested_by to the \
+             address Studio signs the admin RPC with"
+        ))
+    }
+
     /// The background services that will not run, for startup to report.
     pub fn background_services_off(&self) -> Vec<ServiceOff> {
         let mut off = Vec::new();
@@ -3392,6 +3413,38 @@ mod tests {
             ],
             "a deployment copied from the example starts with no warning about a service left off"
         );
+    }
+
+    /// A request opened over the admin RPC is stored under its signer. A consumer set up with
+    /// any other address would not find it, so its cancel would do nothing and its request
+    /// would open a 2nd one beside it.
+    #[test]
+    fn a_consumer_identity_the_admin_rpc_does_not_allow_gets_a_startup_warning() {
+        const STUDIO: &str = "0x8f8c426f956876325b1e037c6eae9b189952994c";
+        const OTHER: &str = "0x1111111111111111111111111111111111111111";
+        let warning = |requested_by: Option<&str>, allowed: &[&str]| {
+            example_config_edited(|config| {
+                config["admin_rpc"]["gateway_operator_allowlist"] = serde_json::json!(allowed);
+                if let Some(requested_by) = requested_by {
+                    config["indexing_request_consumer"] = serde_json::json!({
+                        "kafka": { "brokers": ["localhost:9092"], "topic": "t" },
+                        "requested_by": requested_by,
+                    });
+                }
+            })
+            .consumer_requester_warning()
+        };
+
+        let warned = warning(Some(OTHER), &[STUDIO]).expect("a warning");
+        assert!(warned.contains("indexing_request_consumer.requested_by"));
+        assert!(warned.contains("admin_rpc.gateway_operator_allowlist"));
+        assert!(warned.to_lowercase().contains(OTHER), "{warned}");
+        assert!(
+            warning(Some(OTHER), &[]).is_some(),
+            "an empty allowlist does not hold it either"
+        );
+        assert_eq!(warning(Some(STUDIO), &[OTHER, STUDIO]), None);
+        assert_eq!(warning(None, &[STUDIO]), None, "no consumer, no warning");
     }
 
     /// Without the listener dipper never learns an offer was accepted, so leaving the section out
