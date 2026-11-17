@@ -218,9 +218,9 @@ where
     (Handle { tx_stop }, service)
 }
 
-/// The consumer service over any way of connecting: [`new`] passes the real brokers, and tests
-/// a script. `connect_timeout` bounds each attempt. Only a fault in dipper's own loops ends it
-/// with an error, never the brokers or the topic, since that would stop every other service.
+/// The consumer service over any way of connecting, each attempt bounded by `connect_timeout`:
+/// [`new`] passes the real brokers, and tests a script. Brokers that are down or a topic that
+/// is missing never end it. A fault in a partition loop or a topic that gains partitions does.
 async fn serve<C, R, W, F, Fut>(
     ctx: Ctx<R, W>,
     mut rx_stop: mpsc::Receiver<()>,
@@ -301,7 +301,7 @@ async fn first_partitions<C: TopicSource>(
 
 /// Waits for the reason to stop the partition loops: `Ok` when the service is asked to stop.
 /// A loop only returns on shutdown, so one ending early panicked or hit a bug, and the service
-/// ends with an error to be restarted. So it does when the topic gains partitions.
+/// ends with an error, which restarts dipper. So it does when the topic gains partitions.
 async fn partition_loops_ended<C: TopicSource>(
     rx_stop: &mut mpsc::Receiver<()>,
     tasks: &mut JoinSet<()>,
@@ -335,7 +335,8 @@ async fn partition_loops_ended<C: TopicSource>(
 }
 
 /// An error once the topic has more partitions than the `serving` this consumer reads, since
-/// nobody would read the new ones and their requests would be lost.
+/// nobody would read the new ones. It costs 1 restart of dipper each time someone grows the
+/// topic, which is a deliberate change and not an outage; the new process reads them all.
 async fn partitions_gained<C: TopicSource>(
     consumer: &Reconnecting<C>,
     serving: usize,
