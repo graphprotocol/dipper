@@ -1737,6 +1737,50 @@ mod lifecycle_event_tests {
         assert_eq!(contexts[0].max_grt_per_30_days, Some(900.0));
     }
 
+    /// A selection reads its ceiling as it is made, so minimum prices taken from indexer-rs
+    /// while dipper runs reach the very next selection, with no restart.
+    #[tokio::test]
+    async fn a_selection_made_after_the_minimums_change_uses_the_new_ceiling() {
+        use crate::price_ceilings::BasePriceCeilings;
+        let minimums =
+            |minimum: f64| std::collections::BTreeMap::from([("test-chain".to_string(), minimum)]);
+        let ceilings = Arc::new(BasePriceCeilings::new(None, None, minimums(100.0)));
+        let contexts = Arc::new(Mutex::new(Vec::new()));
+        let selecting = || {
+            let iisa = MockIisa {
+                contexts: Arc::clone(&contexts),
+                ..Default::default()
+            };
+            let mut ctx = build_ctx(
+                MockRegistry::default(),
+                iisa,
+                MockQueue::default(),
+                MockChainClient::default(),
+                CapturingEventsProducer::new(),
+                indexer_urls::Snapshot::new(),
+            );
+            ctx.agreement_conf = Arc::new(IndexingAgreementConfig {
+                base_price_ceilings: Arc::clone(&ceilings),
+                ..test_agreement_conf()
+            });
+            ctx
+        };
+
+        run(selecting(), 1).await.expect("handler ok");
+        ceilings
+            .follow(minimums(150.0), 1_000.0)
+            .expect("the new minimums are taken");
+        run(selecting(), 1).await.expect("handler ok");
+
+        let sent: Vec<Option<f64>> = contexts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|context| context.max_grt_per_30_days)
+            .collect();
+        assert_eq!(sent, [Some(400.0), Some(600.0)], "4 times each minimum");
+    }
+
     #[tokio::test]
     async fn sends_both_price_ceilings_to_the_breaker_pool_lookup() {
         // The breaker's pool must be priced like selection, so its lookup carries
