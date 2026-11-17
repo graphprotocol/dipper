@@ -4645,6 +4645,173 @@ async fn kafka_consumer_offsets_roundtrip_and_upsert() {
     );
 }
 
+/// Whether `conn` takes the lock within 5 seconds: Postgres ends a session a moment after its
+/// client has gone, so a lock that was just given up is not free at once.
+async fn takes_the_lock_within_5_seconds(
+    conn: &mut dipper_pgregistry::AdvisoryLockConnection,
+) -> Result<bool, Error> {
+    for _ in 0..50 {
+        if conn.try_lock().await? {
+            return Ok(true);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    Ok(false)
+}
+
+#[tokio::test]
+async fn an_advisory_lock_is_held_by_1_connection_until_that_connection_is_gone() {
+    //* Given
+    let (db, _temp_db) = temp_registry_db().await;
+    let registry = PgRegistry::new(db);
+    let minute = std::time::Duration::from_secs(60);
+    let connect = async |key| {
+        registry
+            .advisory_lock_connection(key, "dipper-test-lock", minute)
+            .await
+            .expect("open a connection for the lock")
+    };
+    let (mut first, mut second, mut third) =
+        (connect(42).await, connect(42).await, connect(42).await);
+    let mut other_key = connect(43).await;
+
+    //* When / Then - 1 connection holds a key at a time, and another key is another lock
+    assert!(first.try_lock().await.expect("try the lock"));
+    assert!(
+        !second.try_lock().await.expect("try the lock"),
+        "the 1st connection holds it"
+    );
+    assert!(other_key.try_lock().await.expect("try the lock"));
+    assert!(first.is_alive().await);
+
+    //* When / Then - closing the holder's connection gives the lock up
+    first.close().await.expect("close the 1st connection");
+    let taken = takes_the_lock_within_5_seconds(&mut second).await;
+    assert!(
+        taken.expect("try the lock"),
+        "the lock is free once its holder has closed"
+    );
+
+    //* When / Then - so does a holder whose connection is lost without a goodbye
+    assert!(!third.try_lock().await.expect("try the lock"));
+    drop(second);
+    let taken = takes_the_lock_within_5_seconds(&mut third).await;
+    assert!(
+        taken.expect("try the lock"),
+        "the lock is free once its holder's connection is gone"
+    );
+}
+
+/// A holder whose machine or network vanishes sends no goodbye, so the database goes on
+/// believing in its session and its lock. The idle timeout is what ends such a session.
+#[tokio::test]
+async fn a_lock_connection_that_goes_quiet_is_ended_by_the_database_and_its_lock_freed() {
+    use std::time::Duration;
+
+    //* Given
+    let (db, _temp_db) = temp_registry_db().await;
+    let registry = PgRegistry::new(db);
+    let connect = async |key, idle_timeout| {
+        registry
+            .advisory_lock_connection(key, "dipper-test-lock", idle_timeout)
+            .await
+            .expect("open a connection for the lock")
+    };
+    let mut waiting = connect(42, Duration::from_secs(60)).await;
+    let mut waiting_for_the_other = connect(43, Duration::from_secs(60)).await;
+    let mut quiet = connect(42, Duration::from_secs(2)).await;
+    assert_eq!(quiet.idle_timeout_refused(), None);
+    assert!(quiet.try_lock().await.expect("try the lock"));
+    let mut spoken_on = connect(43, Duration::from_secs(2)).await;
+    assert!(spoken_on.try_lock().await.expect("try the lock"));
+    assert!(!waiting.try_lock().await.expect("try the lock"));
+
+    //* When - 4 seconds pass in which only 1 of the 2 holders is asked anything
+    for _ in 0..16 {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            spoken_on.is_alive().await,
+            "a check every 250 ms keeps a session with a 2 second idle timeout"
+        );
+    }
+
+    //* Then - the quiet holder's session is gone and its lock is free
+    let taken = takes_the_lock_within_5_seconds(&mut waiting).await;
+    assert!(
+        taken.expect("try the lock"),
+        "the database ended the quiet session and freed its lock"
+    );
+    assert!(!quiet.is_alive().await, "the quiet session was ended");
+
+    //* Then - the holder that kept being asked still has its session and its lock
+    assert!(spoken_on.is_alive().await);
+    assert!(
+        !waiting_for_the_other
+            .try_lock()
+            .await
+            .expect("try the lock"),
+        "the lock of the session that was spoken on is still held"
+    );
+}
+
+/// The database refuses the idle timeout when it is older than Postgres 14, which does not
+/// know the setting. It refuses a value past the setting's range the same way, as done here.
+#[tokio::test]
+async fn a_database_that_refuses_the_idle_timeout_still_gives_a_connection_for_the_lock() {
+    //* Given
+    let (db, _temp_db) = temp_registry_db().await;
+    let registry = PgRegistry::new(db);
+    let more_than_the_database_allows = std::time::Duration::from_secs(30 * 24 * 3_600);
+
+    //* When
+    let mut conn = registry
+        .advisory_lock_connection(42, "dipper-test-lock", more_than_the_database_allows)
+        .await
+        .expect("open a connection for the lock");
+
+    //* Then - the refusal is kept to be reported, and the lock works without the timeout
+    let refusal = conn.idle_timeout_refused().map(str::to_owned);
+    assert!(
+        refusal.as_deref().is_some_and(|said| !said.is_empty()),
+        "the database's refusal is kept: {refusal:?}"
+    );
+    assert!(conn.try_lock().await.expect("try the lock"));
+    assert!(conn.is_alive().await);
+}
+
+/// The lock's session has a name of its own, so that the session holding the lock can be
+/// told from the pool's in `pg_stat_activity` when someone has to end it by hand.
+#[tokio::test]
+async fn a_lock_connection_is_listed_by_the_database_under_its_name() {
+    //* Given
+    let (db, _temp_db) = temp_registry_db().await;
+    let registry = PgRegistry::new(db.clone());
+    let named = async || {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM pg_stat_activity WHERE application_name = $1",
+        )
+        .bind("dipper-test-lock")
+        .fetch_one(&db)
+        .await
+        .expect("read pg_stat_activity")
+    };
+    assert_eq!(
+        named().await,
+        0,
+        "the pool's sessions do not carry the name"
+    );
+
+    //* When
+    let conn = registry
+        .advisory_lock_connection(42, "dipper-test-lock", std::time::Duration::from_secs(60))
+        .await
+        .expect("open a connection for the lock");
+
+    //* Then
+    assert_eq!(named().await, 1);
+    conn.close().await.expect("close the connection");
+}
+
 #[tokio::test]
 async fn count_created_agreements_by_indexer_counts_offers_being_withdrawn() {
     //* Given
