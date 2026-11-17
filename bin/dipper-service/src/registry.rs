@@ -1126,6 +1126,48 @@ impl crate::network::service::indexing_request_consumer::KafkaConsumerOffsetRegi
     }
 }
 
+#[async_trait]
+impl crate::network::service::indexing_request_consumer::ConsumerLock for RegistryProvider {
+    async fn consumer_lock_connection(
+        &self,
+        key: i64,
+        name: &str,
+        idle_timeout: std::time::Duration,
+    ) -> RegistryResult<Box<dyn crate::network::service::indexing_request_consumer::LockConnection>>
+    {
+        let connection = self
+            .inner
+            .advisory_lock_connection(key, name, idle_timeout)
+            .await?;
+        Ok(Box::new(connection))
+    }
+}
+
+#[async_trait]
+impl crate::network::service::indexing_request_consumer::LockConnection
+    for dipper_pgregistry::AdvisoryLockConnection
+{
+    fn idle_timeout_refused(&self) -> Option<&str> {
+        dipper_pgregistry::AdvisoryLockConnection::idle_timeout_refused(self)
+    }
+
+    async fn try_lock(&mut self) -> RegistryResult<bool> {
+        Ok(dipper_pgregistry::AdvisoryLockConnection::try_lock(self).await?)
+    }
+
+    async fn is_alive(&mut self) -> bool {
+        dipper_pgregistry::AdvisoryLockConnection::is_alive(self).await
+    }
+
+    async fn close(self: Box<Self>) {
+        // The lock goes with the connection either way; a failed goodbye only delays it until
+        // the database notices the socket has closed.
+        if let Err(error) = dipper_pgregistry::AdvisoryLockConnection::close(*self).await {
+            tracing::debug!(%error, "the consumer lock's connection did not close cleanly");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use dipper_core::ids::IndexingAgreementId;

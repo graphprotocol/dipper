@@ -32,9 +32,12 @@ use super::{
     result::Error,
 };
 
+mod advisory_lock;
 pub(crate) mod common;
 mod indexing_agreement;
 mod indexing_request;
+
+pub use self::advisory_lock::AdvisoryLockConnection;
 
 /// Chain listener state row from the database.
 #[derive(Debug, Clone)]

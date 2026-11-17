@@ -55,6 +55,40 @@ const PARTITION_METADATA_CHECK_INTERVAL: Duration = Duration::from_secs(300);
 /// cap, since the stop channel is not polled while the read is in flight.
 const PARTITION_METADATA_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// How often a dipper without the lock tries for it again. It tries, where it could queue for
+/// the lock inside the database, so that a stop is never held up; and often, so the new pod of
+/// a deploy takes over soon after the old one lets go.
+const LOCK_RETRY: Duration = Duration::from_secs(2);
+
+/// How often the holder of the lock checks that the connection it lives on still answers,
+/// from the moment the lock is taken until it is given up, so the connection is never idle.
+const LOCK_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Bound on 1 call on the lock's connection: a database that takes longer has not given the
+/// lock, or no longer vouches for it.
+const LOCK_CALL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long giving the lock up may take, within the 5 seconds dipper allows a service to stop.
+const LOCK_RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The application name of the lock's database session, to find it by in `pg_stat_activity`.
+const LOCK_SESSION_NAME: &str = "dipper-studio-request-consumer-lock";
+
+/// How long the lock's session may sit idle before the database ends it and frees the lock.
+/// It bounds how long a dipper that vanished without closing its connection keeps the lock,
+/// where the database would otherwise believe in that session until TCP gives up on it.
+const LOCK_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+// The longest a holder that is well goes between 2 checks reaching the database: 1 interval, a
+// slow answer to the check before, and a partition count read in the way. A timeout of less
+// than twice that would have the database end sessions of dippers that are only slow.
+const _: () = assert!(
+    LOCK_IDLE_TIMEOUT.as_secs()
+        >= 2 * (LOCK_CHECK_INTERVAL.as_secs()
+            + LOCK_CALL_TIMEOUT.as_secs()
+            + PARTITION_METADATA_CHECK_TIMEOUT.as_secs())
+);
+
 /// How long the same record, fetch or connect may be retried before it is alerted on.
 const STALL_ALERT_AFTER: Duration = Duration::from_secs(10 * 60);
 
@@ -105,6 +139,61 @@ pub trait KafkaConsumerOffsetRegistry {
         partition_id: i32,
         next_offset: i64,
     ) -> Result<(), crate::registry::Error>;
+}
+
+/// The lock that lets only 1 dipper read a topic at a time. Without it the outgoing pod of a
+/// rolling deploy can apply a record after the incoming pod has moved past it, and undo a
+/// later request for the same deployment.
+#[async_trait]
+pub trait ConsumerLock {
+    /// Opens a database connection of its own to take the lock `key` on, listed by the
+    /// database under `name` and ended by it once idle for `idle_timeout`.
+    async fn consumer_lock_connection(
+        &self,
+        key: i64,
+        name: &str,
+        idle_timeout: Duration,
+    ) -> Result<Box<dyn LockConnection>, crate::registry::Error>;
+}
+
+/// A database connection the lock is taken and held on. The lock lasts exactly as long as the
+/// connection, so the database must be reached directly: a pooler that lends 1 connection to
+/// many clients would hand the lock to others, or keep it after this dipper has gone.
+#[async_trait]
+pub trait LockConnection: Send {
+    /// What the database said if it would not end this connection once idle, as one older
+    /// than Postgres 14 will not. The lock is held on it all the same.
+    fn idle_timeout_refused(&self) -> Option<&str>;
+
+    /// Tries to take the lock without waiting; `false` while another connection holds it.
+    async fn try_lock(&mut self) -> Result<bool, crate::registry::Error>;
+
+    /// Whether the connection still answers, and so still holds a lock taken on it.
+    async fn is_alive(&mut self) -> bool;
+
+    /// Closes the connection, which gives the lock up at once.
+    async fn close(self: Box<Self>);
+}
+
+/// The key of the database lock for `topic`: a hash of a name nothing else in dipper locks on.
+/// It must come out the same in every build, since the 2 pods of a deploy may be different
+/// versions and exclude each other only if they ask for the same key.
+fn lock_key(topic: &str) -> i64 {
+    let name = format!("dipper/indexing-request-consumer/{topic}");
+    // Always negative: the only other advisory lock dipper's database sees is the one sqlx
+    // holds while it runs migrations, whose key is never negative.
+    let hash = fnv1a_64(name.as_bytes()) | (1 << 63);
+    i64::from_ne_bytes(hash.to_ne_bytes())
+}
+
+/// The FNV-1a hash, 64 bits. Written out here because Rust's own hashers may change between
+/// releases, which a lock key must not.
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    bytes.iter().fold(OFFSET_BASIS, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(PRIME)
+    })
 }
 
 /// One fetched record, reduced to what the consumer reads.
@@ -201,7 +290,8 @@ pub struct Ctx<R, W> {
 /// as a set-indexing-target change, and records its progress per partition.
 pub fn new<R, W>(ctx: Ctx<R, W>) -> (Handle, impl Future<Output = anyhow::Result<()>>)
 where
-    R: IndexingRequestRegistry + KafkaConsumerOffsetRegistry + Clone + Send + Sync + 'static,
+    R: IndexingRequestRegistry + KafkaConsumerOffsetRegistry + ConsumerLock,
+    R: Clone + Send + Sync + 'static,
     W: WorkerQueue + Clone + Send + Sync + 'static,
 {
     let (tx_stop, rx_stop) = mpsc::channel(1);
@@ -229,17 +319,70 @@ async fn serve<C, R, W, F, Fut>(
 ) -> anyhow::Result<()>
 where
     C: TopicSource,
-    R: IndexingRequestRegistry + KafkaConsumerOffsetRegistry + Clone + Send + Sync + 'static,
+    R: IndexingRequestRegistry + KafkaConsumerOffsetRegistry + ConsumerLock,
+    R: Clone + Send + Sync + 'static,
     W: WorkerQueue + Clone + Send + Sync + 'static,
     F: Fn() -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<C, ConsumerError>> + Send,
 {
     let topic = ctx.config.kafka.topic.clone();
     let consumer = connecting(topic.clone(), connect_timeout, connect);
-    let Some(partitions) = first_partitions(&consumer, &mut rx_stop).await else {
-        tracing::info!("indexing request consumer stopped before it had connected");
-        return Ok(());
+    loop {
+        // Nothing is read before the lock is held, the stored offset included: it is where
+        // the dipper that held the lock before this one stopped.
+        let Some(mut lock) = lock_taken(&ctx.registry, &topic, &mut rx_stop).await else {
+            tracing::info!("indexing request consumer stopped while waiting for its lock");
+            return Ok(());
+        };
+        let ended = read_under_lock(&ctx, &consumer, &topic, &mut rx_stop, lock.as_mut()).await;
+        give_up(lock).await;
+        match ended {
+            Ended::Stopped => {
+                tracing::info!("indexing request consumer stopped");
+                return Ok(());
+            }
+            Ended::Fault(fault) => return Err(fault),
+            Ended::LockLost => tracing::warn!(
+                "the database connection holding the indexing request consumer's lock is gone, \
+                 and the lock with it; reading stops until this dipper holds the lock again"
+            ),
+        }
+    }
+}
+
+/// Why the reading of the topic came to an end.
+enum Ended {
+    /// The service was asked to stop.
+    Stopped,
+    /// The lock is no longer held, so another dipper may be reading.
+    LockLost,
+    /// A fault that only a restart of the service puts right.
+    Fault(anyhow::Error),
+}
+
+/// Reads every partition of the topic for as long as `lock` is held, and says why it stopped.
+async fn read_under_lock<C, R, W>(
+    ctx: &Ctx<R, W>,
+    consumer: &Reconnecting<C>,
+    topic: &str,
+    rx_stop: &mut mpsc::Receiver<()>,
+    lock: &mut dyn LockConnection,
+) -> Ended
+where
+    C: TopicSource,
+    R: IndexingRequestRegistry + KafkaConsumerOffsetRegistry + ConsumerLock,
+    R: Clone + Send + Sync + 'static,
+    W: WorkerQueue + Clone + Send + Sync + 'static,
+{
+    let mut held = HeldLock::new(lock);
+    let partitions = match first_partitions(consumer, rx_stop, &mut held).await {
+        Ok(partitions) => partitions,
+        Err(ended) => return ended,
     };
+    // Checked once more, so that nothing is read on a check that is seconds old.
+    if let Some(ended) = held.lost_or_stopped(rx_stop).await {
+        return ended;
+    }
     tracing::info!(
         topic,
         partitions = partitions.len(),
@@ -248,14 +391,194 @@ where
     );
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let mut tasks = partition_loops(&ctx, &consumer, partitions, &shutdown_rx);
-    let result = partition_loops_ended(&mut rx_stop, &mut tasks, &consumer, &topic).await;
+    let mut tasks = partition_loops(ctx, consumer, partitions, &shutdown_rx);
+    let ended = partition_loops_ended(rx_stop, &mut tasks, consumer, topic, &mut held).await;
 
     let _ = shutdown_tx.send(true);
-    while tasks.join_next().await.is_some() {}
+    partition_loops_joined(&mut tasks, &mut held).await;
+    ended
+}
 
-    tracing::info!("indexing request consumer stopped");
-    result
+/// The lock while this dipper holds it: the connection it lives on, and the timer of the
+/// checks that speak on that connection every `LOCK_CHECK_INTERVAL`, the first at once.
+struct HeldLock<'a> {
+    connection: &'a mut dyn LockConnection,
+    check: tokio::time::Interval,
+}
+
+impl<'a> HeldLock<'a> {
+    fn new(connection: &'a mut dyn LockConnection) -> Self {
+        let mut check = tokio::time::interval(LOCK_CHECK_INTERVAL);
+        check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        Self { connection, check }
+    }
+
+    /// Completes when the next check is due.
+    async fn check_due(&mut self) {
+        self.check.tick().await;
+    }
+
+    /// 1 check: why the reading has to end, or `None` while the lock is still held.
+    async fn lost_or_stopped(&mut self, rx_stop: &mut mpsc::Receiver<()>) -> Option<Ended> {
+        match held_or_stopped(self.connection, rx_stop).await {
+            None => Some(Ended::Stopped),
+            Some(false) => Some(Ended::LockLost),
+            Some(true) => None,
+        }
+    }
+}
+
+/// Waits for the partition loops to end once they are told to. A loop finishes the request it
+/// is applying first, and the lock is kept until it has, so its connection is still spoken on.
+async fn partition_loops_joined(tasks: &mut JoinSet<()>, held: &mut HeldLock<'_>) {
+    let joined = async { while tasks.join_next().await.is_some() {} };
+    // Run beside the wait and not inside it, so a database that does not answer delays nothing.
+    let spoken_on = async {
+        loop {
+            held.check_due().await;
+            // The answer changes nothing here: the loops are stopping whatever it is.
+            let _ = tokio::time::timeout(LOCK_CALL_TIMEOUT, held.connection.is_alive()).await;
+        }
+    };
+    tokio::select! {
+        () = joined => {}
+        () = spoken_on => {}
+    }
+}
+
+/// Waits until this dipper holds the lock for `topic`, on a connection of its own. `None` if
+/// asked to stop first.
+async fn lock_taken<L: ConsumerLock>(
+    registry: &L,
+    topic: &str,
+    rx_stop: &mut mpsc::Receiver<()>,
+) -> Option<Box<dyn LockConnection>> {
+    let key = lock_key(topic);
+    let mut connection = None;
+    let mut wait = LockWait::default();
+    loop {
+        let tried = tokio::select! {
+            _ = rx_stop.recv() => return None,
+            tried = try_lock(registry, key, &mut connection) => tried,
+        };
+        if let Some(refusal) = connection.as_ref().and_then(|c| c.idle_timeout_refused()) {
+            wait.has_no_idle_timeout(refusal);
+        }
+        match tried {
+            Ok(true) => {
+                tracing::info!(topic, "holding the lock to read Studio's indexing requests");
+                return connection;
+            }
+            // All a refusal says is that some session holds the lock, not that a dipper does.
+            Ok(false) => wait.goes_on(format_args!(
+                "another database session holds it, which is either a dipper that is still \
+                 running or one that has gone and whose session the database has not ended yet \
+                 (in pg_stat_activity both have the application_name '{LOCK_SESSION_NAME}')"
+            )),
+            Err(error) => wait.goes_on(format_args!("the database could not be asked ({error})")),
+        }
+        tokio::select! {
+            _ = rx_stop.recv() => return None,
+            () = tokio::time::sleep(LOCK_RETRY) => {}
+        }
+    }
+}
+
+/// 1 try at the lock, on `connection`, which is opened first if there is none and dropped if
+/// the try fails. `Ok(false)` while another connection holds the lock.
+async fn try_lock<L: ConsumerLock>(
+    registry: &L,
+    key: i64,
+    connection: &mut Option<Box<dyn LockConnection>>,
+) -> Result<bool, String> {
+    let attempt = async {
+        let connection = match connection {
+            Some(connection) => connection,
+            None => {
+                let opening =
+                    registry.consumer_lock_connection(key, LOCK_SESSION_NAME, LOCK_IDLE_TIMEOUT);
+                connection.insert(opening.await?)
+            }
+        };
+        connection.try_lock().await
+    };
+    let failed = match tokio::time::timeout(LOCK_CALL_TIMEOUT, attempt).await {
+        Ok(Ok(taken)) => return Ok(taken),
+        Ok(Err(error)) => with_causes(&error),
+        Err(_) => format!("no answer in {} seconds", LOCK_CALL_TIMEOUT.as_secs()),
+    };
+    *connection = None;
+    Err(failed)
+}
+
+/// A wait for the lock: whether it has been logged, and how long it has gone on.
+#[derive(Default)]
+struct LockWait {
+    logged: bool,
+    warned_of_no_idle_timeout: bool,
+    stall: Stall,
+}
+
+impl LockWait {
+    /// Warns, once in a wait, that the database would not put the idle timeout on the lock's
+    /// session. The lock still works, as it did before there was a timeout to ask for.
+    fn has_no_idle_timeout(&mut self, refusal: &str) {
+        if self.warned_of_no_idle_timeout {
+            return;
+        }
+        self.warned_of_no_idle_timeout = true;
+        tracing::warn!(
+            refusal,
+            "The database would not take an idle timeout for the session that holds the Studio \
+             indexing request consumer's lock; the setting needs Postgres 14 or later. A dipper \
+             that vanishes without closing its connection will keep the lock until the database \
+             gives up on that connection by itself, which can take hours"
+        );
+    }
+
+    /// Notes 1 more try that did not get the lock. A wait is normal while a deploy replaces
+    /// the pod that holds it, so it is alerted on only once it has lasted far longer than that.
+    fn goes_on(&mut self, why: impl std::fmt::Display) {
+        if !self.logged {
+            self.logged = true;
+            tracing::info!(
+                %why,
+                "waiting for the lock that lets 1 dipper at a time read Studio's indexing requests"
+            );
+        }
+        if let Some(waited) = self.stall.failed() {
+            tracing::error!(
+                event = STALLED_EVENT,
+                stalled_for_secs = waited.as_secs(),
+                "The Studio indexing request consumer is still waiting for the lock that lets 1 \
+                 dipper at a time read Studio's requests: {why}. This dipper applies no request \
+                 from Studio until it holds the lock"
+            );
+        }
+    }
+}
+
+/// Whether `lock` is still held, going by whether its connection answers in time. `None` if
+/// asked to stop before the answer.
+async fn held_or_stopped(
+    lock: &mut dyn LockConnection,
+    rx_stop: &mut mpsc::Receiver<()>,
+) -> Option<bool> {
+    tokio::select! {
+        _ = rx_stop.recv() => None,
+        held = tokio::time::timeout(LOCK_CALL_TIMEOUT, lock.is_alive()) => Some(held.unwrap_or(false)),
+    }
+}
+
+/// Closes the lock's connection, so the next dipper need not wait for the database to notice
+/// that this one has gone.
+async fn give_up(lock: Box<dyn LockConnection>) {
+    if tokio::time::timeout(LOCK_RELEASE_TIMEOUT, lock.close())
+        .await
+        .is_err()
+    {
+        tracing::warn!("closing the indexing request consumer's lock connection timed out");
+    }
 }
 
 /// Starts 1 loop for each of `partitions`, all stopped through `shutdown_rx`.
@@ -267,7 +590,8 @@ fn partition_loops<C, R, W>(
 ) -> JoinSet<()>
 where
     C: TopicSource,
-    R: IndexingRequestRegistry + KafkaConsumerOffsetRegistry + Clone + Send + Sync + 'static,
+    R: IndexingRequestRegistry + KafkaConsumerOffsetRegistry + ConsumerLock,
+    R: Clone + Send + Sync + 'static,
     W: WorkerQueue + Clone + Send + Sync + 'static,
 {
     let mut tasks = JoinSet::new();
@@ -288,33 +612,44 @@ where
 }
 
 /// The topic's partitions, once the first connect gets through: brokers that are down or a
-/// topic that is not there yet are waited for, however long. `None` if asked to stop first.
+/// topic that is not there yet are waited for, however long, and the lock is checked all the
+/// while. `Err` with the reason if the wait has to end before the connect.
 async fn first_partitions<C: TopicSource>(
     consumer: &Reconnecting<C>,
     rx_stop: &mut mpsc::Receiver<()>,
-) -> Option<Vec<i32>> {
-    tokio::select! {
-        _ = rx_stop.recv() => None,
-        first = consumer.connected() => Some(first.partitions()),
+    held: &mut HeldLock<'_>,
+) -> Result<Vec<i32>, Ended> {
+    loop {
+        tokio::select! {
+            _ = rx_stop.recv() => return Err(Ended::Stopped),
+            first = consumer.connected() => return Ok(first.partitions()),
+            () = held.check_due() => if let Some(ended) = held.lost_or_stopped(rx_stop).await {
+                return Err(ended);
+            },
+        }
     }
 }
 
-/// Waits for the reason to stop the partition loops: `Ok` when the service is asked to stop.
-/// A loop only returns on shutdown, so one ending early panicked or hit a bug, and the service
-/// ends with an error, which restarts dipper. So it does when the topic gains partitions.
+/// Waits for the reason to stop the partition loops. A loop only returns on shutdown, so one
+/// ending early panicked or hit a bug, and the service ends with an error, which restarts
+/// dipper. So it does when the topic gains partitions. A lost lock only stops the reading.
 async fn partition_loops_ended<C: TopicSource>(
     rx_stop: &mut mpsc::Receiver<()>,
     tasks: &mut JoinSet<()>,
     consumer: &Reconnecting<C>,
     topic: &str,
-) -> anyhow::Result<()> {
+    held: &mut HeldLock<'_>,
+) -> Ended {
     let serving = tasks.len();
     let mut metadata_check = tokio::time::interval(PARTITION_METADATA_CHECK_INTERVAL);
     metadata_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
-            _ = rx_stop.recv() => return Ok(()),
-            joined = tasks.join_next() => return Err(match joined {
+            _ = rx_stop.recv() => return Ended::Stopped,
+            () = held.check_due() => if let Some(ended) = held.lost_or_stopped(rx_stop).await {
+                return ended;
+            },
+            joined = tasks.join_next() => return Ended::Fault(match joined {
                 Some(Ok(())) => anyhow::anyhow!(
                     "an indexing request consumer partition loop exited unexpectedly"
                 ),
@@ -327,7 +662,7 @@ async fn partition_loops_ended<C: TopicSource>(
             }),
             _ = metadata_check.tick() => {
                 if let Some(gained) = partitions_gained(consumer, serving, topic).await {
-                    return Err(gained);
+                    return Ended::Fault(gained);
                 }
             },
         }
@@ -1412,6 +1747,10 @@ mod tests {
         calls: Arc<Mutex<Vec<SetTargetCall>>>,
         /// Every consumer offset stored, in order; the last is the one a restart resumes from.
         offsets: Arc<Mutex<Vec<i64>>>,
+        /// The lock that lets 1 dipper at a time read the topic; free unless a test says so.
+        lock: Arc<MockLock>,
+        /// How long the database takes over each change to a request.
+        apply_takes: Duration,
     }
 
     impl MockRegistry {
@@ -1421,6 +1760,8 @@ mod tests {
                 script: Arc::new(Mutex::new(script)),
                 calls: Arc::new(Mutex::new(Vec::new())),
                 offsets: Arc::default(),
+                lock: Arc::default(),
+                apply_takes: Duration::ZERO,
             }
         }
 
@@ -1452,6 +1793,7 @@ mod tests {
                 deployment_chain_id,
                 num_candidates,
             ));
+            tokio::time::sleep(self.apply_takes).await;
             let mut script = self.script.lock().expect("poisoned");
             match if script.is_empty() {
                 None
@@ -1510,6 +1852,7 @@ mod tests {
             _topic: &str,
             _partition_id: i32,
         ) -> RegistryResult<Option<i64>> {
+            self.lock.note("offset read");
             Ok(self.stored_offsets().last().copied())
         }
 
@@ -1521,6 +1864,138 @@ mod tests {
         ) -> RegistryResult<()> {
             self.offsets.lock().expect("poisoned").push(next_offset);
             Ok(())
+        }
+    }
+
+    /// What 1 try at the lock finds.
+    #[derive(Clone, Copy)]
+    enum Try {
+        /// Another dipper holds it.
+        Refused,
+        /// The database answers with an error.
+        Fails,
+        /// The database never answers.
+        Hangs,
+    }
+
+    /// The database lock as a test scripts it, shared by every connection opened for it.
+    #[derive(Default)]
+    struct MockLock {
+        /// What the next tries find, in order. Once the script runs out the lock is free.
+        tries: Mutex<std::collections::VecDeque<Try>>,
+        /// While set, another dipper holds the lock whatever the script says.
+        held_elsewhere: std::sync::atomic::AtomicBool,
+        /// Set while the connection that took the lock is gone.
+        lost: std::sync::atomic::AtomicBool,
+        /// Set while the database does not answer when asked if the connection is alive.
+        check_hangs: std::sync::atomic::AtomicBool,
+        /// What happened, in order: "refused", "failed", "locked", "offset read", "closed".
+        events: Mutex<Vec<&'static str>>,
+        /// The key each connection was opened for.
+        keys: Mutex<Vec<i64>>,
+        /// When the database was asked something on a connection, a try or a check.
+        spoken: Mutex<Vec<tokio::time::Instant>>,
+        /// The name and the idle timeout each connection was opened with.
+        sessions: Mutex<Vec<(String, Duration)>>,
+        /// While set the database refuses the idle timeout, as one older than Postgres 14 does.
+        no_idle_timeout: std::sync::atomic::AtomicBool,
+    }
+
+    impl MockLock {
+        fn note(&self, event: &'static str) {
+            self.events.lock().expect("poisoned").push(event);
+        }
+
+        fn spoken_on(&self) {
+            let now = tokio::time::Instant::now();
+            self.spoken.lock().expect("poisoned").push(now);
+        }
+
+        /// The longest the database went without being asked anything, from the first time
+        /// it was to now. A database told to end idle sessions ends one that is silent too long.
+        fn longest_silence(&self) -> Duration {
+            let mut spoken = self.spoken.lock().expect("poisoned").clone();
+            spoken.push(tokio::time::Instant::now());
+            let gaps = spoken.windows(2).map(|pair| pair[1] - pair[0]);
+            gaps.max().unwrap_or_default()
+        }
+
+        fn events(&self) -> Vec<&'static str> {
+            self.events.lock().expect("poisoned").clone()
+        }
+
+        fn script(&self, tries: &[Try]) {
+            self.tries.lock().expect("poisoned").extend(tries);
+        }
+    }
+
+    struct MockLockConnection(Arc<MockLock>);
+
+    #[async_trait]
+    impl LockConnection for MockLockConnection {
+        fn idle_timeout_refused(&self) -> Option<&str> {
+            let refused = &self.0.no_idle_timeout;
+            refused
+                .load(std::sync::atomic::Ordering::SeqCst)
+                .then_some("unrecognized configuration parameter")
+        }
+
+        async fn try_lock(&mut self) -> RegistryResult<bool> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.0.spoken_on();
+            if self.0.held_elsewhere.load(SeqCst) {
+                self.0.note("refused");
+                return Ok(false);
+            }
+            let next = self.0.tries.lock().expect("poisoned").pop_front();
+            match next {
+                Some(Try::Refused) => {
+                    self.0.note("refused");
+                    Ok(false)
+                }
+                Some(Try::Fails) => {
+                    self.0.note("failed");
+                    Err(crate::registry::Error::NoRecordsUpdated)
+                }
+                Some(Try::Hangs) => {
+                    self.0.note("hung");
+                    std::future::pending().await
+                }
+                None => {
+                    self.0.lost.store(false, SeqCst);
+                    self.0.note("locked");
+                    Ok(true)
+                }
+            }
+        }
+
+        async fn is_alive(&mut self) -> bool {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.0.spoken_on();
+            if self.0.check_hangs.swap(false, SeqCst) {
+                self.0.note("check hung");
+                return std::future::pending().await;
+            }
+            !self.0.lost.load(SeqCst)
+        }
+
+        async fn close(self: Box<Self>) {
+            self.0.note("closed");
+        }
+    }
+
+    #[async_trait]
+    impl ConsumerLock for MockRegistry {
+        async fn consumer_lock_connection(
+            &self,
+            key: i64,
+            name: &str,
+            idle_timeout: Duration,
+        ) -> RegistryResult<Box<dyn LockConnection>> {
+            self.lock.keys.lock().expect("poisoned").push(key);
+            let session = (name.to_string(), idle_timeout);
+            self.lock.sessions.lock().expect("poisoned").push(session);
+            Ok(Box::new(MockLockConnection(Arc::clone(&self.lock))))
         }
     }
 
@@ -2910,6 +3385,538 @@ mod tests {
 
         assert!(matches!(ended, Some(Ok(()))), "{ended:?}");
         assert_eq!(worker.reassessments().len(), 1, "the request is applied");
+    }
+
+    // -------- 1 dipper at a time --------
+
+    #[test]
+    fn the_lock_key_is_a_fixed_hash_of_the_topic() {
+        // FNV-1a's published test values: the key must not change from 1 build to the next, or
+        // the 2 pods of a deploy would lock on different keys and both read the topic.
+        assert_eq!(fnv1a_64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a_64(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a_64(b"foobar"), 0x8594_4171_f739_67e8);
+
+        assert_eq!(
+            lock_key("studio.subgraph.indexing.requests"),
+            -8_046_658_312_834_537_626
+        );
+        assert_ne!(lock_key("requests"), lock_key("requests.testnet"));
+        // sqlx locks on a key that is never negative while it migrates the database at start.
+        for topic in ["requests", "requests.testnet", "a", "t", ""] {
+            assert!(lock_key(topic) < 0, "{topic}");
+        }
+    }
+
+    /// During a rolling deploy the new pod starts while the old one still reads the topic. It
+    /// must wait for the old one to let go, and only then read where the old one stopped.
+    #[tokio::test(start_paused = true)]
+    async fn the_stored_offset_is_read_only_once_the_lock_is_held() {
+        let (registry, stored) = registry_for_a_request();
+        registry.lock.script(&[Try::Refused, Try::Refused]);
+        let worker = MockWorker::new();
+        let (tx_stop, rx_stop) = mpsc::channel(1);
+
+        let ended = serve_until(
+            serve_over(
+                |_| Some(Ok(topic_with_a_request())),
+                &registry,
+                &worker,
+                rx_stop,
+            ),
+            tx_stop,
+            an_offset_is_stored(stored),
+        )
+        .await;
+
+        assert!(matches!(ended, Some(Ok(()))), "{ended:?}");
+        let events = registry.lock.events();
+        assert_eq!(
+            events,
+            ["refused", "refused", "locked", "offset read", "closed"],
+            "tried until it held the lock, read the offset under it, gave it up on stopping"
+        );
+        let keys = registry.lock.keys.lock().expect("poisoned").clone();
+        assert_eq!(keys, [lock_key("t")], "1 connection, for this topic's key");
+    }
+
+    /// A pod that waits for the lock is a normal sight during a deploy, which takes 75 seconds
+    /// at most to tear the old pod down. It reads nothing, alerts nobody, and stops when asked.
+    #[tokio::test(start_paused = true)]
+    async fn a_dipper_waiting_for_the_lock_reads_nothing_and_is_quiet_for_5_minutes() {
+        let (registry, _) = registry_for_a_request();
+        let held_elsewhere = &registry.lock.held_elsewhere;
+        held_elsewhere.store(true, std::sync::atomic::Ordering::SeqCst);
+        let worker = MockWorker::new();
+        let (tx_stop, rx_stop) = mpsc::channel(1);
+        let mut ended = None;
+
+        let logs = logged(async {
+            ended = serve_until(
+                serve_over(
+                    |_| Some(Ok(topic_with_a_request())),
+                    &registry,
+                    &worker,
+                    rx_stop,
+                ),
+                tx_stop,
+                tokio::time::sleep(Duration::from_secs(300)),
+            )
+            .await;
+        })
+        .await;
+
+        assert!(matches!(ended, Some(Ok(()))), "{ended:?}");
+        let events = registry.lock.events();
+        assert!(events.contains(&"refused"), "it kept trying: {events:?}");
+        assert!(!events.contains(&"offset read"), "{events:?}");
+        assert!(registry.calls().is_empty(), "nothing is applied");
+        assert_eq!(alerts(&logs, STALLED_EVENT), 0, "{logs}");
+    }
+
+    /// 2 dippers left running side by side, or a lock nobody lets go of, is not a deploy.
+    #[tokio::test(start_paused = true)]
+    async fn a_dipper_that_waits_10_minutes_for_the_lock_is_alerted_on() {
+        let (registry, _) = registry_for_a_request();
+        let held_elsewhere = &registry.lock.held_elsewhere;
+        held_elsewhere.store(true, std::sync::atomic::Ordering::SeqCst);
+        let worker = MockWorker::new();
+        let (tx_stop, rx_stop) = mpsc::channel(1);
+
+        let logs = logged(async {
+            serve_until(
+                serve_over(
+                    |_| Some(Ok(topic_with_a_request())),
+                    &registry,
+                    &worker,
+                    rx_stop,
+                ),
+                tx_stop,
+                tokio::time::sleep(Duration::from_secs(25 * 60)),
+            )
+            .await;
+        })
+        .await;
+
+        assert_eq!(
+            alerts(&logs, STALLED_EVENT),
+            2,
+            "at 10 and 20 minutes: {logs}"
+        );
+        assert!(
+            !logs.contains("another dipper holds"),
+            "a refused lock does not say who holds it: {logs}"
+        );
+        assert!(logs.contains("another database session holds it"), "{logs}");
+        assert!(
+            logs.contains(LOCK_SESSION_NAME),
+            "it says what to look for in the database: {logs}"
+        );
+    }
+
+    /// The lock lives on 1 database connection. When that connection is lost the lock is too,
+    /// and another dipper may take it, so this one stops reading until it holds it again.
+    #[tokio::test(start_paused = true)]
+    async fn losing_the_lock_stops_the_reading_until_it_is_held_again() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (registry, stored) = registry_for_a_request();
+        let lock = Arc::clone(&registry.lock);
+        let worker = MockWorker::new();
+        let (tx_stop, rx_stop) = mpsc::channel(1);
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let asked_of_topic = Arc::clone(&asked);
+        let found = move |_| {
+            let mut topic = topic_with_a_request();
+            topic.asked = Arc::clone(&asked_of_topic);
+            Some(Ok(topic))
+        };
+        let held_again = async {
+            an_offset_is_stored(stored).await;
+            // The connection goes, and for a while another dipper has the lock.
+            lock.script(&[Try::Refused, Try::Refused]);
+            lock.lost.store(true, SeqCst);
+            let locked_again = async {
+                while lock.events().iter().filter(|e| **e == "locked").count() < 2 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(300), locked_again)
+                .await
+                .expect("the lock is taken again within 5 minutes");
+            // Long enough for the loop to read its offset and ask for records again.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        };
+
+        let ended = serve_until(
+            serve_over(found, &registry, &worker, rx_stop),
+            tx_stop,
+            held_again,
+        )
+        .await;
+
+        assert!(matches!(ended, Some(Ok(()))), "{ended:?}");
+        assert_eq!(
+            registry.lock.events(),
+            [
+                "locked",
+                "offset read",
+                "closed",
+                "refused",
+                "refused",
+                "locked",
+                "offset read",
+                "closed"
+            ],
+            "the lost connection is closed, and the offset read again under the new lock"
+        );
+        let asked = asked.lock().expect("poisoned").clone();
+        assert_eq!(asked, [0, 1, 1], "it carries on from the stored offset");
+        assert_eq!(registry.calls().len(), 1, "the request is applied once");
+    }
+
+    /// A database that no longer answers for the lock's connection can't vouch that the lock
+    /// is held, so that reads as a lost lock, and is not waited on.
+    #[tokio::test(start_paused = true)]
+    async fn a_lock_connection_that_stops_answering_counts_as_lost() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (registry, stored) = registry_for_a_request();
+        let lock = Arc::clone(&registry.lock);
+        let worker = MockWorker::new();
+        let (tx_stop, rx_stop) = mpsc::channel(1);
+        let held_again = async {
+            an_offset_is_stored(stored).await;
+            lock.check_hangs.store(true, SeqCst);
+            let locked_again = async {
+                while lock.events().iter().filter(|e| **e == "locked").count() < 2 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(300), locked_again)
+                .await
+                .expect("the lock is taken again within 5 minutes");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        };
+
+        let ended = serve_until(
+            serve_over(
+                |_| Some(Ok(topic_with_a_request())),
+                &registry,
+                &worker,
+                rx_stop,
+            ),
+            tx_stop,
+            held_again,
+        )
+        .await;
+
+        assert!(matches!(ended, Some(Ok(()))), "{ended:?}");
+        assert_eq!(
+            registry.lock.events(),
+            [
+                "locked",
+                "offset read",
+                "check hung",
+                "closed",
+                "locked",
+                "offset read",
+                "closed"
+            ]
+        );
+    }
+
+    /// The lock is taken before the brokers are reached, and they can be down for hours. A
+    /// connection left silent that long is one a network drops, or a database ends as idle.
+    #[tokio::test(start_paused = true)]
+    async fn the_lock_is_checked_all_through_a_broker_outage_and_the_reading_after_it() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (registry, stored) = registry_for_a_request();
+        let lock = Arc::clone(&registry.lock);
+        let worker = MockWorker::new();
+        let (tx_stop, rx_stop) = mpsc::channel(1);
+        let brokers_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let up = Arc::clone(&brokers_up);
+        let found = move |_| {
+            Some(if up.load(SeqCst) {
+                Ok(topic_with_a_request())
+            } else {
+                Err(ConsumerError::Timeout)
+            })
+        };
+        let an_outage_then_reading = async {
+            tokio::time::sleep(Duration::from_secs(600)).await;
+            brokers_up.store(true, SeqCst);
+            tokio::time::timeout(Duration::from_secs(120), an_offset_is_stored(stored))
+                .await
+                .expect("the request is read within 2 minutes of the brokers' return");
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        };
+
+        let ended = serve_until(
+            serve_over(found, &registry, &worker, rx_stop),
+            tx_stop,
+            an_outage_then_reading,
+        )
+        .await;
+
+        assert!(matches!(ended, Some(Ok(()))), "{ended:?}");
+        let silence = lock.longest_silence();
+        assert!(
+            silence <= LOCK_CHECK_INTERVAL,
+            "the lock's connection went {silence:?} without a word"
+        );
+    }
+
+    /// A lock lost while the brokers are down is found out then, and taken again, so that
+    /// the brokers' return does not find this dipper locked out by its own dead connection.
+    #[tokio::test(start_paused = true)]
+    async fn a_lock_lost_while_the_brokers_are_down_is_noticed_and_taken_again() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (registry, _) = registry_for_a_request();
+        let lock = Arc::clone(&registry.lock);
+        let worker = MockWorker::new();
+        let (tx_stop, rx_stop) = mpsc::channel(1);
+        let lost_a_minute_in = async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            lock.script(&[Try::Refused, Try::Refused]);
+            lock.lost.store(true, SeqCst);
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        };
+
+        let ended = serve_until(
+            serve_over(
+                |_| Some(Err(ConsumerError::Timeout)),
+                &registry,
+                &worker,
+                rx_stop,
+            ),
+            tx_stop,
+            lost_a_minute_in,
+        )
+        .await;
+
+        assert!(matches!(ended, Some(Ok(()))), "{ended:?}");
+        assert_eq!(
+            registry.lock.events(),
+            ["locked", "closed", "refused", "refused", "locked", "closed"],
+            "the lost connection is closed and the lock taken again, all before any broker answers"
+        );
+    }
+
+    /// A stop does not cut short a request that is being applied, and the lock is given up
+    /// only once that is done. Until then its connection must not fall silent either.
+    #[tokio::test(start_paused = true)]
+    async fn the_lock_is_checked_until_a_stopping_loop_has_finished_its_request() {
+        let (mut registry, _) = registry_for_a_request();
+        registry.apply_takes = Duration::from_secs(20);
+        let lock = Arc::clone(&registry.lock);
+        let worker = MockWorker::new();
+        let (tx_stop, rx_stop) = mpsc::channel(1);
+        let service = serve_over(
+            |_| Some(Ok(topic_with_a_request())),
+            &registry,
+            &worker,
+            rx_stop,
+        );
+        tokio::pin!(service);
+
+        // The stop arrives 1 second into an apply that takes 20.
+        tokio::select! {
+            ended = &mut service => panic!("the service ended by itself: {ended:?}"),
+            () = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+        let asked_to_stop = tokio::time::Instant::now();
+        tx_stop.send(()).await.expect("the service is running");
+        let ended = tokio::time::timeout(Duration::from_secs(60), &mut service).await;
+
+        assert!(matches!(ended, Ok(Ok(()))), "{ended:?}");
+        assert_eq!(registry.stored_offsets(), [1], "the request was finished");
+        let stopping = asked_to_stop.elapsed();
+        assert!(stopping >= Duration::from_secs(15), "{stopping:?}");
+        let silence = lock.longest_silence();
+        assert!(
+            silence <= LOCK_CHECK_INTERVAL,
+            "the lock's connection went {silence:?} without a word"
+        );
+        assert_eq!(lock.events(), ["locked", "offset read", "closed"]);
+    }
+
+    /// A dipper that vanishes without closing its connection leaves a session the database
+    /// goes on believing in, lock and all. So the database is told to end the session once it
+    /// goes quiet: soon enough to free the lock, and never while the holder is only waiting.
+    #[tokio::test(start_paused = true)]
+    async fn the_database_is_told_to_end_a_lock_session_that_goes_quiet() {
+        let (registry, stored) = registry_for_a_request();
+        let lock = Arc::clone(&registry.lock);
+        let worker = MockWorker::new();
+        let (tx_stop, rx_stop) = mpsc::channel(1);
+        let reading_for_10_minutes = async {
+            an_offset_is_stored(stored).await;
+            tokio::time::sleep(Duration::from_secs(600)).await;
+        };
+
+        let ended = serve_until(
+            serve_over(
+                |_| Some(Ok(topic_with_a_request())),
+                &registry,
+                &worker,
+                rx_stop,
+            ),
+            tx_stop,
+            reading_for_10_minutes,
+        )
+        .await;
+
+        assert!(matches!(ended, Some(Ok(()))), "{ended:?}");
+        let sessions = lock.sessions.lock().expect("poisoned").clone();
+        let [(name, idle_timeout)] = sessions.as_slice() else {
+            panic!("1 connection is opened: {sessions:?}");
+        };
+        assert_eq!(name, LOCK_SESSION_NAME);
+        let silence = lock.longest_silence();
+        assert!(
+            *idle_timeout >= 3 * silence,
+            "a holder that is well goes {silence:?} without a word, and its session would be \
+             ended after {idle_timeout:?}"
+        );
+        assert!(
+            *idle_timeout <= Duration::from_secs(60),
+            "a holder that has gone would keep the lock for {idle_timeout:?}"
+        );
+    }
+
+    /// The idle timeout came with Postgres 14. An older database refuses it, and the lock
+    /// must still work there as it did before, with a warning that it has no such bound.
+    #[tokio::test(start_paused = true)]
+    async fn a_database_that_cannot_end_idle_sessions_still_gives_the_lock_and_is_warned_on() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (registry, stored) = registry_for_a_request();
+        registry.lock.script(&[Try::Refused, Try::Refused]);
+        registry.lock.no_idle_timeout.store(true, SeqCst);
+        let worker = MockWorker::new();
+        let (tx_stop, rx_stop) = mpsc::channel(1);
+        let mut ended = None;
+
+        let logs = logged(async {
+            ended = serve_until(
+                serve_over(
+                    |_| Some(Ok(topic_with_a_request())),
+                    &registry,
+                    &worker,
+                    rx_stop,
+                ),
+                tx_stop,
+                an_offset_is_stored(stored),
+            )
+            .await;
+        })
+        .await;
+
+        assert!(matches!(ended, Some(Ok(()))), "{ended:?}");
+        assert_eq!(
+            registry.lock.events(),
+            ["refused", "refused", "locked", "offset read", "closed"]
+        );
+        assert_eq!(
+            logs.matches("would not take an idle timeout").count(),
+            1,
+            "warned about once, not at each of the 3 tries: {logs}"
+        );
+        assert!(
+            logs.contains("unrecognized configuration parameter") && logs.contains("Postgres 14"),
+            "the warning says why: {logs}"
+        );
+    }
+
+    /// The check on the lock runs every few seconds for as long as dipper does, so a stop
+    /// will sooner or later arrive in the middle of one that the database is not answering.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_is_not_held_up_by_a_lock_check_the_database_never_answers() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (registry, stored) = registry_for_a_request();
+        let lock = Arc::clone(&registry.lock);
+        let worker = MockWorker::new();
+        let (tx_stop, rx_stop) = mpsc::channel(1);
+        let check_hung = async {
+            an_offset_is_stored(stored).await;
+            lock.check_hangs.store(true, SeqCst);
+            while !lock.events().contains(&"check hung") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+
+        let ended = serve_until(
+            serve_over(
+                |_| Some(Ok(topic_with_a_request())),
+                &registry,
+                &worker,
+                rx_stop,
+            ),
+            tx_stop,
+            check_hung,
+        )
+        .await;
+
+        assert!(matches!(ended, Some(Ok(()))), "{ended:?}");
+        assert_eq!(
+            registry.lock.events(),
+            ["locked", "offset read", "check hung", "closed"]
+        );
+    }
+
+    /// The wait for the lock is a try, a pause and another try, never a wait inside the
+    /// database, so a stop gets through even while the database is not answering.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_is_not_held_up_by_a_lock_the_database_never_answers_for() {
+        let (registry, _) = registry_for_a_request();
+        registry.lock.script(&[Try::Hangs]);
+        let worker = MockWorker::new();
+        let (tx_stop, rx_stop) = mpsc::channel(1);
+
+        let ended = serve_until(
+            serve_over(
+                |_| Some(Ok(topic_with_a_request())),
+                &registry,
+                &worker,
+                rx_stop,
+            ),
+            tx_stop,
+            tokio::time::sleep(Duration::from_secs(1)),
+        )
+        .await;
+
+        assert!(matches!(ended, Some(Ok(()))), "{ended:?}");
+        assert_eq!(
+            registry.lock.events(),
+            ["hung"],
+            "it was asking for the lock"
+        );
+        assert!(registry.calls().is_empty(), "nothing is applied");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_database_error_while_taking_the_lock_is_tried_again() {
+        let (registry, stored) = registry_for_a_request();
+        registry.lock.script(&[Try::Fails, Try::Fails]);
+        let worker = MockWorker::new();
+        let (tx_stop, rx_stop) = mpsc::channel(1);
+
+        let ended = serve_until(
+            serve_over(
+                |_| Some(Ok(topic_with_a_request())),
+                &registry,
+                &worker,
+                rx_stop,
+            ),
+            tx_stop,
+            an_offset_is_stored(stored),
+        )
+        .await;
+
+        assert!(matches!(ended, Some(Ok(()))), "{ended:?}");
+        assert_eq!(
+            registry.lock.events(),
+            ["failed", "failed", "locked", "offset read", "closed"]
+        );
     }
 
     // -------- Redpanda-backed service test --------
