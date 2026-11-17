@@ -370,6 +370,9 @@ async fn partition_loop<C, R, W>(
     // the earliest available record so requests published before the consumer's
     // first deploy are not lost.
     let mut next_offset = loop {
+        if stopping(&shutdown_rx) {
+            return;
+        }
         let restored = match registry.get_kafka_consumer_offset(&topic, partition).await {
             Ok(restored) => restored,
             Err(err) => {
@@ -468,6 +471,11 @@ async fn partition_loop<C, R, W>(
 
         let records_was_empty = records.is_empty();
         for record in records {
+            // A batch can hold thousands of records, so a stop is looked for before each one;
+            // the rest are fetched again on the next run.
+            if stopping(&shutdown_rx) {
+                return;
+            }
             let offset = record.offset;
             match decode_propose(record.value.as_deref(), &expected_network) {
                 Err(reason) => {
@@ -568,7 +576,8 @@ where
     Fut: Future<Output = Result<T, ConsumerError>>,
 {
     tokio::select! {
-        _ = shutdown_rx.changed() => None,
+        biased;
+        () = stop_requested(shutdown_rx) => None,
         result = consumer.call(call) => Some(result),
     }
 }
@@ -576,9 +585,22 @@ where
 /// Wait out a backoff, returning `true` when shutdown was requested instead.
 async fn sleep_or_shutdown(shutdown_rx: &mut watch::Receiver<bool>, delay: Duration) -> bool {
     tokio::select! {
-        _ = shutdown_rx.changed() => true,
-        _ = tokio::time::sleep(delay) => false,
+        biased;
+        () = stop_requested(shutdown_rx) => true,
+        () = tokio::time::sleep(delay) => false,
     }
+}
+
+/// Whether the consumer was asked to stop. Reads the value, not the change to it: a change is
+/// reported to 1 wait only, so a loop that carried on after that wait would never stop.
+fn stopping(shutdown_rx: &watch::Receiver<bool>) -> bool {
+    *shutdown_rx.borrow()
+}
+
+/// Resolves once the consumer is asked to stop, at once if it already was.
+async fn stop_requested(shutdown_rx: &mut watch::Receiver<bool>) {
+    // An error means the sender is gone, which only happens once the service itself has ended.
+    let _ = shutdown_rx.wait_for(|stop| *stop).await;
 }
 
 /// Apply a decoded propose until it takes effect; `false` if shutdown came first. A registry
@@ -627,18 +649,18 @@ where
             // Interactive: a developer just asked for this in Studio.
             priority: JobPriority::Interactive,
         };
-        let result = match check_chain(chain_check, request).await {
-            Ok(request) => {
-                apply_set_indexing_target(
-                    registry,
-                    worker_queue,
-                    events,
-                    protocol_chain_id,
-                    request,
-                )
-                .await
-            }
-            Err(err) => Err(err),
+        let Some(result) = check_and_apply(
+            registry,
+            worker_queue,
+            events,
+            chain_check,
+            protocol_chain_id,
+            request,
+            shutdown_rx,
+        )
+        .await
+        else {
+            return false;
         };
 
         match result {
@@ -675,6 +697,36 @@ where
             return true;
         }
     }
+}
+
+/// 1 attempt at a record: its chain check, then the apply. `None` if a stop came during the
+/// check, which only reads and can take the whole IPFS timeout for 1 manifest. The apply is
+/// never cut short, since it must not end between its write and the job that follows.
+async fn check_and_apply<R, W>(
+    registry: &R,
+    worker_queue: &W,
+    events: &Arc<dyn SubgraphIndexingAgreementEventsProducer>,
+    chain_check: &dyn RequestChainCheck,
+    protocol_chain_id: ChainId,
+    request: SetIndexingTarget,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> Option<Result<Option<dipper_core::ids::IndexingRequestId>, ApplyError>>
+where
+    R: IndexingRequestRegistry + Send + Sync,
+    W: WorkerQueue + Send + Sync,
+{
+    let checked = tokio::select! {
+        biased;
+        () = stop_requested(shutdown_rx) => return None,
+        checked = check_chain(chain_check, request) => checked,
+    };
+    Some(match checked {
+        Ok(request) => {
+            apply_set_indexing_target(registry, worker_queue, events, protocol_chain_id, request)
+                .await
+        }
+        Err(err) => Err(err),
+    })
 }
 
 /// Raise an alert for a Studio request dropped because its chain is wrong: Studio
@@ -1486,9 +1538,9 @@ mod tests {
         assert!(events.is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_unreadable_manifest_is_retried_not_skipped() {
-        //* Arrange - shutdown is already pending, so the 1st backoff ends the loop
+        //* Arrange - the stop arrives during the wait after the 1st attempt, ending the loop
         let registry = MockRegistry::returning(SetTargetOutcome::Inserted {
             id: IndexingRequestId::new(),
         });
@@ -1497,16 +1549,19 @@ mod tests {
         let events: Arc<dyn SubgraphIndexingAgreementEventsProducer> =
             Arc::new(CapturingEventsProducer::new());
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
-        shutdown_tx.send(true).expect("send shutdown");
         let target = ProposedTarget {
             event_id: "e".to_string(),
             deployment_id: deployment_id!(QM_HASH),
             deployment_chain_id: INDEXED_CHAIN_ID,
             num_candidates: 3,
         };
+        let stop = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            shutdown_tx.send(true).expect("send shutdown");
+        };
 
         //* Act
-        let applied = apply_target_with_retries(
+        let apply = apply_target_with_retries(
             &registry,
             &worker,
             &events,
@@ -1518,8 +1573,8 @@ mod tests {
             0,
             0,
             &mut shutdown_rx,
-        )
-        .await;
+        );
+        let (applied, ()) = tokio::join!(apply, stop);
 
         //* Assert - unapplied, so the record is redelivered rather than lost
         assert!(!applied);
@@ -1697,6 +1752,152 @@ mod tests {
         assert_eq!(counts, [3, 5]);
         assert_eq!(registry.stored_offsets(), [7, 8, 9]);
         assert_eq!(*asked.lock().expect("poisoned"), [7, 9]);
+    }
+
+    /// A chain check that asks the consumer to stop each time it is asked, then passes.
+    struct StopsTheConsumer(watch::Sender<bool>);
+
+    #[async_trait]
+    impl RequestChainCheck for StopsTheConsumer {
+        async fn check(&self, _: &DeploymentId, _: ChainId) -> Result<(), ChainCheckError> {
+            let _ = self.0.send(true);
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_is_noticed_before_the_next_record_of_a_batch() {
+        let inserted = || {
+            Some(SetTargetOutcome::Inserted {
+                id: IndexingRequestId::new(),
+            })
+        };
+        let registry = MockRegistry::scripted(vec![inserted(), inserted(), inserted()]);
+        registry.offsets.lock().expect("poisoned").push(0);
+        let worker = MockWorker::new();
+        let source = ScriptedSource::new(vec![batch(0, &[3, 4, 5])]);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let check = Arc::new(StopsTheConsumer(shutdown_tx));
+
+        tokio::time::timeout(
+            Duration::from_secs(600),
+            partition_loop_over(source, &registry, &worker, check, shutdown_rx),
+        )
+        .await
+        .expect("the partition loop stops once asked to");
+
+        assert_eq!(
+            registry.calls().len(),
+            1,
+            "the record in hand is applied and the rest are left for the next run"
+        );
+        assert_eq!(registry.stored_offsets(), [0, 1]);
+    }
+
+    /// A stop that lands while a failed job push waits to be retried is used up by that wait.
+    /// The last try then succeeds, and the loop must still stop rather than carry on reading.
+    #[tokio::test(start_paused = true)]
+    async fn the_loop_still_stops_after_a_last_chance_push_succeeds() {
+        let inserted = || {
+            Some(SetTargetOutcome::Inserted {
+                id: IndexingRequestId::new(),
+            })
+        };
+        let registry = MockRegistry::scripted(vec![inserted(), inserted()]);
+        registry.offsets.lock().expect("poisoned").push(0);
+        let worker = MockWorker::failing_pushes(1);
+        let failures_left = Arc::clone(&worker.failures_left);
+        let source = ScriptedSource::new(vec![batch(0, &[3, 4])]);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        run_until(
+            partition_loop_over(
+                source,
+                &registry,
+                &worker,
+                Arc::new(SkipChainCheck),
+                shutdown_rx,
+            ),
+            &shutdown_tx,
+            || *failures_left.lock().expect("poisoned") == 0,
+        )
+        .await;
+
+        assert_eq!(
+            worker.reassessments().len(),
+            1,
+            "the job that failed at first is queued on the last try"
+        );
+        assert_eq!(
+            registry.calls().len(),
+            1,
+            "nothing more is applied once asked to stop"
+        );
+        assert_eq!(registry.stored_offsets(), [0, 1]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_seen_once_already_still_ends_the_next_wait() {
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        shutdown_tx.send(true).expect("send shutdown");
+
+        let first = sleep_or_shutdown(&mut shutdown_rx, RETRY_BACKOFF).await;
+        let second = sleep_or_shutdown(&mut shutdown_rx, RETRY_BACKOFF).await;
+
+        assert!(first);
+        assert!(second, "the stop was seen once before, and is still set");
+    }
+
+    /// A chain check that never answers, like a manifest read that hangs.
+    struct NeverAnswers;
+
+    #[async_trait]
+    impl RequestChainCheck for NeverAnswers {
+        async fn check(&self, _: &DeploymentId, _: ChainId) -> Result<(), ChainCheckError> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_interrupts_a_manifest_read() {
+        let registry = MockRegistry::returning(SetTargetOutcome::Inserted {
+            id: IndexingRequestId::new(),
+        });
+        let worker = MockWorker::new();
+        let events: Arc<dyn SubgraphIndexingAgreementEventsProducer> =
+            Arc::new(CapturingEventsProducer::new());
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let target = ProposedTarget {
+            event_id: "e".to_string(),
+            deployment_id: deployment_id!(QM_HASH),
+            deployment_chain_id: INDEXED_CHAIN_ID,
+            num_candidates: 3,
+        };
+        let apply = apply_target_with_retries(
+            &registry,
+            &worker,
+            &events,
+            &NeverAnswers,
+            PROTOCOL_CHAIN_ID,
+            requester(),
+            TEST_MAX_CANDIDATES,
+            &target,
+            0,
+            0,
+            &mut shutdown_rx,
+        );
+        let stop = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            shutdown_tx.send(true).expect("send shutdown");
+        };
+
+        let (applied, ()) =
+            tokio::time::timeout(Duration::from_secs(60), async { tokio::join!(apply, stop) })
+                .await
+                .expect("the stop is noticed while the manifest is being read");
+
+        assert!(!applied, "unapplied, so the record is redelivered");
+        assert!(registry.calls().is_empty());
     }
 
     // -------- Redpanda-backed service test --------
