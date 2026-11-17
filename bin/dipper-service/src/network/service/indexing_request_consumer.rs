@@ -847,8 +847,9 @@ where
     };
 
     loop {
-        // On a stop, 1 last immediate attempt: the row change is already committed, so leaving
-        // without the job strands the request until the daily reassignment sweep queues it.
+        // On a stop, 1 last immediate attempt: the row change is already committed. The record
+        // is read again at the next start and queues the job then, unless it is a cancel, which
+        // finds nothing to cancel the 2nd time and queues none.
         let stopping = sleep_or_shutdown(shutdown_rx, RETRY_BACKOFF).await;
         let Err(err) =
             retry_reassess_push(worker_queue, queue_retry_id, num_candidates, target).await
@@ -2076,6 +2077,59 @@ mod tests {
             1,
             "nothing more is applied once asked to stop"
         );
+        assert_eq!(registry.stored_offsets(), [0, 1]);
+    }
+
+    /// A stop while the job queue is down ends the run with the request written and no job
+    /// behind it. The record's offset is not stored, so the next run reads it again and
+    /// queues the job, with no need for the daily reassignment pass.
+    #[tokio::test(start_paused = true)]
+    async fn a_job_lost_at_a_stop_is_queued_when_its_record_is_read_again() {
+        let id = IndexingRequestId::new();
+        let registry = MockRegistry::scripted(vec![
+            Some(SetTargetOutcome::Inserted { id }),
+            Some(SetTargetOutcome::NoOp { id }),
+        ]);
+        registry.offsets.lock().expect("poisoned").push(0);
+        // The push after the write fails, and so does the last try made on the stop.
+        let worker = MockWorker::failing_pushes(2);
+        let failures_left = Arc::clone(&worker.failures_left);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        run_until(
+            partition_loop_over(
+                ScriptedSource::new(vec![batch(0, &[3])]),
+                &registry,
+                &worker,
+                Arc::new(SkipChainCheck),
+                shutdown_rx,
+            ),
+            &shutdown_tx,
+            || *failures_left.lock().expect("poisoned") == 1,
+        )
+        .await;
+        assert!(worker.reassessments().is_empty(), "the job is lost");
+        assert_eq!(registry.stored_offsets(), [0], "and its record not passed");
+
+        let stored = Arc::clone(&registry.offsets);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        run_until(
+            partition_loop_over(
+                ScriptedSource::new(vec![batch(0, &[3])]),
+                &registry,
+                &worker,
+                Arc::new(SkipChainCheck),
+                shutdown_rx,
+            ),
+            &shutdown_tx,
+            || stored.lock().expect("poisoned").len() == 2,
+        )
+        .await;
+        let queued: Vec<_> = worker
+            .reassessments()
+            .into_iter()
+            .map(|(id, _, _, count)| (id, count))
+            .collect();
+        assert_eq!(queued, [(id, 3)], "the 2nd run queues it");
         assert_eq!(registry.stored_offsets(), [0, 1]);
     }
 

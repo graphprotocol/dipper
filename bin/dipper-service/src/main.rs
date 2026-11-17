@@ -713,17 +713,7 @@ pub async fn main() -> anyhow::Result<()> {
                 chain_check: Arc::clone(&request_chain_check),
                 config: consumer_conf.clone(),
             };
-            let (handle, service) = network::service::indexing_request_consumer::new(ctx);
-            // A reassessment push lost at the shutdown edge is only repaired by
-            // the periodic reassignment sweep; without it the request would sit
-            // open with no job behind it.
-            if !conf.reassignment.as_ref().is_some_and(|r| r.enabled) {
-                tracing::warn!(
-                    "the indexing request consumer is enabled without the reassignment service; \
-                     a reassessment job lost during a shutdown would never be retried"
-                );
-            }
-            Some((handle, service))
+            Some(network::service::indexing_request_consumer::new(ctx))
         }
         _ => None,
     };
