@@ -11,7 +11,7 @@ use std::{
 use async_trait::async_trait;
 use dipper_producer::{
     events::SubgraphIndexingAgreementEventsProducer,
-    kafka::{ConsumerError, KafkaConsumer, KafkaConsumerConfig, OffsetAt, Reconnecting},
+    kafka::{ConsumerError, KafkaConsumer, OffsetAt, Reconnecting},
     prost::Message as _,
     proto::studio,
 };
@@ -131,6 +131,16 @@ trait PartitionSource: Send + Sync + 'static {
     async fn offset(&self, partition: i32, at: OffsetAt) -> Result<i64, ConsumerError>;
 }
 
+/// What the service asks of a connected client, on top of what each partition loop does.
+#[async_trait]
+trait TopicSource: PartitionSource {
+    /// The partitions the topic had when this client connected, in ascending order.
+    fn partitions(&self) -> Vec<i32>;
+
+    /// The topic's partition count now, read again from the brokers.
+    async fn current_partition_count(&self) -> Result<usize, ConsumerError>;
+}
+
 #[async_trait]
 impl PartitionSource for KafkaConsumer {
     async fn fetch(
@@ -155,6 +165,17 @@ impl PartitionSource for KafkaConsumer {
 
     async fn offset(&self, partition: i32, at: OffsetAt) -> Result<i64, ConsumerError> {
         KafkaConsumer::offset(self, partition, at).await
+    }
+}
+
+#[async_trait]
+impl TopicSource for KafkaConsumer {
+    fn partitions(&self) -> Vec<i32> {
+        KafkaConsumer::partitions(self)
+    }
+
+    async fn current_partition_count(&self) -> Result<usize, ConsumerError> {
+        KafkaConsumer::current_partition_count(self).await
     }
 }
 
@@ -187,118 +208,175 @@ where
     R: IndexingRequestRegistry + KafkaConsumerOffsetRegistry + Clone + Send + Sync + 'static,
     W: WorkerQueue + Clone + Send + Sync + 'static,
 {
-    let (tx_stop, mut rx_stop) = mpsc::channel(1);
-
-    let service = async move {
-        let first = match connect_with_retries(&ctx.config, &mut rx_stop).await {
-            Ok(Some(consumer)) => consumer,
-            // Stop was requested while still connecting; a clean exit.
-            Ok(None) => return Ok(()),
-            Err(err) => return Err(err),
-        };
-
-        let partitions = first.partitions();
-        let topic = first.topic().to_string();
-        tracing::info!(
-            topic,
-            partitions = partitions.len(),
-            requested_by = %ctx.config.requested_by,
-            "indexing request consumer started"
-        );
-        let consumer = reconnecting(first, ctx.config.kafka.clone());
-
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let mut tasks: JoinSet<()> = JoinSet::new();
-        for partition in partitions {
-            tasks.spawn(partition_loop(
-                consumer.clone(),
-                partition,
-                ctx.registry.clone(),
-                ctx.worker_queue.clone(),
-                Arc::clone(&ctx.events),
-                ctx.protocol_chain_id,
-                ctx.max_candidates,
-                Arc::clone(&ctx.chain_check),
-                ctx.config.clone(),
-                shutdown_rx.clone(),
-            ));
-        }
-
-        // A partition loop only returns on shutdown, so one ending early panicked or hit a bug:
-        // tear the service down to restart with every partition. The metadata timer does the
-        // same when the topic grows, as nobody would read the new partitions and requests are lost.
-        let serving = tasks.len();
-        let mut metadata_check = tokio::time::interval(PARTITION_METADATA_CHECK_INTERVAL);
-        metadata_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let result = loop {
-            tokio::select! {
-                _ = rx_stop.recv() => break Ok(()),
-                joined = tasks.join_next() => break match joined {
-                    Some(Ok(())) => Err(anyhow::anyhow!(
-                        "an indexing request consumer partition loop exited unexpectedly"
-                    )),
-                    Some(Err(err)) => Err(anyhow::anyhow!(
-                        "an indexing request consumer partition loop panicked: {err}"
-                    )),
-                    None => Err(anyhow::anyhow!(
-                        "the indexing request consumer had no partition loops to run"
-                    )),
-                },
-                _ = metadata_check.tick() => {
-                    // While the client is being rebuilt there is nothing to ask; the next tick does.
-                    let Some(client) = consumer.current() else { continue };
-                    let count = tokio::time::timeout(
-                        PARTITION_METADATA_CHECK_TIMEOUT,
-                        client.current_partition_count(),
-                    )
-                    .await;
-                    match count {
-                        Ok(Ok(count)) if count > serving => break Err(anyhow::anyhow!(
-                            "topic '{}' now has {count} partitions but this consumer serves \
-                             {serving}; restarting to consume the full set",
-                            topic
-                        )),
-                        // Kafka partitions only ever grow, so a lower count is a
-                        // stale or partial metadata read, never a real change;
-                        // restarting the process over it would be a false alarm.
-                        Ok(Ok(count)) if count < serving => tracing::warn!(
-                            count,
-                            serving,
-                            "metadata reported fewer partitions than this consumer serves; \
-                             ignoring the stale read"
-                        ),
-                        Ok(Ok(_)) => {}
-                        Ok(Err(err)) => {
-                            tracing::warn!(error = %err, "failed to re-check topic partition metadata");
-                        }
-                        Err(_) => {
-                            tracing::warn!("topic partition metadata re-check timed out");
-                        }
-                    }
-                },
-            }
-        };
-
-        let _ = shutdown_tx.send(true);
-        while tasks.join_next().await.is_some() {}
-
-        tracing::info!("indexing request consumer stopped");
-        result
+    let (tx_stop, rx_stop) = mpsc::channel(1);
+    let kafka = ctx.config.kafka.clone();
+    // `connect` enforces its own deadline, so each attempt allows a little longer and that
+    // deadline's error is the one logged.
+    let connect_timeout = Duration::from_secs(kafka.connect_timeout_secs.saturating_add(5));
+    let connect = move || {
+        let kafka = kafka.clone();
+        async move { KafkaConsumer::connect(&kafka).await }
     };
+    let service = serve(ctx, rx_stop, connect_timeout, connect);
 
     (Handle { tx_stop }, service)
+}
+
+/// The consumer service over any way of connecting: [`new`] passes the real brokers, and tests
+/// a script. `connect_timeout` bounds each attempt to connect again after the first.
+async fn serve<C, R, W, F, Fut>(
+    ctx: Ctx<R, W>,
+    mut rx_stop: mpsc::Receiver<()>,
+    connect_timeout: Duration,
+    connect: F,
+) -> anyhow::Result<()>
+where
+    C: TopicSource,
+    R: IndexingRequestRegistry + KafkaConsumerOffsetRegistry + Clone + Send + Sync + 'static,
+    W: WorkerQueue + Clone + Send + Sync + 'static,
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<C, ConsumerError>> + Send,
+{
+    let first = match connect_with_retries(&connect, &mut rx_stop).await {
+        Ok(Some(consumer)) => consumer,
+        // Stop was requested while still connecting; a clean exit.
+        Ok(None) => return Ok(()),
+        Err(err) => return Err(err),
+    };
+
+    let partitions = first.partitions();
+    let topic = ctx.config.kafka.topic.clone();
+    tracing::info!(
+        topic,
+        partitions = partitions.len(),
+        requested_by = %ctx.config.requested_by,
+        "indexing request consumer started"
+    );
+    let consumer = reconnecting(first, connect_timeout, connect);
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let mut tasks: JoinSet<()> = JoinSet::new();
+    for partition in partitions {
+        tasks.spawn(partition_loop(
+            consumer.clone(),
+            partition,
+            ctx.registry.clone(),
+            ctx.worker_queue.clone(),
+            Arc::clone(&ctx.events),
+            ctx.protocol_chain_id,
+            ctx.max_candidates,
+            Arc::clone(&ctx.chain_check),
+            ctx.config.clone(),
+            shutdown_rx.clone(),
+        ));
+    }
+
+    let result = partition_loops_ended(&mut rx_stop, &mut tasks, &consumer, &topic).await;
+
+    let _ = shutdown_tx.send(true);
+    while tasks.join_next().await.is_some() {}
+
+    tracing::info!("indexing request consumer stopped");
+    result
+}
+
+/// Waits for the reason to stop the partition loops: `Ok` when the service is asked to stop.
+/// A loop only returns on shutdown, so one ending early panicked or hit a bug, and the service
+/// ends with an error to be restarted. So it does when the topic gains partitions.
+async fn partition_loops_ended<C: TopicSource>(
+    rx_stop: &mut mpsc::Receiver<()>,
+    tasks: &mut JoinSet<()>,
+    consumer: &Reconnecting<C>,
+    topic: &str,
+) -> anyhow::Result<()> {
+    let serving = tasks.len();
+    let mut metadata_check = tokio::time::interval(PARTITION_METADATA_CHECK_INTERVAL);
+    metadata_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = rx_stop.recv() => return Ok(()),
+            joined = tasks.join_next() => return Err(match joined {
+                Some(Ok(())) => anyhow::anyhow!(
+                    "an indexing request consumer partition loop exited unexpectedly"
+                ),
+                Some(Err(err)) => anyhow::anyhow!(
+                    "an indexing request consumer partition loop panicked: {err}"
+                ),
+                None => anyhow::anyhow!(
+                    "the indexing request consumer had no partition loops to run"
+                ),
+            }),
+            _ = metadata_check.tick() => {
+                if let Some(gained) = partitions_gained(consumer, serving, topic).await {
+                    return Err(gained);
+                }
+            },
+        }
+    }
+}
+
+/// An error once the topic has more partitions than the `serving` this consumer reads, since
+/// nobody would read the new ones and their requests would be lost.
+async fn partitions_gained<C: TopicSource>(
+    consumer: &Reconnecting<C>,
+    serving: usize,
+    topic: &str,
+) -> Option<anyhow::Error> {
+    // While the client is being rebuilt there is nothing to ask; the next tick does.
+    let client = consumer.current()?;
+    let count = partition_count_now(client.as_ref()).await?;
+    if count > serving {
+        return Some(anyhow::anyhow!(
+            "topic '{topic}' now has {count} partitions but this consumer serves {serving}; \
+             restarting to consume the full set"
+        ));
+    }
+    // Kafka partitions only ever grow, so a lower count is a stale or partial metadata read,
+    // never a real change; restarting the process over it would be a false alarm.
+    if count < serving {
+        tracing::warn!(
+            count,
+            serving,
+            "metadata reported fewer partitions than this consumer serves; ignoring the stale read"
+        );
+    }
+    None
+}
+
+/// The topic's partition count as the brokers give it now, or `None` when it can't be read.
+async fn partition_count_now<C: TopicSource>(client: &C) -> Option<usize> {
+    let count = tokio::time::timeout(
+        PARTITION_METADATA_CHECK_TIMEOUT,
+        client.current_partition_count(),
+    )
+    .await;
+    match count {
+        Ok(Ok(count)) => Some(count),
+        Ok(Err(err)) => {
+            tracing::warn!(error = %err, "failed to re-check topic partition metadata");
+            None
+        }
+        Err(_) => {
+            tracing::warn!("topic partition metadata re-check timed out");
+            None
+        }
+    }
 }
 
 /// Connects to the brokers, retrying transient failures a bounded number of
 /// times. A missing topic fails immediately: it is configuration, and reading
 /// from a wrong or absent topic must be loud, not an idle consumer.
-async fn connect_with_retries(
-    config: &IndexingRequestConsumerConfig,
+async fn connect_with_retries<C, F, Fut>(
+    connect: &F,
     rx_stop: &mut mpsc::Receiver<()>,
-) -> anyhow::Result<Option<KafkaConsumer>> {
+) -> anyhow::Result<Option<C>>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<C, ConsumerError>>,
+{
     let mut attempt: u32 = 0;
     loop {
-        match KafkaConsumer::connect(&config.kafka).await {
+        match connect().await {
             Ok(consumer) => return Ok(Some(consumer)),
             Err(err @ ConsumerError::TopicNotFound { .. }) => {
                 return Err(anyhow::anyhow!(
@@ -332,16 +410,18 @@ async fn connect_with_retries(
 
 /// Wraps the first consumer client so it is rebuilt from the bootstrap addresses when needed, since
 /// rskafka never goes back to them while it knows any broker, even after the cluster replaces them.
-fn reconnecting(first: KafkaConsumer, kafka: KafkaConsumerConfig) -> Reconnecting<KafkaConsumer> {
-    // `connect` enforces its own deadline, so each attempt allows a little longer and that
-    // deadline's error is the one logged.
-    let connect_timeout = Duration::from_secs(kafka.connect_timeout_secs.saturating_add(5));
+fn reconnecting<C, F, Fut>(first: C, connect_timeout: Duration, connect: F) -> Reconnecting<C>
+where
+    C: TopicSource,
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<C, ConsumerError>> + Send,
+{
     let stall = Arc::new(Mutex::new(Stall::default()));
     Reconnecting::with_client("indexing requests", first, connect_timeout, move || {
-        let kafka = kafka.clone();
+        let attempt = connect();
         let stall = Arc::clone(&stall);
         async move {
-            let connected = KafkaConsumer::connect(&kafka).await;
+            let connected = attempt.await;
             note_reconnect(&stall, &connected);
             connected
         }
@@ -1847,6 +1927,8 @@ mod tests {
         /// Once the script runs out, answer every fetch with an error the broker would keep
         /// giving, in place of waiting.
         fails_after_script: bool,
+        /// The partitions the topic has.
+        partitions: Vec<i32>,
     }
 
     impl ScriptedSource {
@@ -1857,7 +1939,19 @@ mod tests {
                 earliest: 0,
                 latest: 0,
                 fails_after_script: false,
+                partitions: vec![0],
             }
+        }
+    }
+
+    #[async_trait]
+    impl TopicSource for ScriptedSource {
+        fn partitions(&self) -> Vec<i32> {
+            self.partitions.clone()
+        }
+
+        async fn current_partition_count(&self) -> Result<usize, ConsumerError> {
+            Ok(self.partitions.len())
         }
     }
 
@@ -2522,6 +2616,84 @@ mod tests {
             0,
             "{after_reconnecting}"
         );
+    }
+
+    // -------- the service --------
+
+    /// The service as dipper runs it, over a topic that `found` stands in for: it is given
+    /// the number of each attempt to connect, from 1, and says what that attempt finds.
+    fn serve_over(
+        found: impl Fn(u32) -> Result<ScriptedSource, ConsumerError> + Send + Sync + 'static,
+        registry: &MockRegistry,
+        worker: &MockWorker,
+        rx_stop: mpsc::Receiver<()>,
+    ) -> impl Future<Output = anyhow::Result<()>> {
+        let ctx = Ctx {
+            registry: registry.clone(),
+            worker_queue: worker.clone(),
+            events: Arc::new(CapturingEventsProducer::new()),
+            protocol_chain_id: PROTOCOL_CHAIN_ID,
+            max_candidates: TEST_MAX_CANDIDATES,
+            chain_check: Arc::new(SkipChainCheck),
+            config: test_config(),
+        };
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        serve(ctx, rx_stop, Duration::from_secs(65), move || {
+            let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let found = found(attempt);
+            async move { found }
+        })
+    }
+
+    /// Runs `service` until `done`, then asks it to stop as dipper's shutdown does, and
+    /// returns how it ended. `None` if it ended by itself before `done`.
+    async fn serve_until(
+        service: impl Future<Output = anyhow::Result<()>>,
+        tx_stop: mpsc::Sender<()>,
+        done: impl Fn() -> bool,
+    ) -> Option<anyhow::Result<()>> {
+        tokio::pin!(service);
+        let asked_to_stop = async {
+            while !done() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::select! {
+            ended = &mut service => {
+                drop(ended);
+                return None;
+            }
+            () = asked_to_stop => {}
+        }
+        let _ = tx_stop.send(()).await;
+        let ended = tokio::time::timeout(Duration::from_secs(5), service).await;
+        Some(ended.expect("the service stops within the 5 seconds dipper allows it"))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_service_reads_the_topic_it_connects_to_and_stops_when_asked() {
+        let registry = MockRegistry::scripted(vec![Some(SetTargetOutcome::Inserted {
+            id: IndexingRequestId::new(),
+        })]);
+        let worker = MockWorker::new();
+        let stored = Arc::clone(&registry.offsets);
+        let (tx_stop, rx_stop) = mpsc::channel(1);
+
+        let ended = serve_until(
+            serve_over(
+                |_| Ok(ScriptedSource::new(vec![batch(0, &[3])])),
+                &registry,
+                &worker,
+                rx_stop,
+            ),
+            tx_stop,
+            || !stored.lock().expect("poisoned").is_empty(),
+        )
+        .await;
+
+        assert!(matches!(ended, Some(Ok(()))), "{ended:?}");
+        assert_eq!(worker.reassessments().len(), 1);
+        assert_eq!(registry.stored_offsets(), [1]);
     }
 
     // -------- Redpanda-backed service test --------
