@@ -4645,6 +4645,62 @@ async fn kafka_consumer_offsets_roundtrip_and_upsert() {
     );
 }
 
+/// Whether `conn` takes the lock within 5 seconds: Postgres ends a session a moment after its
+/// client has gone, so a lock that was just given up is not free at once.
+async fn takes_the_lock_within_5_seconds(
+    conn: &mut dipper_pgregistry::AdvisoryLockConnection,
+) -> Result<bool, Error> {
+    for _ in 0..50 {
+        if conn.try_lock().await? {
+            return Ok(true);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    Ok(false)
+}
+
+#[tokio::test]
+async fn an_advisory_lock_is_held_by_1_connection_until_that_connection_is_gone() {
+    //* Given
+    let (db, _temp_db) = temp_registry_db().await;
+    let registry = PgRegistry::new(db);
+    let connect = async |key| {
+        registry
+            .advisory_lock_connection(key)
+            .await
+            .expect("open a connection for the lock")
+    };
+    let (mut first, mut second, mut third) =
+        (connect(42).await, connect(42).await, connect(42).await);
+    let mut other_key = connect(43).await;
+
+    //* When / Then - 1 connection holds a key at a time, and another key is another lock
+    assert!(first.try_lock().await.expect("try the lock"));
+    assert!(
+        !second.try_lock().await.expect("try the lock"),
+        "the 1st connection holds it"
+    );
+    assert!(other_key.try_lock().await.expect("try the lock"));
+    assert!(first.is_alive().await);
+
+    //* When / Then - closing the holder's connection gives the lock up
+    first.close().await.expect("close the 1st connection");
+    let taken = takes_the_lock_within_5_seconds(&mut second).await;
+    assert!(
+        taken.expect("try the lock"),
+        "the lock is free once its holder has closed"
+    );
+
+    //* When / Then - so does a holder whose connection is lost without a goodbye
+    assert!(!third.try_lock().await.expect("try the lock"));
+    drop(second);
+    let taken = takes_the_lock_within_5_seconds(&mut third).await;
+    assert!(
+        taken.expect("try the lock"),
+        "the lock is free once its holder's connection is gone"
+    );
+}
+
 #[tokio::test]
 async fn count_created_agreements_by_indexer_counts_offers_being_withdrawn() {
     //* Given
