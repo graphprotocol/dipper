@@ -2971,7 +2971,8 @@ mod tests {
         let rules = [
             "each start begins on the minimums built into its release",
             "A read that fails is tried again after 1 minute",
-            "these 2 rules do not protect the first read after a start",
+            "adds a chain above the highest minimum in use or below a tenth of the lowest",
+            "these 3 rules do not protect the first read after a start",
         ];
 
         for rule in rules {

@@ -167,7 +167,10 @@ impl Refusal {
     /// Whether the table was refused for how it differs from the one fetched before it.
     /// A dipper that restarts has no such table, and so takes the same table.
     pub fn is_against_table_in_use(&self) -> bool {
-        matches!(self, Self::ChainDropped { .. } | Self::MovedTooFar { .. })
+        matches!(
+            self,
+            Self::ChainDropped { .. } | Self::MovedTooFar { .. } | Self::NewChainOutOfRange { .. }
+        )
     }
 }
 
@@ -186,6 +189,16 @@ pub enum Refusal {
         "it moves the minimum for {chain} from {from} to {to}, more than {MAX_CHANGE_FACTOR} times"
     )]
     MovedTooFar { chain: String, from: f64, to: f64 },
+    #[error(
+        "it adds {chain} at {minimum}, and a chain added while dipper runs has to be between \
+         {at_least}, a tenth of the lowest minimum in use, and {at_most}, the highest"
+    )]
+    NewChainOutOfRange {
+        chain: String,
+        minimum: f64,
+        at_least: f64,
+        at_most: f64,
+    },
     #[error(
         "its minimum for {chain} ({minimum}) puts that ceiling at {ceiling}, above \
          max_agreement_grt_per_30_days ({cap})"
@@ -274,8 +287,8 @@ fn checked(fetched: &Minimums, max_agreement_grt_per_30_days: f64) -> Result<(),
     Ok(())
 }
 
-/// Checks a table against the one fetched before it: it may not drop a chain, nor move a
-/// minimum by more than [`MAX_CHANGE_FACTOR`] times.
+/// Checks a table against the one fetched before it: it may not drop a chain, move a minimum
+/// by more than [`MAX_CHANGE_FACTOR`] times, or add a chain priced outside the ones in use.
 fn checked_against(fetched: &Minimums, in_use: &Minimums) -> Result<(), Refusal> {
     for (chain, from) in in_use {
         let Some(to) = fetched.get(chain).copied() else {
@@ -288,6 +301,20 @@ fn checked_against(fetched: &Minimums, in_use: &Minimums) -> Result<(), Refusal>
                 chain: chain.clone(),
                 from: *from,
                 to,
+            });
+        }
+    }
+    // A chain new to the table has no figure of its own to be held to. By default the
+    // highest minimum sets the ceiling of every unlisted chain, so no new one may top it.
+    let at_most = in_use.values().copied().fold(0.0, f64::max);
+    let at_least = in_use.values().copied().fold(f64::INFINITY, f64::min) / MAX_CHANGE_FACTOR;
+    for (chain, minimum) in fetched {
+        if !in_use.contains_key(chain) && !(at_least..=at_most).contains(minimum) {
+            return Err(Refusal::NewChainOutOfRange {
+                chain: chain.clone(),
+                minimum: *minimum,
+                at_least,
+                at_most,
             });
         }
     }
@@ -431,6 +458,72 @@ mod tests {
             });
             assert_eq!(outcome, if taken { Ok(()) } else { moved_too_far }, "{to}");
         }
+    }
+
+    /// A chain new to the table has no figure of its own to be held to, and by default the
+    /// highest minimum sets the ceiling of every chain the table does not list. So a new
+    /// chain may not be above the highest minimum in use, nor under a tenth of the lowest.
+    #[test]
+    fn refuses_a_new_chain_priced_outside_the_minimums_in_use() {
+        for (minimum, taken) in [
+            (450.0, true),
+            (450.01, false),
+            (0.5, true),
+            (0.49, false),
+            (80.0, true),
+        ] {
+            let mut fetched = in_use();
+            fetched.insert("gnosis".to_string(), minimum);
+
+            let outcome = checked_against(&fetched, &in_use());
+
+            let out_of_range = Err(Refusal::NewChainOutOfRange {
+                chain: "gnosis".to_string(),
+                minimum,
+                at_least: 0.5,
+                at_most: 450.0,
+            });
+            assert_eq!(
+                outcome,
+                if taken { Ok(()) } else { out_of_range },
+                "{minimum}"
+            );
+        }
+    }
+
+    /// 4,500 typed for 45 on a new line is refused, so the fallback stays where it was and
+    /// the corrected file is taken with nothing to walk back.
+    #[test]
+    fn a_slip_in_a_new_chain_is_refused_and_its_correction_is_taken() {
+        let ceilings = BasePriceCeilings::new(None, None, in_use());
+        ceilings.follow(in_use(), CAP).expect("the first table");
+        let with_gnosis_at = |minimum: f64| {
+            let mut fetched = in_use();
+            fetched.insert("gnosis".to_string(), minimum);
+            fetched
+        };
+
+        let slip = ceilings.follow(with_gnosis_at(4_500.0), CAP);
+
+        assert!(
+            matches!(&slip, Err(refusal) if refusal.is_against_table_in_use()),
+            "{slip:?}"
+        );
+        assert_eq!(ceilings.fallback(), 1_800.0);
+        let corrected = ceilings.follow(with_gnosis_at(45.0), CAP);
+        assert!(corrected.is_ok(), "{corrected:?}");
+        assert_eq!(ceilings.for_chain("gnosis"), 180.0);
+    }
+
+    /// The first table after a start is taken as it is, new chains and all.
+    #[test]
+    fn a_new_chain_in_the_first_table_after_a_start_is_held_to_no_other_minimum() {
+        let ceilings = BasePriceCeilings::new(None, None, in_use());
+        let mut fetched = in_use();
+        fetched.insert("gnosis".to_string(), 4_500.0);
+
+        assert!(ceilings.follow(fetched, CAP).is_ok());
+        assert_eq!(ceilings.fallback(), 18_000.0);
     }
 
     /// The contract refuses an agreement priced above the cap, so a ceiling above it would

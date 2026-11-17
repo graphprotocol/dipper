@@ -595,6 +595,32 @@ mod tests {
         );
     }
 
+    /// A new line above every figure in use would raise the fallback, and with it the
+    /// ceiling of every chain the table does not list. Dipper refuses it while it runs.
+    #[tokio::test(start_paused = true)]
+    async fn a_new_chain_above_every_minimum_in_use_is_refused_while_dipper_runs() {
+        fn gnosis_at_4500() -> Fetched {
+            Ok(published(&[
+                ("arbitrum-one", 450.0),
+                ("mainnet", 45.0),
+                ("sepolia", 5.0),
+                ("gnosis", 4_500.0),
+            ]))
+        }
+        let ceilings = default_ceilings();
+        let script: Vec<fn() -> Fetched> = vec![unchanged, gnosis_at_4500];
+
+        let (_, logs) = served(&ceilings, 6 * HOUR, script, 7 * HOUR).await;
+
+        assert_eq!(alerts(&logs, REFUSED_EVENT), 1, "{logs}");
+        assert_eq!(ceilings.fallback(), 1_800.0);
+        assert!(logs.contains("it adds gnosis at 4500"), "{logs}");
+        assert!(
+            logs.contains("restart dipper, which takes the published table as it starts"),
+            "the way out: {logs}"
+        );
+    }
+
     /// A dipper that restarts is back on the table built into its release. The published
     /// one may be far from that by then, and is what dipper was on before it restarted.
     #[tokio::test(start_paused = true)]
