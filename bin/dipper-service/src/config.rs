@@ -2194,10 +2194,9 @@ pub fn default_event_queue_capacity() -> NonZeroUsize {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IndexingRequestConsumerConfig {
-    /// Whether the consumer is enabled (default: false). Leave off until
-    /// Studio's propose events carry `indexed_network_caip2id`: without the
-    /// field every consumed request is skipped and its offset committed, so
-    /// enabling early permanently discards real requests.
+    /// Whether the consumer runs (default: false). Until Studio sends `indexed_network_caip2id`
+    /// every request is skipped for good. The first switch-on applies every record the topic
+    /// still holds, oldest first, so switch on when Studio starts sending the field, not later.
     #[serde(default)]
     pub enabled: bool,
 

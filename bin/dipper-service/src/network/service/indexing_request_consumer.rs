@@ -169,9 +169,9 @@ pub struct Ctx<R, W> {
     /// The protocol network chain id (signer chain id), for validating the
     /// envelope's network and stamping emitted lifecycle events
     pub protocol_chain_id: ChainId,
-    /// Ceiling on the indexer count a consumed request may ask for; larger
-    /// counts are clamped with a warning. Kafka records carry no signature,
-    /// so this door gets a cap the signed admin RPC does not need.
+    /// Ceiling on the indexer count a consumed request may ask for; larger counts are clamped
+    /// with a warning. Kafka records carry no signature, so this door is held to a lower count
+    /// than the signed admin RPC, which refuses anything above `MAX_NUM_CANDIDATES`.
     pub max_candidates: usize,
     /// Refuses requests whose chain is not their subgraph manifest's
     pub chain_check: Arc<dyn RequestChainCheck>,
