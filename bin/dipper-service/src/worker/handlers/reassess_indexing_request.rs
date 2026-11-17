@@ -1440,6 +1440,20 @@ mod lifecycle_event_tests {
         )
     }
 
+    /// Base-price ceilings an operator set in full: 1 for each of `chains`, and the fallback.
+    fn ceilings_set(
+        chains: &[(&str, f64)],
+        fallback: f64,
+    ) -> Arc<crate::price_ceilings::BasePriceCeilings> {
+        let chains = chains
+            .iter()
+            .map(|(chain, ceiling)| ((*chain).to_string(), *ceiling))
+            .collect();
+        Arc::new(crate::price_ceilings::BasePriceCeilings::set(
+            chains, fallback,
+        ))
+    }
+
     fn test_agreement_conf() -> IndexingAgreementConfig {
         IndexingAgreementConfig {
             data_service: Address::repeat_byte(0x03),
@@ -1454,10 +1468,7 @@ mod lifecycle_event_tests {
             price_rejection_lookback_days: 1,
             transient_rejection_lookback_minutes: 30,
             uncertain_rejection_lookback_days: 1,
-            max_grt_per_30_days: std::collections::BTreeMap::from([(
-                "test-chain".to_string(),
-                450.0,
-            )]),
+            base_price_ceilings: ceilings_set(&[("test-chain", 450.0)], 1800.0),
             max_grt_per_billion_entities_per_30_days: 2000.0,
             ..IndexingAgreementConfig::for_tests()
         }
@@ -1715,11 +1726,7 @@ mod lifecycle_event_tests {
             indexer_urls::Snapshot::new(),
         );
         ctx.agreement_conf = Arc::new(IndexingAgreementConfig {
-            max_grt_per_30_days: std::collections::BTreeMap::from([(
-                "other-chain".to_string(),
-                450.0,
-            )]),
-            fallback_max_grt_per_30_days: 900.0,
+            base_price_ceilings: ceilings_set(&[("other-chain", 450.0)], 900.0),
             ..test_agreement_conf()
         });
 

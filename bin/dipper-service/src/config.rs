@@ -17,6 +17,10 @@ use thegraph_core::alloy::{
 };
 use url::Url;
 
+use crate::price_ceilings::{
+    BasePriceCeilings, Minimums, default_ceiling, default_fallback_ceiling,
+};
+
 /// How many indexers a request gets when it doesn't say. Despite the name, it is a default,
 /// not a limit; [`MAX_NUM_CANDIDATES`] is the limit.
 pub const DEFAULT_MAX_CANDIDATES: usize = 3;
@@ -1357,14 +1361,16 @@ pub struct DipsAgreementConfig {
     ///
     /// Used as a ceiling when requesting indexers from IISA. Indexers asking
     /// more than the ceiling for their chain are excluded from selection.
-    /// Keys are chain names (e.g. "arbitrum-one", "mainnet").
-    #[serde(default = "default_max_grt_per_30_days")]
-    pub max_grt_per_30_days: BTreeMap<String, f64>,
+    /// Keys are chain names (e.g. "arbitrum-one", "mainnet"). `None` when the
+    /// config leaves it out, which gives each chain its default ceiling.
+    #[serde(default)]
+    pub max_grt_per_30_days: Option<BTreeMap<String, f64>>,
 
     /// Maximum GRT per 30 days Dipper will pay on a chain with no entry in
-    /// `max_grt_per_30_days`, so every chain has a base-price ceiling.
-    #[serde(default = "default_fallback_max_grt_per_30_days")]
-    pub fallback_max_grt_per_30_days: f64,
+    /// `max_grt_per_30_days`, so every chain has a base-price ceiling. `None`
+    /// when the config leaves it out, which gives the default fallback.
+    #[serde(default)]
+    pub fallback_max_grt_per_30_days: Option<f64>,
 
     /// Maximum GRT per billion entities per 30 days Dipper will pay, on every chain.
     ///
@@ -1479,15 +1485,16 @@ impl DipsAgreementConfig {
         }
         // A chain's cap of 0 excludes every priced indexer there, and IISA refuses a negative
         // one, which dipper takes for an outage and retries forever; refuse to start instead.
-        for (chain, cap) in &self.max_grt_per_30_days {
+        for (chain, cap) in self.max_grt_per_30_days.iter().flatten() {
             if !(cap.is_finite() && *cap > 0.0) {
                 return Err(format!(
                     "max_grt_per_30_days for chain {chain} ({cap}) must be a positive number"
                 ));
             }
         }
-        let fallback = self.fallback_max_grt_per_30_days;
-        if !(fallback.is_finite() && fallback > 0.0) {
+        if let Some(fallback) = self.fallback_max_grt_per_30_days
+            && !(fallback.is_finite() && fallback > 0.0)
+        {
             return Err(format!(
                 "fallback_max_grt_per_30_days ({fallback}) must be a positive number"
             ));
@@ -1554,13 +1561,16 @@ impl DipsAgreementConfig {
     fn validate_prices_within_agreement_cap(&self) -> Result<(), String> {
         let cap_grt = self.max_agreement_grt_per_30_days;
         let cap = crate::worker::grt_per_30_days_to_wei_per_second(cap_grt);
-        let ceilings = self
-            .max_grt_per_30_days
-            .iter()
-            .map(|(chain, ceiling)| (format!("max_grt_per_30_days for chain {chain}"), *ceiling))
+        // A setting left out is checked at the default dipper starts with.
+        let chains = self.max_grt_per_30_days.clone();
+        let fallback = self.fallback_max_grt_per_30_days;
+        let ceilings = chains
+            .unwrap_or_else(default_max_grt_per_30_days)
+            .into_iter()
+            .map(|(chain, ceiling)| (format!("max_grt_per_30_days for chain {chain}"), ceiling))
             .chain(std::iter::once((
                 "fallback_max_grt_per_30_days".to_string(),
-                self.fallback_max_grt_per_30_days,
+                fallback.unwrap_or_else(default_fallback_max_grt_per_30_days),
             )));
         for (name, ceiling) in ceilings {
             if crate::worker::grt_per_30_days_to_wei_per_second(ceiling) > cap {
@@ -1625,23 +1635,28 @@ const INDEXER_RS_MIN_GRT_PER_30_DAYS: &[(&str, f64)] = &[
 ];
 
 /// Multiplier applied to indexer-rs minimums to derive dipper's max ceilings.
-const PAYMENT_CEILING_MULTIPLIER: f64 = 4.0;
+pub const PAYMENT_CEILING_MULTIPLIER: f64 = 4.0;
+
+/// The suggested minimums built into this release, by chain name.
+pub fn built_in_minimums() -> Minimums {
+    INDEXER_RS_MIN_GRT_PER_30_DAYS
+        .iter()
+        .map(|(name, min)| ((*name).to_string(), *min))
+        .collect()
+}
 
 /// Default selection ceiling: 4 times the indexer-rs minimum per chain.
 fn default_max_grt_per_30_days() -> BTreeMap<String, f64> {
-    INDEXER_RS_MIN_GRT_PER_30_DAYS
-        .iter()
-        .map(|(name, min)| ((*name).to_string(), min * PAYMENT_CEILING_MULTIPLIER))
+    built_in_minimums()
+        .into_iter()
+        .map(|(name, min)| (name, default_ceiling(min)))
         .collect()
 }
 
 /// Default ceiling for chains outside the rollout set: the highest of the default chain
 /// ceilings, whatever `max_grt_per_30_days` an operator configures.
 fn default_fallback_max_grt_per_30_days() -> f64 {
-    INDEXER_RS_MIN_GRT_PER_30_DAYS
-        .iter()
-        .map(|(_, min)| min * PAYMENT_CEILING_MULTIPLIER)
-        .fold(0.0, f64::max)
+    default_fallback_ceiling(&built_in_minimums())
 }
 
 fn default_max_grt_per_billion_entities_per_30_days() -> f64 {
@@ -1828,10 +1843,8 @@ pub struct IndexingAgreementConfig {
     pub duration_seconds: u64,
     /// Deadline duration in seconds.
     pub deadline_seconds: u64,
-    /// Payment ceiling per chain (GRT per 30 days).
-    pub max_grt_per_30_days: BTreeMap<String, f64>,
-    /// Payment ceiling (GRT per 30 days) for a chain with no entry in `max_grt_per_30_days`.
-    pub fallback_max_grt_per_30_days: f64,
+    /// Base-price ceiling per chain (GRT per 30 days), and for a chain with none of its own.
+    pub base_price_ceilings: Arc<BasePriceCeilings>,
     /// Payment ceiling for entity pricing (GRT per billion entities per 30 days).
     pub max_grt_per_billion_entities_per_30_days: f64,
     /// Number of days to look back for declined indexers (standard exclusion).
@@ -1877,8 +1890,11 @@ impl IndexingAgreementConfig {
             min_seconds_per_collection: 0,
             duration_seconds: 0,
             deadline_seconds: 0,
-            max_grt_per_30_days: BTreeMap::new(),
-            fallback_max_grt_per_30_days: default_fallback_max_grt_per_30_days(),
+            base_price_ceilings: Arc::new(BasePriceCeilings::new(
+                Some(BTreeMap::new()),
+                None,
+                built_in_minimums(),
+            )),
             max_grt_per_billion_entities_per_30_days:
                 default_max_grt_per_billion_entities_per_30_days(),
             declined_indexer_lookback_days: 0,
@@ -1941,10 +1957,7 @@ impl IndexingAgreementConfig {
 
     /// The base-price ceiling for a chain: its own entry, or the fallback when it has none.
     pub fn max_grt_per_30_days_for(&self, chain: &str) -> f64 {
-        self.max_grt_per_30_days
-            .get(chain)
-            .copied()
-            .unwrap_or(self.fallback_max_grt_per_30_days)
+        self.base_price_ceilings.for_chain(chain)
     }
 
     pub fn max_grt_per_billion_entities_per_30_days(&self) -> f64 {
@@ -2016,8 +2029,11 @@ impl From<DipsAgreementConfig>
             min_seconds_per_collection: value.min_seconds_per_collection,
             duration_seconds: value.duration_seconds.unwrap_or(u64::MAX),
             deadline_seconds: value.deadline_seconds,
-            max_grt_per_30_days: value.max_grt_per_30_days,
-            fallback_max_grt_per_30_days: value.fallback_max_grt_per_30_days,
+            base_price_ceilings: Arc::new(BasePriceCeilings::new(
+                value.max_grt_per_30_days,
+                value.fallback_max_grt_per_30_days,
+                built_in_minimums(),
+            )),
             max_grt_per_billion_entities_per_30_days: value
                 .max_grt_per_billion_entities_per_30_days,
             declined_indexer_lookback_days: value.declined_indexer_lookback_days,
@@ -2268,8 +2284,8 @@ mod tests {
             assert!(err.contains("max_agreement_grt_per_30_days"), "{err}");
         }
         // The price ceilings may not exceed the cap, so a tiny cap needs ceilings as small.
-        conf.max_grt_per_30_days.clear();
-        conf.fallback_max_grt_per_30_days = 0.01;
+        conf.max_grt_per_30_days = Some(BTreeMap::new());
+        conf.fallback_max_grt_per_30_days = Some(0.01);
         for cap in [0.01, 20_000.0] {
             conf.max_agreement_grt_per_30_days = cap;
             assert!(conf.validate().is_ok(), "{cap}");
@@ -2312,16 +2328,15 @@ mod tests {
             }"#,
         )
         .expect("deserialization");
+        let arbitrum_at = |ceiling| Some(BTreeMap::from([("arbitrum-one".to_string(), ceiling)]));
         for ceiling in [0.0, -1.0, f64::NAN, f64::INFINITY] {
-            conf.max_grt_per_30_days
-                .insert("arbitrum-one".to_string(), ceiling);
+            conf.max_grt_per_30_days = arbitrum_at(ceiling);
             let err = conf.validate().expect_err(&format!("{ceiling}"));
             assert!(err.contains("arbitrum-one"), "{err}");
             assert!(err.contains(&format!("({ceiling})")), "{err}");
         }
         for ceiling in [0.01, 4500.0] {
-            conf.max_grt_per_30_days
-                .insert("arbitrum-one".to_string(), ceiling);
+            conf.max_grt_per_30_days = arbitrum_at(ceiling);
             assert!(conf.validate().is_ok(), "{ceiling}");
         }
     }
@@ -2348,24 +2363,23 @@ mod tests {
         let mut conf = dips_conf_with_default_prices();
         conf.max_agreement_grt_per_30_days = 20_000.0;
 
-        conf.max_grt_per_30_days
-            .insert("arbitrum-one".to_string(), 20_001.0);
+        let arbitrum_at = |ceiling| Some(BTreeMap::from([("arbitrum-one".to_string(), ceiling)]));
+        conf.max_grt_per_30_days = arbitrum_at(20_001.0);
         let err = conf
             .validate()
             .expect_err("a chain ceiling above the cap must be refused");
         assert!(err.contains("arbitrum-one"), "{err}");
         assert!(err.contains("max_agreement_grt_per_30_days"), "{err}");
 
-        conf.max_grt_per_30_days
-            .insert("arbitrum-one".to_string(), 20_000.0);
-        conf.fallback_max_grt_per_30_days = 20_001.0;
+        conf.max_grt_per_30_days = arbitrum_at(20_000.0);
+        conf.fallback_max_grt_per_30_days = Some(20_001.0);
         let err = conf
             .validate()
             .expect_err("a fallback ceiling above the cap must be refused");
         assert!(err.contains("fallback_max_grt_per_30_days"), "{err}");
 
         // A ceiling at the cap is fine: the highest price it allows is exactly the cap.
-        conf.fallback_max_grt_per_30_days = 20_000.0;
+        conf.fallback_max_grt_per_30_days = Some(20_000.0);
         assert_eq!(conf.validate(), Ok(()));
     }
 
@@ -2428,7 +2442,7 @@ mod tests {
         )
         .expect("deserialization");
         // Unset, the fallback is the highest default chain ceiling (arbitrum-one's).
-        assert_eq!(conf.fallback_max_grt_per_30_days, 1800.0);
+        assert_eq!(conf.fallback_max_grt_per_30_days, None);
         let (agreement_conf, _) =
             <(Arc<IndexingAgreementConfig>, Arc<BTreeMap<ChainId, _>>)>::from(conf);
         assert_eq!(agreement_conf.max_grt_per_30_days_for("mainnet"), 450.0);
@@ -2449,12 +2463,12 @@ mod tests {
         )
         .expect("deserialization");
         for ceiling in [0.0, -1.0, f64::NAN, f64::INFINITY] {
-            conf.fallback_max_grt_per_30_days = ceiling;
+            conf.fallback_max_grt_per_30_days = Some(ceiling);
             let err = conf.validate().expect_err(&format!("{ceiling}"));
             assert!(err.contains("fallback_max_grt_per_30_days"), "{err}");
         }
         for ceiling in [0.01, 4500.0] {
-            conf.fallback_max_grt_per_30_days = ceiling;
+            conf.fallback_max_grt_per_30_days = Some(ceiling);
             assert!(conf.validate().is_ok(), "{ceiling}");
         }
     }

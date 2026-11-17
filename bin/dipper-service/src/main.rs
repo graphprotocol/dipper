@@ -30,6 +30,7 @@ mod indexer_addresses;
 mod indexer_rpc_client;
 mod log_text;
 mod network;
+mod price_ceilings;
 mod registry;
 mod signing;
 mod supervisor;
