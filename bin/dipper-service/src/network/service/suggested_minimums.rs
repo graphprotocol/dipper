@@ -54,6 +54,9 @@ pub struct Ctx {
     pub url: Url,
     /// How long to wait between fetches.
     pub interval: Duration,
+    /// A note for each `pricing_table` price above its ceiling, as the ceilings stand when
+    /// it is called.
+    pub table_prices_above_ceilings: Box<dyn Fn() -> Vec<String> + Send + Sync>,
 }
 
 /// Creates the service: a handle to stop it, and a future to spawn that fetches the table at
@@ -137,6 +140,7 @@ impl Ctx {
             Ok(table) => table,
             Err(failure) => return self.note_fetch_failure(&failure, alerted),
         };
+        let above_before = (self.table_prices_above_ceilings)();
         let taken = parse_minimums(&table).and_then(|minimums| {
             self.ceilings
                 .follow(minimums, self.max_agreement_grt_per_30_days)
@@ -145,6 +149,12 @@ impl Ctx {
             Ok(changes) => {
                 *alerted = Alerted::default();
                 note_changes(&changes);
+                // Start-up warned of the table prices above a ceiling then, so this warns
+                // only of those a ceiling that moved has left above it.
+                let above = (self.table_prices_above_ceilings)();
+                for note in above.iter().filter(|note| !above_before.contains(note)) {
+                    tracing::warn!("{note}");
+                }
             }
             Err(refusal) => {
                 // Tagged for an alert only when one is due; logged every time.
@@ -252,20 +262,26 @@ fn without_secrets(url: &Url) -> String {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::VecDeque,
+        collections::{BTreeMap, VecDeque},
         sync::{
             Mutex,
             atomic::{AtomicUsize, Ordering},
         },
     };
 
+    use thegraph_core::alloy::primitives::{ChainId, U256};
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{method, path},
     };
 
     use super::*;
-    use crate::{price_ceilings::Minimums, test_support::logged};
+    use crate::{
+        config::{IndexingAgreementChainPrices, IndexingAgreementConfig},
+        price_ceilings::Minimums,
+        test_support::logged,
+        worker,
+    };
 
     const HOUR: Duration = Duration::from_secs(3_600);
 
@@ -296,6 +312,7 @@ mod tests {
                 .parse()
                 .expect("a URL"),
             interval,
+            table_prices_above_ceilings: Box::new(Vec::new),
         }
     }
 
@@ -314,6 +331,15 @@ mod tests {
         script: Vec<fn() -> Fetched>,
         lasting: Duration,
     ) -> (usize, String) {
+        served_with(ctx(ceilings, interval), script, lasting).await
+    }
+
+    /// [`served`], for a service the test built itself.
+    async fn served_with(
+        ctx: Ctx,
+        script: Vec<fn() -> Fetched>,
+        lasting: Duration,
+    ) -> (usize, String) {
         let fetches = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&fetches);
         let script = Mutex::new(VecDeque::from(script));
@@ -329,7 +355,7 @@ mod tests {
             async move { answer() }
         };
         let (tx_stop, rx_stop) = mpsc::channel(1);
-        let service = run(ctx(ceilings, interval), rx_stop, fetch);
+        let service = run(ctx, rx_stop, fetch);
         let logs = logged(async {
             tokio::pin!(service);
             tokio::select! {
@@ -407,6 +433,62 @@ mod tests {
             assert!(logs.contains(change), "the alert says {change}: {logs}");
         }
         assert!(!logs.contains("sepolia from"), "unchanged: {logs}");
+    }
+
+    /// Start-up warns about each `pricing_table` price above its ceiling as the ceilings
+    /// stand then. A ceiling that a fetched table moves under a table price is warned about
+    /// as it moves, once, and nothing start-up already said is said again.
+    #[tokio::test(start_paused = true)]
+    async fn a_table_price_left_above_a_ceiling_that_moved_is_warned_about_once() {
+        let ceilings = default_ceilings();
+        let conf = IndexingAgreementConfig {
+            base_price_ceilings: Arc::clone(&ceilings),
+            ..IndexingAgreementConfig::for_tests()
+        };
+        let price = |grt| IndexingAgreementChainPrices {
+            tokens_per_second: worker::grt_per_30_days_to_wei_per_second(grt),
+            tokens_per_entity_per_second: U256::ZERO,
+        };
+        // Against the ceilings at start of 1,800, 180 and 20: above, below and above.
+        let table = BTreeMap::from([
+            (42161, price(1_900.0)),
+            (1, price(150.0)),
+            (11155111, price(50.0)),
+        ]);
+        let chain_name = |chain: ChainId| {
+            let name = match chain {
+                42161 => "arbitrum-one",
+                1 => "mainnet",
+                _ => "sepolia",
+            };
+            Some(name.to_string())
+        };
+        let ctx = Ctx {
+            table_prices_above_ceilings: Box::new(move || {
+                worker::table_prices_above_ceilings(&conf, &table, chain_name)
+            }),
+            ..ctx(&ceilings, 6 * HOUR)
+        };
+
+        // `raised` moves the 3 ceilings to 2,000, 120 and 20.
+        let (fetches, logs) = served_with(ctx, vec![raised], 25 * HOUR).await;
+
+        let lowered_past = "chain 1 (mainnet) is worth 150 GRT per 30 days, above that chain's \
+                            base-price ceiling of 120";
+        assert_eq!(fetches, 5);
+        assert_eq!(
+            logs.matches(lowered_past).count(),
+            1,
+            "said as the ceiling moves, and not by the 4 fetches after: {logs}"
+        );
+        assert!(
+            !logs.contains("chain 42161"),
+            "a raised ceiling is above the table price: {logs}"
+        );
+        assert!(
+            !logs.contains("chain 11155111"),
+            "above a ceiling that did not move, which start-up said: {logs}"
+        );
     }
 
     /// Each chain's change is also logged as a line of its own, with the ceiling before and

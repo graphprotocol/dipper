@@ -136,18 +136,6 @@ pub async fn main() -> anyhow::Result<()> {
     // TODO: Decouple the config file format from the internal representation
     let (agreement_conf, pricing_table) = conf.dips.into();
 
-    // Keeps the default price ceilings in step with indexer-rs. Left out when it is switched
-    // off, or when the config sets both ceilings and so leaves it nothing to keep in step.
-    let follows = agreement_conf.base_price_ceilings.follows_minimums();
-    let suggested_minimums_service = (conf.suggested_minimums.enabled && follows).then(|| {
-        network::service::suggested_minimums::new(network::service::suggested_minimums::Ctx {
-            ceilings: Arc::clone(&agreement_conf.base_price_ceilings),
-            max_agreement_grt_per_30_days: agreement_conf.max_agreement_grt_per_30_days(),
-            url: conf.suggested_minimums.url.clone(),
-            interval: conf.suggested_minimums.interval,
-        })
-    });
-
     // Clones for services that outlive the worker's move of `agreement_conf`;
     // they need the manager address for cancel dispatch.
     let chain_listener_agreement_conf = agreement_conf.clone();
@@ -395,11 +383,30 @@ pub async fn main() -> anyhow::Result<()> {
     let additional_networks = Arc::new(conf.additional_networks);
 
     // Logged here and not with the other start-up notes, since it takes the chains' names.
-    let chain_name =
-        |chain| worker::resolve_chain_name(chain, &networks_registry, &additional_networks);
-    for note in worker::table_prices_above_ceilings(&agreement_conf, &pricing_table, chain_name) {
+    let table_prices_above_ceilings = {
+        let (agreement_conf, table) = (Arc::clone(&agreement_conf), Arc::clone(&pricing_table));
+        let (registry, additional) = (networks_registry.clone(), additional_networks.clone());
+        move || {
+            let chain_name = |chain| worker::resolve_chain_name(chain, &registry, &additional);
+            worker::table_prices_above_ceilings(&agreement_conf, &table, chain_name)
+        }
+    };
+    for note in table_prices_above_ceilings() {
         tracing::warn!("{note}");
     }
+
+    // Keeps the default price ceilings in step with indexer-rs. Left out when it is switched
+    // off, or when the config sets both ceilings and so leaves it nothing to keep in step.
+    let follows = agreement_conf.base_price_ceilings.follows_minimums();
+    let suggested_minimums_service = (conf.suggested_minimums.enabled && follows).then(|| {
+        network::service::suggested_minimums::new(network::service::suggested_minimums::Ctx {
+            ceilings: Arc::clone(&agreement_conf.base_price_ceilings),
+            max_agreement_grt_per_30_days: agreement_conf.max_agreement_grt_per_30_days(),
+            url: conf.suggested_minimums.url.clone(),
+            interval: conf.suggested_minimums.interval,
+            table_prices_above_ceilings: Box::new(table_prices_above_ceilings),
+        })
+    });
 
     // Application services
 
