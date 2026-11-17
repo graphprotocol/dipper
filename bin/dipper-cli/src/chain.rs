@@ -373,4 +373,38 @@ mod tests {
         //* Assert
         assert_eq!(chain_id, 421614);
     }
+
+    /// graph-node indexes a subgraph on its data sources' network whatever a template says,
+    /// so the chain is taken from there without asking for `--chain-id`.
+    #[tokio::test]
+    async fn test_resolve_takes_the_chain_from_data_sources_not_a_template() {
+        //* Arrange
+        let server = MockServer::start().await;
+        let with_stale_template = format!(
+            "{}templates:\n  - kind: ethereum\n    network: mainnet\n",
+            manifest("arbitrum-sepolia")
+        );
+        Mock::given(method("POST"))
+            .and(path("/ipfs/api/v0/cat"))
+            .and(query_param("arg", DEPLOYMENT))
+            .respond_with(ResponseTemplate::new(200).set_body_string(with_stale_template))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/registry.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(TEST_REGISTRY_JSON))
+            .mount(&server)
+            .await;
+        let resolver = ChainResolver::with_registry_url(
+            Url::parse(&format!("{}/ipfs", server.uri())).unwrap(),
+            format!("{}/registry.json", server.uri()),
+        )
+        .unwrap();
+
+        //* Act
+        let chain_id = resolver.resolve(&DEPLOYMENT.parse().unwrap(), None).await;
+
+        //* Assert
+        assert_eq!(chain_id.map_err(|err| err.to_string()), Ok(421614));
+    }
 }

@@ -229,6 +229,39 @@ mod tests {
         assert!(result.is_ok(), "{result:?}");
     }
 
+    /// A template can keep the network of the project it was copied from. graph-node indexes
+    /// such a subgraph on its data sources' chain, so a request for that chain is let through.
+    #[tokio::test]
+    async fn passes_a_request_whose_manifest_has_a_template_on_another_network() {
+        let server = MockServer::start().await;
+        let with_stale_template = format!(
+            "{}templates:\n  - kind: ethereum\n    network: mainnet\n",
+            manifest("arbitrum-sepolia")
+        );
+        let body = ResponseTemplate::new(200).set_body_string(with_stale_template);
+        serve_manifest(&server, body, 1).await;
+        let check = check_against(&server);
+
+        let on_the_data_sources_chain = check.check(&deployment_id!(DEPLOYMENT), 421614).await;
+        let on_the_templates_chain = check.check(&deployment_id!(DEPLOYMENT), 1).await;
+
+        assert!(
+            on_the_data_sources_chain.is_ok(),
+            "{on_the_data_sources_chain:?}"
+        );
+        assert!(
+            matches!(
+                on_the_templates_chain,
+                Err(ChainCheckError::Mismatch {
+                    manifest_chain_id: 421614,
+                    requested_chain_id: 1,
+                    ..
+                })
+            ),
+            "{on_the_templates_chain:?}"
+        );
+    }
+
     #[tokio::test]
     async fn refuses_a_request_on_another_chain() {
         let server = MockServer::start().await;

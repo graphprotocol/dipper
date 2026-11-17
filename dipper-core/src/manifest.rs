@@ -85,9 +85,9 @@ pub async fn fetch_manifest(
 pub enum ManifestNetworkError {
     #[error("the subgraph manifest is not valid YAML")]
     InvalidYaml(#[source] serde_yaml::Error),
-    #[error("the subgraph manifest names no network")]
+    #[error("the subgraph manifest's data sources name no network")]
     NoNetwork,
-    #[error("the subgraph manifest names more than 1 network: {}", .0.join(", "))]
+    #[error("the subgraph manifest's data sources name more than 1 network: {}", .0.join(", "))]
     SeveralNetworks(Vec<String>),
 }
 
@@ -100,14 +100,14 @@ pub enum NetworkLookupError {
     NotEvm { network: String, caip2_id: String },
 }
 
-/// The 1 network a subgraph manifest indexes, across its data sources and templates.
+/// The 1 network a subgraph manifest indexes, read from its data sources alone. That is
+/// graph-node's rule: it never reads a template's network, so a template left on another
+/// network must not get a subgraph that graph-node indexes refused here.
 pub fn network_from_manifest(manifest: &str) -> Result<String, ManifestNetworkError> {
     #[derive(serde::Deserialize)]
     struct Manifest {
         #[serde(default, rename = "dataSources")]
         data_sources: Vec<Source>,
-        #[serde(default)]
-        templates: Vec<Source>,
     }
 
     #[derive(serde::Deserialize)]
@@ -120,7 +120,6 @@ pub fn network_from_manifest(manifest: &str) -> Result<String, ManifestNetworkEr
     let networks: BTreeSet<String> = manifest
         .data_sources
         .into_iter()
-        .chain(manifest.templates)
         .filter_map(|source| source.network)
         .collect();
     let mut iter = networks.iter();
@@ -305,9 +304,11 @@ mod tests {
     }
 
     #[test]
-    fn test_network_from_manifest_reads_data_sources_and_templates() {
+    fn test_network_from_manifest_reads_the_data_sources() {
         let manifest = indoc::indoc! {"
             dataSources:
+              - kind: ethereum
+                network: arbitrum-sepolia
               - kind: ethereum
                 network: arbitrum-sepolia
             templates:
@@ -318,12 +319,39 @@ mod tests {
         assert_eq!(network_from_manifest(manifest).unwrap(), "arbitrum-sepolia");
     }
 
+    /// graph-node takes a subgraph's network from its data sources and never reads a
+    /// template's, so a template left on another network does not stop it indexing.
+    #[test]
+    fn test_network_from_manifest_ignores_the_network_of_a_template() {
+        let stale_template = indoc::indoc! {"
+            dataSources:
+              - kind: ethereum
+                network: matic
+            templates:
+              - kind: ethereum
+                network: mainnet
+              - kind: file/ipfs
+        "};
+        assert_eq!(network_from_manifest(stale_template).unwrap(), "matic");
+
+        let template_only = indoc::indoc! {"
+            dataSources:
+              - kind: ethereum
+            templates:
+              - kind: ethereum
+                network: mainnet
+        "};
+        assert!(matches!(
+            network_from_manifest(template_only),
+            Err(ManifestNetworkError::NoNetwork)
+        ));
+    }
+
     #[test]
     fn test_network_from_manifest_rejects_mixed_or_missing_networks() {
         let mixed = indoc::indoc! {"
             dataSources:
               - network: mainnet
-            templates:
               - network: arbitrum-sepolia
         "};
         let err = network_from_manifest(mixed).unwrap_err().to_string();
