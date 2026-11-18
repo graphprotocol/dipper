@@ -124,6 +124,11 @@ pub async fn main() -> anyhow::Result<()> {
     if let Err(err) = conf.validate_expiration_and_reassignment() {
         anyhow::bail!("invalid config: {err}");
     }
+    // Before connecting, so a pool too small for the worker loops is refused at once rather
+    // than after the RPC, database and indexer URL startup steps.
+    if let Err(err) = conf.validate_db_pool() {
+        anyhow::bail!("invalid db config: {err}");
+    }
     // 1 line for each background service that will not run, so none is off unnoticed.
     for off in conf.background_services_off() {
         off.log();
@@ -460,38 +465,7 @@ pub async fn main() -> anyhow::Result<()> {
 
     //- The worker service
     let (worker_handle, worker_service) = {
-        // Each loop can hold up to three pooled connections at once and shares
-        // the pool with the registry and background reconcilers. Refuse to start
-        // when the loops would crowd it, rather than deadlocking under load.
-        const CONNECTIONS_PER_LOOP: usize = 3;
-        const SHARED_SERVICES_HEADROOM: usize = 2;
-        if conf.worker_concurrency == 0 {
-            anyhow::bail!("worker_concurrency must be at least 1");
-        }
-        let max_conns = conf
-            .db
-            .max_connections
-            .unwrap_or(db::DEFAULT_MAX_CONNECTIONS) as usize;
-        // Saturating so an absurd configured value can't overflow and slip past
-        // the check below (the very check meant to catch oversized sizing).
-        let required_conns = conf
-            .worker_concurrency
-            .saturating_mul(CONNECTIONS_PER_LOOP)
-            .saturating_add(SHARED_SERVICES_HEADROOM);
-        if required_conns > max_conns {
-            anyhow::bail!(
-                "worker_concurrency ({}) needs at least {} db connections (each loop may hold {} \
-                 for its listener, open job transaction and a registry query, plus {} reserved for \
-                 the registry and background services), but db.max_connections is {}; raise \
-                 db.max_connections to at least {} or lower worker_concurrency",
-                conf.worker_concurrency,
-                required_conns,
-                CONNECTIONS_PER_LOOP,
-                SHARED_SERVICES_HEADROOM,
-                max_conns,
-                required_conns,
-            );
-        }
+        // The pool was sized against the worker loops by `Config::validate_db_pool` at startup.
 
         // A single global reassess lock, shared across all worker loops.
         let reassess_lock = Arc::new(tokio::sync::Mutex::new(()));
