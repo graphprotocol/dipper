@@ -63,9 +63,12 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 6
+          # Ready while dipper can reach its database: every service works through it, so a
+          # pod that lost it can do nothing, though restarting it would not help either.
           readinessProbe:
-            tcpSocket:
-              port: admin-rpc
+            httpGet:
+              path: /ready
+              port: health
             periodSeconds: 5
             timeoutSeconds: 3
             failureThreshold: 3

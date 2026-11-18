@@ -531,6 +531,17 @@ pub struct IisaConfig {
     /// the unresponsive breaker. Must match IISA_PUSH_TOKEN. None = no auth header.
     #[serde(default)]
     pub push_token: Option<Hidden<String>>,
+
+    /// How long, in seconds, dipper waits at startup for IISA's health check to pass before it
+    /// gives up and exits (default: 180). IISA's own rollout leaves it away for 90s or more, so a
+    /// dipper starting meanwhile waits for it rather than restarting in a loop.
+    #[serde(default = "default_iisa_startup_wait")]
+    #[serde_as(as = "serde_with::DurationSeconds")]
+    pub startup_wait: Duration,
+}
+
+fn default_iisa_startup_wait() -> Duration {
+    Duration::from_secs(180)
 }
 
 fn default_request_timeout() -> Duration {
@@ -1758,6 +1769,18 @@ pub struct DbConfig {
     /// The maximum number of connections to the database
     #[serde(default)]
     pub max_connections: Option<u32>,
+
+    /// How long, in seconds, dipper keeps trying at startup to reach the database before it
+    /// gives up and exits (default: 120), so a database restarting or failing over as dipper
+    /// starts is waited for. A server that answers with a refusal, such as a wrong password or a
+    /// missing database, is not retried.
+    #[serde(default = "default_db_connect_wait")]
+    #[serde_as(as = "serde_with::DurationSeconds")]
+    pub connect_wait: Duration,
+}
+
+fn default_db_connect_wait() -> Duration {
+    Duration::from_secs(120)
 }
 
 /// The indexer URLs service configuration

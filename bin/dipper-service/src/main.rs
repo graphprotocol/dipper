@@ -32,6 +32,7 @@ mod log_text;
 mod network;
 mod registry;
 mod signing;
+mod startup;
 mod supervisor;
 #[cfg(test)]
 mod test_support;
@@ -341,28 +342,10 @@ pub async fn main() -> anyhow::Result<()> {
     };
     let iisa_client =
         iisa::HttpIisaClient::with_config(conf.iisa.endpoint.to_string(), iisa_config);
-    let mut iisa_healthy = false;
-    for attempt in 1..=3 {
-        if iisa_client.health_check().await.unwrap_or(false) {
-            iisa_healthy = true;
-            break;
-        }
-        if attempt < 3 {
-            tracing::warn!(
-                endpoint=%conf.iisa.endpoint,
-                attempt=%attempt,
-                "IISA health check failed, retrying in 2s"
-            );
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        }
-    }
-    if !iisa_healthy {
-        anyhow::bail!(
-            "IISA service is not reachable at {} after 3 attempts",
-            conf.iisa.endpoint
-        );
-    }
-    tracing::info!(endpoint=%conf.iisa.endpoint, "IISA service is healthy");
+    startup::wait_for_iisa(&conf.iisa.endpoint, conf.iisa.startup_wait, || {
+        iisa_client.health_check()
+    })
+    .await?;
 
     //- The graph networks registry (maps chain IDs to canonical network names)
     let networks_registry = Arc::new(
@@ -703,6 +686,7 @@ pub async fn main() -> anyhow::Result<()> {
             conf.health.listen_addr,
             worker_liveness.clone(),
             conf.health.threshold,
+            Some(db_conn.clone()),
         )
         .await?;
         tracing::info!(%addr, "initialized health endpoint");

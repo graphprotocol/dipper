@@ -6,7 +6,7 @@ Kubernetes manifests for deploying the dipper service.
 
 - PostgreSQL database accessible from the cluster
 - Configuration secrets managed separately
-- IISA service reachable at startup (dipper health-checks IISA and exits if it is unreachable)
+- IISA service reachable at startup (dipper health-checks IISA, waits up to `iisa.startup_wait`, 180s by default, and exits if it stays unreachable)
 
 ## Files
 
@@ -21,7 +21,7 @@ Kubernetes manifests for deploying the dipper service.
 2. Create `dipper-config` ConfigMap with actual values
 3. Apply dipper manifests
 
-Dipper requires IISA at startup: it runs an IISA health check and exits if IISA is not reachable after a few attempts. Deploy and verify IISA before starting dipper.
+Dipper requires IISA at startup: it runs an IISA health check, retrying with growing pauses for up to `iisa.startup_wait` (180s by default, enough for IISA's own rollout), and exits if IISA is still not reachable. It waits for the database the same way, for up to `db.connect_wait` (120s by default), but exits at once if the database refuses it, as with a wrong password. Deploy and verify IISA before starting dipper.
 
 ## Configuration
 
@@ -48,7 +48,7 @@ This assumes IISA is deployed with a Service named `iisa` in the same namespace.
 | Service | Port | Protocol | Purpose |
 |---------|------|----------|---------|
 | Admin RPC | 8545 | TCP | JSON-RPC for admin operations |
-| Health | 8546 | TCP | HTTP `GET /health` for the startup and liveness probes |
+| Health | 8546 | TCP | HTTP `GET /health` for the startup and liveness probes, `GET /ready` (the database is reachable) for the readiness probe |
 
 The health port is deliberately absent from `service.yaml`: the kubelet probes the pod directly, so
 the endpoint does not need to be reachable from elsewhere in the cluster.

@@ -27,13 +27,99 @@ pub async fn connect(conf: &DbConfig) -> anyhow::Result<Pool<Postgres>> {
         .username(&conf.username)
         .password(&conf.password);
 
-    // Try to connect to the DB
-    let pool = PgPoolOptions::new()
-        .max_connections(conf.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS))
-        .acquire_timeout(ACQUIRE_TIMEOUT)
-        .connect_with(conn_options)
-        .await
-        .context("failed to connect to DB")?;
+    // Connect, waiting out a database that is not reachable yet. The pool itself only retries a
+    // refused connection, and only for its acquire timeout.
+    let pool = crate::startup::retry_within(
+        "database connection",
+        conf.connect_wait,
+        worth_retrying,
+        || {
+            PgPoolOptions::new()
+                .max_connections(conf.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS))
+                .acquire_timeout(ACQUIRE_TIMEOUT)
+                .connect_with(conn_options.clone())
+        },
+    )
+    .await
+    .context("failed to connect to DB")?;
 
     Ok(pool)
+}
+
+/// Whether a failed connect may succeed if tried again. A server that answered with an error (a
+/// wrong password, a missing database) or a connection set up wrongly (its options, its TLS)
+/// will fail the same way each time, so those end the wait at once; a server that could not be
+/// reached, or dropped the connection, may be back soon.
+fn worth_retrying(err: &sqlx::Error) -> bool {
+    matches!(
+        err,
+        sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut | sqlx::Error::Protocol(_)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    };
+
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    fn db_config(url: &str, connect_wait_secs: u64) -> DbConfig {
+        serde_json::from_value(serde_json::json!({
+            "url": url,
+            "username": "dipper",
+            "password": "unused",
+            "connect_wait": connect_wait_secs,
+        }))
+        .expect("a valid db config")
+    }
+
+    #[tokio::test]
+    async fn connect_retries_a_server_that_drops_the_connection() {
+        // A server that accepts and at once drops each connection, as one restarting or failing
+        // over can. The pool gives up on that at the first try; dipper must keep trying.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicU32::new(0));
+        let server = {
+            let accepted = Arc::clone(&accepted);
+            tokio::spawn(async move {
+                while let Ok((socket, _)) = listener.accept().await {
+                    accepted.fetch_add(1, Ordering::Relaxed);
+                    drop(socket);
+                }
+            })
+        };
+
+        let result = connect(&db_config(&format!("postgres://{addr}/dipper"), 2)).await;
+        server.abort();
+
+        assert!(result.is_err(), "the server never lets dipper in");
+        assert!(
+            accepted.load(Ordering::Relaxed) >= 2,
+            "dipper tried {} time(s) within its 2s wait",
+            accepted.load(Ordering::Relaxed)
+        );
+    }
+
+    #[test]
+    fn only_failures_that_may_clear_up_are_retried() {
+        // A connection set up wrongly fails the same way every time, so it ends the wait at once
+        // and dipper exits with the reason instead of retrying for minutes.
+        assert!(!worth_retrying(&sqlx::Error::Configuration(
+            "bad option".into()
+        )));
+        assert!(!worth_retrying(&sqlx::Error::Tls(
+            "untrusted certificate".into()
+        )));
+        // A server out of reach, or one that dropped the connection, may be back soon.
+        assert!(worth_retrying(&sqlx::Error::PoolTimedOut));
+        assert!(worth_retrying(&sqlx::Error::Io(std::io::Error::from(
+            std::io::ErrorKind::ConnectionReset
+        ))));
+    }
 }
