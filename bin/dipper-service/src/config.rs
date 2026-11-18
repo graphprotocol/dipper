@@ -17,6 +17,8 @@ use thegraph_core::alloy::{
 };
 use url::Url;
 
+pub mod sources;
+
 /// How many indexers a request gets when it doesn't say. Despite the name, it is a default,
 /// not a limit; [`MAX_NUM_CANDIDATES`] is the limit.
 pub const DEFAULT_MAX_CANDIDATES: usize = 3;
@@ -69,11 +71,26 @@ fn debug_endpoints(urls: &Vec<Url>, f: &mut std::fmt::Formatter<'_>) -> std::fmt
         .finish()
 }
 
-/// Load the configuration from a JSON file.
+/// Load the configuration from a JSON file, with the overrides the environment sets
+/// (`DIPPER__<SECTION>__<FIELD>`) and the values read from files that `<field>_file` members name
+/// (see [`sources`]).
 pub fn load_from_file(path: &Path) -> Result<Config, Error> {
+    load(path, std::env::vars(), |path| std::fs::read_to_string(path))
+}
+
+/// [`load_from_file`] with the environment and the file reader given, for tests.
+fn load(
+    path: &Path,
+    env: impl IntoIterator<Item = (String, String)>,
+    read: impl Fn(&Path) -> std::io::Result<String>,
+) -> Result<Config, Error> {
     let config_content = std::fs::read_to_string(path)?;
-    let config = serde_json::from_str(&config_content)?;
-    Ok(config)
+    let mut json: serde_json::Value = serde_json::from_str(&config_content)?;
+    if !sources::apply(&mut json, env, read)? {
+        // Nothing overrode the file, so read it as it is: its errors then carry a line and column.
+        return Ok(serde_json::from_str(&config_content)?);
+    }
+    Ok(serde_json::from_value(json)?)
 }
 
 /// An error that can occur when loading the configuration.
@@ -86,6 +103,10 @@ pub enum Error {
     /// An error occurred while deserializing the configuration.
     #[error("failed to deserialize configuration: {0}")]
     Deserialize(#[from] serde_json::Error),
+
+    /// An environment override or a value read from a file could not be applied.
+    #[error("failed to apply the configuration's environment overrides and files: {0}")]
+    Source(#[from] sources::SourceError),
 }
 
 /// The configuration for the DIPs service
@@ -3091,14 +3112,105 @@ mod tests {
     /// The example as a whole config after `edit`, with the placeholders that are not valid values
     /// (the contracts not yet deployed and the signing key) filled in.
     fn example_config_edited(edit: impl FnOnce(&mut serde_json::Value)) -> Config {
+        serde_json::from_value(example_config_json(edit))
+            .expect("the edited example is a valid config")
+    }
+
+    /// [`example_config_edited`] before it is read as a config: the JSON a config file holds.
+    fn example_config_json(edit: impl FnOnce(&mut serde_json::Value)) -> serde_json::Value {
         let mut config = example_config();
         config["dips"]["recurring_collector"] = "0x2222222222222222222222222222222222222222".into();
         config["dips"]["recurring_agreement_manager"] =
             "0x3333333333333333333333333333333333333333".into();
-        config["signer"]["secret_key"] =
-            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".into();
+        config["signer"]["secret_key"] = TEST_SECRET_KEY.into();
         edit(&mut config);
-        serde_json::from_value(config).expect("the edited example is a valid config")
+        config
+    }
+
+    /// A well-known development key (anvil's first account), never a real one.
+    const TEST_SECRET_KEY: &str =
+        "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+
+    /// A fresh directory for one test's files, removed by the test when it is done.
+    fn test_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("dipper-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn load_applies_environment_overrides_and_files_they_name() {
+        let dir = test_dir("env-overrides");
+        let key = dir.join("signer-key");
+        std::fs::write(&key, format!("{TEST_SECRET_KEY}\n")).unwrap();
+        let config = example_config_json(|config| {
+            config["signer"]
+                .as_object_mut()
+                .unwrap()
+                .remove("secret_key");
+        });
+        let path = dir.join("config.json");
+        std::fs::write(&path, config.to_string()).unwrap();
+        let env = [
+            ("DIPPER__DB__MAX_CONNECTIONS", "40".to_string()),
+            (
+                "DIPPER__DB__URL",
+                "postgres://db.internal:5432/dipper".to_string(),
+            ),
+            (
+                "DIPPER__SIGNER__SECRET_KEY_FILE",
+                key.to_str().unwrap().to_string(),
+            ),
+        ]
+        .map(|(name, value)| (name.to_string(), value));
+
+        let loaded = load(&path, env, |path| std::fs::read_to_string(path));
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let loaded = loaded.expect("the overridden config loads");
+        assert_eq!(loaded.db.max_connections, Some(40));
+        assert_eq!(loaded.db.url.as_str(), "postgres://db.internal:5432/dipper");
+    }
+
+    #[test]
+    fn load_without_overrides_reports_where_in_the_file_an_error_is() {
+        let dir = test_dir("plain-error");
+        let path = dir.join("config.json");
+        std::fs::write(&path, "{\n  \"db\": {\"typo\": 1}\n}").unwrap();
+
+        let err = load(&path, [], |path| std::fs::read_to_string(path));
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let Err(Error::Deserialize(err)) = err else {
+            panic!("expected a deserialize error");
+        };
+        assert_eq!(err.line(), 2, "the error points into the file: {err}");
+    }
+
+    #[test]
+    fn load_from_file_reads_the_db_password_from_a_file() {
+        // A secret kept in a file of its own (a mounted Kubernetes Secret, say) keeps it out of
+        // the config file, which can then be shared and reviewed like any other config.
+        let dir = test_dir("password-file");
+        let password = dir.join("db-password");
+        std::fs::write(&password, "s3cret\n").unwrap();
+        let config = example_config_json(|config| {
+            let db = config["db"].as_object_mut().unwrap();
+            db.remove("password");
+            db.insert("password_file".into(), password.to_str().unwrap().into());
+        });
+        let path = dir.join("config.json");
+        std::fs::write(&path, config.to_string()).unwrap();
+
+        let loaded = load_from_file(&path);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let loaded = loaded.expect("a config that reads the password from a file loads");
+        assert_eq!(
+            loaded.db.password.0, "s3cret",
+            "the file's final newline is not part of it"
+        );
     }
 
     fn remove_sections(config: &mut serde_json::Value, sections: &[&str]) {

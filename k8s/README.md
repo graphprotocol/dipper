@@ -33,6 +33,14 @@ kubectl create configmap dipper-config --from-file=config.json=your-config.json
 
 Or apply a ConfigMap manifest with the values injected from your secrets management system.
 
+To keep secrets out of `config.json`, mount them from a Secret as files and name each with a
+`<field>_file` member instead of the field itself, for example `"db": {"password_file":
+"/secrets/db-password"}` and `"signer": {"secret_key_file": "/secrets/signer-key"}`. The
+ConfigMap then holds no secret and can be kept in version control like any other config.
+Environment variables `DIPPER__<SECTION>__<FIELD>` override single fields as well, such as
+`DIPPER__DB__URL` per environment. Dipper reads these files once, when it starts, so restart it
+after rotating a secret.
+
 ## IISA Service Discovery
 
 Dipper finds IISA via Kubernetes DNS. The config.json `iisa.endpoint` should be set to:
