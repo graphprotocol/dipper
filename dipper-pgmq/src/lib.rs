@@ -8,5 +8,5 @@ mod queue;
 
 pub use id::JobId;
 pub use job::JobGuard;
-pub use postgres::{JobPriority, RetryOutcome, run_db_migrations};
+pub use postgres::{JobPriority, QueueDepth, RetryOutcome, run_db_migrations};
 pub use queue::{JobBuilder, PgQueue, PgQueueListener};

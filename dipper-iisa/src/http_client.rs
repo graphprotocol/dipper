@@ -510,7 +510,9 @@ impl CandidateSelection for HttpIisaClient {
         };
 
         let url = format!("{}select-indexers", self.endpoint);
-        let result: SelectionResponse = self.post_with_retry(&url, &request).await?;
+        let result = self.post_with_retry(&url, &request).await;
+        record_request("select-indexers", &result);
+        let result: SelectionResponse = result?;
 
         // Parse returned indexer entries into SelectedIndexer types
         let mut selected = Vec::with_capacity(result.indexers.len());
@@ -547,7 +549,9 @@ impl CandidateSelection for HttpIisaClient {
         chain: &str,
         ceilings: PriceCeilings,
     ) -> Result<DipsAcceptingSnapshot, SelectionError> {
-        let response = self.get_dips_indexers(chain, ceilings).await?;
+        let response = self.get_dips_indexers(chain, ceilings).await;
+        record_request("dips-indexers", &response);
+        let response = response?;
         let mut indexers = Vec::with_capacity(response.indexers.len());
         for id_str in response.indexers {
             match id_str.parse::<IndexerId>() {
@@ -568,6 +572,18 @@ impl CandidateSelection for HttpIisaClient {
     }
 }
 
+/// Counts 1 request to IISA by its final outcome, after the client's own retries.
+fn record_request<T>(endpoint: &'static str, result: &Result<T, SelectionError>) {
+    let outcome = match result {
+        Ok(_) => "ok",
+        Err(SelectionError::IisaRejected { .. }) => "rejected",
+        Err(SelectionError::IisaServiceUnavailable) => "unavailable",
+        Err(SelectionError::Error(_)) => "error",
+    };
+    metrics::counter!(crate::METRIC_REQUESTS, "endpoint" => endpoint, "outcome" => outcome)
+        .increment(1);
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -578,6 +594,38 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn requests_are_counted_by_endpoint_and_final_outcome() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            record_request::<()>("select-indexers", &Ok(()));
+            record_request::<()>("select-indexers", &Ok(()));
+            record_request::<()>(
+                "select-indexers",
+                &Err(SelectionError::IisaServiceUnavailable),
+            );
+            record_request::<()>(
+                "dips-indexers",
+                &Err(SelectionError::IisaRejected {
+                    status: 403,
+                    body: String::new(),
+                }),
+            );
+        });
+        let rendered = handle.render();
+        for (series, count) in [
+            (r#"endpoint="select-indexers",outcome="ok""#, 2),
+            (r#"endpoint="select-indexers",outcome="unavailable""#, 1),
+            (r#"endpoint="dips-indexers",outcome="rejected""#, 1),
+        ] {
+            assert!(
+                rendered.contains(&format!("dipper_iisa_requests_total{{{series}}} {count}")),
+                "{series}: {rendered}"
+            );
+        }
+    }
 
     #[test]
     fn test_endpoint_normalization() {

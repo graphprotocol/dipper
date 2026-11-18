@@ -148,6 +148,47 @@ where
     Ok(rows.into_iter().map(|(descriptor,)| descriptor).collect())
 }
 
+/// How many jobs the queue holds, by state, for monitoring.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QueueDepth {
+    /// Jobs due now, including any a worker is running: a running job's state is only visible
+    /// inside the transaction that holds it.
+    pub ready: i64,
+    /// Jobs scheduled for later, such as retries waiting out their backoff.
+    pub scheduled: i64,
+    /// Jobs that ran out of attempts. They stay in the table, so this only grows.
+    pub failed: i64,
+    /// How long, in seconds, the longest-waiting ready job has been due, if any is.
+    pub oldest_ready_age_secs: Option<f64>,
+}
+
+/// Count the queue's jobs by state in 1 query, using the `(status, scheduled_for)` index.
+pub async fn depth<'q, E>(executor: E) -> anyhow::Result<QueueDepth>
+where
+    E: sqlx::Executor<'q, Database = Postgres>,
+{
+    let (ready, scheduled, failed, oldest_ready_age_secs): (i64, i64, i64, Option<f64>) =
+        sqlx::query_as(
+            "SELECT \
+                 count(*) FILTER (WHERE status = $1 AND scheduled_for <= now()), \
+                 count(*) FILTER (WHERE status = $1 AND scheduled_for > now()), \
+                 count(*) FILTER (WHERE status = $2), \
+                 EXTRACT(EPOCH FROM now() - min(scheduled_for) \
+                     FILTER (WHERE status = $1 AND scheduled_for <= now()))::float8 \
+             FROM pgmq_queue WHERE status IN ($1, $2)",
+        )
+        .bind(PgJobStatus::Queued)
+        .bind(PgJobStatus::Failed)
+        .fetch_one(executor)
+        .await?;
+    Ok(QueueDepth {
+        ready,
+        scheduled,
+        failed,
+        oldest_ready_age_secs,
+    })
+}
+
 /// Clear the queue
 pub async fn clear<'q, E>(executor: E) -> anyhow::Result<()>
 where

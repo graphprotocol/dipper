@@ -277,6 +277,7 @@ async fn await_next_tick<N: JobNotifications>(
                                 ),
                             }
                             *listener = None;
+                            metrics::counter!(crate::telemetry::JOB_LISTENER_FALLBACKS).increment(1);
                             Tick::Poll { listener_failed: true }
                         }
                     }
@@ -332,6 +333,7 @@ impl<N: JobNotifications> Subscription<N> {
                     error=?err,
                     "could not subscribe to job-available notifications at startup; starting in poll-only mode"
                 );
+                metrics::counter!(crate::telemetry::JOB_LISTENER_FALLBACKS).increment(1);
             }
         }
         this
@@ -593,9 +595,16 @@ where
         };
 
         let _span = tracing::debug_span!("process_job", job = %job.id());
+        let kind = job.desc().kind();
+        let in_flight = metrics::gauge!(crate::telemetry::JOBS_IN_FLIGHT);
+        in_flight.increment(1.0);
+        let started = Instant::now();
         let result =
             run_job_with_timeout(PROCESS_JOB_TIMEOUT, process_job(&state, job.desc())).await;
+        metrics::histogram!(crate::telemetry::JOB_DURATION, "kind" => kind)
+            .record(started.elapsed().as_secs_f64());
         settle_job(job, result).await;
+        in_flight.decrement(1.0);
     }
 }
 
@@ -648,12 +657,23 @@ impl FinishedJob for JobGuard<'_, Message> {
 
 /// Removes, retries or defers a job according to how its run went.
 async fn settle_job(job: impl FinishedJob, result: JobResult<()>) {
-    match result {
-        Ok(..) => remove_job(job).await,
+    let kind = job.message().kind();
+    let outcome = match result {
+        Ok(..) => {
+            remove_job(job).await;
+            "success"
+        }
         Err(JobError::Retryable(err, base_delay)) => retry_job(job, &err, base_delay).await,
-        Err(JobError::Deferred(delay)) => defer_job(job, delay).await,
-        Err(JobError::Fatal(err)) => drop_job(job, &err).await,
-    }
+        Err(JobError::Deferred(delay)) => {
+            defer_job(job, delay).await;
+            "deferred"
+        }
+        Err(JobError::Fatal(err)) => {
+            drop_job(job, &err).await;
+            "fatal"
+        }
+    };
+    metrics::counter!(crate::telemetry::JOBS, "kind" => kind, "outcome" => outcome).increment(1);
 }
 
 /// Takes a job that failed in a way a retry can't fix off the queue, and only then alerts that it
@@ -698,22 +718,35 @@ async fn defer_job(job: impl FinishedJob, delay: Duration) {
 
 /// Records a failed attempt, which queues the job to run again after a backoff unless that was its
 /// last allowed attempt.
-async fn retry_job(job: impl FinishedJob, err: &anyhow::Error, base_delay: Duration) {
+/// Returns the outcome to count it under: `retry`, or `gave_up` when that was its last attempt.
+async fn retry_job(
+    job: impl FinishedJob,
+    err: &anyhow::Error,
+    base_delay: Duration,
+) -> &'static str {
     let failed = FailedJob::of(&job);
     let delay = calculate_backoff_delay(base_delay, job.failed_attempts());
     let scheduled_for = OffsetDateTime::now_utc() + delay;
     match job.retry_at(scheduled_for).await {
         Ok(RetryOutcome::WillRetry) => {
             log_job_failure(&failed, err, AfterFailure::WillRetry(delay));
+            "retry"
         }
-        Ok(RetryOutcome::GaveUp) => log_job_failure(&failed, err, AfterFailure::OutOfAttempts),
-        Err(db_err) => tracing::error!(
-            job_id = %failed.id,
-            kind = failed.kind,
-            job_error = %format_args!("{err:#}"),
-            error = ?db_err,
-            "Failed to reschedule job"
-        ),
+        Ok(RetryOutcome::GaveUp) => {
+            log_job_failure(&failed, err, AfterFailure::OutOfAttempts);
+            "gave_up"
+        }
+        Err(db_err) => {
+            tracing::error!(
+                job_id = %failed.id,
+                kind = failed.kind,
+                job_error = %format_args!("{err:#}"),
+                error = ?db_err,
+                "Failed to reschedule job"
+            );
+            // The rescheduling rolled back, so the job runs again as a retry would.
+            "retry"
+        }
     }
 }
 
@@ -1605,6 +1638,54 @@ mod tests {
         assert_eq!(alerts.len(), 1, "{logs}");
         assert!(alerts[0].contains("ERROR"), "{logs}");
         assert!(alerts[0].contains("no network name"), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn settling_counts_each_job_by_kind_and_outcome() {
+        let recorder = crate::telemetry::recorder().unwrap();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
+        let retryable = || {
+            Err(JobError::Retryable(
+                anyhow::anyhow!("rpc down"),
+                Duration::from_secs(1),
+            ))
+        };
+
+        settle(TestJob::on_attempt(1), Ok(())).await;
+        let will_retry = TestJob {
+            retry: Some(RetryOutcome::WillRetry),
+            ..TestJob::on_attempt(1)
+        };
+        settle(will_retry, retryable()).await;
+        let last_try = TestJob {
+            retry: Some(RetryOutcome::GaveUp),
+            ..TestJob::on_attempt(3)
+        };
+        settle(last_try, retryable()).await;
+        settle(
+            TestJob::on_attempt(1),
+            Err(JobError::Deferred(Duration::from_secs(5))),
+        )
+        .await;
+        settle(
+            TestJob::on_attempt(1),
+            Err(JobError::Fatal(anyhow::anyhow!("bad job"))),
+        )
+        .await;
+
+        let rendered = handle.render();
+        for outcome in ["success", "retry", "gave_up", "deferred", "fatal"] {
+            assert_eq!(
+                crate::test_support::metric_value(
+                    &rendered,
+                    crate::telemetry::JOBS,
+                    &[("kind", "ReassessIndexingRequest"), ("outcome", outcome)],
+                ),
+                Some(1.0),
+                "{outcome}: {rendered}"
+            );
+        }
     }
 
     /// A job whose removal fails rolls back into the queue and runs again, so its unretryable

@@ -8,6 +8,7 @@ edition = "2024"
 async-trait.workspace = true
 chrono = "0.4.45"
 fs-err = "3.3.0"
+metrics.workspace = true
 prost = "0.14.4"
 rskafka = { version = "0.6.0", features = ["transport-tls"] }
 rustls = "0.23.41"

@@ -431,10 +431,11 @@ impl SubgraphIndexingAgreementsEventsEmitter {
         let event_type = event.payload.event_type();
         if let Err(err) = streaming.queue.try_send(event) {
             let total = streaming.dropped.fetch_add(1, Ordering::Relaxed) + 1;
-            let reason = match err {
-                mpsc::error::TrySendError::Full(_) => "event queue full",
-                mpsc::error::TrySendError::Closed(_) => "event queue closed",
+            let (reason, label) = match err {
+                mpsc::error::TrySendError::Full(_) => ("event queue full", "queue_full"),
+                mpsc::error::TrySendError::Closed(_) => ("event queue closed", "queue_closed"),
             };
+            metrics::counter!(crate::METRIC_KAFKA_EVENTS_DROPPED, "reason" => label).increment(1);
             tracing::warn!(
                 event_type = %event_type,
                 dropped_total = total,
@@ -613,13 +614,18 @@ fn report<T: Send + Sync + 'static>(
     client: &Arc<T>,
     result: &Result<(), kafka::Error>,
 ) {
-    match result {
-        Ok(()) => conn.report_success(),
+    let outcome = match result {
+        Ok(()) => {
+            conn.report_success();
+            "ok"
+        }
         Err(e) if e.is_unreachable() => {
             conn.report_unreachable(client);
+            "unreachable"
         }
-        Err(_) => {}
-    }
+        Err(_) => "error",
+    };
+    metrics::counter!(crate::METRIC_KAFKA_SENDS, "outcome" => outcome).increment(1);
 }
 
 /// Waits until a client is available, checking every 250ms. Returns `None` if shutdown is

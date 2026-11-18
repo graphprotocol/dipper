@@ -130,6 +130,7 @@ pub async fn new(
     addr: SocketAddr,
     liveness: Liveness,
     threshold: Duration,
+    metrics: Option<metrics_exporter_prometheus::PrometheusHandle>,
 ) -> anyhow::Result<(
     Handle,
     SocketAddr,
@@ -138,7 +139,7 @@ pub async fn new(
     let listener = TcpListener::bind(addr).await?;
     let local_addr = listener.local_addr()?;
     let (tx_stop, rx_stop) = mpsc::channel(1);
-    let fut = serve(listener, liveness, threshold, rx_stop);
+    let fut = serve(listener, liveness, threshold, metrics, rx_stop);
     Ok((Handle { tx_stop }, local_addr, fut))
 }
 
@@ -147,6 +148,7 @@ pub async fn new(
 struct HealthState {
     liveness: Liveness,
     threshold: Duration,
+    metrics: Option<metrics_exporter_prometheus::PrometheusHandle>,
 }
 
 /// `GET /health`: 200 while the worker watermark is fresh, 503 once it has gone
@@ -159,6 +161,23 @@ async fn health(State(state): State<HealthState>) -> impl IntoResponse {
     }
 }
 
+/// `GET /metrics`: the Prometheus metrics in the text exposition format, or 404 when the server
+/// was built without them.
+async fn metrics(State(state): State<HealthState>) -> impl IntoResponse {
+    match &state.metrics {
+        Some(handle) => (
+            StatusCode::OK,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; version=0.0.4; charset=utf-8",
+            )],
+            handle.render(),
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 /// Serves health requests until `stop_rx` fires. axum/hyper gives request parsing, per-connection
 /// isolation and graceful shutdown, but no header-read or idle timeout: a stalled client holds its
 /// connection for the process lifetime, which is acceptable on a cluster-internal port.
@@ -166,14 +185,17 @@ async fn serve(
     listener: TcpListener,
     liveness: Liveness,
     threshold: Duration,
+    metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
     mut stop_rx: mpsc::Receiver<()>,
 ) -> anyhow::Result<()> {
     tracing::info!(addr = %listener.local_addr()?, "health server listening");
     let app = Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .with_state(HealthState {
             liveness,
             threshold,
+            metrics: metrics_handle,
         });
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
@@ -288,17 +310,72 @@ mod tests {
     /// Reads an HTTP response's status line from a fresh connection to the
     /// server.
     async fn probe(addr: SocketAddr) -> String {
+        let response = get(addr, "/health").await;
+        response.lines().next().unwrap_or_default().to_string()
+    }
+
+    /// The whole HTTP response to a GET of `path`.
+    async fn get(addr: SocketAddr, path: &str) -> String {
         let mut stream = TcpStream::connect(addr).await.unwrap();
         // `Connection: close` so the server closes the socket after responding
         // and `read_to_end` returns rather than blocking on HTTP/1.1 keep-alive.
         stream
-            .write_all(b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .write_all(
+                format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes(),
+            )
             .await
             .unwrap();
         let mut buf = Vec::new();
         stream.read_to_end(&mut buf).await.unwrap();
-        let text = String::from_utf8_lossy(&buf);
-        text.lines().next().unwrap_or_default().to_string()
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    #[tokio::test]
+    async fn metrics_are_served_in_the_prometheus_text_format() {
+        let recorder = crate::telemetry::recorder().unwrap();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            metrics::counter!("dipper_test_total", "outcome" => "ok").increment(3);
+        });
+        let (stop, addr, fut) = new(
+            "127.0.0.1:0".parse().unwrap(),
+            Liveness::new(),
+            Duration::from_secs(600),
+            Some(handle),
+        )
+        .await
+        .unwrap();
+        let server = tokio::spawn(fut);
+
+        let response = get(addr, "/metrics").await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("text/plain; version=0.0.4"), "{response}");
+        assert!(
+            response.contains(r#"dipper_test_total{outcome="ok"} 3"#),
+            "{response}"
+        );
+
+        stop.stop().await;
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn metrics_are_absent_without_a_recorder() {
+        let (stop, addr, fut) = new(
+            "127.0.0.1:0".parse().unwrap(),
+            Liveness::new(),
+            Duration::from_secs(600),
+            None,
+        )
+        .await
+        .unwrap();
+        let server = tokio::spawn(fut);
+
+        let response = get(addr, "/metrics").await;
+        assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+
+        stop.stop().await;
+        let _ = server.await;
     }
 
     #[tokio::test]
@@ -308,9 +385,14 @@ mod tests {
         // A zero threshold plus a backdated watermark makes the worker stale on
         // the spot, so the unhealthy branch is exercised without waiting.
         ticker.slot.store(elapsed_secs() - 1, Ordering::Relaxed);
-        let (handle, addr, fut) = new("127.0.0.1:0".parse().unwrap(), liveness, Duration::ZERO)
-            .await
-            .unwrap();
+        let (handle, addr, fut) = new(
+            "127.0.0.1:0".parse().unwrap(),
+            liveness,
+            Duration::ZERO,
+            None,
+        )
+        .await
+        .unwrap();
         let server = tokio::spawn(fut);
 
         let status = probe(addr).await;
@@ -331,6 +413,7 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             liveness,
             Duration::from_secs(600),
+            None,
         )
         .await
         .unwrap();
@@ -357,6 +440,7 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             liveness,
             Duration::from_secs(600),
+            None,
         )
         .await
         .unwrap();

@@ -48,10 +48,13 @@ This assumes IISA is deployed with a Service named `iisa` in the same namespace.
 | Service | Port | Protocol | Purpose |
 |---------|------|----------|---------|
 | Admin RPC | 8545 | TCP | JSON-RPC for admin operations |
-| Health | 8546 | TCP | HTTP `GET /health` for the startup and liveness probes |
+| Health | 8546 | TCP | HTTP `GET /health` for the startup and liveness probes, and `GET /metrics` for Prometheus |
 
 The health port is deliberately absent from `service.yaml`: the kubelet probes the pod directly, so
-the endpoint does not need to be reachable from elsewhere in the cluster.
+the endpoint does not need to be reachable from elsewhere in the cluster. A metrics scraper reaches
+`/metrics` on the pod directly as well (for example through a PodMonitor), and
+`network-policy.yaml` refuses it like any other pod until you allow it: add a policy admitting your
+scraper's namespace to the `health` port only.
 
 ## Network policy
 

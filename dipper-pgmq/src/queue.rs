@@ -43,6 +43,11 @@ impl PgQueue {
 }
 
 impl PgQueue {
+    /// Counts the queue's jobs by state, for monitoring.
+    pub async fn depth(&self) -> anyhow::Result<crate::postgres::QueueDepth> {
+        crate::postgres::depth(&self.pool).await
+    }
+
     /// Pushes a job into the queue
     ///
     /// If the job is scheduled for immediate execution, the job will be available for processing

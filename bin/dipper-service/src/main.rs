@@ -33,6 +33,7 @@ mod network;
 mod registry;
 mod signing;
 mod supervisor;
+mod telemetry;
 #[cfg(test)]
 mod test_support;
 mod worker;
@@ -51,7 +52,7 @@ const RCA_DOMAIN_FETCH_MAX_RETRIES: u32 = 5;
 const INDEXER_URLS_FETCH_MAX_RETRIES: u32 = 5;
 
 /// Total budget for the teardown, from shutdown being requested to the last task draining. The
-/// stop sequence's own ceiling is 65s (11 stop steps and the event flush and the DB pool close,
+/// stop sequence's own ceiling is 70s (12 stop steps and the event flush and the DB pool close,
 /// each capped locally at `STOP_STEP_TIMEOUT`), so this sits above it and below the pod's 90s grace.
 const TEARDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(75);
 
@@ -75,15 +76,22 @@ pub async fn main() -> anyhow::Result<()> {
         .expect("Invalid path");
     let conf = config::load_from_file(&conf_path).expect("Failed to load config");
 
-    // Set up logging. Plain text, with no colour codes, so log stores can search it. Alerts see
-    // warnings and errors whatever the log level is set to.
+    // The metrics recorder goes in before logging, so the log layer counting tagged lines sees
+    // every one of them.
+    let metrics_handle = telemetry::install()?;
+
+    // Set up logging, as plain text or as JSON per `logging.format`, with no colour codes, so log
+    // stores can search it. Alerts see warnings and errors whatever the log level is set to, and
+    // every line tagged with an `event` is counted for the metrics.
+    let log_output = log_layer(
+        conf.logging.format,
+        log_filter(env::var(EnvFilter::DEFAULT_ENV).ok().as_deref()),
+        std::io::stdout,
+    );
     tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_ansi(false)
-                .with_filter(log_filter(env::var(EnvFilter::DEFAULT_ENV).ok().as_deref())),
-        )
+        .with(log_output)
         .with(alerts::layer(&conf.alerts).map(|layer| layer.with_filter(LevelFilter::WARN)))
+        .with(telemetry::EventCounter)
         .init();
     tracing::debug!(conf=?conf, "configuration loaded");
     let left_out = conf.alerts.default_events_left_out();
@@ -230,6 +238,10 @@ pub async fn main() -> anyhow::Result<()> {
     dipper_pgmq::run_db_migrations(&db_conn).await?;
     dipper_pgregistry::run_db_migrations(&db_conn).await?;
     tracing::info!("applied DB migrations");
+
+    //- The metrics sampler: the database's reachability and the queue's depth
+    let (metrics_sampler_handle, metrics_sampler_service) =
+        telemetry::sampler(db_conn.clone(), telemetry::SAMPLE_INTERVAL);
 
     //- The message queue component
     let queue = QueueImpl::new(db_conn.clone());
@@ -703,6 +715,7 @@ pub async fn main() -> anyhow::Result<()> {
             conf.health.listen_addr,
             worker_liveness.clone(),
             conf.health.threshold,
+            Some(metrics_handle.clone()),
         )
         .await?;
         tracing::info!(%addr, "initialized health endpoint");
@@ -799,6 +812,9 @@ pub async fn main() -> anyhow::Result<()> {
         None
     };
 
+    let metrics_sampler_task_handle = task_tree.spawn(metrics_sampler_service);
+    tracing::debug!(task_id=%metrics_sampler_task_handle.id(), "Metrics sampler started");
+
     let admin_rpc_task_handle = task_tree.spawn(admin_rpc_service);
     tracing::debug!(task_id=%admin_rpc_task_handle.id(), "Admin RPC service started");
 
@@ -885,6 +901,8 @@ pub async fn main() -> anyhow::Result<()> {
         all_stopped &= stop_service("Worker", worker_handle.stop()).await;
         all_stopped &= stop_service("indexer URLs", indexer_urls_handle.stop()).await;
 
+        all_stopped &= stop_service("Metrics sampler", metrics_sampler_handle.stop()).await;
+
         // Stop the health endpoint last: Kubernetes probes /health for as long as the pod runs,
         // so stopping it early makes every clean teardown look like a liveness failure. The
         // worker watermark freezes here, but its staleness threshold dwarfs the teardown ceiling.
@@ -940,6 +958,37 @@ enum SignalHandlerError {
 }
 
 // -------- Private app helpers --------
+
+/// The log output layer for `format`: plain text or JSON lines, filtered by `filter` and written
+/// to `writer`. JSON lines carry the event's fields, the `event` tag among them, at the top level
+/// next to `timestamp`, `level`, `target` and `message`.
+fn log_layer<S, W>(
+    format: config::LogFormat,
+    filter: EnvFilter,
+    writer: W,
+) -> Box<dyn tracing_subscriber::Layer<S> + Send + Sync>
+where
+    S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
+    W: for<'writer> tracing_subscriber::fmt::MakeWriter<'writer> + Send + Sync + 'static,
+{
+    match format {
+        config::LogFormat::Text => Box::new(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(writer)
+                .with_filter(filter),
+        ),
+        config::LogFormat::Json => Box::new(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .flatten_event(true)
+                .with_current_span(false)
+                .with_span_list(false)
+                .with_writer(writer)
+                .with_filter(filter),
+        ),
+    }
+}
 
 /// The filter for dipper's own log output, given the value of `RUST_LOG`. Its directives are
 /// used as written, skipping any that cannot be read; with none, dipper logs at info rather than
@@ -1020,7 +1069,70 @@ async fn create_subgraph_indexing_agreements_events_emitter(
 mod tests {
     use tracing_subscriber::filter::LevelFilter;
 
-    use super::{log_filter, stop_service};
+    /// A log writer capturing what it is given, for tests of the log format.
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Captured {
+        /// Logs a stuck cancel and a debug line through `format`'s layer, returning the output.
+        fn log_through(format: config::LogFormat) -> String {
+            use tracing_subscriber::layer::SubscriberExt;
+            let captured = Self::default();
+            let writer = {
+                let captured = captured.clone();
+                move || captured.clone()
+            };
+            let layer = log_layer(format, EnvFilter::new("info"), writer);
+            let subscriber = tracing_subscriber::registry().with(layer);
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::warn!(
+                    event = "agreement_cancel_stuck",
+                    attempts = 3,
+                    "a cancel is stuck"
+                );
+                tracing::debug!("below the filter");
+            });
+            String::from_utf8(captured.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    #[test]
+    fn json_logs_write_each_line_as_1_object_with_its_fields_at_the_top() {
+        let output = Captured::log_through(config::LogFormat::Json);
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 1, "the debug line is filtered out: {output}");
+        let line: serde_json::Value = serde_json::from_str(lines[0]).expect("a JSON line");
+        assert_eq!(line["level"], "WARN", "{line}");
+        assert_eq!(line["message"], "a cancel is stuck", "{line}");
+        assert_eq!(line["event"], "agreement_cancel_stuck", "{line}");
+        assert_eq!(line["attempts"], 3, "{line}");
+        assert!(line["timestamp"].is_string(), "{line}");
+    }
+
+    #[test]
+    fn text_logs_stay_plain_lines() {
+        let output = Captured::log_through(config::LogFormat::Text);
+        assert_eq!(output.lines().count(), 1, "{output}");
+        assert!(!output.starts_with('{'), "{output}");
+        assert!(output.contains("a cancel is stuck"), "{output}");
+        assert!(
+            output.contains(r#"event="agreement_cancel_stuck""#),
+            "{output}"
+        );
+    }
+
+    use super::{EnvFilter, config, log_filter, log_layer, stop_service};
 
     /// The normal path: a service that stops promptly reports success, which is
     /// what lets the graceful DB pool close go ahead.

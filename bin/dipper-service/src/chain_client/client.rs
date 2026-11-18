@@ -465,6 +465,22 @@ fn is_already_broadcast(error: &TransportError) -> bool {
     ALREADY_BROADCAST_PATTERNS.iter().any(|p| lower.contains(p))
 }
 
+/// Counts 1 transaction dipper sent for `call` by how it ended.
+fn record_transaction(call: &'static str, outcome: &'static str) {
+    metrics::counter!(crate::telemetry::TRANSACTIONS, "call" => call, "outcome" => outcome)
+        .increment(1);
+}
+
+/// The outcome to count a transaction under when it could not be sent.
+fn submit_outcome(err: &ChainClientError) -> &'static str {
+    match err {
+        ChainClientError::SubmitFailed(_) => "submit_failed",
+        ChainClientError::ContractRevert { .. } => "contract_revert",
+        ChainClientError::RpcError(_) => "rpc_error",
+        _ => "error",
+    }
+}
+
 /// Classify the outcome of a nonce-gap fill submission. Pure so the
 /// swallow rule (`is_nonce_error` → `Ok(())`) is unit-testable without
 /// an RPC mock.
@@ -716,6 +732,7 @@ impl AlloyChainClient {
     /// decreases it, so an endpoint reporting a stale pending count cannot wind the
     /// counter back onto a slot a broadcast has already spent.
     async fn resync_nonce(&self) -> Result<(), ChainClientError> {
+        metrics::counter!(crate::telemetry::NONCE_RESYNCS).increment(1);
         let chain_nonce = self.fetch_chain_nonce().await?;
         self.inner.nonce.fetch_max(chain_nonce, Ordering::SeqCst);
         Ok(())
@@ -892,6 +909,7 @@ impl AlloyChainClient {
     /// `subject` names what is being reconciled, for the logs.
     async fn send_reconcile(
         &self,
+        call: &'static str,
         calldata: Vec<u8>,
         log_agreement_id: &[u8; 16],
         subject: &str,
@@ -905,12 +923,20 @@ impl AlloyChainClient {
                 calldata,
                 log_agreement_id,
             )
-            .await?;
+            .await
+            .inspect_err(|err| record_transaction(call, submit_outcome(err)))?;
 
         match self.wait_for_receipt(tx_hash, RECEIPT_POLL_TIMEOUT).await? {
-            ReceiptWait::Mined(true) => Ok(Some(tx_hash)),
-            ReceiptWait::Mined(false) => Err(ChainClientError::TxReverted { tx_hash }),
+            ReceiptWait::Mined(true) => {
+                record_transaction(call, "mined");
+                Ok(Some(tx_hash))
+            }
+            ReceiptWait::Mined(false) => {
+                record_transaction(call, "reverted");
+                Err(ChainClientError::TxReverted { tx_hash })
+            }
             ReceiptWait::NotSeen { checked } => {
+                record_transaction(call, "dropped");
                 tracing::warn!(
                     reconciling = subject,
                     tx_hash = %tx_hash,
@@ -1168,16 +1194,24 @@ impl ChainClient for AlloyChainClient {
 
         let submitted = self
             .build_and_send_call(manager, calldata, &agreement_id)
-            .await?;
+            .await
+            .inspect_err(|err| record_transaction("offer", submit_outcome(err)))?;
 
         let SubmittedTx {
             hash: tx_hash,
             nonce: dropped_nonce,
         } = submitted;
         match self.wait_for_receipt(tx_hash, RECEIPT_POLL_TIMEOUT).await? {
-            ReceiptWait::Mined(true) => Ok(Some(tx_hash)),
-            ReceiptWait::Mined(false) => Err(ChainClientError::TxReverted { tx_hash }),
+            ReceiptWait::Mined(true) => {
+                record_transaction("offer", "mined");
+                Ok(Some(tx_hash))
+            }
+            ReceiptWait::Mined(false) => {
+                record_transaction("offer", "reverted");
+                Err(ChainClientError::TxReverted { tx_hash })
+            }
             ReceiptWait::NotSeen { checked } => {
+                record_transaction("offer", "dropped");
                 tracing::warn!(
                     agreement_id = %format_args!("0x{}", agreement_id.iter().map(|b| format!("{b:02x}")).collect::<String>()),
                     tx_hash = %tx_hash,
@@ -1221,7 +1255,8 @@ impl ChainClient for AlloyChainClient {
 
         let submitted = self
             .build_and_send_call(manager, calldata, agreement_id)
-            .await?;
+            .await
+            .inspect_err(|err| record_transaction("cancel", submit_outcome(err)))?;
 
         // Wait for the receipt so a returned Ok means the cancel mined, not just
         // that it entered the mempool. The dispatch layer then re-reads on-chain
@@ -1231,9 +1266,16 @@ impl ChainClient for AlloyChainClient {
             nonce: dropped_nonce,
         } = submitted;
         match self.wait_for_receipt(tx_hash, RECEIPT_POLL_TIMEOUT).await? {
-            ReceiptWait::Mined(true) => Ok(Some(tx_hash)),
-            ReceiptWait::Mined(false) => Err(ChainClientError::TxReverted { tx_hash }),
+            ReceiptWait::Mined(true) => {
+                record_transaction("cancel", "mined");
+                Ok(Some(tx_hash))
+            }
+            ReceiptWait::Mined(false) => {
+                record_transaction("cancel", "reverted");
+                Err(ChainClientError::TxReverted { tx_hash })
+            }
             ReceiptWait::NotSeen { checked } => {
+                record_transaction("cancel", "dropped");
                 tracing::warn!(
                     agreement_id = %format_args!("0x{}", agreement_id.iter().map(|b| format!("{b:02x}")).collect::<String>()),
                     tx_hash = %tx_hash,
@@ -1280,8 +1322,13 @@ impl ChainClient for AlloyChainClient {
 
         // No agreement context here; pass a zero id for the shared call's
         // logging field only.
-        self.send_reconcile(calldata, &[0u8; 16], &format!("provider {provider}"))
-            .await
+        self.send_reconcile(
+            "reconcile_provider",
+            calldata,
+            &[0u8; 16],
+            &format!("provider {provider}"),
+        )
+        .await
     }
 
     async fn reconcile_agreement(
@@ -1305,7 +1352,8 @@ impl ChainClient for AlloyChainClient {
             "agreement 0x{}",
             thegraph_core::alloy::primitives::hex::encode(agreement_id)
         );
-        self.send_reconcile(calldata, agreement_id, &subject).await
+        self.send_reconcile("reconcile_agreement", calldata, agreement_id, &subject)
+            .await
     }
 }
 
@@ -2387,6 +2435,9 @@ mod tests {
     /// counts and logs what this returns, and a reverted call reclaimed nothing.
     #[tokio::test]
     async fn reconcile_provider_reports_a_reverted_transaction() {
+        let recorder = crate::telemetry::recorder().unwrap();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
         let (client, _server, _broadcast) = client_whose_tx_mines(false).await;
 
         let result = client
@@ -2396,6 +2447,16 @@ mod tests {
         assert!(
             matches!(result, Err(ChainClientError::TxReverted { .. })),
             "got {result:?}"
+        );
+        let rendered = handle.render();
+        assert_eq!(
+            crate::test_support::metric_value(
+                &rendered,
+                crate::telemetry::TRANSACTIONS,
+                &[("call", "reconcile_provider"), ("outcome", "reverted")],
+            ),
+            Some(1.0),
+            "{rendered}"
         );
     }
 
