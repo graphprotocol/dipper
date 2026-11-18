@@ -2892,12 +2892,16 @@ mod tests {
         }
     }
 
-    /// A ceiling written in the config stays as written, so an example that spelt the ceilings
-    /// out would have every deployment copied from it stop following indexer-rs.
+    /// A value written in the config stays as written. So the example leaves out the ceilings,
+    /// which would stop following indexer-rs, and the address, whose default is due to move to
+    /// indexer-rs's `main` branch: a deployment copied from it then moves with the default.
     #[test]
     fn the_example_configmap_leaves_the_ceilings_to_follow_indexer_rs() {
         let example = example_config();
         let dips = example["dips"].as_object().expect("a dips section");
+        let written = example["suggested_minimums"]
+            .as_object()
+            .expect("a suggested_minimums section");
         let fetch: SuggestedMinimumsConfig =
             serde_json::from_value(example["suggested_minimums"].clone())
                 .expect("the example's suggested_minimums section parses");
@@ -2906,7 +2910,10 @@ mod tests {
         assert!(!dips.contains_key("max_grt_per_30_days"));
         assert!(!dips.contains_key("fallback_max_grt_per_30_days"));
         assert!(fetch.enabled, "the example shows the fetch switched on");
-        assert_eq!(fetch.url, defaults.url, "and spells the defaults out");
+        assert!(
+            !written.contains_key("url"),
+            "the address is left to the default"
+        );
         assert_eq!(fetch.interval, defaults.interval);
         assert_eq!(
             dips["max_grt_per_billion_entities_per_30_days"].as_f64(),

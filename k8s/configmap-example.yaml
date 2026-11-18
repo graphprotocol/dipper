@@ -129,7 +129,6 @@ data:
       },
       "suggested_minimums": {
         "enabled": true,
-        "url": "https://raw.githubusercontent.com/graphprotocol/indexer-rs/main-dips-rebased/crates/config/suggested-min-grt-per-30-days.json",
         "interval": 21600
       }
     }
