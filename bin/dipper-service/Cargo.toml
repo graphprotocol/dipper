@@ -39,6 +39,7 @@ url.workspace = true
 
 [dev-dependencies]
 fake = { workspace = true, features = ["url"] }
+pgtemp = "0.6.0"
 # `test-util` gives tests a paused clock, so timing tests assert on an elapsed
 # interval instead of really waiting for one.
 tokio = { workspace = true, features = ["test-util"] }
