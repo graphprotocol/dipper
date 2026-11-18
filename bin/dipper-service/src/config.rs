@@ -160,7 +160,7 @@ pub struct Config {
     #[serde(default)]
     pub alerts: AlertsConfig,
     /// Where dipper reads the minimum prices indexer-rs suggests, which its default price
-    /// ceilings follow. Left out, it reads them from indexer-rs's `main` branch every 6 hours.
+    /// ceilings follow. Left out, it reads them from indexer-rs's DIPs branch every 6 hours.
     #[serde(default)]
     pub suggested_minimums: SuggestedMinimumsConfig,
 }
@@ -418,15 +418,16 @@ pub struct SuggestedMinimumsConfig {
     /// Whether to fetch the minimums at all. On by default; off, the default ceilings stay
     /// on the minimums built into this release.
     pub enabled: bool,
-    /// The file indexer-rs publishes them in. By default the one on its `main` branch.
+    /// The file indexer-rs publishes them in. By default the one on its DIPs branch.
     pub url: Url,
     /// Seconds between fetches (default: 21,600, which is 6 hours). At least 60.
     #[serde_as(as = "serde_with::DurationSeconds<u64>")]
     pub interval: Duration,
 }
 
-/// The minimums as indexer-rs publishes them, on the branch its releases are cut from.
-const SUGGESTED_MINIMUMS_URL: &str = "https://raw.githubusercontent.com/graphprotocol/indexer-rs/main/crates/config/suggested-min-grt-per-30-days.json";
+/// The minimums as indexer-rs publishes them, on `main-dips-rebased`: the branch that holds its
+/// DIPs work and that indexers testing DIPs run. Move this to `main` once that branch merges.
+const SUGGESTED_MINIMUMS_URL: &str = "https://raw.githubusercontent.com/graphprotocol/indexer-rs/main-dips-rebased/crates/config/suggested-min-grt-per-30-days.json";
 
 impl Default for SuggestedMinimumsConfig {
     #[expect(
@@ -3303,8 +3304,8 @@ mod tests {
             assert_eq!(section.interval, Duration::from_secs(21_600));
             assert_eq!(
                 section.url.as_str(),
-                "https://raw.githubusercontent.com/graphprotocol/indexer-rs/main/crates/config/\
-                 suggested-min-grt-per-30-days.json"
+                "https://raw.githubusercontent.com/graphprotocol/indexer-rs/main-dips-rebased/crates/\
+                 config/suggested-min-grt-per-30-days.json"
             );
             assert_eq!(section.validate(), Ok(()));
         }
