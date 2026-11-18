@@ -6,7 +6,7 @@ use dipper_iisa::{PriceCeilings, SelectedIndexer};
 use graph_networks_registry::NetworksRegistry;
 use thegraph_core::alloy::primitives::{ChainId, U256};
 
-use crate::config::IndexingAgreementChainPrices;
+use crate::config::{IndexingAgreementChainPrices, IndexingAgreementConfig};
 
 /// Seconds in 30 days (30 * 24 * 60 * 60).
 const SECONDS_PER_30_DAYS: u128 = 2_592_000;
@@ -100,6 +100,55 @@ pub(crate) fn resolve_pricing(
     None
 }
 
+/// A note for each `pricing_table` price above the ceiling an IISA price is held to there.
+/// Dipper offers a table price as it stands to an indexer IISA has no price for, so such a
+/// price is a way to pay more than the ceilings allow. A chain with no name gets the fallback.
+pub(crate) fn table_prices_above_ceilings(
+    agreement_conf: &IndexingAgreementConfig,
+    table: &BTreeMap<ChainId, IndexingAgreementChainPrices>,
+    chain_name: impl Fn(ChainId) -> Option<String>,
+) -> Vec<String> {
+    const OFFERED_ANYWAY: &str =
+        "an indexer IISA has no price for is offered the table price, which no ceiling limits";
+    let entity_ceiling = agreement_conf.max_grt_per_billion_entities_per_30_days();
+    let entity_ceiling_wei =
+        grt_per_billion_entities_per_30_days_to_wei_per_entity_per_second(entity_ceiling);
+    let mut notes = Vec::new();
+    for (chain_id, prices) in table {
+        let name = chain_name(*chain_id);
+        let chain = match &name {
+            Some(name) => format!("chain {chain_id} ({name})"),
+            None => format!("chain {chain_id}"),
+        };
+        let ceiling = agreement_conf.max_grt_per_30_days_for(name.as_deref().unwrap_or_default());
+        if prices.tokens_per_second > grt_per_30_days_to_wei_per_second(ceiling) {
+            let worth = grt_from_wei(prices.tokens_per_second, SECONDS_PER_30_DAYS);
+            notes.push(format!(
+                "pricing_table tokens_per_second for {chain} is worth {worth} GRT per 30 days, \
+                 above that chain's base-price ceiling of {ceiling}: {OFFERED_ANYWAY}"
+            ));
+        }
+        if prices.tokens_per_entity_per_second > entity_ceiling_wei {
+            let per_billion = SECONDS_PER_30_DAYS * 1_000_000_000;
+            let worth = grt_from_wei(prices.tokens_per_entity_per_second, per_billion);
+            notes.push(format!(
+                "pricing_table tokens_per_entity_per_second for {chain} is worth {worth} GRT per \
+                 billion entities per 30 days, above the per-entity ceiling of {entity_ceiling}: \
+                 {OFFERED_ANYWAY}"
+            ));
+        }
+    }
+    notes
+}
+
+/// `wei` times `times`, in GRT, to 2 decimal places at the most, for a message.
+fn grt_from_wei(wei: U256, times: u128) -> String {
+    let grt = wei.saturating_to::<u128>() as f64 * times as f64 / WEI_PER_GRT as f64;
+    let rounded = format!("{grt:.2}");
+    let trimmed = rounded.trim_end_matches('0').trim_end_matches('.');
+    trimmed.to_string()
+}
+
 /// Whether dipper may offer an IISA price: finite, not below zero, and at most `cap`
 /// (`None` is no cap). A price equal to the cap passes, as it does in IISA.
 fn within_cap(price: f64, cap: Option<f64>) -> bool {
@@ -148,6 +197,63 @@ mod tests {
             max_grt_per_30_days: base,
             max_grt_per_billion_entities_per_30_days: per_entity,
         }
+    }
+
+    /// A table price is what dipper offers an indexer that IISA has no price for, whatever
+    /// the ceilings are. Start-up says so for each one above its ceiling, and still starts.
+    #[test]
+    fn notes_each_table_price_above_the_ceiling_for_its_chain() {
+        let conf = IndexingAgreementConfig {
+            max_grt_per_30_days: BTreeMap::from([("arbitrum-one".to_string(), 1_800.0)]),
+            fallback_max_grt_per_30_days: 900.0,
+            max_grt_per_billion_entities_per_30_days: 800.0,
+            ..IndexingAgreementConfig::for_tests()
+        };
+        let prices = |base: f64, per_entity: f64| IndexingAgreementChainPrices {
+            tokens_per_second: grt_per_30_days_to_wei_per_second(base),
+            tokens_per_entity_per_second:
+                grt_per_billion_entities_per_30_days_to_wei_per_entity_per_second(per_entity),
+        };
+        let table = BTreeMap::from([
+            // Both parts above their ceilings of 1,800 and 800.
+            (42161, prices(3_000.0, 2_000.0)),
+            // At its chain's ceiling, the fallback of 900, and at the per-entity one.
+            (1, prices(900.0, 800.0)),
+            // A chain with no name is held to the fallback.
+            (1337, prices(1_000.0, 0.0)),
+        ]);
+        let chain_name = |chain: ChainId| match chain {
+            42161 => Some("arbitrum-one".to_string()),
+            1 => Some("mainnet".to_string()),
+            _ => None,
+        };
+
+        let notes = table_prices_above_ceilings(&conf, &table, chain_name);
+
+        assert_eq!(notes.len(), 3, "{notes:#?}");
+        let base = &notes[1];
+        assert!(base.contains("chain 42161 (arbitrum-one)"), "{base}");
+        assert!(
+            base.contains("3000 GRT per 30 days") && base.contains("ceiling of 1800"),
+            "it names both figures: {base}"
+        );
+        let per_entity = &notes[2];
+        assert!(
+            per_entity.contains("chain 42161 (arbitrum-one)"),
+            "{per_entity}"
+        );
+        assert!(
+            per_entity.contains("2000 GRT per billion entities per 30 days")
+                && per_entity.contains("ceiling of 800"),
+            "{per_entity}"
+        );
+        let unnamed = &notes[0];
+        assert!(
+            unnamed.contains("chain 1337")
+                && unnamed.contains("1000 GRT per 30 days")
+                && unnamed.contains("ceiling of 900"),
+            "{unnamed}"
+        );
     }
 
     #[test]

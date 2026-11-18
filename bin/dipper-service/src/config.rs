@@ -1592,13 +1592,13 @@ fn default_deadline_seconds() -> u64 {
 /// `default_max_grt_per_30_days` to derive a per-chain
 /// **selection-filter** ceiling.
 ///
-/// The default `max_grt_per_30_days` map multiplies each value by 10:
+/// The default `max_grt_per_30_days` map multiplies each value by 4:
 /// an indexer is dropped from selection if its advertised base price
 /// exceeds that ceiling on the relevant chain. This is a filter, not
 /// a payment rate — actual payment per indexer is set by IISA's
 /// reported price (or the fallback `pricing_table`), bounded above
-/// by `max_agreement_grt_per_30_days`. Operators do not pay 10x by
-/// default; they simply tolerate indexers asking up to 10x the
+/// by `max_agreement_grt_per_30_days`. Operators do not pay 4 times by
+/// default; they simply tolerate indexers asking up to 4 times the
 /// indexer-rs published minimum on a given chain.
 ///
 /// **Scope**: only the chains in the initial DIPs rollout set are
@@ -1625,9 +1625,9 @@ const INDEXER_RS_MIN_GRT_PER_30_DAYS: &[(&str, f64)] = &[
 ];
 
 /// Multiplier applied to indexer-rs minimums to derive dipper's max ceilings.
-const PAYMENT_CEILING_MULTIPLIER: f64 = 10.0;
+const PAYMENT_CEILING_MULTIPLIER: f64 = 4.0;
 
-/// Default selection ceiling: 10x the indexer-rs minimum per chain.
+/// Default selection ceiling: 4 times the indexer-rs minimum per chain.
 fn default_max_grt_per_30_days() -> BTreeMap<String, f64> {
     INDEXER_RS_MIN_GRT_PER_30_DAYS
         .iter()
@@ -1644,8 +1644,12 @@ fn default_fallback_max_grt_per_30_days() -> f64 {
         .fold(0.0, f64::max)
 }
 
+/// The minimum GRT per billion entities per 30 days that indexer-rs suggests, on every chain.
+const INDEXER_RS_MIN_GRT_PER_BILLION_ENTITIES_PER_30_DAYS: f64 = 200.0;
+
+/// Default per-entity ceiling: the same multiple of the indexer-rs minimum as the base ceilings.
 fn default_max_grt_per_billion_entities_per_30_days() -> f64 {
-    2000.0
+    INDEXER_RS_MIN_GRT_PER_BILLION_ENTITIES_PER_30_DAYS * PAYMENT_CEILING_MULTIPLIER
 }
 
 /// Default per-agreement payment ceiling (GRT per 30 days).
@@ -2428,11 +2432,11 @@ mod tests {
         )
         .expect("deserialization");
         // Unset, the fallback is the highest default chain ceiling (arbitrum-one's).
-        assert_eq!(conf.fallback_max_grt_per_30_days, 4500.0);
+        assert_eq!(conf.fallback_max_grt_per_30_days, 1800.0);
         let (agreement_conf, _) =
             <(Arc<IndexingAgreementConfig>, Arc<BTreeMap<ChainId, _>>)>::from(conf);
         assert_eq!(agreement_conf.max_grt_per_30_days_for("mainnet"), 450.0);
-        assert_eq!(agreement_conf.max_grt_per_30_days_for("gnosis"), 4500.0);
+        assert_eq!(agreement_conf.max_grt_per_30_days_for("gnosis"), 1800.0);
     }
 
     #[test]
@@ -2765,7 +2769,7 @@ mod tests {
     /// Guards against silent typos and accidental duplicates in the
     /// indexer-rs mirror. Failure modes the test catches:
     ///   * a chain name is mistyped on either side of the multiplier
-    ///   * the multiplier itself drifts away from 10x
+    ///   * the multiplier itself drifts away from 4 times
     ///   * two rows accidentally share a chain name (BTreeMap would mask the
     ///     duplicate by silently dropping the earlier value)
     #[test]
@@ -2774,9 +2778,9 @@ mod tests {
 
         // Spot-check three values: high-traffic mainnet chains and a small
         // testnet, picked to cover both ends of the value range.
-        assert_eq!(map.get("arbitrum-one"), Some(&4500.0), "arbitrum-one");
-        assert_eq!(map.get("mainnet"), Some(&450.0), "mainnet");
-        assert_eq!(map.get("sepolia"), Some(&50.0), "sepolia");
+        assert_eq!(map.get("arbitrum-one"), Some(&1800.0), "arbitrum-one");
+        assert_eq!(map.get("mainnet"), Some(&180.0), "mainnet");
+        assert_eq!(map.get("sepolia"), Some(&20.0), "sepolia");
 
         // The const should mirror indexer-rs's published minimum table.
         // Updates that change the row count are intentional — refresh
@@ -2799,12 +2803,74 @@ mod tests {
             "duplicate chain name in INDEXER_RS_MIN_GRT_PER_30_DAYS"
         );
 
-        // Every output entry is 10x its source entry — confirms the
-        // multiplier wired through without rounding surprises.
+        // Every output entry is 4 times its source entry, which confirms
+        // the multiplier wired through without rounding surprises.
         for (name, min) in INDEXER_RS_MIN_GRT_PER_30_DAYS {
             let want = *min * PAYMENT_CEILING_MULTIPLIER;
             assert_eq!(map.get(*name), Some(&want), "ceiling for {name}");
         }
+    }
+
+    /// The example spells the default ceilings out, and an operator who copies it sets them
+    /// explicitly. Left behind by a change to the defaults, it would quietly undo that change.
+    #[test]
+    fn the_example_configmap_spells_out_the_default_ceilings() {
+        let dips = &example_config()["dips"];
+        let ceilings: BTreeMap<String, f64> =
+            serde_json::from_value(dips["max_grt_per_30_days"].clone())
+                .expect("the example's ceilings parse");
+
+        assert_eq!(ceilings, default_max_grt_per_30_days());
+        assert_eq!(
+            dips["fallback_max_grt_per_30_days"].as_f64(),
+            Some(default_fallback_max_grt_per_30_days())
+        );
+        assert_eq!(
+            dips["max_grt_per_billion_entities_per_30_days"].as_f64(),
+            Some(default_max_grt_per_billion_entities_per_30_days())
+        );
+    }
+
+    /// For a subgraph with many entities the per-entity part is most of what an agreement
+    /// pays, so its ceiling is the same multiple of the published minimum as the base one.
+    #[test]
+    fn the_default_per_entity_ceiling_is_4_times_the_published_minimum() {
+        let conf = dips_conf_with_default_prices();
+
+        assert_eq!(conf.max_grt_per_billion_entities_per_30_days, 800.0);
+        assert_eq!(
+            conf.max_grt_per_billion_entities_per_30_days,
+            INDEXER_RS_MIN_GRT_PER_BILLION_ENTITIES_PER_30_DAYS * PAYMENT_CEILING_MULTIPLIER
+        );
+        assert_eq!(conf.validate(), Ok(()));
+    }
+
+    /// The README tells indexers how far above the published minimums they may price before
+    /// dipper stops selecting them, so it has to state the rule dipper applies: the multiplier,
+    /// the chains it holds for, and the flat ceiling every other chain gets.
+    #[test]
+    fn the_readme_tells_indexers_the_multiplier_dipper_uses() {
+        let readme = include_str!("../../../README.md");
+        let rules = [
+            format!("the base ceiling is {PAYMENT_CEILING_MULTIPLIER} times that minimum"),
+            "every other chain shares 1 flat ceiling of 1,800 GRT per 30 days".to_string(),
+            format!(
+                "The per-entity ceiling is {PAYMENT_CEILING_MULTIPLIER} times the published \
+                 per-entity minimum"
+            ),
+            "800 GRT per billion entities per 30 days".to_string(),
+        ];
+
+        for rule in rules {
+            assert!(readme.contains(&rule), "the README does not say: {rule}");
+        }
+        // The 2 figures spelt out above are the defaults.
+        assert_eq!(default_fallback_max_grt_per_30_days(), 1_800.0);
+        assert_eq!(default_max_grt_per_billion_entities_per_30_days(), 800.0);
+        assert!(
+            !readme.contains("the published minimum for a chain"),
+            "only the chains indexer-rs lists are held to a multiple of their own minimum"
+        );
     }
 
     /// Stale `max_initial_tokens` and `max_ongoing_tokens_per_second` keys
