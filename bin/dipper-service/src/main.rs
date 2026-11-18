@@ -30,6 +30,7 @@ mod indexer_addresses;
 mod indexer_rpc_client;
 mod log_text;
 mod network;
+mod price_ceilings;
 mod registry;
 mod signing;
 mod supervisor;
@@ -117,6 +118,9 @@ pub async fn main() -> anyhow::Result<()> {
         && let Err(err) = watcher_conf.validate()
     {
         anyhow::bail!("invalid DIPs info watcher config: {err}");
+    }
+    if let Err(err) = conf.suggested_minimums.validate() {
+        anyhow::bail!("invalid suggested minimums config: {err}");
     }
     if let Err(err) = conf.validate_chain_listener() {
         anyhow::bail!("invalid chain listener config: {err}");
@@ -379,11 +383,30 @@ pub async fn main() -> anyhow::Result<()> {
     let additional_networks = Arc::new(conf.additional_networks);
 
     // Logged here and not with the other start-up notes, since it takes the chains' names.
-    let chain_name =
-        |chain| worker::resolve_chain_name(chain, &networks_registry, &additional_networks);
-    for note in worker::table_prices_above_ceilings(&agreement_conf, &pricing_table, chain_name) {
+    let table_prices_above_ceilings = {
+        let (agreement_conf, table) = (Arc::clone(&agreement_conf), Arc::clone(&pricing_table));
+        let (registry, additional) = (networks_registry.clone(), additional_networks.clone());
+        move || {
+            let chain_name = |chain| worker::resolve_chain_name(chain, &registry, &additional);
+            worker::table_prices_above_ceilings(&agreement_conf, &table, chain_name)
+        }
+    };
+    for note in table_prices_above_ceilings() {
         tracing::warn!("{note}");
     }
+
+    // Keeps the default price ceilings in step with indexer-rs. Left out when it is switched
+    // off, or when the config sets both ceilings and so leaves it nothing to keep in step.
+    let follows = agreement_conf.base_price_ceilings.follows_minimums();
+    let suggested_minimums_service = (conf.suggested_minimums.enabled && follows).then(|| {
+        network::service::suggested_minimums::new(network::service::suggested_minimums::Ctx {
+            ceilings: Arc::clone(&agreement_conf.base_price_ceilings),
+            max_agreement_grt_per_30_days: agreement_conf.max_agreement_grt_per_30_days(),
+            url: conf.suggested_minimums.url.clone(),
+            interval: conf.suggested_minimums.interval,
+            table_prices_above_ceilings: Box::new(table_prices_above_ceilings),
+        })
+    });
 
     // Application services
 
@@ -740,6 +763,15 @@ pub async fn main() -> anyhow::Result<()> {
     let domain_refresh_task_handle = task_tree.spawn(domain_refresh_service);
     tracing::debug!(task_id=%domain_refresh_task_handle.id(), "RCA domain refresh started");
 
+    // Spawn the fetch of indexer-rs's suggested minimum prices if anything follows them
+    let suggested_minimums_handle = if let Some((handle, service)) = suggested_minimums_service {
+        let task_handle = task_tree.spawn(service);
+        tracing::debug!(task_id=%task_handle.id(), "Suggested minimums service started");
+        Some(handle)
+    } else {
+        None
+    };
+
     // Spawn the reassignment service if enabled
     let reassignment_stop_handle = if let Some((handle, service)) = reassignment_handle {
         let task_handle = task_tree.spawn(service);
@@ -888,6 +920,11 @@ pub async fn main() -> anyhow::Result<()> {
         // Stop the RCA domain refresh. It drops any in-flight refresh rather
         // than waiting for it, so a wedged RPC provider cannot stall shutdown.
         all_stopped &= stop_service("RCA domain refresh", domain_refresh_handle.stop()).await;
+
+        // Stop the fetch of suggested minimum prices, which drops a fetch in flight.
+        if let Some(handle) = suggested_minimums_handle {
+            all_stopped &= stop_service("Suggested minimums", handle.stop()).await;
+        }
 
         all_stopped &= stop_service("Worker", worker_handle.stop()).await;
         all_stopped &= stop_service("indexer URLs", indexer_urls_handle.stop()).await;

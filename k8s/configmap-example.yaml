@@ -29,18 +29,6 @@ data:
         "deadline_seconds": 600,
         "pricing_table": {},
         "max_agreement_grt_per_30_days": 20000,
-        "max_grt_per_30_days": {
-          "arbitrum-one": 1800,
-          "matic": 1200,
-          "avalanche": 900,
-          "bsc": 800,
-          "base": 320,
-          "mainnet": 180,
-          "optimism": 120,
-          "base-sepolia": 60,
-          "sepolia": 20
-        },
-        "fallback_max_grt_per_30_days": 1800,
         "max_grt_per_billion_entities_per_30_days": 800,
         "non_accepting_test_interval_minutes": 60
       },
@@ -138,5 +126,9 @@ data:
       "alerts": {
         "slack_webhook_url": "https://hooks.slack.com/services/REPLACE_ME_OR_REMOVE_FOR_NO_ALERTS",
         "throttle": 900
+      },
+      "suggested_minimums": {
+        "enabled": true,
+        "interval": 21600
       }
     }

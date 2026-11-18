@@ -178,9 +178,12 @@ pub(crate) fn resolve_chain_name(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use thegraph_core::{IndexerId, alloy::primitives::Address};
 
     use super::*;
+    use crate::price_ceilings::BasePriceCeilings;
 
     const CHAIN: ChainId = 42161;
 
@@ -204,8 +207,10 @@ mod tests {
     #[test]
     fn notes_each_table_price_above_the_ceiling_for_its_chain() {
         let conf = IndexingAgreementConfig {
-            max_grt_per_30_days: BTreeMap::from([("arbitrum-one".to_string(), 1_800.0)]),
-            fallback_max_grt_per_30_days: 900.0,
+            base_price_ceilings: Arc::new(BasePriceCeilings::set(
+                BTreeMap::from([("arbitrum-one".to_string(), 1_800.0)]),
+                900.0,
+            )),
             max_grt_per_billion_entities_per_30_days: 800.0,
             ..IndexingAgreementConfig::for_tests()
         };

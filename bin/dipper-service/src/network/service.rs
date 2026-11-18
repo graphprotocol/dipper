@@ -10,3 +10,4 @@ mod indexer_reply;
 pub mod indexer_urls;
 pub mod liveness_checker;
 pub mod reassignment;
+pub mod suggested_minimums;
