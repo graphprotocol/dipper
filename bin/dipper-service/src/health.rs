@@ -1,7 +1,6 @@
 //! Worker liveness watermarks and a minimal HTTP health endpoint. Exit-based supervision catches
 //! a worker that exits, not one that is wedged (alive but making no progress). Each worker loop
 //! ticks its own watermark per iteration; the server reports 503 once any watermark goes stale.
-//! A second endpoint, `/ready`, reports whether dipper can reach its database.
 
 use std::{
     net::SocketAddr,
@@ -131,7 +130,6 @@ pub async fn new(
     addr: SocketAddr,
     liveness: Liveness,
     threshold: Duration,
-    db: Option<sqlx::PgPool>,
 ) -> anyhow::Result<(
     Handle,
     SocketAddr,
@@ -140,7 +138,7 @@ pub async fn new(
     let listener = TcpListener::bind(addr).await?;
     let local_addr = listener.local_addr()?;
     let (tx_stop, rx_stop) = mpsc::channel(1);
-    let fut = serve(listener, liveness, threshold, db, rx_stop);
+    let fut = serve(listener, liveness, threshold, rx_stop);
     Ok((Handle { tx_stop }, local_addr, fut))
 }
 
@@ -149,12 +147,7 @@ pub async fn new(
 struct HealthState {
     liveness: Liveness,
     threshold: Duration,
-    db: Option<sqlx::PgPool>,
 }
-
-/// How long `/ready` waits for the database to answer before it reports the pod not ready. Well
-/// under the readiness probe's own timeout, so a slow database is answered with a 503.
-const READY_DB_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// `GET /health`: 200 while the worker watermark is fresh, 503 once it has gone
 /// stale (the worker is wedged and the orchestrator should restart it).
@@ -166,20 +159,6 @@ async fn health(State(state): State<HealthState>) -> impl IntoResponse {
     }
 }
 
-/// `GET /ready`: 200 while dipper can reach its database, 503 when it cannot. Every service in
-/// dipper works through the database, so a pod without it can do nothing useful, but restarting
-/// it would not bring the database back, which is why this is the readiness probe's endpoint and
-/// not the liveness probe's.
-async fn ready(State(state): State<HealthState>) -> impl IntoResponse {
-    let Some(db) = &state.db else {
-        return (StatusCode::OK, "ready");
-    };
-    match tokio::time::timeout(READY_DB_TIMEOUT, sqlx::query("SELECT 1").execute(db)).await {
-        Ok(Ok(_)) => (StatusCode::OK, "ready"),
-        Ok(Err(_)) | Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "database unreachable"),
-    }
-}
-
 /// Serves health requests until `stop_rx` fires. axum/hyper gives request parsing, per-connection
 /// isolation and graceful shutdown, but no header-read or idle timeout: a stalled client holds its
 /// connection for the process lifetime, which is acceptable on a cluster-internal port.
@@ -187,17 +166,14 @@ async fn serve(
     listener: TcpListener,
     liveness: Liveness,
     threshold: Duration,
-    db: Option<sqlx::PgPool>,
     mut stop_rx: mpsc::Receiver<()>,
 ) -> anyhow::Result<()> {
     tracing::info!(addr = %listener.local_addr()?, "health server listening");
     let app = Router::new()
         .route("/health", get(health))
-        .route("/ready", get(ready))
         .with_state(HealthState {
             liveness,
             threshold,
-            db,
         });
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
@@ -312,18 +288,11 @@ mod tests {
     /// Reads an HTTP response's status line from a fresh connection to the
     /// server.
     async fn probe(addr: SocketAddr) -> String {
-        probe_path(addr, "/health").await
-    }
-
-    /// [`probe`] for any path the server serves.
-    async fn probe_path(addr: SocketAddr, path: &str) -> String {
         let mut stream = TcpStream::connect(addr).await.unwrap();
         // `Connection: close` so the server closes the socket after responding
         // and `read_to_end` returns rather than blocking on HTTP/1.1 keep-alive.
         stream
-            .write_all(
-                format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes(),
-            )
+            .write_all(b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
             .await
             .unwrap();
         let mut buf = Vec::new();
@@ -339,14 +308,9 @@ mod tests {
         // A zero threshold plus a backdated watermark makes the worker stale on
         // the spot, so the unhealthy branch is exercised without waiting.
         ticker.slot.store(elapsed_secs() - 1, Ordering::Relaxed);
-        let (handle, addr, fut) = new(
-            "127.0.0.1:0".parse().unwrap(),
-            liveness,
-            Duration::ZERO,
-            None,
-        )
-        .await
-        .unwrap();
+        let (handle, addr, fut) = new("127.0.0.1:0".parse().unwrap(), liveness, Duration::ZERO)
+            .await
+            .unwrap();
         let server = tokio::spawn(fut);
 
         let status = probe(addr).await;
@@ -367,7 +331,6 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             liveness,
             Duration::from_secs(600),
-            None,
         )
         .await
         .unwrap();
@@ -394,7 +357,6 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             liveness,
             Duration::from_secs(600),
-            None,
         )
         .await
         .unwrap();
@@ -414,96 +376,6 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), handle.stop())
             .await
             .expect("a stalled client blocked shutdown");
-        let _ = server.await;
-    }
-
-    /// A pool for a database no one listens at, so every query against it fails.
-    async fn unreachable_db() -> sqlx::PgPool {
-        let port = {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            listener.local_addr().unwrap().port()
-        };
-        let options: sqlx::postgres::PgConnectOptions =
-            format!("postgres://dipper@127.0.0.1:{port}/dipper")
-                .parse()
-                .unwrap();
-        sqlx::postgres::PgPoolOptions::new()
-            .acquire_timeout(Duration::from_millis(500))
-            .connect_lazy_with(options)
-    }
-
-    #[tokio::test]
-    async fn ready_reports_503_while_the_database_is_unreachable() {
-        // Readiness is what keeps a pod that cannot do its work from counting as available, so a
-        // dipper that lost its database must say so there, while liveness stays fine: a restart
-        // would not bring the database back.
-        let liveness = Liveness::new();
-        let _ticker = liveness.register();
-        let (handle, addr, fut) = new(
-            "127.0.0.1:0".parse().unwrap(),
-            liveness,
-            Duration::from_secs(600),
-            Some(unreachable_db().await),
-        )
-        .await
-        .unwrap();
-        let server = tokio::spawn(fut);
-
-        let ready = probe_path(addr, "/ready").await;
-        let health = probe(addr).await;
-        assert!(
-            ready.contains("503"),
-            "expected 503 from /ready, got: {ready:?}"
-        );
-        assert!(
-            health.contains("200"),
-            "liveness ignores the database, got: {health:?}"
-        );
-
-        handle.stop().await;
-        let _ = server.await;
-    }
-
-    #[tokio::test]
-    async fn ready_reports_200_without_a_database_to_check() {
-        let liveness = Liveness::new();
-        let (handle, addr, fut) = new(
-            "127.0.0.1:0".parse().unwrap(),
-            liveness,
-            Duration::from_secs(600),
-            None,
-        )
-        .await
-        .unwrap();
-        let server = tokio::spawn(fut);
-
-        let ready = probe_path(addr, "/ready").await;
-        assert!(ready.contains("200"), "expected 200, got: {ready:?}");
-
-        handle.stop().await;
-        let _ = server.await;
-    }
-
-    #[tokio::test]
-    async fn it_ready_reports_200_with_a_reachable_database() {
-        let temp_db = pgtemp::PgTempDB::new();
-        let db = sqlx::PgPool::connect(&temp_db.connection_uri())
-            .await
-            .unwrap();
-        let (handle, addr, fut) = new(
-            "127.0.0.1:0".parse().unwrap(),
-            Liveness::new(),
-            Duration::from_secs(600),
-            Some(db),
-        )
-        .await
-        .unwrap();
-        let server = tokio::spawn(fut);
-
-        let ready = probe_path(addr, "/ready").await;
-        assert!(ready.contains("200"), "expected 200, got: {ready:?}");
-
-        handle.stop().await;
         let _ = server.await;
     }
 }

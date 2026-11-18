@@ -686,7 +686,6 @@ pub async fn main() -> anyhow::Result<()> {
             conf.health.listen_addr,
             worker_liveness.clone(),
             conf.health.threshold,
-            Some(db_conn.clone()),
         )
         .await?;
         tracing::info!(%addr, "initialized health endpoint");
