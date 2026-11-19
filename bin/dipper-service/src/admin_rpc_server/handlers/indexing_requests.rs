@@ -270,8 +270,9 @@ where
             }
         }
 
-        // A Studio request for the same subgraph that still waits on its manifest is older
-        // than this one. It goes first, so that it is never applied over this one later.
+        // A Studio request set aside for the same subgraph is older than this one, so it is
+        // removed before this one is applied. That covers a request already stored, not one
+        // the consumer is still retrying or is applying at this moment.
         match self
             .registry
             .forget_set_aside_request(requested_by, deployment_id, chain_id)
@@ -288,6 +289,9 @@ where
             Err(err) => {
                 tracing::error!(
                     error=?err,
+                    %requested_by,
+                    %deployment_id,
+                    %chain_id,
                     "Failed to remove the Studio request set aside for the same subgraph"
                 );
                 return Err(ErrorObject::borrowed(503, "Service unavailable", None));

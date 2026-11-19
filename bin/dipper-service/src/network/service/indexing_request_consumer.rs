@@ -3973,7 +3973,7 @@ mod tests {
 
     /// A request is removed, once applied, as the record it was listed from. One stored for
     /// the same subgraph in the meantime came from a later record and is not yet applied, so
-    /// it stays. Only a dipper that lost the lock mid-apply can meet this.
+    /// it stays. It takes a dipper that lost the lock mid-apply, or 1 subgraph on 2 partitions.
     #[tokio::test(start_paused = true)]
     async fn a_request_set_aside_while_an_older_one_is_applied_is_kept() {
         let id = IndexingRequestId::new();
