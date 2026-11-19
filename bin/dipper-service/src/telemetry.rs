@@ -54,6 +54,9 @@ pub const NONCE_RESYNCS: &str = "dipper_nonce_resyncs_total";
 /// among them.
 pub const LOG_EVENTS: &str = "dipper_log_events_total";
 
+/// 1 while this dipper holds the singleton lock on its database, 0 otherwise.
+pub const SINGLETON_LOCK_HELD: &str = "dipper_singleton_lock_held";
+
 /// How often the sampler reads the database.
 pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(15);
 
@@ -114,6 +117,10 @@ pub fn describe() {
     describe_gauge!(
         DB_UP,
         "1 while the database answers dipper's samples, 0 otherwise"
+    );
+    describe_gauge!(
+        SINGLETON_LOCK_HELD,
+        "1 while this dipper holds the singleton lock on its database"
     );
     describe_gauge!(DB_POOL_CONNECTIONS, "Database pool connections by state");
     describe_counter!(

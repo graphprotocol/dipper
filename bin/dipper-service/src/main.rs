@@ -28,6 +28,7 @@ mod db;
 mod health;
 mod indexer_addresses;
 mod indexer_rpc_client;
+mod lock;
 mod log_text;
 mod network;
 mod price_ceilings;
@@ -35,6 +36,7 @@ mod registry;
 mod request_chain_check;
 mod set_indexing_target;
 mod signing;
+mod singleton;
 mod startup;
 mod supervisor;
 mod telemetry;
@@ -66,10 +68,13 @@ const TEARDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(75);
 const WORKER_DRAIN: std::time::Duration = std::time::Duration::from_secs(45);
 
 /// The stop sequence's ceiling: the worker's drain, with the services that feed or call it
-/// stopping alongside, then 4 steps in turn, each capped at [`STOP_STEP_TIMEOUT`]: the services
-/// the jobs read from, the health endpoint, the event flush and the DB pool.
+/// stopping alongside, then 5 steps in turn, each capped at [`STOP_STEP_TIMEOUT`]: the services
+/// the jobs read from, the health endpoint, the event flush, the DB pool and the singleton lock.
 const TEARDOWN_CEILING: std::time::Duration =
-    std::time::Duration::from_secs(WORKER_DRAIN.as_secs() + 4 * STOP_STEP_TIMEOUT.as_secs());
+    std::time::Duration::from_secs(WORKER_DRAIN.as_secs() + 5 * STOP_STEP_TIMEOUT.as_secs());
+
+/// The exit code of a dipper that lost its singleton lock and stopped at once.
+const EXIT_SINGLETON_LOST: i32 = 3;
 
 // The sequence must end before the supervisor stops waiting for it.
 const _: () = assert!(TEARDOWN_CEILING.as_secs() < TEARDOWN_GRACE.as_secs());
@@ -279,6 +284,20 @@ pub async fn main() -> anyhow::Result<()> {
     //- DB connect and run migrations
     let db_conn = db::connect(&conf.db).await?;
     tracing::info!(db = %config::database_name(&conf.db.url), "initialized DB connection pool");
+
+    //- The singleton lock, before migrating or starting anything that acts: see `singleton`.
+    let lock_connection = dipper_pgregistry::PgRegistry::new(db_conn.clone())
+        .advisory_lock_connection(
+            singleton::key(),
+            &singleton_connection_name(),
+            singleton::IDLE_TIMEOUT,
+        )
+        .await
+        .map_err(|err| anyhow::anyhow!("failed to open the singleton lock's connection: {err}"))?;
+    let singleton = singleton::hold(Box::new(lock_connection), || {
+        std::process::exit(EXIT_SINGLETON_LOST)
+    })
+    .await?;
 
     dipper_pgmq::run_db_migrations(&db_conn).await?;
     dipper_pgregistry::run_db_migrations(&db_conn).await?;
@@ -1021,9 +1040,14 @@ pub async fn main() -> anyhow::Result<()> {
         // it, costs nothing: Postgres rolls back anything open once the sockets drop.
         if all_stopped {
             stop_service("DB connection pool", db_conn.close()).await;
+            // Last of all, once nothing here acts any more: another dipper may start then.
+            stop_service("Singleton lock", singleton.release()).await;
         } else {
+            // A service still running may still act, so the lock stays held until the process
+            // exits, which frees it as surely.
             tracing::warn!(
-                "skipping the graceful DB pool close because a service did not stop in time"
+                "skipping the graceful DB pool close and keeping the singleton lock until exit \
+                 because a service did not stop in time"
             );
         }
 
@@ -1094,6 +1118,20 @@ fn log_filter(rust_log: Option<&str>) -> EnvFilter {
     EnvFilter::builder()
         .with_default_directive(LevelFilter::INFO.into())
         .parse_lossy(rust_log.unwrap_or_default())
+}
+
+/// How this dipper's singleton lock connection is named in `pg_stat_activity`: with the pod's
+/// name where there is one, so an operator can tell which dipper holds the lock.
+fn singleton_connection_name() -> String {
+    let mut name = match std::env::var("HOSTNAME") {
+        Ok(host) if !host.is_empty() => format!("dipper-singleton {host}"),
+        _ => "dipper-singleton".to_string(),
+    };
+    // Postgres keeps at most 63 bytes of an application name.
+    while name.len() > 63 {
+        name.pop();
+    }
+    name
 }
 
 /// Stop one service, giving up after [`STOP_STEP_TIMEOUT`]. Returns whether it stopped in time,

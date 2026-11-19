@@ -1283,8 +1283,7 @@ impl crate::network::service::indexing_request_consumer::ConsumerLock for Regist
         key: i64,
         name: &str,
         idle_timeout: std::time::Duration,
-    ) -> RegistryResult<Box<dyn crate::network::service::indexing_request_consumer::LockConnection>>
-    {
+    ) -> RegistryResult<Box<dyn crate::lock::LockConnection>> {
         let connection = self
             .inner
             .advisory_lock_connection(key, name, idle_timeout)
@@ -1294,9 +1293,7 @@ impl crate::network::service::indexing_request_consumer::ConsumerLock for Regist
 }
 
 #[async_trait]
-impl crate::network::service::indexing_request_consumer::LockConnection
-    for dipper_pgregistry::AdvisoryLockConnection
-{
+impl crate::lock::LockConnection for dipper_pgregistry::AdvisoryLockConnection {
     fn idle_timeout_refused(&self) -> Option<&str> {
         dipper_pgregistry::AdvisoryLockConnection::idle_timeout_refused(self)
     }
