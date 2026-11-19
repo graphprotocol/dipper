@@ -52,7 +52,7 @@ const RCA_DOMAIN_FETCH_MAX_RETRIES: u32 = 5;
 const INDEXER_URLS_FETCH_MAX_RETRIES: u32 = 5;
 
 /// Total budget for the teardown, from shutdown being requested to the last task draining. The
-/// stop sequence's own ceiling is 70s (12 stop steps and the event flush and the DB pool close,
+/// stop sequence's own ceiling is 65s (11 stop steps and the event flush and the DB pool close,
 /// each capped locally at `STOP_STEP_TIMEOUT`), so this sits above it and below the pod's 90s grace.
 const TEARDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(75);
 
@@ -77,8 +77,13 @@ pub async fn main() -> anyhow::Result<()> {
     let conf = config::load_from_file(&conf_path).expect("Failed to load config");
 
     // The metrics recorder goes in before logging, so the log layer counting tagged lines sees
-    // every one of them.
-    let metrics_handle = telemetry::install()?;
+    // every one of them. Without the health server nothing could read the metrics, so none are
+    // recorded then.
+    let metrics_handle = if conf.health.enabled {
+        Some(telemetry::install()?)
+    } else {
+        None
+    };
 
     // Set up logging, as plain text or as JSON per `logging.format`, with no colour codes, so log
     // stores can search it. Alerts see warnings and errors whatever the log level is set to, and
@@ -91,7 +96,7 @@ pub async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(log_output)
         .with(alerts::layer(&conf.alerts).map(|layer| layer.with_filter(LevelFilter::WARN)))
-        .with(telemetry::EventCounter)
+        .with(telemetry::EventCounter.with_filter(telemetry::TaggedEvents))
         .init();
     tracing::debug!(conf=?conf, "configuration loaded");
     let left_out = conf.alerts.default_events_left_out();
@@ -240,8 +245,9 @@ pub async fn main() -> anyhow::Result<()> {
     tracing::info!("applied DB migrations");
 
     //- The metrics sampler: the database's reachability and the queue's depth
-    let (metrics_sampler_handle, metrics_sampler_service) =
-        telemetry::sampler(db_conn.clone(), telemetry::SAMPLE_INTERVAL);
+    let metrics_sampler = metrics_handle
+        .clone()
+        .map(|handle| telemetry::sampler(db_conn.clone(), handle, telemetry::SAMPLE_INTERVAL));
 
     //- The message queue component
     let queue = QueueImpl::new(db_conn.clone());
@@ -715,7 +721,7 @@ pub async fn main() -> anyhow::Result<()> {
             conf.health.listen_addr,
             worker_liveness.clone(),
             conf.health.threshold,
-            Some(metrics_handle.clone()),
+            metrics_handle.clone(),
         )
         .await?;
         tracing::info!(%addr, "initialized health endpoint");
@@ -812,8 +818,13 @@ pub async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let metrics_sampler_task_handle = task_tree.spawn(metrics_sampler_service);
-    tracing::debug!(task_id=%metrics_sampler_task_handle.id(), "Metrics sampler started");
+    let metrics_sampler_stop_handle = if let Some((handle, service)) = metrics_sampler {
+        let task_handle = task_tree.spawn(service);
+        tracing::debug!(task_id=%task_handle.id(), "Metrics sampler started");
+        Some(handle)
+    } else {
+        None
+    };
 
     let admin_rpc_task_handle = task_tree.spawn(admin_rpc_service);
     tracing::debug!(task_id=%admin_rpc_task_handle.id(), "Admin RPC service started");
@@ -901,13 +912,20 @@ pub async fn main() -> anyhow::Result<()> {
         all_stopped &= stop_service("Worker", worker_handle.stop()).await;
         all_stopped &= stop_service("indexer URLs", indexer_urls_handle.stop()).await;
 
-        all_stopped &= stop_service("Metrics sampler", metrics_sampler_handle.stop()).await;
-
         // Stop the health endpoint last: Kubernetes probes /health for as long as the pod runs,
         // so stopping it early makes every clean teardown look like a liveness failure. The
         // worker watermark freezes here, but its staleness threshold dwarfs the teardown ceiling.
+        // The metrics sampler stops in the same step, as it only exists with the endpoint and
+        // drops a sample in progress at once, so it adds no step to the sequence.
         if let Some(handle) = health_stop_handle {
-            all_stopped &= stop_service("Health endpoint", handle.stop()).await;
+            let sampler = metrics_sampler_stop_handle;
+            let stop_both = async move {
+                if let Some(sampler) = sampler {
+                    sampler.stop().await;
+                }
+                handle.stop().await;
+            };
+            all_stopped &= stop_service("Health endpoint", stop_both).await;
         }
 
         // All event producers have stopped; flush buffered diagnostic events to the broker

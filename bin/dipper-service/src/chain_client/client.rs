@@ -471,14 +471,20 @@ fn record_transaction(call: &'static str, outcome: &'static str) {
         .increment(1);
 }
 
-/// The outcome to count a transaction under when it could not be sent.
-fn submit_outcome(err: &ChainClientError) -> &'static str {
-    match err {
+/// Counts 1 transaction for `call` that could not be sent, by why. It never reached the chain.
+fn record_submit_failure(call: &'static str, err: &ChainClientError) {
+    let reason = match err {
         ChainClientError::SubmitFailed(_) => "submit_failed",
         ChainClientError::ContractRevert { .. } => "contract_revert",
         ChainClientError::RpcError(_) => "rpc_error",
         _ => "error",
-    }
+    };
+    metrics::counter!(
+        crate::telemetry::TRANSACTION_SUBMIT_FAILURES,
+        "call" => call,
+        "reason" => reason
+    )
+    .increment(1);
 }
 
 /// Classify the outcome of a nonce-gap fill submission. Pure so the
@@ -924,7 +930,7 @@ impl AlloyChainClient {
                 log_agreement_id,
             )
             .await
-            .inspect_err(|err| record_transaction(call, submit_outcome(err)))?;
+            .inspect_err(|err| record_submit_failure(call, err))?;
 
         match self.wait_for_receipt(tx_hash, RECEIPT_POLL_TIMEOUT).await? {
             ReceiptWait::Mined(true) => {
@@ -936,7 +942,7 @@ impl AlloyChainClient {
                 Err(ChainClientError::TxReverted { tx_hash })
             }
             ReceiptWait::NotSeen { checked } => {
-                record_transaction(call, "dropped");
+                record_transaction(call, if checked { "dropped" } else { "unconfirmed" });
                 tracing::warn!(
                     reconciling = subject,
                     tx_hash = %tx_hash,
@@ -1195,7 +1201,7 @@ impl ChainClient for AlloyChainClient {
         let submitted = self
             .build_and_send_call(manager, calldata, &agreement_id)
             .await
-            .inspect_err(|err| record_transaction("offer", submit_outcome(err)))?;
+            .inspect_err(|err| record_submit_failure("offer", err))?;
 
         let SubmittedTx {
             hash: tx_hash,
@@ -1211,7 +1217,7 @@ impl ChainClient for AlloyChainClient {
                 Err(ChainClientError::TxReverted { tx_hash })
             }
             ReceiptWait::NotSeen { checked } => {
-                record_transaction("offer", "dropped");
+                record_transaction("offer", if checked { "dropped" } else { "unconfirmed" });
                 tracing::warn!(
                     agreement_id = %format_args!("0x{}", agreement_id.iter().map(|b| format!("{b:02x}")).collect::<String>()),
                     tx_hash = %tx_hash,
@@ -1256,7 +1262,7 @@ impl ChainClient for AlloyChainClient {
         let submitted = self
             .build_and_send_call(manager, calldata, agreement_id)
             .await
-            .inspect_err(|err| record_transaction("cancel", submit_outcome(err)))?;
+            .inspect_err(|err| record_submit_failure("cancel", err))?;
 
         // Wait for the receipt so a returned Ok means the cancel mined, not just
         // that it entered the mempool. The dispatch layer then re-reads on-chain
@@ -1275,7 +1281,7 @@ impl ChainClient for AlloyChainClient {
                 Err(ChainClientError::TxReverted { tx_hash })
             }
             ReceiptWait::NotSeen { checked } => {
-                record_transaction("cancel", "dropped");
+                record_transaction("cancel", if checked { "dropped" } else { "unconfirmed" });
                 tracing::warn!(
                     agreement_id = %format_args!("0x{}", agreement_id.iter().map(|b| format!("{b:02x}")).collect::<String>()),
                     tx_hash = %tx_hash,

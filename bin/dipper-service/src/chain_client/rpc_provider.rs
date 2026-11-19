@@ -286,14 +286,16 @@ impl RpcProviderPool {
 
             // Check if we've tried all providers
             if providers_tried >= self.providers.len() {
+                // A named refusal, such as a gas estimate the contract reverts, is the chain's
+                // answer to the call, not a failure to reach it.
+                if let Some(named) = named_refusal {
+                    return Err(named);
+                }
                 metrics::counter!(
                     crate::telemetry::RPC_CALLS_FAILED,
                     "operation" => operation.to_string()
                 )
                 .increment(1);
-                if let Some(named) = named_refusal {
-                    return Err(named);
-                }
 
                 return Err(ChainClientError::RpcError(anyhow::anyhow!(
                     "All {} RPC providers failed for '{}': {}",
@@ -365,6 +367,9 @@ impl RpcProviderPool {
                 Ok(_) => "ok",
                 Err(e) if Self::is_behind(e) => "behind",
                 Err(e) if Self::is_retryable(e) => "retryable_error",
+                // The provider answered, with a JSON-RPC error such as a revert: not a fault of
+                // the provider, so an alert on its errors must not count it.
+                Err(e) if e.is_error_resp() => "refused",
                 Err(_) => "error",
             });
             match answer {
@@ -525,6 +530,46 @@ mod tests {
             1,
             "the healthy endpoint should answer on the first ask"
         );
+    }
+
+    #[tokio::test]
+    async fn a_provider_answering_with_an_error_is_counted_as_refused() {
+        // A JSON-RPC error, such as a revert, is the chain's answer, not the provider failing.
+        let recorder = crate::telemetry::recorder().unwrap();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 0,
+                "error": {"code": 3, "message": "execution reverted"},
+            })))
+            .mount(&server)
+            .await;
+        let url: Url = server.uri().parse().unwrap();
+        let pool = RpcProviderPool::new(vec![url.clone()], Duration::from_secs(5), 0).unwrap();
+
+        let _ = pool
+            .execute("estimate_gas", |provider| async move {
+                provider.get_block_number().await
+            })
+            .await;
+
+        let rendered = handle.render();
+        let requests = |outcome| {
+            crate::test_support::metric_value(
+                &rendered,
+                crate::telemetry::RPC_REQUESTS,
+                &[
+                    ("operation", "estimate_gas"),
+                    ("provider", endpoint_name(&url).as_str()),
+                    ("outcome", outcome),
+                ],
+            )
+        };
+        assert_eq!(requests("refused"), Some(1.0), "{rendered}");
+        assert_eq!(requests("error"), None, "{rendered}");
     }
 
     #[tokio::test]
