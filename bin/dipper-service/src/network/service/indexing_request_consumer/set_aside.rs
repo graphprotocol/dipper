@@ -14,7 +14,8 @@ use thegraph_core::{
 use tokio::sync::watch;
 
 use super::{
-    ProposedTarget, RETRY_BACKOFF, Retries, alert_refused_record, sleep_or_shutdown, stop_requested,
+    ProposedTarget, RETRY_BACKOFF, Retries, Stall, alert_refused_record, sleep_or_shutdown,
+    stop_requested,
 };
 use crate::{
     registry::IndexingRequestRegistry,
@@ -393,7 +394,9 @@ where
             }
             Err(err) => Err(err),
         };
-        finish_ready_request(registry, &request, applied).await;
+        if finish_ready_request(registry, &request, applied, shutdown_rx).await {
+            return true;
+        }
     }
     false
 }
@@ -407,12 +410,14 @@ fn no_quick_answer() -> ApplyError {
 }
 
 /// Removes a ready request that was applied or that its manifest refuses, and leaves any other
-/// in the database to be tried again.
+/// in the database to be tried again; `true` if a stop came first.
 async fn finish_ready_request<R>(
     registry: &R,
     request: &SetAsideRequest,
     applied: Result<Option<IndexingRequestId>, ApplyError>,
-) where
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> bool
+where
     R: SetAsideRequestRegistry + Send + Sync,
 {
     let applied = match applied {
@@ -439,19 +444,54 @@ async fn finish_ready_request<R>(
             false
         }
         Err(ApplyError::ManifestNotFound(err) | ApplyError::ChainCheckUnavailable(err)) => {
-            return log_if_unrecorded(request, wait_longer(registry, request, &err).await);
+            log_if_unrecorded(request, wait_longer(registry, request, &err).await);
+            return false;
         }
         // The database or the job queue failed, and logged it. The request stays ready, so the
         // next pass applies it again: a write already made is then a no-op, and queues its job.
-        Err(ApplyError::Registry(_) | ApplyError::QueueReassess { .. }) => return,
+        Err(ApplyError::Registry(_) | ApplyError::QueueReassess { .. }) => return false,
     };
-    // Removed as the record it was listed from: a request stored for the same subgraph since
-    // then came from a later record, and still has to be applied.
-    let forgotten = registry.forget_set_aside_record(request).await;
-    if applied && matches!(forgotten, Ok(false)) {
-        warn_newer_request_arrived(request);
+    forget_dealt_with(registry, request, applied, shutdown_rx).await
+}
+
+/// Removes `request` now that it is applied (`applied`) or refused; `true` if a stop came first.
+/// A database failure is retried here for as long as it lasts: left ready, the request would be
+/// applied or alerted on again at the next pass, over whatever changed since.
+async fn forget_dealt_with<R>(
+    registry: &R,
+    request: &SetAsideRequest,
+    applied: bool,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> bool
+where
+    R: SetAsideRequestRegistry + Send + Sync,
+{
+    let mut retries = Retries {
+        partition: request.partition,
+        offset: request.offset,
+        stall: Stall::default(),
+    };
+    let mut failed_before = false;
+    loop {
+        // Removed as the record it was listed from: a request stored for the same subgraph
+        // since then came from a later record, and still has to be applied.
+        match registry.forget_set_aside_record(request).await {
+            Ok(was_there) => {
+                // After a failure, a row found gone may be one that failed write removed.
+                if applied && !was_there && !failed_before {
+                    warn_newer_request_arrived(request);
+                }
+                return false;
+            }
+            Err(err) => {
+                failed_before = true;
+                retries.failed("removing it once dealt with", &err);
+                if sleep_or_shutdown(shutdown_rx, RETRY_BACKOFF).await {
+                    return true;
+                }
+            }
+        }
     }
-    log_if_unrecorded(request, forgotten);
 }
 
 /// Says that a request was applied while another for the same subgraph arrived. A later record

@@ -3734,14 +3734,24 @@ mod tests {
         worker: &MockWorker,
         shutdown_rx: &mut watch::Receiver<bool>,
     ) -> bool {
+        apply_ready_checked_by(registry, worker, &SkipChainCheck, shutdown_rx).await
+    }
+
+    /// [`apply_ready`], with `check` deciding what the manifest says of each request.
+    async fn apply_ready_checked_by(
+        registry: &MockRegistry,
+        worker: &MockWorker,
+        check: &dyn RequestChainCheck,
+        shutdown_rx: &mut watch::Receiver<bool>,
+    ) -> bool {
         let events: Arc<dyn SubgraphIndexingAgreementEventsProducer> =
             Arc::new(CapturingEventsProducer::new());
-        let (check, network) = (SkipChainCheck, PROTOCOL_CHAIN_ID);
+        let network = PROTOCOL_CHAIN_ID;
         apply_ready_requests(
             registry,
             worker,
             &events,
-            &check,
+            check,
             network,
             "t",
             0,
@@ -3992,6 +4002,78 @@ mod tests {
             [newer],
             "and the newer one still waits"
         );
+    }
+
+    /// The removal that follows the apply of a request set aside is retried where it is. Left
+    /// to the next pass, the request would be applied again, over whatever changed since.
+    #[tokio::test(start_paused = true)]
+    async fn a_database_failure_while_removing_an_applied_request_is_retried_in_place() {
+        let id = IndexingRequestId::new();
+        let answers = vec![Some(SetTargetOutcome::Inserted { id })];
+        let registry = registry_with_a_request_ready(answers).await;
+        registry.fail_set_aside_writes(2);
+        let worker = MockWorker::new();
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let started = Instant::now();
+
+        let mut stopped = true;
+        let logs = logged(async {
+            stopped = apply_ready(&registry, &worker, &mut shutdown_rx).await;
+        })
+        .await;
+
+        assert!(!stopped, "{logs}");
+        assert_eq!(started.elapsed(), 2 * RETRY_BACKOFF, "{logs}");
+        assert_eq!(applied_counts(&registry), [3], "applied once");
+        assert!(
+            registry.set_aside().is_empty(),
+            "gone before the next fetch"
+        );
+        let failures = logs.matches("failed at removing it once dealt with");
+        assert_eq!(failures.count(), 2, "{logs}");
+    }
+
+    /// A request its manifest refuses is removed the same way, so it is alerted on once.
+    #[tokio::test(start_paused = true)]
+    async fn a_database_failure_while_removing_a_refused_request_is_retried_in_place() {
+        let registry = registry_with_a_request_ready(vec![]).await;
+        registry.fail_set_aside_writes(2);
+        let worker = MockWorker::new();
+        let check = RefusingChainCheck::wrong_chain();
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+        let logs = logged(async {
+            apply_ready_checked_by(&registry, &worker, &check, &mut shutdown_rx).await;
+            apply_ready_checked_by(&registry, &worker, &check, &mut shutdown_rx).await;
+        })
+        .await;
+
+        assert_eq!(alerts(&logs, "studio_request_chain_refused"), 1, "{logs}");
+        assert!(registry.calls().is_empty(), "nothing is applied");
+        assert!(registry.set_aside().is_empty());
+    }
+
+    /// A stop does not wait for the database: the request stays ready, and the next start
+    /// applies it again, which changes nothing and queues its job.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_ends_the_retries_of_a_removal_and_leaves_the_request_ready() {
+        let id = IndexingRequestId::new();
+        let answers = vec![Some(SetTargetOutcome::Inserted { id })];
+        let registry = registry_with_a_request_ready(answers).await;
+        registry.fail_set_aside_writes(usize::MAX);
+        let worker = MockWorker::new();
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+        let stop = async {
+            tokio::time::sleep(Duration::from_secs(12)).await;
+            let _ = shutdown_tx.send(true);
+        };
+        let applying = apply_ready(&registry, &worker, &mut shutdown_rx);
+        let (stopped, ()) = tokio::join!(applying, stop);
+
+        assert!(stopped);
+        assert_eq!(applied_counts(&registry), [3]);
+        assert!(registry.stored()[0].ready, "kept for the next start");
     }
 
     /// End to end: the cancel for a subgraph arrives while its request waits on IPFS. When the
