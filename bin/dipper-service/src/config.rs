@@ -2260,6 +2260,16 @@ impl EventStreamingConfig {
                     .to_string(),
             );
         }
+        // 0 makes every connect time out at once, and the retries that follow blame the brokers.
+        if self
+            .kafka
+            .as_ref()
+            .is_some_and(|kafka| kafka.connect_timeout_secs == 0)
+        {
+            return Err(
+                "event_streaming_config.kafka.connect_timeout_secs must be at least 1".to_string(),
+            );
+        }
         Ok(())
     }
 }
@@ -3380,6 +3390,26 @@ mod tests {
             "event_queue_capacity should default to 1024"
         );
         assert!(config.kafka.is_none(), "kafka should default to None");
+    }
+
+    /// A connect given no time fails every attempt, and the retries that follow blame the brokers.
+    #[test]
+    fn an_event_producer_with_no_time_to_connect_is_rejected() {
+        let config = |timeout: u64| -> EventStreamingConfig {
+            serde_json::from_value(serde_json::json!({
+                "enabled": true,
+                "kafka": { "brokers": ["localhost:9092"], "connect_timeout_secs": timeout },
+            }))
+            .expect("a valid event streaming section")
+        };
+
+        assert!(
+            config(0)
+                .validate()
+                .unwrap_err()
+                .contains("event_streaming_config.kafka.connect_timeout_secs")
+        );
+        assert!(config(1).validate().is_ok());
     }
 
     /// A fully specified section round-trips every field, including the nested Kafka block.
