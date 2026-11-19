@@ -176,7 +176,7 @@ pub struct Config {
 /// How indexing requests are checked against their subgraph manifest's chain. A request
 /// whose manifest can't be read is refused, so a check that can't run never waves it through.
 #[serde_as]
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(custom_debug::CustomDebug, Clone, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RequestChainCheckConfig {
     /// Whether to check at all. Turn it off only where manifests can't be read, or for a
@@ -185,6 +185,7 @@ pub struct RequestChainCheckConfig {
 
     /// The IPFS API subgraph manifests are read from.
     #[serde_as(as = "serde_with::DisplayFromStr")]
+    #[debug(with = debug_endpoint)]
     pub ipfs_url: Url,
 
     /// How long to wait on IPFS for 1 manifest, in seconds. IPFS takes about 30 seconds
@@ -204,11 +205,7 @@ impl RequestChainCheckConfig {
 
     /// The IPFS endpoint named by host, for logs: an IPFS URL can carry credentials.
     pub fn ipfs_host(&self) -> String {
-        match (self.ipfs_url.host_str(), self.ipfs_url.port()) {
-            (Some(host), Some(port)) => format!("{host}:{port}"),
-            (Some(host), None) => host.to_string(),
-            (None, _) => "unnamed endpoint".to_string(),
-        }
+        endpoint_name(&self.ipfs_url)
     }
 }
 
@@ -4192,6 +4189,10 @@ mod tests {
         };
 
         assert_eq!(config.ipfs_host(), "ipfs.example.com:5001");
+        // Startup logs the whole config with Debug, which must leave the credentials out too.
+        let debugged = format!("{config:?}");
+        assert!(!debugged.contains("secret"), "{debugged}");
+        assert!(debugged.contains("ipfs.example.com:5001"), "{debugged}");
     }
 
     #[test]
