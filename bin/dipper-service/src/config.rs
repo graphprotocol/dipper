@@ -1965,8 +1965,13 @@ pub struct DbConfig {
     /// The database auth username
     pub username: String,
 
-    /// The database auth password
-    pub password: Hidden<String>,
+    /// The database auth password. Leave it out for a database that asks for none, such as one
+    /// reached through the Cloud SQL Auth Proxy with automatic IAM database authentication, where
+    /// the proxy's identity stands in for a password. Without it, dipper sets no password of its
+    /// own: the Postgres driver may still find one in `PGPASSWORD` or `~/.pgpass`, and answers a
+    /// server that asks for one with an empty password.
+    #[serde(default)]
+    pub password: Option<Hidden<String>>,
 
     /// The maximum number of connections to the database
     #[serde(default)]
@@ -4446,6 +4451,18 @@ mod tests {
             HealthConfig::default().validate(admin_rpc).is_ok(),
             "distinct ports are fine"
         );
+    }
+
+    #[test]
+    fn db_config_may_leave_the_password_out() {
+        // A database that asks for no password (one reached through the Cloud SQL Auth Proxy with
+        // automatic IAM authentication, or a local one trusting its clients) needs none here.
+        let db: Result<DbConfig, _> = serde_json::from_value(serde_json::json!({
+            "url": "postgres://127.0.0.1:5432/dipper",
+            "username": "dipper",
+        }));
+        let db = db.expect("a db section without a password is valid");
+        assert!(db.password.is_none(), "no password is set");
     }
 
     #[test]

@@ -4,7 +4,7 @@ Kubernetes manifests for deploying the dipper service.
 
 ## Prerequisites
 
-- PostgreSQL database accessible from the cluster
+- PostgreSQL database accessible from the cluster. `db.password` can be left out where the database asks for none, as through the Cloud SQL Auth Proxy with automatic IAM database authentication
 - Configuration secrets managed separately
 - IISA service reachable at startup (dipper health-checks IISA and exits if it is unreachable)
 
