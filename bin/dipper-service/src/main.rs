@@ -127,7 +127,7 @@ pub async fn main() -> anyhow::Result<()> {
     // Before connecting, so a pool too small for the worker loops is refused at once rather
     // than after the RPC, database and indexer URL startup steps.
     if let Err(err) = conf.validate_db_pool() {
-        anyhow::bail!("invalid db config: {err}");
+        anyhow::bail!("invalid config: {err}");
     }
     // 1 line for each background service that will not run, so none is off unnoticed.
     for off in conf.background_services_off() {
