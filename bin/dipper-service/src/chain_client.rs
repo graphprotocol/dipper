@@ -111,8 +111,8 @@ impl AgreementOnChain {
 #[async_trait]
 pub trait ChainClient {
     /// Offer an RCA via `RecurringAgreementManager.offerAgreement` (manager as
-    /// payer); returns the tx hash once mined. No crash-recovery idempotency,
-    /// so a re-run re-sends — pending validation of the contract's re-offer path.
+    /// payer); returns the tx hash once mined. Sends unconditionally: a caller that
+    /// may be repeating an offer checks `agreement_on_chain` first.
     async fn offer_via_manager(
         &self,
         rca: &RecurringCollectionAgreement,

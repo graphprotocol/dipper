@@ -13,9 +13,14 @@
 //!    to the RecurringCollector. The indexer-agent then calls
 //!    `acceptIndexingAgreement` — the contract checks `rcaOffers`.
 //!
-//! Nothing here is idempotent across a crash: a re-run submits the offer again. The
-//! `rcaOffers` mapping on `RecurringCollector` sits in an ERC-7201 namespaced storage
-//! struct with no public getter, so the chain cannot cheaply be asked what already landed.
+//! A run of this job can repeat after its offer mined: the job is dropped when dipper crashes,
+//! or when shutdown runs out of time for it, and its row runs again on the next start. So before
+//! sending, it asks the RecurringCollector for the agreement (`getAgreementDetails`). The
+//! agreement's id is derived from the offer's terms, so if the chain shows it waiting to be
+//! accepted, accepted, or ended by the indexer, this offer landed already, and the job sends
+//! nothing. 2 cases still send again: an offer still in the mempool when dipper stopped, which
+//! is not on-chain yet, and one already withdrawn or past its deadline, which the chain no longer
+//! tells from one never made. What the contract does with such a re-offer is unverified.
 
 use std::{sync::Arc, time::Duration};
 
@@ -25,7 +30,7 @@ use url::Url;
 
 use crate::{
     cancel_dispatch::{LiveCancel, cancel_if_live, log_unconfirmed},
-    chain_client::{ChainClient, ChainClientError, decode_revert_reason},
+    chain_client::{AgreementOnChain, ChainClient, ChainClientError, decode_revert_reason},
     config::IndexingAgreementConfig,
     indexer_rpc_client::into_sol_rca,
     registry::{AgreementRegistry, IndexingAgreement, IndexingAgreementStatus},
@@ -97,6 +102,14 @@ where
         return Err(JobError::Fatal(anyhow::anyhow!(
             "derived on-chain ID drift"
         )));
+    }
+
+    if offer_already_made(&ctx.chain_client, agreement_id).await? {
+        // Fall through to the check after a send: a cancel that came in since still withdraws it.
+        if let Some(agreement) = cancelled_meanwhile(&ctx.registry, agreement_id).await {
+            return withdraw_offer_if_stored(&ctx, &agreement).await;
+        }
+        return Ok(());
     }
 
     tracing::info!(
@@ -190,6 +203,37 @@ where
     // pick up the pending_rca_proposals row and call acceptIndexingAgreement. No
     // further enqueue needed; chain_listener detects the acceptance event.
     Ok(())
+}
+
+/// Whether the chain shows the agreement live or ended by its indexer, which only an earlier
+/// run's offer can have brought about. A failed read retries the job: the offer may be there, and a 2nd send of it is what
+/// this check exists to prevent.
+async fn offer_already_made<T: ChainClient>(
+    chain_client: &T,
+    agreement_id: &IndexingAgreementId,
+) -> JobResult<bool> {
+    match chain_client
+        .agreement_on_chain(agreement_id.as_bytes())
+        .await
+    {
+        Ok(AgreementOnChain::NotLive) => Ok(false),
+        Ok(state) => {
+            tracing::info!(
+                agreement_id = %agreement_id,
+                state = ?state,
+                "Offer already on-chain from an earlier run, not sending it again"
+            );
+            Ok(true)
+        }
+        Err(err) => {
+            tracing::warn!(
+                agreement_id = %agreement_id,
+                error = %err,
+                "Could not check whether the offer is already on-chain, will retry"
+            );
+            Err(JobError::Retryable(err.into(), TRANSIENT_RETRY_BASE))
+        }
+    }
 }
 
 /// What this run of the job does with its agreement.
@@ -320,7 +364,6 @@ mod tests {
 
     use super::*;
     use crate::{
-        chain_client::AgreementOnChain,
         indexer_rpc_client::compute_on_chain_id,
         registry::{
             IndexingAgreement, IndexingAgreementTerms, IndexingAgreementTermsMetadata,
@@ -370,6 +413,10 @@ mod tests {
         /// Whether the agreement's offer (or the agreement) is live on-chain: set
         /// by a mined offer, cleared by a cancel.
         on_chain: Arc<AtomicBool>,
+        /// What the chain shows of the agreement in place of `on_chain`, when set.
+        on_chain_as: Option<AgreementOnChain>,
+        /// When set, reading the agreement from the chain fails.
+        chain_read_fails: bool,
         fail_cancel: bool,
     }
 
@@ -427,6 +474,12 @@ mod tests {
             &self,
             _agreement_id: &[u8; 16],
         ) -> Result<AgreementOnChain, ChainClientError> {
+            if self.chain_read_fails {
+                return Err(ChainClientError::RpcError(anyhow::anyhow!("rpc down")));
+            }
+            if let Some(state) = self.on_chain_as {
+                return Ok(state);
+            }
             Ok(AgreementOnChain::live_if(
                 self.on_chain.load(Ordering::SeqCst),
             ))
@@ -517,6 +570,8 @@ mod tests {
                 cancel_mid_send: None,
                 cancelled: Arc::default(),
                 on_chain: Arc::default(),
+                on_chain_as: None,
+                chain_read_fails: false,
                 fail_cancel: false,
             },
             agreement_conf: Arc::new(test_agreement_conf()),
@@ -525,6 +580,71 @@ mod tests {
 
     fn test_agreement_conf() -> crate::config::IndexingAgreementConfig {
         crate::config::IndexingAgreementConfig::for_tests()
+    }
+
+    impl Ctx<MockRegistry, MockChainClient> {
+        /// A context on the same agreement row and chain state, as the next run of the job sees
+        /// them. Its offer result is the original's, so only 1 of the 2 may send.
+        fn clone_for_rerun(&self) -> Self {
+            Ctx {
+                registry: MockRegistry {
+                    agreement: Arc::clone(&self.registry.agreement),
+                    later_reads_fail: false,
+                    reads: AtomicU32::new(0),
+                },
+                chain_client: MockChainClient {
+                    offer_result: Mutex::new(self.chain_client.offer_result.lock().unwrap().take()),
+                    cancel_mid_send: None,
+                    cancelled: Arc::clone(&self.chain_client.cancelled),
+                    on_chain: Arc::clone(&self.chain_client.on_chain),
+                    on_chain_as: None,
+                    chain_read_fails: false,
+                    fail_cancel: false,
+                },
+                agreement_conf: Arc::clone(&self.agreement_conf),
+            }
+        }
+    }
+
+    /// A run after the offer mined, as after a crash or a shutdown that dropped the job before
+    /// it finished, finds the offer on-chain and sends nothing.
+    #[tokio::test]
+    async fn a_rerun_after_the_offer_mined_sends_nothing() {
+        let agreement = make_test_agreement();
+        let msg = make_message(agreement.id);
+        let ctx = ctx_with_offer_result(agreement, Ok(Some(B256::repeat_byte(0xab))));
+        handle(ctx.clone_for_rerun(), &msg)
+            .await
+            .expect("the 1st run offers");
+        // The mock's offer result is spent, so a 2nd send would panic.
+        handle(ctx, &msg)
+            .await
+            .expect("the rerun finds the offer and stops");
+    }
+
+    /// An agreement the chain shows live, or ended by its indexer, was offered already: an
+    /// indexer that ended it was offered it first.
+    #[tokio::test]
+    async fn sends_nothing_for_an_agreement_already_on_chain() {
+        for state in [AgreementOnChain::Live, AgreementOnChain::EndedByIndexer] {
+            let agreement = make_test_agreement();
+            let msg = make_message(agreement.id);
+            let mut ctx = ctx_with(agreement, None);
+            ctx.chain_client.on_chain_as = Some(state);
+            handle(ctx, &msg).await.expect("nothing left to offer");
+        }
+    }
+
+    /// Without an answer from the chain the offer may already be there, so the job tries again
+    /// later rather than send it blind.
+    #[tokio::test]
+    async fn retries_without_sending_when_the_chain_cannot_be_asked() {
+        let agreement = make_test_agreement();
+        let msg = make_message(agreement.id);
+        let mut ctx = ctx_with(agreement, None);
+        ctx.chain_client.chain_read_fails = true;
+        let result = handle(ctx, &msg).await;
+        assert!(matches!(result, Err(JobError::Retryable(..))), "{result:?}");
     }
 
     #[tokio::test]
