@@ -319,7 +319,7 @@ impl Config {
              admin_rpc.gateway_operator_allowlist. Requests are stored under who asked, so a \
              cancel from Kafka will not close a request opened over the admin RPC, and a request \
              from Kafka will open a 2nd one for the same deployment. Set requested_by to the \
-             address Studio signs the admin RPC with"
+             allowlisted address that opens requests over the admin RPC"
         ))
     }
 
@@ -2295,7 +2295,7 @@ pub struct IndexingRequestConsumerConfig {
 
     /// The identity recorded as the requester on consumed requests, since
     /// Kafka messages carry no signature to recover one from. Use the address
-    /// Studio signs the admin RPC with, so both doors share request rows.
+    /// that opens requests over the admin RPC, so both doors share request rows.
     pub requested_by: Address,
 
     /// How long a fetch waits server-side for new records before returning
@@ -3696,7 +3696,7 @@ mod tests {
     /// would open a 2nd one beside it.
     #[test]
     fn a_consumer_identity_the_admin_rpc_does_not_allow_gets_a_startup_warning() {
-        const STUDIO: &str = "0x8f8c426f956876325b1e037c6eae9b189952994c";
+        const OPERATOR: &str = "0x8f8c426f956876325b1e037c6eae9b189952994c";
         const OTHER: &str = "0x1111111111111111111111111111111111111111";
         let warning = |requested_by: Option<&str>, allowed: &[&str]| {
             example_config_edited(|config| {
@@ -3711,16 +3711,19 @@ mod tests {
             .consumer_requester_warning()
         };
 
-        let warned = warning(Some(OTHER), &[STUDIO]).expect("a warning");
+        let warned = warning(Some(OTHER), &[OPERATOR]).expect("a warning");
         assert!(warned.contains("indexing_request_consumer.requested_by"));
         assert!(warned.contains("admin_rpc.gateway_operator_allowlist"));
         assert!(warned.to_lowercase().contains(OTHER), "{warned}");
+        // Studio only writes to the topic, so the warning must not send anyone looking for
+        // an address Studio signs with.
+        assert!(!warned.contains("Studio signs"), "{warned}");
         assert!(
             warning(Some(OTHER), &[]).is_some(),
             "an empty allowlist does not hold it either"
         );
-        assert_eq!(warning(Some(STUDIO), &[OTHER, STUDIO]), None);
-        assert_eq!(warning(None, &[STUDIO]), None, "no consumer, no warning");
+        assert_eq!(warning(Some(OPERATOR), &[OTHER, OPERATOR]), None);
+        assert_eq!(warning(None, &[OPERATOR]), None, "no consumer, no warning");
     }
 
     /// Without the listener dipper never learns an offer was accepted, so leaving the section out
