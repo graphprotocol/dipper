@@ -5,6 +5,7 @@ use dipper_rpc::admin::{
 use jsonrpsee::RpcModule;
 
 use crate::{
+    network::service::indexing_request_consumer::SetAsideRequestRemoval,
     registry::{AgreementRegistry, IndexingRequestRegistry, RequestOrderRegistry},
     worker::service::WorkerQueue,
 };
@@ -27,6 +28,7 @@ pub(super) fn rpc_handlers<S, R, W>(ctx: S) -> RpcModule<S>
 where
     R: IndexingRequestRegistry
         + RequestOrderRegistry
+        + SetAsideRequestRemoval
         + AgreementRegistry
         + Clone
         + Send

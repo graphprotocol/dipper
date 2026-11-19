@@ -4,7 +4,7 @@ Kubernetes manifests for deploying the dipper service.
 
 ## Prerequisites
 
-- PostgreSQL database accessible from the cluster
+- PostgreSQL database accessible from the cluster. Ask for an encrypted, verified connection in `db.url`, for example `postgres://<host>:5432/dipper?sslmode=verify-full&sslrootcert=/config/db-ca.pem` with the server's CA mounted next to `config.json`, where `<host>` is a name the server's certificate covers (a managed database may give one, such as Cloud SQL's instance DNS name with its shared CA). `sslmode=verify-ca` checks the name as well for now, so it is no way round a certificate that does not name the address dipper uses; reach such a database through a proxy that authenticates for dipper instead, such as the Cloud SQL Auth Proxy. `db.password` can be left out where the database asks for none, as through the Cloud SQL Auth Proxy with automatic IAM database authentication
 - Configuration secrets managed separately
 - IISA service reachable at startup (dipper health-checks IISA, waits up to `iisa.startup_wait`, 180s by default, and exits if it stays unreachable)
 
@@ -22,6 +22,10 @@ Kubernetes manifests for deploying the dipper service.
 3. Apply dipper manifests
 
 Dipper requires IISA at startup: it runs an IISA health check, retrying with growing pauses for up to `iisa.startup_wait` (180s by default, enough for IISA's own rollout), and exits if IISA is still not reachable. It waits for the database the same way, for up to `db.connect_wait` (120s by default), but exits at once if the database refuses it, as with a wrong password. Deploy and verify IISA before starting dipper.
+
+Run exactly 1 replica. The signer's nonce and the locks that keep 2 jobs from acting on the same agreement live in the process, so 2 pods side by side could send transactions on the same nonce or act on an agreement twice. `deployment.yaml` sets `strategy: Recreate` for that reason: a rollout stops the old pod before the new one starts, at the cost of a gap while the new pod starts up. Keep it if you deploy with other manifests.
+
+`Recreate` only covers rollouts. When a pod is evicted, deleted or its node drained, Kubernetes starts the replacement while the old pod is still shutting down, and the old pod's worker keeps taking jobs until its turn in the stop sequence comes. Until dipper holds a lock of its own for as long as it runs, keep such disruptions to planned windows: set a maintenance window on the cluster, and drain a node only after scaling dipper to 0.
 
 ## Configuration
 
