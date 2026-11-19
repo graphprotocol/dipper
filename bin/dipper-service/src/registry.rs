@@ -1156,7 +1156,14 @@ impl crate::network::service::indexing_request_consumer::LockConnection
     }
 
     async fn is_alive(&mut self) -> bool {
-        dipper_pgregistry::AdvisoryLockConnection::is_alive(self).await
+        match dipper_pgregistry::AdvisoryLockConnection::ping(self).await {
+            Ok(()) => true,
+            Err(error) => {
+                // The caller only learns the lock is gone, so the reason is logged here.
+                tracing::warn!(%error, "the consumer lock's connection did not answer");
+                false
+            }
+        }
     }
 
     async fn close(self: Box<Self>) {

@@ -566,7 +566,13 @@ async fn held_or_stopped(
 ) -> Option<bool> {
     tokio::select! {
         _ = rx_stop.recv() => None,
-        held = tokio::time::timeout(LOCK_CALL_TIMEOUT, lock.is_alive()) => Some(held.unwrap_or(false)),
+        held = tokio::time::timeout(LOCK_CALL_TIMEOUT, lock.is_alive()) => Some(held.unwrap_or_else(|_| {
+            tracing::warn!(
+                waited = ?LOCK_CALL_TIMEOUT,
+                "the consumer lock's connection gave no answer in time"
+            );
+            false
+        })),
     }
 }
 

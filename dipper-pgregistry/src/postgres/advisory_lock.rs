@@ -68,7 +68,13 @@ impl AdvisoryLockConnection {
     /// Whether the connection still answers. A lock taken on it is held exactly that long.
     /// Asking also counts as use, so it puts off the idle timeout the connection was opened with.
     pub async fn is_alive(&mut self) -> bool {
-        self.conn.ping().await.is_ok()
+        self.ping().await.is_ok()
+    }
+
+    /// Asks the connection to answer, as [`Self::is_alive`] does, and says why it did not.
+    pub async fn ping(&mut self) -> Result<()> {
+        self.conn.ping().await?;
+        Ok(())
     }
 
     /// Closes the connection, which gives the lock up at once.
