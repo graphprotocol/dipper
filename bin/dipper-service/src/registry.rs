@@ -1098,6 +1098,233 @@ impl crate::network::service::chain_listener::ChainListenerStateRegistry for Reg
     }
 }
 
+#[async_trait]
+impl crate::network::service::indexing_request_consumer::KafkaConsumerOffsetRegistry
+    for RegistryProvider
+{
+    async fn get_kafka_consumer_offset(
+        &self,
+        topic: &str,
+        partition_id: i32,
+    ) -> RegistryResult<Option<i64>> {
+        self.inner
+            .get_kafka_consumer_offset(topic, partition_id)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn set_kafka_consumer_offset(
+        &self,
+        topic: &str,
+        partition_id: i32,
+        next_offset: i64,
+    ) -> RegistryResult<()> {
+        self.inner
+            .set_kafka_consumer_offset(topic, partition_id, next_offset)
+            .await
+            .map_err(Into::into)
+    }
+}
+
+/// A request set aside by the Studio consumer, as the database stores it.
+fn stored_set_aside_request(
+    request: &crate::network::service::indexing_request_consumer::SetAsideRequest,
+) -> RegistryResult<dipper_pgregistry::SetAsideRequest> {
+    let num_candidates = i32::try_from(request.num_candidates).map_err(|_| Error::TooLarge {
+        field: "num_candidates",
+        value: request.num_candidates,
+    })?;
+    Ok(dipper_pgregistry::SetAsideRequest {
+        requested_by: request.requested_by,
+        deployment_id: request.deployment_id,
+        deployment_chain_id: request.deployment_chain_id,
+        num_candidates,
+        topic: request.topic.clone(),
+        partition_id: request.partition,
+        record_offset: request.offset,
+        event_id: request.event_id.clone(),
+        reason: request.reason.clone(),
+        attempts: i32::try_from(request.attempts).unwrap_or(i32::MAX),
+        waited_secs: i64::try_from(request.waited.as_secs()).unwrap_or(i64::MAX),
+    })
+}
+
+/// A request set aside by the Studio consumer, as read back from the database.
+fn read_set_aside_request(
+    row: dipper_pgregistry::SetAsideRequest,
+) -> crate::network::service::indexing_request_consumer::SetAsideRequest {
+    crate::network::service::indexing_request_consumer::SetAsideRequest {
+        requested_by: row.requested_by,
+        deployment_id: row.deployment_id,
+        deployment_chain_id: row.deployment_chain_id,
+        // The table lets none of these 3 be negative. A count that were would be refused when
+        // applied as too large to store, where 0 would cancel the request.
+        num_candidates: usize::try_from(row.num_candidates).unwrap_or(usize::MAX),
+        topic: row.topic,
+        partition: row.partition_id,
+        offset: row.record_offset,
+        event_id: row.event_id,
+        reason: row.reason,
+        attempts: u32::try_from(row.attempts).unwrap_or(u32::MAX),
+        waited: std::time::Duration::from_secs(u64::try_from(row.waited_secs).unwrap_or(0)),
+    }
+}
+
+/// A wait in whole seconds, as the database takes it.
+fn whole_seconds(wait: std::time::Duration) -> i64 {
+    i64::try_from(wait.as_secs()).unwrap_or(i64::MAX)
+}
+
+#[async_trait]
+impl crate::network::service::indexing_request_consumer::SetAsideRequestRemoval
+    for RegistryProvider
+{
+    async fn forget_set_aside_request(
+        &self,
+        requested_by: Address,
+        deployment_id: DeploymentId,
+        deployment_chain_id: ChainId,
+    ) -> RegistryResult<bool> {
+        self.inner
+            .forget_set_aside_studio_request(requested_by, deployment_id, deployment_chain_id)
+            .await
+            .map_err(Into::into)
+    }
+}
+
+#[async_trait]
+impl crate::network::service::indexing_request_consumer::SetAsideRequestRegistry
+    for RegistryProvider
+{
+    async fn set_aside_request(
+        &self,
+        request: &crate::network::service::indexing_request_consumer::SetAsideRequest,
+        retry_in: std::time::Duration,
+    ) -> RegistryResult<bool> {
+        self.inner
+            .set_aside_studio_request(&stored_set_aside_request(request)?, whole_seconds(retry_in))
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn forget_set_aside_record(
+        &self,
+        request: &crate::network::service::indexing_request_consumer::SetAsideRequest,
+    ) -> RegistryResult<bool> {
+        self.inner
+            .forget_set_aside_studio_record(&stored_set_aside_request(request)?)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn due_set_aside_requests(
+        &self,
+        topic: &str,
+    ) -> RegistryResult<Vec<crate::network::service::indexing_request_consumer::SetAsideRequest>>
+    {
+        let rows = self.inner.get_due_set_aside_studio_requests(topic).await?;
+        Ok(rows.into_iter().map(read_set_aside_request).collect())
+    }
+
+    async fn ready_set_aside_requests(
+        &self,
+        topic: &str,
+        partition: i32,
+    ) -> RegistryResult<Vec<crate::network::service::indexing_request_consumer::SetAsideRequest>>
+    {
+        let rows = self
+            .inner
+            .get_ready_set_aside_studio_requests(topic, partition)
+            .await?;
+        Ok(rows.into_iter().map(read_set_aside_request).collect())
+    }
+
+    async fn mark_set_aside_request_ready(
+        &self,
+        request: &crate::network::service::indexing_request_consumer::SetAsideRequest,
+    ) -> RegistryResult<()> {
+        self.inner
+            .mark_set_aside_studio_request_ready(&stored_set_aside_request(request)?)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn retry_set_aside_request_later(
+        &self,
+        request: &crate::network::service::indexing_request_consumer::SetAsideRequest,
+        reason: &str,
+        retry_in: std::time::Duration,
+    ) -> RegistryResult<()> {
+        let request = stored_set_aside_request(request)?;
+        self.inner
+            .retry_set_aside_studio_request_later(&request, reason, whole_seconds(retry_in))
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn claim_still_waiting_requests(
+        &self,
+        topic: &str,
+        waiting: std::time::Duration,
+    ) -> RegistryResult<Vec<crate::network::service::indexing_request_consumer::SetAsideRequest>>
+    {
+        let rows = self
+            .inner
+            .claim_still_waiting_studio_requests(topic, whole_seconds(waiting))
+            .await?;
+        Ok(rows.into_iter().map(read_set_aside_request).collect())
+    }
+}
+
+#[async_trait]
+impl crate::network::service::indexing_request_consumer::ConsumerLock for RegistryProvider {
+    async fn consumer_lock_connection(
+        &self,
+        key: i64,
+        name: &str,
+        idle_timeout: std::time::Duration,
+    ) -> RegistryResult<Box<dyn crate::network::service::indexing_request_consumer::LockConnection>>
+    {
+        let connection = self
+            .inner
+            .advisory_lock_connection(key, name, idle_timeout)
+            .await?;
+        Ok(Box::new(connection))
+    }
+}
+
+#[async_trait]
+impl crate::network::service::indexing_request_consumer::LockConnection
+    for dipper_pgregistry::AdvisoryLockConnection
+{
+    fn idle_timeout_refused(&self) -> Option<&str> {
+        dipper_pgregistry::AdvisoryLockConnection::idle_timeout_refused(self)
+    }
+
+    async fn try_lock(&mut self) -> RegistryResult<bool> {
+        Ok(dipper_pgregistry::AdvisoryLockConnection::try_lock(self).await?)
+    }
+
+    async fn is_alive(&mut self) -> bool {
+        match dipper_pgregistry::AdvisoryLockConnection::ping(self).await {
+            Ok(()) => true,
+            Err(error) => {
+                // The caller only learns the lock is gone, so the reason is logged here.
+                tracing::warn!(%error, "the consumer lock's connection did not answer");
+                false
+            }
+        }
+    }
+
+    async fn close(self: Box<Self>) {
+        // The lock goes with the connection either way; a failed goodbye only delays it until
+        // the database notices the socket has closed.
+        if let Err(error) = dipper_pgregistry::AdvisoryLockConnection::close(*self).await {
+            tracing::debug!(%error, "the consumer lock's connection did not close cleanly");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use dipper_core::ids::IndexingAgreementId;
