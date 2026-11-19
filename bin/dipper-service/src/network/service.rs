@@ -11,3 +11,4 @@ pub mod indexer_urls;
 pub mod indexing_request_consumer;
 pub mod liveness_checker;
 pub mod reassignment;
+pub mod suggested_minimums;
