@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.3](https://github.com/graphprotocol/dipper/compare/v0.3.2...v0.3.3) (2026-11-19)
+
+
+### Added
+
+* apply Studio's indexing requests from the Redpanda topic ([#753](https://github.com/graphprotocol/dipper/issues/753)) ([13793e0](https://github.com/graphprotocol/dipper/commit/13793e0acce5219b5c3ea891810511dd1db76312))
+
 ## [0.3.2](https://github.com/graphprotocol/dipper/compare/v0.3.1...v0.3.2) (2026-11-18)
 
 
