@@ -27,7 +27,7 @@ use tokio::{
     time::Instant,
 };
 
-use self::set_aside::{SET_ASIDE_AFTER, set_aside};
+use self::set_aside::{SET_ASIDE_AFTER, apply_ready_requests, check_set_aside_requests, set_aside};
 pub use self::set_aside::{SetAsideRequest, SetAsideRequestRegistry};
 use crate::{
     config::{IndexingRequestConsumerConfig, MAX_NUM_CANDIDATES},
@@ -395,8 +395,18 @@ where
     );
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let serving = partitions.len();
     let mut tasks = partition_loops(ctx, consumer, partitions, &shutdown_rx);
-    let ended = partition_loops_ended(rx_stop, &mut tasks, consumer, topic, &mut held).await;
+    // Under the lock like the loops, and stopped with them: only the dipper that reads the
+    // topic reads the manifests of the requests it set aside.
+    tasks.spawn(check_set_aside_requests(
+        ctx.registry.clone(),
+        Arc::clone(&ctx.chain_check),
+        topic.to_string(),
+        shutdown_rx.clone(),
+    ));
+    let ended =
+        partition_loops_ended(rx_stop, &mut tasks, serving, consumer, topic, &mut held).await;
 
     let _ = shutdown_tx.send(true);
     partition_loops_joined(&mut tasks, &mut held).await;
@@ -640,17 +650,17 @@ async fn first_partitions<C: TopicSource>(
     }
 }
 
-/// Waits for the reason to stop the partition loops. A loop only returns on shutdown, so one
-/// ending early panicked or hit a bug, and the service ends with an error, which restarts
-/// dipper. So it does when the topic gains partitions. A lost lock only stops the reading.
+/// Waits for the reason to stop the partition loops. A task only returns on shutdown, so one
+/// ending early panicked or hit a bug, and the service ends with an error, which restarts dipper.
+/// So it does when the topic gains partitions past `serving`. A lost lock only stops the reading.
 async fn partition_loops_ended<C: TopicSource>(
     rx_stop: &mut mpsc::Receiver<()>,
     tasks: &mut JoinSet<()>,
+    serving: usize,
     consumer: &Reconnecting<C>,
     topic: &str,
     held: &mut HeldLock<'_>,
 ) -> Ended {
-    let serving = tasks.len();
     let mut metadata_check = tokio::time::interval(PARTITION_METADATA_CHECK_INTERVAL);
     metadata_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -661,13 +671,13 @@ async fn partition_loops_ended<C: TopicSource>(
             },
             joined = tasks.join_next() => return Ended::Fault(match joined {
                 Some(Ok(())) => anyhow::anyhow!(
-                    "an indexing request consumer partition loop exited unexpectedly"
+                    "an indexing request consumer task exited unexpectedly"
                 ),
                 Some(Err(err)) => anyhow::anyhow!(
-                    "an indexing request consumer partition loop panicked: {err}"
+                    "an indexing request consumer task panicked: {err}"
                 ),
                 None => anyhow::anyhow!(
-                    "the indexing request consumer had no partition loops to run"
+                    "the indexing request consumer had no tasks to run"
                 ),
             }),
             _ = metadata_check.tick() => {
@@ -835,6 +845,22 @@ async fn partition_loop<C, R, W>(
     tracing::debug!(partition, next_offset, "partition consumer resuming");
 
     loop {
+        // Between fetches, in the task that applies this partition's records: a request set
+        // aside and a later record for the same subgraph can then never overtake each other.
+        if apply_ready_requests(
+            &registry,
+            &worker_queue,
+            &events,
+            chain_check.as_ref(),
+            protocol_chain_id,
+            &topic,
+            partition,
+            &mut shutdown_rx,
+        )
+        .await
+        {
+            return;
+        }
         let Some(fetch) = with_consumer(&consumer, &mut shutdown_rx, |c| async move {
             c.fetch(partition, next_offset, fetch_max_bytes, max_wait_ms)
                 .await
@@ -1586,7 +1612,10 @@ mod tests {
     use thegraph_core::{DeploymentId, deployment_id};
     use url::Url;
 
-    use super::{set_aside::SET_ASIDE_EVENT, *};
+    use super::{
+        set_aside::{SET_ASIDE_EVENT, STILL_WAITING_EVENT, retry_wait},
+        *,
+    };
     use crate::{
         registry::{
             IndexingRequest as IndexingRequestRecord, Result as RegistryResult, SetTargetOutcome,
@@ -1862,6 +1891,27 @@ mod tests {
     struct Stored {
         request: SetAsideRequest,
         set_aside_at: Instant,
+        next_attempt_at: Instant,
+        ready: bool,
+        alerted_on_as_still_waiting: bool,
+    }
+
+    impl Stored {
+        /// The request as the database returns it, with how long it has waited.
+        fn listed(&self) -> SetAsideRequest {
+            SetAsideRequest {
+                waited: self.set_aside_at.elapsed(),
+                ..self.request.clone()
+            }
+        }
+
+        /// Whether this is still `request` as it was listed, not a later record's request.
+        fn is(&self, request: &SetAsideRequest) -> bool {
+            let record = |request: &SetAsideRequest| {
+                (request.topic.clone(), request.partition, request.offset)
+            };
+            key_of(&self.request) == key_of(request) && record(&self.request) == record(request)
+        }
     }
 
     impl MockRegistry {
@@ -2007,17 +2057,11 @@ mod tests {
         async fn set_aside_request(
             &self,
             request: &SetAsideRequest,
-            _retry_in: Duration,
+            retry_in: Duration,
         ) -> RegistryResult<bool> {
             self.set_aside_write()?;
             let mut rows = self.set_aside.lock().expect("poisoned");
-            let record = |request: &SetAsideRequest| {
-                (request.topic.clone(), request.partition, request.offset)
-            };
-            let kept = rows
-                .iter()
-                .find(|stored| key_of(&stored.request) == key_of(request));
-            if kept.is_some_and(|stored| record(&stored.request) == record(request)) {
+            if rows.iter().any(|stored| stored.is(request)) {
                 return Ok(false);
             }
             rows.retain(|stored| key_of(&stored.request) != key_of(request));
@@ -2028,6 +2072,9 @@ mod tests {
                     ..request.clone()
                 },
                 set_aside_at: Instant::now(),
+                next_attempt_at: Instant::now() + retry_in,
+                ready: false,
+                alerted_on_as_still_waiting: false,
             });
             self.note(format!("set aside {}", request.offset));
             Ok(true)
@@ -2046,6 +2093,80 @@ mod tests {
             rows.retain(|stored| key_of(&stored.request) != key);
             self.note("forget".to_string());
             Ok(rows.len() < before)
+        }
+
+        async fn due_set_aside_requests(
+            &self,
+            topic: &str,
+        ) -> RegistryResult<Vec<SetAsideRequest>> {
+            let mut due = self.stored();
+            let now = Instant::now();
+            due.retain(|stored| {
+                stored.request.topic == topic && !stored.ready && stored.next_attempt_at <= now
+            });
+            due.sort_by_key(|stored| stored.next_attempt_at);
+            Ok(due.iter().map(Stored::listed).collect())
+        }
+
+        async fn ready_set_aside_requests(
+            &self,
+            topic: &str,
+            partition: i32,
+        ) -> RegistryResult<Vec<SetAsideRequest>> {
+            let mut ready = self.stored();
+            ready.retain(|stored| {
+                let request = &stored.request;
+                stored.ready && request.topic == topic && request.partition == partition
+            });
+            ready.sort_by_key(|stored| stored.request.offset);
+            Ok(ready.iter().map(Stored::listed).collect())
+        }
+
+        async fn mark_set_aside_request_ready(
+            &self,
+            request: &SetAsideRequest,
+        ) -> RegistryResult<()> {
+            self.set_aside_write()?;
+            let mut rows = self.set_aside.lock().expect("poisoned");
+            if let Some(stored) = rows.iter_mut().find(|stored| stored.is(request)) {
+                stored.ready = true;
+                self.note(format!("ready {}", request.offset));
+            }
+            Ok(())
+        }
+
+        async fn retry_set_aside_request_later(
+            &self,
+            request: &SetAsideRequest,
+            reason: &str,
+            retry_in: Duration,
+        ) -> RegistryResult<()> {
+            self.set_aside_write()?;
+            let mut rows = self.set_aside.lock().expect("poisoned");
+            if let Some(stored) = rows.iter_mut().find(|stored| stored.is(request)) {
+                stored.request.attempts += 1;
+                stored.request.reason = reason.to_string();
+                stored.next_attempt_at = Instant::now() + retry_in;
+                stored.ready = false;
+            }
+            Ok(())
+        }
+
+        async fn claim_still_waiting_requests(
+            &self,
+            topic: &str,
+            waiting: Duration,
+        ) -> RegistryResult<Vec<SetAsideRequest>> {
+            let mut rows = self.set_aside.lock().expect("poisoned");
+            let mut claimed = Vec::new();
+            for stored in rows.iter_mut() {
+                let due = stored.set_aside_at.elapsed() >= waiting;
+                if stored.request.topic == topic && due && !stored.alerted_on_as_still_waiting {
+                    stored.alerted_on_as_still_waiting = true;
+                    claimed.push(stored.listed());
+                }
+            }
+            Ok(claimed)
         }
     }
 
@@ -2669,6 +2790,9 @@ mod tests {
         /// Once the script runs out, answer every fetch with an error the broker would keep
         /// giving, in place of waiting.
         fails_after_script: bool,
+        /// Once the script runs out, answer every fetch with no records after 5 seconds, as a
+        /// broker with nothing new does, in place of waiting for ever.
+        answers_empty_after_script: bool,
         /// The partitions the topic has.
         partitions: Vec<i32>,
     }
@@ -2681,6 +2805,7 @@ mod tests {
                 earliest: 0,
                 latest: 0,
                 fails_after_script: false,
+                answers_empty_after_script: false,
                 partitions: vec![0],
             }
         }
@@ -2713,6 +2838,10 @@ mod tests {
                 None if self.fails_after_script => Err(ConsumerError::Fetch(
                     rskafka::client::error::Error::InvalidResponse("unreadable".to_string()),
                 )),
+                None if self.answers_empty_after_script => {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    Ok((Vec::new(), offset))
+                }
                 None => std::future::pending().await,
             }
         }
@@ -3280,8 +3409,12 @@ mod tests {
     enum Manifest {
         /// It indexes the chain the test requests name.
         Readable,
+        /// It indexes another chain.
+        OnAnotherChain,
         /// IPFS answers that it can't find it.
         NotFound,
+        /// IPFS never answers.
+        Hangs,
     }
 
     /// A chain check over the manifests a test describes. One it does not describe is readable.
@@ -3303,6 +3436,15 @@ mod tests {
             let mut manifests = self.manifests.lock().expect("poisoned");
             manifests.insert(deployment, manifest);
         }
+
+        /// When the test deployment's manifest was asked for.
+        fn asked(&self) -> Vec<Instant> {
+            let asked = self.asked.lock().expect("poisoned");
+            let test_deployment = asked
+                .iter()
+                .filter(|(id, _)| *id == deployment_id!(QM_HASH));
+            test_deployment.map(|(_, at)| *at).collect()
+        }
     }
 
     #[async_trait]
@@ -3310,7 +3452,7 @@ mod tests {
         async fn check(
             &self,
             deployment: &DeploymentId,
-            _requested_chain_id: ChainId,
+            requested_chain_id: ChainId,
         ) -> Result<(), ChainCheckError> {
             let asked = (*deployment, Instant::now());
             self.asked.lock().expect("poisoned").push(asked);
@@ -3322,7 +3464,13 @@ mod tests {
                 .copied();
             match manifest.unwrap_or(Manifest::Readable) {
                 Manifest::Readable => Ok(()),
+                Manifest::OnAnotherChain => Err(ChainCheckError::Mismatch {
+                    network: "arbitrum-sepolia".to_string(),
+                    manifest_chain_id: 421614,
+                    requested_chain_id,
+                }),
                 Manifest::NotFound => Err(ChainCheckError::NotFound(NOT_FOUND.to_string())),
+                Manifest::Hangs => std::future::pending().await,
             }
         }
     }
@@ -3520,6 +3668,510 @@ mod tests {
         assert_eq!(stored[0].set_aside_at, set_aside_at);
     }
 
+    // -------- requests set aside: trying again --------
+
+    #[test]
+    fn the_wait_between_manifest_reads_doubles_from_5_minutes_up_to_1_hour() {
+        let minutes = |attempts| retry_wait(attempts).as_secs() / 60;
+
+        assert_eq!(
+            minutes(0),
+            5,
+            "the 1st read, 5 minutes after it is set aside"
+        );
+        assert_eq!([minutes(1), minutes(2), minutes(3)], [10, 20, 40]);
+        assert_eq!(minutes(4), 60, "never more than 1 hour apart");
+        assert_eq!(minutes(5), 60);
+        assert_eq!(minutes(u32::MAX), 60, "however long it goes on");
+    }
+
+    /// A registry holding the test request for 3 indexers, set aside from offset 0 of
+    /// partition 0 as the partition loop of these tests does it.
+    async fn registry_with_a_request_waiting() -> MockRegistry {
+        let registry = MockRegistry::scripted(vec![]);
+        let request = SetAsideRequest {
+            partition: 0,
+            ..set_aside_at(0, 3, NOT_FOUND)
+        };
+        let stored = registry.set_aside_request(&request, retry_wait(0)).await;
+        assert!(matches!(stored, Ok(true)), "{stored:?}");
+        registry.offsets.lock().expect("poisoned").push(1);
+        registry
+    }
+
+    /// Runs `run`, which stops when told to through `shutdown_tx`, for `time`.
+    async fn run_for(
+        run: impl Future<Output = ()>,
+        shutdown_tx: &watch::Sender<bool>,
+        time: Duration,
+    ) {
+        let stop = async {
+            tokio::time::sleep(time).await;
+            let _ = shutdown_tx.send(true);
+        };
+        tokio::time::timeout(time + Duration::from_secs(60), async {
+            tokio::join!(run, stop)
+        })
+        .await
+        .expect("it stops within 1 minute of being asked to");
+    }
+
+    /// The background task that reads the manifests of the requests set aside again.
+    fn checker_over(
+        registry: &MockRegistry,
+        manifests: &Arc<Manifests>,
+        shutdown_rx: watch::Receiver<bool>,
+    ) -> impl Future<Output = ()> {
+        let chain_check: Arc<dyn RequestChainCheck> = Arc::clone(manifests) as _;
+        check_set_aside_requests(registry.clone(), chain_check, "t".to_string(), shutdown_rx)
+    }
+
+    /// A partition with nothing new on it, whose fetches come back empty every 5 seconds.
+    fn quiet_partition() -> ScriptedSource {
+        let mut source = ScriptedSource::new(vec![]);
+        source.answers_empty_after_script = true;
+        source
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_request_set_aside_has_its_manifest_read_again_after_5_minutes_then_less_often() {
+        let registry = registry_with_a_request_waiting().await;
+        let manifests = Manifests::with(deployment_id!(QM_HASH), Manifest::NotFound);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let started = Instant::now();
+
+        run_for(
+            checker_over(&registry, &manifests, shutdown_rx),
+            &shutdown_tx,
+            Duration::from_secs(4 * 3_600),
+        )
+        .await;
+
+        // Each read comes within 30 seconds of when it falls due, counted from the one before.
+        let read_at: Vec<u64> = manifests
+            .asked()
+            .iter()
+            .map(|at| (*at - started).as_secs())
+            .collect();
+        let waits: Vec<u64> = std::iter::once(&0)
+            .chain(&read_at)
+            .zip(&read_at)
+            .map(|(before, at)| (at - before) / 60)
+            .collect();
+        assert_eq!(waits, [5, 10, 20, 40, 60, 60], "minutes: {read_at:?}");
+        let stored = registry.stored();
+        assert_eq!(stored[0].request.attempts, 6, "each read is counted");
+        assert!(!stored[0].ready);
+        assert!(registry.calls().is_empty(), "nothing is applied meanwhile");
+    }
+
+    /// A request set aside by 1 run of dipper is applied by the next, once IPFS returns its
+    /// manifest: it was kept in the database, and goes through the same check and apply as a
+    /// request read from the topic.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_set_aside_is_applied_once_its_manifest_can_be_read() {
+        //* Arrange - a 1st run sets the request aside and stops
+        let id = IndexingRequestId::new();
+        let registry = MockRegistry::scripted(vec![Some(SetTargetOutcome::Inserted { id })]);
+        registry.offsets.lock().expect("poisoned").push(0);
+        let worker = MockWorker::new();
+        let manifests = Manifests::with(deployment_id!(QM_HASH), Manifest::NotFound);
+        let source = ScriptedSource::new(vec![Ok((vec![propose_record(0, QM_HASH, 3)], 1))]);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let set_aside = Arc::clone(&registry.set_aside);
+        run_until(
+            partition_loop_over(source, &registry, &worker, manifests.clone(), shutdown_rx),
+            &shutdown_tx,
+            || !set_aside.lock().expect("poisoned").is_empty(),
+        )
+        .await;
+        assert_eq!(registry.stored_offsets(), [0, 1], "its record is passed");
+
+        //* Act - IPFS has the manifest by the time the next run reads it again
+        manifests.set(deployment_id!(QM_HASH), Manifest::Readable);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let reading = partition_loop_over(
+            quiet_partition(),
+            &registry,
+            &worker,
+            manifests.clone(),
+            shutdown_rx.clone(),
+        );
+        let checking = checker_over(&registry, &manifests, shutdown_rx);
+        let logs = logged(run_until(
+            async {
+                tokio::join!(reading, checking);
+            },
+            &shutdown_tx,
+            || set_aside.lock().expect("poisoned").is_empty(),
+        ))
+        .await;
+
+        //* Assert
+        let test_deployment = deployment_id!(QM_HASH);
+        assert_eq!(
+            registry.calls(),
+            [(requester(), test_deployment, INDEXED_CHAIN_ID, 3)]
+        );
+        assert_eq!(
+            worker.reassessments(),
+            [(id, test_deployment, INDEXED_CHAIN_ID, 3)],
+            "its reassessment job is queued like any other request's"
+        );
+        assert_eq!(
+            registry.journal(),
+            ["set aside 0", "ready 0", "apply 3", "forget"],
+            "kept until it is applied, so a failure in between loses nothing"
+        );
+        assert!(logs.contains("Inserted new indexing request"), "{logs}");
+    }
+
+    /// Once the manifest can be read it may turn out to rule the request out. The request is
+    /// then dropped with the alert a refused record gets, which names its record.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_set_aside_is_dropped_if_its_manifest_turns_out_to_refuse_it() {
+        let registry = registry_with_a_request_waiting().await;
+        let worker = MockWorker::new();
+        let manifests = Manifests::with(deployment_id!(QM_HASH), Manifest::OnAnotherChain);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let set_aside = Arc::clone(&registry.set_aside);
+        let reading = partition_loop_over(
+            quiet_partition(),
+            &registry,
+            &worker,
+            manifests.clone(),
+            shutdown_rx.clone(),
+        );
+        let checking = checker_over(&registry, &manifests, shutdown_rx);
+
+        let logs = logged(run_until(
+            async {
+                tokio::join!(reading, checking);
+            },
+            &shutdown_tx,
+            || set_aside.lock().expect("poisoned").is_empty(),
+        ))
+        .await;
+
+        assert_eq!(alerts(&logs, "studio_request_chain_refused"), 1, "{logs}");
+        let alert = logs
+            .lines()
+            .find(|line| line.contains("studio_request_chain_refused"));
+        let alert = alert.expect("counted above");
+        assert!(alert.contains("indexes arbitrum-sepolia"), "{alert}");
+        assert!(alert.contains("offset=0"), "{alert}");
+        assert!(alert.contains(EVENT_ID), "{alert}");
+        assert!(registry.calls().is_empty(), "nothing is applied");
+    }
+
+    /// The reader of a partition applies its ready requests between fetches, so for 1 subgraph
+    /// either the request set aside comes first and the newer record after it, or the newer
+    /// record removes it. Both ways the newer record has the last word.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_set_aside_is_never_applied_after_a_newer_record() {
+        let id = IndexingRequestId::new();
+        let ready_request = async |answers: Vec<Option<SetTargetOutcome>>| {
+            let registry = registry_with_a_request_waiting().await;
+            *registry.script.lock().expect("poisoned") = answers;
+            tokio::time::advance(retry_wait(0)).await;
+            let listed = registry.due_set_aside_requests("t").await;
+            let listed = listed.expect("the mock always answers");
+            let marked = registry.mark_set_aside_request_ready(&listed[0]).await;
+            assert!(marked.is_ok(), "{marked:?}");
+            registry
+        };
+        let worker = MockWorker::new();
+        let events: Arc<dyn SubgraphIndexingAgreementEventsProducer> =
+            Arc::new(CapturingEventsProducer::new());
+        let apply_ready = async |registry: &MockRegistry| {
+            let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+            let check = SkipChainCheck;
+            let network = PROTOCOL_CHAIN_ID;
+            let stop = &mut shutdown_rx;
+            apply_ready_requests(registry, &worker, &events, &check, network, "t", 0, stop).await
+        };
+        let applied = |registry: &MockRegistry| -> Vec<usize> {
+            registry.calls().iter().map(|call| call.3).collect()
+        };
+
+        // The newer record, a cancel, is read before the reader gets to the ready request.
+        let registry = ready_request(vec![Some(SetTargetOutcome::NoOpAlreadyEmpty)]).await;
+        let done = apply_record(&registry, &worker, &SkipChainCheck, 0, 9).await;
+        assert_eq!(done, Some(true));
+        apply_ready(&registry).await;
+        assert_eq!(applied(&registry), [0], "only the cancel takes effect");
+
+        // The reader gets to the ready request first, and reads the cancel after it.
+        let answers = vec![
+            Some(SetTargetOutcome::Inserted { id }),
+            Some(SetTargetOutcome::Canceled { id }),
+        ];
+        let registry = ready_request(answers).await;
+        apply_ready(&registry).await;
+        let done = apply_record(&registry, &worker, &SkipChainCheck, 0, 9).await;
+        assert_eq!(done, Some(true));
+        assert_eq!(applied(&registry), [3, 0], "the cancel is applied last");
+        assert!(registry.set_aside().is_empty());
+    }
+
+    /// End to end: the cancel for a subgraph arrives while its request waits on IPFS. When the
+    /// manifest turns up later there is nothing left to apply, so the cancel stands.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_set_aside_then_cancelled_stays_cancelled_when_its_manifest_turns_up() {
+        let registry = MockRegistry::scripted(vec![Some(SetTargetOutcome::NoOpAlreadyEmpty)]);
+        registry.offsets.lock().expect("poisoned").push(0);
+        let worker = MockWorker::new();
+        let manifests = Manifests::with(deployment_id!(QM_HASH), Manifest::NotFound);
+        let mut source = ScriptedSource::new(vec![
+            Ok((vec![propose_record(0, QM_HASH, 3)], 1)),
+            Ok((vec![propose_record(1, QM_HASH, 0)], 2)),
+        ]);
+        source.answers_empty_after_script = true;
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let reading = partition_loop_over(
+            source,
+            &registry,
+            &worker,
+            manifests.clone(),
+            shutdown_rx.clone(),
+        );
+        let checking = checker_over(&registry, &manifests, shutdown_rx);
+        let turns_up = async {
+            tokio::time::sleep(Duration::from_secs(600)).await;
+            manifests.set(deployment_id!(QM_HASH), Manifest::Readable);
+        };
+
+        run_for(
+            async {
+                tokio::join!(reading, checking, turns_up);
+            },
+            &shutdown_tx,
+            Duration::from_secs(3 * 3_600),
+        )
+        .await;
+
+        let applied: Vec<usize> = registry.calls().iter().map(|call| call.3).collect();
+        assert_eq!(applied, [0], "the cancel, and never the request before it");
+        assert_eq!(
+            registry.journal(),
+            ["set aside 0", "forget", "apply 0"],
+            "the request set aside went when the cancel was read"
+        );
+    }
+
+    /// The manifest of a ready request is normally remembered, so its check answers at once.
+    /// If it can't be read after all, the request goes back to waiting and the partition on.
+    #[tokio::test(start_paused = true)]
+    async fn a_ready_request_whose_manifest_cannot_be_read_after_all_goes_back_to_waiting() {
+        for manifest in [Manifest::NotFound, Manifest::Hangs] {
+            let registry = registry_with_a_request_waiting().await;
+            tokio::time::advance(retry_wait(0)).await;
+            let listed = registry.due_set_aside_requests("t").await;
+            let listed = listed.expect("the mock always answers");
+            let marked = registry.mark_set_aside_request_ready(&listed[0]).await;
+            assert!(marked.is_ok(), "{marked:?}");
+            let worker = MockWorker::new();
+            let manifests = Manifests::with(deployment_id!(QM_HASH), manifest);
+            let events: Arc<dyn SubgraphIndexingAgreementEventsProducer> =
+                Arc::new(CapturingEventsProducer::new());
+            let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+            let started = Instant::now();
+
+            let (check, network, stop) = (manifests.as_ref(), PROTOCOL_CHAIN_ID, &mut shutdown_rx);
+            let stopped =
+                apply_ready_requests(&registry, &worker, &events, check, network, "t", 0, stop)
+                    .await;
+
+            assert!(!stopped);
+            assert!(
+                started.elapsed() <= Duration::from_secs(5),
+                "the partition is not held up: {:?}",
+                started.elapsed()
+            );
+            let stored = registry.stored();
+            assert_eq!(stored.len(), 1, "the request is kept");
+            assert!(!stored[0].ready);
+            assert_eq!(stored[0].request.attempts, 1);
+            assert!(
+                stored[0].next_attempt_at > Instant::now(),
+                "and read again later"
+            );
+            assert!(registry.calls().is_empty());
+        }
+    }
+
+    /// A ready request stays ready until it is applied and its job queued, so a failure of
+    /// the database or of the job queue on the way is made good by the next pass.
+    #[tokio::test(start_paused = true)]
+    async fn a_ready_request_that_fails_to_apply_is_applied_by_the_next_pass() {
+        let id = IndexingRequestId::new();
+        let registry = registry_with_a_request_waiting().await;
+        *registry.script.lock().expect("poisoned") = vec![
+            None,
+            Some(SetTargetOutcome::Inserted { id }),
+            Some(SetTargetOutcome::NoOp { id }),
+        ];
+        tokio::time::advance(retry_wait(0)).await;
+        let listed = registry.due_set_aside_requests("t").await;
+        let listed = listed.expect("the mock always answers");
+        let marked = registry.mark_set_aside_request_ready(&listed[0]).await;
+        assert!(marked.is_ok(), "{marked:?}");
+        let worker = MockWorker::failing_pushes(1);
+        let events: Arc<dyn SubgraphIndexingAgreementEventsProducer> =
+            Arc::new(CapturingEventsProducer::new());
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let mut pass = async || {
+            let (check, network, stop) = (&SkipChainCheck, PROTOCOL_CHAIN_ID, &mut shutdown_rx);
+            apply_ready_requests(&registry, &worker, &events, check, network, "t", 0, stop).await;
+            (registry.set_aside().len(), worker.reassessments().len())
+        };
+
+        let after_the_database_failed = pass().await;
+        let after_the_job_queue_failed = pass().await;
+        let after_both_worked = pass().await;
+
+        assert_eq!(after_the_database_failed, (1, 0), "kept, nothing queued");
+        assert_eq!(
+            after_the_job_queue_failed,
+            (1, 0),
+            "written, but kept for its job"
+        );
+        assert_eq!(
+            after_both_worked,
+            (0, 1),
+            "its job is queued, and it is done with"
+        );
+    }
+
+    /// A request still waiting after 24 hours may never get its manifest, so an operator is
+    /// told once more. The database records that, so a restart does not tell them again.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_still_set_aside_after_24_hours_is_alerted_on_once_more_and_only_once() {
+        let registry = registry_with_a_request_waiting().await;
+        let manifests = Manifests::with(deployment_id!(QM_HASH), Manifest::NotFound);
+        let run = async |time: u64| {
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let checking = checker_over(&registry, &manifests, shutdown_rx);
+            logged(run_for(checking, &shutdown_tx, Duration::from_secs(time))).await
+        };
+
+        let first_23_hours = run(23 * 3_600).await;
+        let next_2_hours = run(2 * 3_600).await;
+        let after_a_restart = run(48 * 3_600).await;
+
+        assert_eq!(alerts(&first_23_hours, STILL_WAITING_EVENT), 0);
+        assert_eq!(
+            alerts(&next_2_hours, STILL_WAITING_EVENT),
+            1,
+            "{next_2_hours}"
+        );
+        let alert = next_2_hours
+            .lines()
+            .find(|line| line.contains(STILL_WAITING_EVENT));
+        let alert = alert.expect("counted above");
+        assert!(alert.contains("24 hours"), "{alert}");
+        assert!(alert.contains(NOT_FOUND), "it says why: {alert}");
+        assert!(alert.contains("offset=0"), "and which record: {alert}");
+        assert_eq!(alerts(&after_a_restart, STILL_WAITING_EVENT), 0);
+        assert_eq!(
+            registry.set_aside().len(),
+            1,
+            "it is kept for as long as it takes"
+        );
+    }
+
+    /// The service over a quiet topic, with `manifests` as what IPFS returns.
+    fn serve_with_manifests(
+        registry: &MockRegistry,
+        worker: &MockWorker,
+        manifests: &Arc<Manifests>,
+        rx_stop: mpsc::Receiver<()>,
+    ) -> impl Future<Output = anyhow::Result<()>> {
+        let ctx = Ctx {
+            registry: registry.clone(),
+            worker_queue: worker.clone(),
+            events: Arc::new(CapturingEventsProducer::new()),
+            protocol_chain_id: PROTOCOL_CHAIN_ID,
+            chain_check: Arc::clone(manifests) as _,
+            config: test_config(),
+        };
+        serve(ctx, rx_stop, Duration::from_secs(65), || async {
+            Ok(quiet_partition())
+        })
+    }
+
+    /// 2 dippers reading manifests and applying the same request would race like 2 reading
+    /// the topic. So the requests set aside are left alone by a dipper without the lock.
+    #[tokio::test(start_paused = true)]
+    async fn requests_set_aside_are_only_tried_again_by_the_dipper_that_holds_the_lock() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let registry = registry_with_a_request_waiting().await;
+        *registry.script.lock().expect("poisoned") = vec![Some(SetTargetOutcome::Inserted {
+            id: IndexingRequestId::new(),
+        })];
+        registry.lock.held_elsewhere.store(true, SeqCst);
+        let worker = MockWorker::new();
+        let manifests = Arc::new(Manifests::default());
+        let (tx_stop, rx_stop) = mpsc::channel(1);
+        let lock = Arc::clone(&registry.lock);
+        let set_aside = Arc::clone(&registry.set_aside);
+        let read_without_the_lock = Arc::new(Mutex::new(None));
+        let then = async {
+            tokio::time::sleep(Duration::from_secs(2 * 3_600)).await;
+            *read_without_the_lock.lock().expect("poisoned") = Some(manifests.asked().len());
+            lock.held_elsewhere.store(false, SeqCst);
+            let applied = async {
+                while !set_aside.lock().expect("poisoned").is_empty() {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            };
+            let _ = tokio::time::timeout(Duration::from_secs(3_600), applied).await;
+        };
+
+        let ended = serve_until(
+            serve_with_manifests(&registry, &worker, &manifests, rx_stop),
+            tx_stop,
+            then,
+        )
+        .await;
+
+        assert!(matches!(ended, Some(Ok(()))), "{ended:?}");
+        assert_eq!(
+            *read_without_the_lock.lock().expect("poisoned"),
+            Some(0),
+            "no manifest is read for 2 hours without the lock"
+        );
+        assert_eq!(registry.calls().len(), 1, "with it, the request is applied");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_is_not_held_up_by_the_manifest_read_of_a_request_set_aside() {
+        let registry = registry_with_a_request_waiting().await;
+        let worker = MockWorker::new();
+        let manifests = Manifests::with(deployment_id!(QM_HASH), Manifest::Hangs);
+        let (tx_stop, rx_stop) = mpsc::channel(1);
+        let asked = Arc::clone(&manifests);
+        let then = async {
+            let reading = async {
+                while asked.asked().is_empty() {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            };
+            let _ = tokio::time::timeout(Duration::from_secs(3_600), reading).await;
+        };
+
+        let ended = serve_until(
+            serve_with_manifests(&registry, &worker, &manifests, rx_stop),
+            tx_stop,
+            then,
+        )
+        .await;
+
+        assert!(matches!(ended, Some(Ok(()))), "{ended:?}");
+        assert_eq!(manifests.asked().len(), 1, "the read was under way");
+        assert_eq!(registry.set_aside().len(), 1, "the request is kept");
+    }
+
     // -------- offsets out of range --------
 
     /// The broker's answer to a fetch from an offset outside what it retains.
@@ -3627,6 +4279,7 @@ mod tests {
             DROPPED_EVENT,
             NOT_CONNECTED_EVENT,
             SET_ASIDE_EVENT,
+            STILL_WAITING_EVENT,
         ] {
             assert!(defaults.iter().any(|default| default == event), "{event}");
         }

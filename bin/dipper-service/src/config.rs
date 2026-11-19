@@ -173,8 +173,9 @@ pub struct Config {
     pub suggested_minimums: SuggestedMinimumsConfig,
 }
 
-/// How indexing requests are checked against their subgraph manifest's chain. A request
-/// whose manifest can't be read is refused, so a check that can't run never waves it through.
+/// How indexing requests are checked against their subgraph manifest's chain. A check that
+/// can't read the manifest never waves a request through: the admin RPC refuses it, and one
+/// from Studio is set aside and applied once the manifest can be read.
 #[serde_as]
 #[derive(custom_debug::CustomDebug, Clone, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -593,6 +594,7 @@ impl Default for AlertsConfig {
                 "studio_request_dropped",
                 "studio_request_consumer_not_connected",
                 "studio_request_set_aside",
+                "studio_request_still_waiting",
                 "iisa_request_rejected",
                 "dips_info_missing",
                 "dips_info_checks_paused",

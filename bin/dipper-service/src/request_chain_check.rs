@@ -46,6 +46,13 @@ pub enum ChainCheckError {
     Unavailable(String),
 }
 
+impl ChainCheckError {
+    /// Whether the manifest was read and rules the request out, so that no retry can pass.
+    pub fn refuses(&self) -> bool {
+        matches!(self, Self::Mismatch { .. } | Self::Unresolvable(_))
+    }
+}
+
 #[async_trait]
 pub trait RequestChainCheck: Send + Sync {
     /// `Ok` when `deployment`'s manifest indexes `chain_id`.
@@ -281,6 +288,10 @@ mod tests {
             ),
             "{err:?}"
         );
+        assert!(
+            err.refuses(),
+            "the manifest was read and names another chain"
+        );
     }
 
     #[tokio::test]
@@ -311,6 +322,7 @@ mod tests {
         for answer in [first, second] {
             let err = answer.expect_err("a manifest that is not there passes no request");
             assert!(matches!(err, ChainCheckError::NotFound(_)), "{err:?}");
+            assert!(!err.refuses(), "{err:?}");
             assert!(err.to_string().contains("HTTP 404"), "{err}");
         }
     }
@@ -326,6 +338,7 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, ChainCheckError::Unavailable(_)), "{err:?}");
+        assert!(!err.refuses(), "an outage says nothing about the request");
     }
 
     #[tokio::test]
@@ -388,6 +401,7 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(matches!(err, ChainCheckError::Unresolvable(_)), "{err:?}");
+            assert!(err.refuses(), "the manifest was read and names no chain");
         }
     }
 }
