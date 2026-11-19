@@ -69,7 +69,7 @@ impl sqlx::FromRow<'_, sqlx::postgres::PgRow> for SetAsideRequest {
 impl PgRegistry {
     /// Set `request` aside, its manifest to be read again in `retry_in_secs`, in place of any
     /// request set aside for the same requester, deployment and chain. Returns `false`, changing
-    /// nothing, when that same record is already set aside, as when Kafka delivers it twice.
+    /// nothing, when that same event's record is already set aside, as when it is delivered twice.
     pub async fn set_aside_studio_request(
         &self,
         request: &SetAsideRequest,
@@ -95,8 +95,9 @@ impl PgRegistry {
                 next_attempt_at = EXCLUDED.next_attempt_at,
                 ready = FALSE,
                 still_waiting_alerted_at = NULL
-            WHERE (stored.topic, stored.partition_id, stored.record_offset)
-                IS DISTINCT FROM (EXCLUDED.topic, EXCLUDED.partition_id, EXCLUDED.record_offset)
+            WHERE (stored.topic, stored.partition_id, stored.record_offset, stored.event_id)
+                IS DISTINCT FROM
+                (EXCLUDED.topic, EXCLUDED.partition_id, EXCLUDED.record_offset, EXCLUDED.event_id)
             "#,
         )
         .bind(PgAddress(request.requested_by))
@@ -187,7 +188,7 @@ impl PgRegistry {
             UPDATE dipper_studio_set_aside_requests
             SET ready = TRUE
             WHERE requested_by = $1 AND deployment_id = $2 AND deployment_chain_id = $3
-              AND topic = $4 AND partition_id = $5 AND record_offset = $6
+              AND topic = $4 AND partition_id = $5 AND record_offset = $6 AND event_id = $7
             "#,
         )
         .bind(PgAddress(request.requested_by))
@@ -196,6 +197,7 @@ impl PgRegistry {
         .bind(&request.topic)
         .bind(request.partition_id)
         .bind(request.record_offset)
+        .bind(&request.event_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -218,7 +220,7 @@ impl PgRegistry {
                 next_attempt_at = now() + make_interval(secs => $8::DOUBLE PRECISION),
                 ready = FALSE
             WHERE requested_by = $1 AND deployment_id = $2 AND deployment_chain_id = $3
-              AND topic = $4 AND partition_id = $5 AND record_offset = $6
+              AND topic = $4 AND partition_id = $5 AND record_offset = $6 AND event_id = $9
             "#,
         )
         .bind(PgAddress(request.requested_by))
@@ -229,6 +231,7 @@ impl PgRegistry {
         .bind(request.record_offset)
         .bind(reason)
         .bind(seconds(retry_in_secs))
+        .bind(&request.event_id)
         .execute(&self.pool)
         .await?;
         Ok(())

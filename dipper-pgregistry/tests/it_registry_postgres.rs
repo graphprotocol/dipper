@@ -4805,6 +4805,46 @@ async fn a_newer_record_replaces_a_set_aside_request_and_the_same_record_changes
     );
 }
 
+/// A topic that is deleted and made again starts its offsets over, so the record of another
+/// event can sit where the record of a request set aside sat. It is not that record again.
+#[tokio::test]
+async fn another_event_at_the_offset_of_a_set_aside_request_takes_its_place() {
+    //* Given
+    let (db, _temp_db) = temp_registry_db().await;
+    let registry = PgRegistry::new(db);
+    let kept = studio_request_at(10);
+    registry
+        .set_aside_studio_request(&kept, 0)
+        .await
+        .expect("Failed to set the request aside");
+    let another_event = SetAsideRequest {
+        num_candidates: 5,
+        event_id: "another-event".to_string(),
+        ..studio_request_at(10)
+    };
+
+    //* When - a manifest read for the request kept ends after the other event took its place
+    let replaced = registry
+        .set_aside_studio_request(&another_event, 0)
+        .await
+        .expect("Failed to set the other event's request aside");
+    registry
+        .mark_set_aside_studio_request_ready(&kept)
+        .await
+        .expect("Failed to mark the request ready");
+    registry
+        .retry_set_aside_studio_request_later(&kept, "IPFS is down", 3_600)
+        .await
+        .expect("Failed to count the attempt");
+
+    //* Then
+    assert!(
+        replaced,
+        "another event is a new request, whatever its offset"
+    );
+    assert_eq!(due_studio_requests(&registry).await, vec![another_event]);
+}
+
 #[tokio::test]
 async fn a_set_aside_studio_request_is_forgotten_by_requester_deployment_and_chain() {
     //* Given

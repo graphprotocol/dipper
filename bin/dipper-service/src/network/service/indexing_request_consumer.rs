@@ -1908,7 +1908,13 @@ mod tests {
         /// Whether this is still `request` as it was listed, not a later record's request.
         fn is(&self, request: &SetAsideRequest) -> bool {
             let record = |request: &SetAsideRequest| {
-                (request.topic.clone(), request.partition, request.offset)
+                let event = request.event_id.clone();
+                (
+                    request.topic.clone(),
+                    request.partition,
+                    request.offset,
+                    event,
+                )
             };
             key_of(&self.request) == key_of(request) && record(&self.request) == record(request)
         }
