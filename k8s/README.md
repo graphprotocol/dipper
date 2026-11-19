@@ -23,6 +23,10 @@ Kubernetes manifests for deploying the dipper service.
 
 Dipper requires IISA at startup: it runs an IISA health check and exits if IISA is not reachable after a few attempts. Deploy and verify IISA before starting dipper.
 
+Run exactly 1 replica. The signer's nonce and the locks that keep 2 jobs from acting on the same agreement live in the process, so 2 pods side by side could send transactions on the same nonce or act on an agreement twice. `deployment.yaml` sets `strategy: Recreate` for that reason: a rollout stops the old pod before the new one starts, at the cost of a gap while the new pod starts up. Keep it if you deploy with other manifests.
+
+`Recreate` only covers rollouts. When a pod is evicted, deleted or its node drained, Kubernetes starts the replacement while the old pod is still shutting down, and the old pod's worker keeps taking jobs until its turn in the stop sequence comes. Until dipper holds a lock of its own for as long as it runs, keep such disruptions to planned windows: set a maintenance window on the cluster, and drain a node only after scaling dipper to 0.
+
 ## Configuration
 
 The `configmap-example.yaml` shows the required config.json structure. Create a ConfigMap named `dipper-config` with your actual values:
