@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.3.3](https://github.com/graphprotocol/dipper/compare/v0.3.2...v0.3.3) (2026-11-19)
+
+
+### Added
+
+* apply Studio's indexing requests from the Redpanda topic ([#753](https://github.com/graphprotocol/dipper/issues/753)) ([13793e0](https://github.com/graphprotocol/dipper/commit/13793e0acce5219b5c3ea891810511dd1db76312))
+
+## [0.3.2](https://github.com/graphprotocol/dipper/compare/v0.3.1...v0.3.2) (2026-11-18)
+
+
+### Added
+
+* **pricing:** cap indexer prices at 4 times the minimum ([#843](https://github.com/graphprotocol/dipper/issues/843)) ([7a298d3](https://github.com/graphprotocol/dipper/commit/7a298d3070c12f18363a41a30d55414d52e2a12d))
+* **pricing:** follow indexer-rs's suggested minimum prices ([#844](https://github.com/graphprotocol/dipper/issues/844)) ([d276b11](https://github.com/graphprotocol/dipper/commit/d276b11d1f0b337aa2c9ba6d7afaaa343d57af15))
+
+
+### Changed
+
+* let the chrono unmaintained notice through the scan ([#838](https://github.com/graphprotocol/dipper/issues/838)) ([fe6f7ff](https://github.com/graphprotocol/dipper/commit/fe6f7ff874663ac1e99516e25b2e9968c68dbc75))
+
 ## [0.3.1](https://github.com/graphprotocol/dipper/compare/v0.3.0...v0.3.1) (2026-11-16)
 
 

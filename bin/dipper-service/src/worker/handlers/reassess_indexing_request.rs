@@ -1440,6 +1440,20 @@ mod lifecycle_event_tests {
         )
     }
 
+    /// Base-price ceilings an operator set in full: 1 for each of `chains`, and the fallback.
+    fn ceilings_set(
+        chains: &[(&str, f64)],
+        fallback: f64,
+    ) -> Arc<crate::price_ceilings::BasePriceCeilings> {
+        let chains = chains
+            .iter()
+            .map(|(chain, ceiling)| ((*chain).to_string(), *ceiling))
+            .collect();
+        Arc::new(crate::price_ceilings::BasePriceCeilings::set(
+            chains, fallback,
+        ))
+    }
+
     fn test_agreement_conf() -> IndexingAgreementConfig {
         IndexingAgreementConfig {
             data_service: Address::repeat_byte(0x03),
@@ -1454,10 +1468,7 @@ mod lifecycle_event_tests {
             price_rejection_lookback_days: 1,
             transient_rejection_lookback_minutes: 30,
             uncertain_rejection_lookback_days: 1,
-            max_grt_per_30_days: std::collections::BTreeMap::from([(
-                "test-chain".to_string(),
-                450.0,
-            )]),
+            base_price_ceilings: ceilings_set(&[("test-chain", 450.0)], 1800.0),
             max_grt_per_billion_entities_per_30_days: 2000.0,
             ..IndexingAgreementConfig::for_tests()
         }
@@ -1715,11 +1726,7 @@ mod lifecycle_event_tests {
             indexer_urls::Snapshot::new(),
         );
         ctx.agreement_conf = Arc::new(IndexingAgreementConfig {
-            max_grt_per_30_days: std::collections::BTreeMap::from([(
-                "other-chain".to_string(),
-                450.0,
-            )]),
-            fallback_max_grt_per_30_days: 900.0,
+            base_price_ceilings: ceilings_set(&[("other-chain", 450.0)], 900.0),
             ..test_agreement_conf()
         });
 
@@ -1728,6 +1735,50 @@ mod lifecycle_event_tests {
         let contexts = contexts.lock().unwrap();
         assert_eq!(contexts.len(), 1, "IISA asked once: {contexts:?}");
         assert_eq!(contexts[0].max_grt_per_30_days, Some(900.0));
+    }
+
+    /// A selection reads its ceiling as it is made, so minimum prices taken from indexer-rs
+    /// while dipper runs reach the very next selection, with no restart.
+    #[tokio::test]
+    async fn a_selection_made_after_the_minimums_change_uses_the_new_ceiling() {
+        use crate::price_ceilings::BasePriceCeilings;
+        let minimums =
+            |minimum: f64| std::collections::BTreeMap::from([("test-chain".to_string(), minimum)]);
+        let ceilings = Arc::new(BasePriceCeilings::new(None, None, minimums(100.0)));
+        let contexts = Arc::new(Mutex::new(Vec::new()));
+        let selecting = || {
+            let iisa = MockIisa {
+                contexts: Arc::clone(&contexts),
+                ..Default::default()
+            };
+            let mut ctx = build_ctx(
+                MockRegistry::default(),
+                iisa,
+                MockQueue::default(),
+                MockChainClient::default(),
+                CapturingEventsProducer::new(),
+                indexer_urls::Snapshot::new(),
+            );
+            ctx.agreement_conf = Arc::new(IndexingAgreementConfig {
+                base_price_ceilings: Arc::clone(&ceilings),
+                ..test_agreement_conf()
+            });
+            ctx
+        };
+
+        run(selecting(), 1).await.expect("handler ok");
+        ceilings
+            .follow(minimums(150.0), 1_000.0)
+            .expect("the new minimums are taken");
+        run(selecting(), 1).await.expect("handler ok");
+
+        let sent: Vec<Option<f64>> = contexts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|context| context.max_grt_per_30_days)
+            .collect();
+        assert_eq!(sent, [Some(400.0), Some(600.0)], "4 times each minimum");
     }
 
     #[tokio::test]
