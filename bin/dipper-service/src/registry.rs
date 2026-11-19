@@ -1202,6 +1202,16 @@ impl crate::network::service::indexing_request_consumer::SetAsideRequestRegistry
             .map_err(Into::into)
     }
 
+    async fn forget_set_aside_record(
+        &self,
+        request: &crate::network::service::indexing_request_consumer::SetAsideRequest,
+    ) -> RegistryResult<bool> {
+        self.inner
+            .forget_set_aside_studio_record(&stored_set_aside_request(request)?)
+            .await
+            .map_err(Into::into)
+    }
+
     async fn due_set_aside_requests(
         &self,
         topic: &str,

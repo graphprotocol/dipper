@@ -2101,6 +2101,15 @@ mod tests {
             Ok(rows.len() < before)
         }
 
+        async fn forget_set_aside_record(&self, request: &SetAsideRequest) -> RegistryResult<bool> {
+            self.set_aside_write()?;
+            let mut rows = self.set_aside.lock().expect("poisoned");
+            let before = rows.len();
+            rows.retain(|stored| !stored.is(request));
+            self.note(format!("forget {}", request.offset));
+            Ok(rows.len() < before)
+        }
+
         async fn due_set_aside_requests(
             &self,
             topic: &str,
@@ -3705,6 +3714,47 @@ mod tests {
         registry
     }
 
+    /// [`registry_with_a_request_waiting`] once the manifest was read: the request is ready,
+    /// and the database answers the applies that follow with `answers`.
+    async fn registry_with_a_request_ready(answers: Vec<Option<SetTargetOutcome>>) -> MockRegistry {
+        let registry = registry_with_a_request_waiting().await;
+        *registry.script.lock().expect("poisoned") = answers;
+        tokio::time::advance(retry_wait(0)).await;
+        let listed = registry.due_set_aside_requests("t").await;
+        let listed = listed.expect("the mock always answers");
+        let marked = registry.mark_set_aside_request_ready(&listed[0]).await;
+        assert!(marked.is_ok(), "{marked:?}");
+        registry
+    }
+
+    /// Applies the ready requests of partition 0 as its reader does between fetches; `true` if
+    /// a stop came first.
+    async fn apply_ready(
+        registry: &MockRegistry,
+        worker: &MockWorker,
+        shutdown_rx: &mut watch::Receiver<bool>,
+    ) -> bool {
+        let events: Arc<dyn SubgraphIndexingAgreementEventsProducer> =
+            Arc::new(CapturingEventsProducer::new());
+        let (check, network) = (SkipChainCheck, PROTOCOL_CHAIN_ID);
+        apply_ready_requests(
+            registry,
+            worker,
+            &events,
+            &check,
+            network,
+            "t",
+            0,
+            shutdown_rx,
+        )
+        .await
+    }
+
+    /// The indexer count of each change the database was asked to make, in order.
+    fn applied_counts(registry: &MockRegistry) -> Vec<usize> {
+        registry.calls().iter().map(|call| call.3).collect()
+    }
+
     /// Runs `run`, which stops when told to through `shutdown_tx`, for `time`.
     async fn run_for(
         run: impl Future<Output = ()>,
@@ -3826,7 +3876,7 @@ mod tests {
         );
         assert_eq!(
             registry.journal(),
-            ["set aside 0", "ready 0", "apply 3", "forget"],
+            ["set aside 0", "ready 0", "apply 3", "forget 0"],
             "kept until it is applied, so a failure in between loses nothing"
         );
         assert!(logs.contains("Inserted new indexing request"), "{logs}");
@@ -3876,48 +3926,72 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_request_set_aside_is_never_applied_after_a_newer_record() {
         let id = IndexingRequestId::new();
-        let ready_request = async |answers: Vec<Option<SetTargetOutcome>>| {
-            let registry = registry_with_a_request_waiting().await;
-            *registry.script.lock().expect("poisoned") = answers;
-            tokio::time::advance(retry_wait(0)).await;
-            let listed = registry.due_set_aside_requests("t").await;
-            let listed = listed.expect("the mock always answers");
-            let marked = registry.mark_set_aside_request_ready(&listed[0]).await;
-            assert!(marked.is_ok(), "{marked:?}");
-            registry
-        };
         let worker = MockWorker::new();
-        let events: Arc<dyn SubgraphIndexingAgreementEventsProducer> =
-            Arc::new(CapturingEventsProducer::new());
-        let apply_ready = async |registry: &MockRegistry| {
-            let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
-            let check = SkipChainCheck;
-            let network = PROTOCOL_CHAIN_ID;
-            let stop = &mut shutdown_rx;
-            apply_ready_requests(registry, &worker, &events, &check, network, "t", 0, stop).await
-        };
-        let applied = |registry: &MockRegistry| -> Vec<usize> {
-            registry.calls().iter().map(|call| call.3).collect()
-        };
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
         // The newer record, a cancel, is read before the reader gets to the ready request.
-        let registry = ready_request(vec![Some(SetTargetOutcome::NoOpAlreadyEmpty)]).await;
+        let answers = vec![Some(SetTargetOutcome::NoOpAlreadyEmpty)];
+        let registry = registry_with_a_request_ready(answers).await;
         let done = apply_record(&registry, &worker, &SkipChainCheck, 0, 9).await;
         assert_eq!(done, Some(true));
-        apply_ready(&registry).await;
-        assert_eq!(applied(&registry), [0], "only the cancel takes effect");
+        apply_ready(&registry, &worker, &mut shutdown_rx).await;
+        assert_eq!(
+            applied_counts(&registry),
+            [0],
+            "only the cancel takes effect"
+        );
 
         // The reader gets to the ready request first, and reads the cancel after it.
         let answers = vec![
             Some(SetTargetOutcome::Inserted { id }),
             Some(SetTargetOutcome::Canceled { id }),
         ];
-        let registry = ready_request(answers).await;
-        apply_ready(&registry).await;
+        let registry = registry_with_a_request_ready(answers).await;
+        apply_ready(&registry, &worker, &mut shutdown_rx).await;
         let done = apply_record(&registry, &worker, &SkipChainCheck, 0, 9).await;
         assert_eq!(done, Some(true));
-        assert_eq!(applied(&registry), [3, 0], "the cancel is applied last");
+        assert_eq!(
+            applied_counts(&registry),
+            [3, 0],
+            "the cancel is applied last"
+        );
         assert!(registry.set_aside().is_empty());
+    }
+
+    /// A request is removed, once applied, as the record it was listed from. One stored for
+    /// the same subgraph in the meantime came from a later record and is not yet applied, so
+    /// it stays. Only a dipper that lost the lock mid-apply can meet this.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_set_aside_while_an_older_one_is_applied_is_kept() {
+        let id = IndexingRequestId::new();
+        let answers = vec![Some(SetTargetOutcome::Inserted { id })];
+        let mut registry = registry_with_a_request_ready(answers).await;
+        registry.apply_takes = Duration::from_secs(10);
+        let worker = MockWorker::new();
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let newer = SetAsideRequest {
+            partition: 0,
+            ..set_aside_at(7, 5, NOT_FOUND)
+        };
+
+        let storing_the_newer = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            registry.set_aside_request(&newer, retry_wait(0)).await
+        };
+        let applying = apply_ready(&registry, &worker, &mut shutdown_rx);
+        let (_, stored) = tokio::join!(applying, storing_the_newer);
+
+        assert!(matches!(stored, Ok(true)), "{stored:?}");
+        assert_eq!(
+            applied_counts(&registry),
+            [3],
+            "the older request is applied"
+        );
+        assert_eq!(
+            registry.set_aside(),
+            [newer],
+            "and the newer one still waits"
+        );
     }
 
     /// End to end: the cancel for a subgraph arrives while its request waits on IPFS. When the

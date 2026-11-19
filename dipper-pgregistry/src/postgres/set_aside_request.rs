@@ -137,6 +137,31 @@ impl PgRegistry {
         Ok(result.rows_affected() == 1)
     }
 
+    /// Remove `request` now that it is dealt with. Returns `false`, changing nothing, if it was
+    /// removed or replaced by a later record since it was listed.
+    pub async fn forget_set_aside_studio_record(
+        &self,
+        request: &SetAsideRequest,
+    ) -> Result<bool, Error> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM dipper_studio_set_aside_requests
+            WHERE requested_by = $1 AND deployment_id = $2 AND deployment_chain_id = $3
+              AND topic = $4 AND partition_id = $5 AND record_offset = $6 AND event_id = $7
+            "#,
+        )
+        .bind(PgAddress(request.requested_by))
+        .bind(PgDeploymentId(request.deployment_id))
+        .bind(PgU64(request.deployment_chain_id))
+        .bind(&request.topic)
+        .bind(request.partition_id)
+        .bind(request.record_offset)
+        .bind(&request.event_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// The requests set aside from `topic` whose manifest is due another read, the longest
     /// overdue first.
     pub async fn get_due_set_aside_studio_requests(

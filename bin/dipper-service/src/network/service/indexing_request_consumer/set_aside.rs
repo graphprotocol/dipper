@@ -94,6 +94,13 @@ pub trait SetAsideRequestRegistry {
         deployment_chain_id: ChainId,
     ) -> Result<bool, crate::registry::Error>;
 
+    /// Remove `request` now that it is applied or refused. `false`, changing nothing, if it was
+    /// removed, or replaced by a later record, since it was listed.
+    async fn forget_set_aside_record(
+        &self,
+        request: &SetAsideRequest,
+    ) -> Result<bool, crate::registry::Error>;
+
     /// The requests kept from `topic` whose manifest is due another read, the longest overdue
     /// first.
     async fn due_set_aside_requests(
@@ -408,16 +415,19 @@ async fn finish_ready_request<R>(
 ) where
     R: SetAsideRequestRegistry + Send + Sync,
 {
-    match applied {
-        Ok(_) => tracing::info!(
-            partition = request.partition,
-            offset = request.offset,
-            event_id = %request.event_id,
-            deployment_id = %request.deployment_id,
-            waited_secs = request.waited.as_secs(),
-            "applied a Studio indexing request that was set aside, now that its subgraph \
-             manifest could be read"
-        ),
+    let applied = match applied {
+        Ok(_) => {
+            tracing::info!(
+                partition = request.partition,
+                offset = request.offset,
+                event_id = %request.event_id,
+                deployment_id = %request.deployment_id,
+                waited_secs = request.waited.as_secs(),
+                "applied a Studio indexing request that was set aside, now that its subgraph \
+                 manifest could be read"
+            );
+            true
+        }
         Err(ApplyError::WrongChain(err)) => {
             let target = ProposedTarget {
                 event_id: request.event_id.clone(),
@@ -426,6 +436,7 @@ async fn finish_ready_request<R>(
                 num_candidates: request.num_candidates,
             };
             alert_refused_record(request.partition, request.offset, &target, &err);
+            false
         }
         Err(ApplyError::ManifestNotFound(err) | ApplyError::ChainCheckUnavailable(err)) => {
             return log_if_unrecorded(request, wait_longer(registry, request, &err).await);
@@ -433,11 +444,27 @@ async fn finish_ready_request<R>(
         // The database or the job queue failed, and logged it. The request stays ready, so the
         // next pass applies it again: a write already made is then a no-op, and queues its job.
         Err(ApplyError::Registry(_) | ApplyError::QueueReassess { .. }) => return,
+    };
+    // Removed as the record it was listed from: a request stored for the same subgraph since
+    // then came from a later record, and still has to be applied.
+    let forgotten = registry.forget_set_aside_record(request).await;
+    if applied && matches!(forgotten, Ok(false)) {
+        warn_newer_request_arrived(request);
     }
-    let forgotten = registry.forget_set_aside_request(
-        request.requested_by,
-        request.deployment_id,
-        request.deployment_chain_id,
+    log_if_unrecorded(request, forgotten);
+}
+
+/// Says that a request was applied while another for the same subgraph arrived. A later record
+/// is stored and still to come; a request over the admin RPC may have been applied before it.
+fn warn_newer_request_arrived(request: &SetAsideRequest) {
+    tracing::warn!(
+        partition = request.partition,
+        offset = request.offset,
+        event_id = %request.event_id,
+        deployment_id = %request.deployment_id,
+        chain_id = request.deployment_chain_id,
+        num_candidates = request.num_candidates,
+        "a Studio indexing request that was set aside was applied just as a newer request for \
+         the same subgraph arrived; if the newer one came over the admin RPC, send it again"
     );
-    log_if_unrecorded(request, forgotten.await);
 }

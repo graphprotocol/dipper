@@ -4880,6 +4880,38 @@ async fn a_set_aside_studio_request_is_forgotten_by_requester_deployment_and_cha
 }
 
 #[tokio::test]
+async fn a_set_aside_studio_request_is_forgotten_as_a_record_only_while_it_is_that_record() {
+    //* Given - a request that a later record for the same subgraph replaced
+    let (db, _temp_db) = temp_registry_db().await;
+    let registry = PgRegistry::new(db);
+    let listed = studio_request_at(10);
+    let newer = studio_request_at(11);
+    for request in [&listed, &newer] {
+        registry
+            .set_aside_studio_request(request, 0)
+            .await
+            .expect("Failed to set the request aside");
+    }
+
+    //* When
+    let forgotten_as_listed = registry
+        .forget_set_aside_studio_record(&listed)
+        .await
+        .expect("Failed to forget the request as it was listed");
+    let kept = due_studio_requests(&registry).await;
+    let forgotten_as_newer = registry
+        .forget_set_aside_studio_record(&newer)
+        .await
+        .expect("Failed to forget the newer request");
+
+    //* Then
+    assert!(!forgotten_as_listed, "the newer request took its place");
+    assert_eq!(kept, vec![newer], "and is not removed in its stead");
+    assert!(forgotten_as_newer);
+    assert!(due_studio_requests(&registry).await.is_empty());
+}
+
+#[tokio::test]
 async fn a_studio_request_marked_ready_is_listed_for_its_partition_until_it_must_wait_again() {
     //* Given
     let (db, _temp_db) = temp_registry_db().await;
