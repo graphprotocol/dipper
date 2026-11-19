@@ -55,16 +55,20 @@ spec:
             capabilities:
               drop:
                 - ALL
-          # Startup can take minutes: a retrying RPC domain fetch, database
-          # migrations and an indexer URL snapshot all run before the health
-          # port opens. Liveness stays suspended until this passes (600s).
+          # Startup can take minutes, and every step runs before the health port
+          # opens: the RPC domain fetch (6 tries, 62s of pauses between them), the
+          # wait for the database (db.connect_wait, 120s), migrations, the indexer
+          # URL snapshot (6 tries of up to 30s, 62s of pauses) and the wait for
+          # IISA (iisa.startup_wait, 180s). Those add up to around 10 minutes when
+          # every dependency is slow, so liveness stays suspended for up to 15
+          # minutes (900s); raise it with the waits.
           startupProbe:
             httpGet:
               path: /health
               port: health
             periodSeconds: 10
             timeoutSeconds: 5
-            failureThreshold: 60
+            failureThreshold: 90
           # Probe the health endpoint, not a TCP socket: it returns 503 once the
           # worker watermark goes stale, catching a worker that is alive but
           # stuck. 6 failures so a brief stall cannot kill the only replica.
