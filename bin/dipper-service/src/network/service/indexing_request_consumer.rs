@@ -1444,6 +1444,12 @@ fn decode_propose(value: Option<&[u8]>, expected_network: &str) -> Result<Propos
 
     // Before the type: another network's record is not this dipper's, whatever its type.
     if event.the_graph_network_caip2id != expected_network {
+        // A value that names no network is no other dipper's either, so it is alerted on.
+        if parse_eip155_caip2(&event.the_graph_network_caip2id).is_none() {
+            return Err(Skip::Unreadable(
+                "missing or invalid protocol network caip2 id",
+            ));
+        }
         return Err(Skip::OtherNetwork);
     }
 
@@ -1641,6 +1647,22 @@ mod tests {
             decode_propose(Some(&bytes), "eip155:42161"),
             Err(Skip::OtherNetwork)
         );
+    }
+
+    /// Another dipper's network is passed over quietly, but a value that names no network is
+    /// no dipper's to apply, so it has to raise the alert a dropped request does.
+    #[test]
+    fn alerts_on_a_protocol_network_that_names_no_network() {
+        for network in ["", "42161", "arbitrum-one", "eip155:", "eip155:abc"] {
+            let bytes = encode_propose(EVENT_TYPE_PROPOSE, network, QM_HASH, "eip155:1", 3);
+            assert_eq!(
+                decode_propose(Some(&bytes), "eip155:42161"),
+                Err(Skip::Unreadable(
+                    "missing or invalid protocol network caip2 id"
+                )),
+                "{network:?}"
+            );
+        }
     }
 
     /// Another network's dipper answers for its own records, whatever their type, so none of
