@@ -1,9 +1,6 @@
--- Table: dipper_studio_set_aside_requests
 -- Studio indexing requests whose subgraph manifest IPFS could not return when their Kafka record
--- was read. The consumer moves past such a record rather than hold up every later one, and keeps
--- the request here to apply once the manifest can be read. There is at most 1 row for each
--- requester, deployment and chain: a later record for the same 3 replaces or removes the row, so
--- an old request is never applied over a newer one.
+-- was read, kept to be applied once it can. There is at most 1 row for each requester, deployment
+-- and chain: a later record for them replaces or removes it, so it is never applied over a newer.
 CREATE TABLE dipper_studio_set_aside_requests
 (
     requested_by             BYTEA       NOT NULL,

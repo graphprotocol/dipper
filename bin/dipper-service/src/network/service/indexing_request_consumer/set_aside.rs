@@ -24,7 +24,8 @@ use crate::{
 };
 
 /// How long a record whose manifest can't be read is tried again in place before it is set
-/// aside. A manifest only just published reaches IPFS within this, and the partition waits.
+/// aside. It gives a manifest that was only just published time to turn up, and is as long as
+/// the records behind it on the partition are kept waiting.
 pub(super) const SET_ASIDE_AFTER: Duration = Duration::from_secs(3 * 60);
 
 /// How long after a request is set aside its manifest is read again for the first time.
@@ -333,7 +334,7 @@ where
             attempts = request.attempts,
             "A Studio indexing request has been set aside for {} hours and has still not taken \
              effect, because its subgraph manifest can't be read from IPFS: {}. Dipper goes on \
-             reading the manifest every hour, and the request is only applied once it can",
+             reading the manifest every hour, and applies the request only once it can be read",
             request.waited.as_secs() / 3_600,
             request.reason
         );
