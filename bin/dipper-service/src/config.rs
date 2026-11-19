@@ -300,6 +300,38 @@ impl Config {
         Ok(())
     }
 
+    /// Refuses a worker concurrency the database pool cannot serve. Each worker loop can hold up
+    /// to [`DB_CONNECTIONS_PER_WORKER_LOOP`] pooled connections at once (its listener, an open job
+    /// transaction and a registry query) and shares the pool with the registry and background
+    /// services, which [`DB_CONNECTIONS_RESERVED`] leaves room for. Starting with fewer would
+    /// deadlock the loops under load instead of failing here.
+    pub fn validate_db_pool(&self) -> Result<(), String> {
+        if self.worker_concurrency == 0 {
+            return Err("worker_concurrency must be at least 1".to_string());
+        }
+        let max_conns = self
+            .db
+            .max_connections
+            .unwrap_or(crate::db::DEFAULT_MAX_CONNECTIONS) as usize;
+        // Saturating so an absurd configured value can't overflow and slip past the check below
+        // (the very check meant to catch oversized sizing).
+        let required_conns = self
+            .worker_concurrency
+            .saturating_mul(DB_CONNECTIONS_PER_WORKER_LOOP)
+            .saturating_add(DB_CONNECTIONS_RESERVED);
+        if required_conns > max_conns {
+            return Err(format!(
+                "worker_concurrency ({}) needs at least {required_conns} db connections (each loop \
+                 may hold {DB_CONNECTIONS_PER_WORKER_LOOP} for its listener, open job transaction \
+                 and a registry query, plus {DB_CONNECTIONS_RESERVED} reserved for the registry \
+                 and background services), but db.max_connections is {max_conns}; raise \
+                 db.max_connections to at least {required_conns} or lower worker_concurrency",
+                self.worker_concurrency,
+            ));
+        }
+        Ok(())
+    }
+
     /// A warning for startup to log when the Kafka consumer records requests under an identity
     /// the admin RPC would not accept. Requests are keyed by who asked, so the 2 doors would
     /// keep separate requests for the same deployment.
@@ -926,6 +958,13 @@ fn default_expiration_grace() -> Duration {
 fn default_worker_concurrency() -> usize {
     8
 }
+
+/// Pooled connections one worker loop may hold at once: its listener, an open job transaction
+/// and a registry query.
+pub const DB_CONNECTIONS_PER_WORKER_LOOP: usize = 3;
+
+/// Pooled connections kept free of the worker loops for the registry and background services.
+pub const DB_CONNECTIONS_RESERVED: usize = 2;
 
 impl Default for ExpirationConfig {
     fn default() -> Self {
@@ -4406,6 +4445,56 @@ mod tests {
         assert!(
             HealthConfig::default().validate(admin_rpc).is_ok(),
             "distinct ports are fine"
+        );
+    }
+
+    #[test]
+    fn example_config_has_db_connections_for_its_worker_loops() {
+        // The example is what operators copy: a pool it sizes too small for its own worker
+        // loops makes dipper refuse to start on an unedited copy.
+        let config = example_config_edited(|_| {});
+        assert_eq!(config.validate_db_pool(), Ok(()));
+    }
+
+    #[test]
+    fn db_pool_must_serve_every_worker_loop_and_the_reserve() {
+        let with = |workers: usize, max_connections: u32| {
+            example_config_edited(|config| {
+                config["worker_concurrency"] = workers.into();
+                config["db"]["max_connections"] = max_connections.into();
+            })
+            .validate_db_pool()
+        };
+        let needed = 8 * DB_CONNECTIONS_PER_WORKER_LOOP + DB_CONNECTIONS_RESERVED;
+        let needed = u32::try_from(needed).unwrap();
+        assert_eq!(
+            with(8, needed),
+            Ok(()),
+            "exactly enough connections is fine"
+        );
+        let err = with(8, needed - 1).expect_err("1 connection short must be refused");
+        assert!(
+            err.contains(&format!("at least {needed}")),
+            "the error names the size to raise db.max_connections to: {err}"
+        );
+    }
+
+    #[test]
+    fn default_db_pool_serves_the_default_worker_concurrency() {
+        let config = example_config_edited(|config| {
+            let db = config["db"].as_object_mut().unwrap();
+            db.remove("max_connections");
+            config.as_object_mut().unwrap().remove("worker_concurrency");
+        });
+        assert_eq!(config.validate_db_pool(), Ok(()));
+    }
+
+    #[test]
+    fn db_pool_check_refuses_zero_worker_loops() {
+        let config = example_config_edited(|config| config["worker_concurrency"] = 0.into());
+        assert_eq!(
+            config.validate_db_pool(),
+            Err("worker_concurrency must be at least 1".to_string())
         );
     }
 

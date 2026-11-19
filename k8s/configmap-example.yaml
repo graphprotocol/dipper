@@ -40,7 +40,7 @@ data:
         "url": "postgres://localhost:5432/dipper",
         "username": "dipper",
         "password": "REPLACE_ME",
-        "max_connections": 10
+        "max_connections": 32
       },
       "indexer_urls": {
         "subgraph_endpoint": "https://api.studio.thegraph.com/query/REPLACE_ME_USER_ID/REPLACE_ME_INDEXING_PAYMENTS_SLUG/version/latest",
