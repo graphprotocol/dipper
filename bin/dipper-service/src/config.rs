@@ -9,7 +9,7 @@ use std::{
 };
 
 use dipper_core::config::{Hidden, HiddenSecretKeyAsHexStr};
-use dipper_producer::kafka::KafkaConfig;
+use dipper_producer::kafka::{KafkaConfig, KafkaConsumerConfig};
 use serde_with::serde_as;
 use thegraph_core::alloy::{
     primitives::{Address, ChainId, U256},
@@ -144,6 +144,10 @@ pub struct Config {
     /// Events configuration for sending dipper events on the configured topic for streaming
     #[serde(default)]
     pub event_streaming_config: Option<EventStreamingConfig>,
+    /// The Studio indexing request consumer configuration (reads subgraph
+    /// indexing requests from a Redpanda topic; absent means off)
+    #[serde(default)]
+    pub indexing_request_consumer: Option<IndexingRequestConsumerConfig>,
     /// Number of concurrent worker loops draining the job queue (default: 8).
     /// Each loop can hold up to three pooled DB connections at once and shares
     /// the pool with the registry and background services; size accordingly.
@@ -159,10 +163,66 @@ pub struct Config {
     /// none are sent.
     #[serde(default)]
     pub alerts: AlertsConfig,
+    /// Refusing indexing requests whose chain is not the one their subgraph manifest
+    /// indexes. On by default, so omitting the section keeps the check.
+    #[serde(default)]
+    pub request_chain_check: RequestChainCheckConfig,
     /// Where dipper reads the minimum prices indexer-rs suggests, which its default price
     /// ceilings follow. Left out, it reads them from indexer-rs's DIPs branch every 6 hours.
     #[serde(default)]
     pub suggested_minimums: SuggestedMinimumsConfig,
+}
+
+/// How indexing requests are checked against their subgraph manifest's chain. A check that
+/// can't read the manifest never waves a request through: the admin RPC refuses it, and one
+/// from Studio is set aside and applied once the manifest can be read.
+#[serde_as]
+#[derive(custom_debug::CustomDebug, Clone, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RequestChainCheckConfig {
+    /// Whether to check at all. Turn it off only where manifests can't be read, or for a
+    /// chain neither the networks registry nor `additional_networks` names.
+    pub enabled: bool,
+
+    /// The IPFS API subgraph manifests are read from.
+    #[serde_as(as = "serde_with::DisplayFromStr")]
+    #[debug(with = debug_endpoint)]
+    pub ipfs_url: Url,
+
+    /// How long to wait on IPFS for 1 manifest, in seconds. IPFS takes about 30 seconds
+    /// to say it has no such manifest, so a shorter wait turns that into a retry.
+    #[serde_as(as = "serde_with::DurationSeconds")]
+    pub timeout: Duration,
+}
+
+impl RequestChainCheckConfig {
+    /// Rejects a check that would fail every request.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.enabled && self.timeout.is_zero() {
+            return Err("request_chain_check.timeout must be greater than 0".to_string());
+        }
+        Ok(())
+    }
+
+    /// The IPFS endpoint named by host, for logs: an IPFS URL can carry credentials.
+    pub fn ipfs_host(&self) -> String {
+        endpoint_name(&self.ipfs_url)
+    }
+}
+
+impl Default for RequestChainCheckConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ipfs_url: default_ipfs_url(),
+            timeout: Duration::from_secs(45),
+        }
+    }
+}
+
+#[expect(clippy::expect_used, reason = "a fixed URL that always parses")]
+fn default_ipfs_url() -> Url {
+    Url::parse("https://ipfs.thegraph.com").expect("a valid URL")
 }
 
 /// How loudly startup reports a background service that will not run.
@@ -238,6 +298,27 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// A warning for startup to log when the Kafka consumer records requests under an identity
+    /// the admin RPC would not accept. Requests are keyed by who asked, so the 2 doors would
+    /// keep separate requests for the same deployment.
+    pub fn consumer_requester_warning(&self) -> Option<String> {
+        let requested_by = self.indexing_request_consumer.as_ref()?.requested_by;
+        if self
+            .admin_rpc
+            .gateway_operator_allowlist
+            .contains(&requested_by)
+        {
+            return None;
+        }
+        Some(format!(
+            "indexing_request_consumer.requested_by ({requested_by}) is not in \
+             admin_rpc.gateway_operator_allowlist. Requests are stored under who asked, so a \
+             cancel from Kafka will not close a request opened over the admin RPC, and a request \
+             from Kafka will open a 2nd one for the same deployment. Set requested_by to the \
+             allowlisted address that opens requests over the admin RPC"
+        ))
     }
 
     /// The background services that will not run, for startup to report.
@@ -507,6 +588,13 @@ impl Default for AlertsConfig {
                 "chain_listener_fetch_failing",
                 "stale_agreement_uncancellable",
                 "liveness_abandonment_paused",
+                "studio_request_chain_refused",
+                "studio_request_consumer_stalled",
+                "studio_request_offset_jumped",
+                "studio_request_dropped",
+                "studio_request_consumer_not_connected",
+                "studio_request_set_aside",
+                "studio_request_still_waiting",
                 "iisa_request_rejected",
                 "dips_info_missing",
                 "dips_info_checks_paused",
@@ -2175,6 +2263,16 @@ impl EventStreamingConfig {
                     .to_string(),
             );
         }
+        // 0 makes every connect time out at once, and the retries that follow blame the brokers.
+        if self
+            .kafka
+            .as_ref()
+            .is_some_and(|kafka| kafka.connect_timeout_secs == 0)
+        {
+            return Err(
+                "event_streaming_config.kafka.connect_timeout_secs must be at least 1".to_string(),
+            );
+        }
         Ok(())
     }
 }
@@ -2187,9 +2285,199 @@ pub fn default_event_queue_capacity() -> NonZeroUsize {
     NonZeroUsize::new(1024).expect("default event queue capacity is non-zero")
 }
 
+/// Configuration for the Studio indexing request consumer, which reads
+/// subgraph indexing request events from a Redpanda topic and applies them
+/// through the same path as the admin RPC.
+#[serde_as]
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndexingRequestConsumerConfig {
+    /// Whether the consumer runs (default: false). Until Studio sends `indexed_network_caip2id`
+    /// every request is skipped for good. The first switch-on applies every record the topic
+    /// still holds, oldest first, so switch on when Studio starts sending the field, not later.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Kafka connection settings and the topic Studio produces on. The topic has no default.
+    /// A wrong name, like brokers that are down, is alerted on while dipper runs on without
+    /// the consumer, which keeps trying; settings that can never connect are refused at start.
+    pub kafka: KafkaConsumerConfig,
+
+    /// The identity recorded as the requester on consumed requests, since
+    /// Kafka messages carry no signature to recover one from. Use the address
+    /// that opens requests over the admin RPC, so both doors share request rows.
+    pub requested_by: Address,
+
+    /// How long a fetch waits server-side for new records before returning
+    /// empty, in seconds (default: 5).
+    #[serde_as(as = "serde_with::DurationSeconds<u64>")]
+    #[serde(default = "default_indexing_request_consumer_max_wait")]
+    pub max_wait: Duration,
+
+    /// Maximum bytes per fetch (default: 1,048,576).
+    #[serde(default = "default_indexing_request_consumer_fetch_max_bytes")]
+    pub fetch_max_bytes: i32,
+}
+
+fn default_indexing_request_consumer_max_wait() -> Duration {
+    Duration::from_secs(5)
+}
+
+fn default_indexing_request_consumer_fetch_max_bytes() -> i32 {
+    1_048_576
+}
+
+impl IndexingRequestConsumerConfig {
+    /// Reject a configuration the consumer cannot run with. Checked even when
+    /// disabled, so a broken value cannot lie dormant until the flag flips.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.kafka.brokers.is_empty() {
+            return Err(
+                "indexing_request_consumer.kafka.brokers must list at least 1 broker".to_string(),
+            );
+        }
+        if let Err(err) = self.kafka.validate() {
+            return Err(format!(
+                "indexing_request_consumer.kafka: {}",
+                crate::log_text::with_causes(&err)
+            ));
+        }
+        // 0 makes every connect time out instantly, so startup would fail with
+        // a message blaming the broker instead of the config typo.
+        if self.kafka.connect_timeout_secs == 0 {
+            return Err(
+                "indexing_request_consumer.kafka.connect_timeout_secs must be at least 1"
+                    .to_string(),
+            );
+        }
+        // A zero requester is almost certainly an unset value, and it would
+        // silently key every consumed request under the zero address.
+        if self.requested_by == Address::ZERO {
+            return Err(
+                "indexing_request_consumer.requested_by must be a non-zero address".to_string(),
+            );
+        }
+        // Below ~1 KB a fetch cannot hold a whole record, so the consumer
+        // would poll forever without ever making progress.
+        if self.fetch_max_bytes < 1_024 {
+            return Err(format!(
+                "indexing_request_consumer.fetch_max_bytes ({}) must be at least 1024",
+                self.fetch_max_bytes
+            ));
+        }
+        if self.max_wait.is_zero() || self.max_wait.as_millis() > i32::MAX as u128 {
+            return Err(format!(
+                "indexing_request_consumer.max_wait ({}s) must be between 1 second and {} seconds",
+                self.max_wait.as_secs(),
+                i32::MAX / 1_000
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn consumer_config(json: serde_json::Value) -> IndexingRequestConsumerConfig {
+        serde_json::from_value(json).expect("deserializes")
+    }
+
+    #[test]
+    fn indexing_request_consumer_config_defaults_and_validation() {
+        let config = consumer_config(serde_json::json!({
+            "kafka": { "brokers": ["localhost:9092"], "topic": "t" },
+            "requested_by": "0x8f8c426f956876325b1e037c6eae9b189952994c",
+        }));
+        assert!(
+            !config.enabled,
+            "the consumer must be off unless opted into"
+        );
+        assert_eq!(config.max_wait, Duration::from_secs(5));
+        assert_eq!(config.fetch_max_bytes, 1_048_576);
+        assert!(config.validate().is_ok());
+
+        // Validation runs even for a disabled section, so broken values are
+        // caught at startup rather than the day the flag flips.
+        let broken = consumer_config(serde_json::json!({
+            "enabled": false,
+            "kafka": { "brokers": ["localhost:9092"], "topic": "t" },
+            "requested_by": "0x0000000000000000000000000000000000000000",
+        }));
+        assert!(broken.validate().unwrap_err().contains("requested_by"));
+
+        let no_brokers = consumer_config(serde_json::json!({
+            "kafka": { "brokers": [], "topic": "t" },
+            "requested_by": "0x8f8c426f956876325b1e037c6eae9b189952994c",
+        }));
+        assert!(no_brokers.validate().unwrap_err().contains("brokers"));
+
+        let zero_connect_timeout = consumer_config(serde_json::json!({
+            "kafka": { "brokers": ["localhost:9092"], "topic": "t", "connect_timeout_secs": 0 },
+            "requested_by": "0x8f8c426f956876325b1e037c6eae9b189952994c",
+        }));
+        assert!(
+            zero_connect_timeout
+                .validate()
+                .unwrap_err()
+                .contains("connect_timeout_secs")
+        );
+
+        let tiny_fetch = consumer_config(serde_json::json!({
+            "kafka": { "brokers": ["localhost:9092"], "topic": "t" },
+            "requested_by": "0x8f8c426f956876325b1e037c6eae9b189952994c",
+            "fetch_max_bytes": 512,
+        }));
+        assert!(
+            tiny_fetch
+                .validate()
+                .unwrap_err()
+                .contains("fetch_max_bytes")
+        );
+    }
+
+    /// A Kafka setting no connect would accept fails at start, even while the consumer is off.
+    /// Found only on the day it is switched on, it would be retried like a broker outage.
+    #[test]
+    fn consumer_kafka_settings_that_can_never_connect_are_refused_while_off() {
+        let refusal = |kafka: serde_json::Value| {
+            consumer_config(serde_json::json!({
+                "enabled": false,
+                "kafka": kafka,
+                "requested_by": "0x8f8c426f956876325b1e037c6eae9b189952994c",
+            }))
+            .validate()
+            .expect_err("a config that can never connect is refused")
+        };
+
+        let mechanism = refusal(serde_json::json!({
+            "brokers": ["localhost:9092"], "topic": "t", "sasl_mechanism": "SCRAM",
+        }));
+        let password = refusal(serde_json::json!({
+            "brokers": ["localhost:9092"], "topic": "t",
+            "sasl_mechanism": "PLAIN", "sasl_username": "dipper",
+        }));
+        let ca_file = refusal(serde_json::json!({
+            "brokers": ["localhost:9092"], "topic": "t",
+            "tls_enabled": true, "tls_ca_cert_path": "/no/such/folder/ca.pem",
+        }));
+        let topic = refusal(serde_json::json!({ "brokers": ["localhost:9092"], "topic": "" }));
+
+        assert!(
+            mechanism.contains("unsupported SASL mechanism 'SCRAM'"),
+            "{mechanism}"
+        );
+        assert!(password.contains("sasl_password is required"), "{password}");
+        assert!(ca_file.contains("/no/such/folder/ca.pem"), "{ca_file}");
+        assert!(topic.contains("topic must not be empty"), "{topic}");
+        for refused in [mechanism, password, ca_file, topic] {
+            assert!(
+                refused.starts_with("indexing_request_consumer.kafka: "),
+                "{refused}"
+            );
+        }
+    }
 
     #[test]
     fn test_dips_agreement_config_deserialization() {
@@ -3107,6 +3395,26 @@ mod tests {
         assert!(config.kafka.is_none(), "kafka should default to None");
     }
 
+    /// A connect given no time fails every attempt, and the retries that follow blame the brokers.
+    #[test]
+    fn an_event_producer_with_no_time_to_connect_is_rejected() {
+        let config = |timeout: u64| -> EventStreamingConfig {
+            serde_json::from_value(serde_json::json!({
+                "enabled": true,
+                "kafka": { "brokers": ["localhost:9092"], "connect_timeout_secs": timeout },
+            }))
+            .expect("a valid event streaming section")
+        };
+
+        assert!(
+            config(0)
+                .validate()
+                .unwrap_err()
+                .contains("event_streaming_config.kafka.connect_timeout_secs")
+        );
+        assert!(config(1).validate().is_ok());
+    }
+
     /// A fully specified section round-trips every field, including the nested Kafka block.
     #[test]
     fn event_streaming_config_parses_full() {
@@ -3411,6 +3719,41 @@ mod tests {
             ],
             "a deployment copied from the example starts with no warning about a service left off"
         );
+    }
+
+    /// A request opened over the admin RPC is stored under its signer. A consumer set up with
+    /// any other address would not find it, so its cancel would do nothing and its request
+    /// would open a 2nd one beside it.
+    #[test]
+    fn a_consumer_identity_the_admin_rpc_does_not_allow_gets_a_startup_warning() {
+        const OPERATOR: &str = "0x8f8c426f956876325b1e037c6eae9b189952994c";
+        const OTHER: &str = "0x1111111111111111111111111111111111111111";
+        let warning = |requested_by: Option<&str>, allowed: &[&str]| {
+            example_config_edited(|config| {
+                config["admin_rpc"]["gateway_operator_allowlist"] = serde_json::json!(allowed);
+                if let Some(requested_by) = requested_by {
+                    config["indexing_request_consumer"] = serde_json::json!({
+                        "kafka": { "brokers": ["localhost:9092"], "topic": "t" },
+                        "requested_by": requested_by,
+                    });
+                }
+            })
+            .consumer_requester_warning()
+        };
+
+        let warned = warning(Some(OTHER), &[OPERATOR]).expect("a warning");
+        assert!(warned.contains("indexing_request_consumer.requested_by"));
+        assert!(warned.contains("admin_rpc.gateway_operator_allowlist"));
+        assert!(warned.to_lowercase().contains(OTHER), "{warned}");
+        // Studio only writes to the topic, so the warning must not send anyone looking for
+        // an address Studio signs with.
+        assert!(!warned.contains("Studio signs"), "{warned}");
+        assert!(
+            warning(Some(OTHER), &[]).is_some(),
+            "an empty allowlist does not hold it either"
+        );
+        assert_eq!(warning(Some(OPERATOR), &[OTHER, OPERATOR]), None);
+        assert_eq!(warning(None, &[OPERATOR]), None, "no consumer, no warning");
     }
 
     /// Without the listener dipper never learns an offer was accepted, so leaving the section out
@@ -3840,6 +4183,49 @@ mod tests {
             liveness.unreachable_trip_min_indexers,
             defaults.unreachable_trip_min_indexers
         );
+    }
+
+    #[test]
+    fn the_example_configmap_request_chain_check_section_parses() {
+        let check = serde_json::from_value::<RequestChainCheckConfig>(
+            example_config()["request_chain_check"].clone(),
+        )
+        .expect("the example's request_chain_check section is a valid config");
+        let defaults = RequestChainCheckConfig::default();
+
+        assert_eq!(check.enabled, defaults.enabled);
+        assert_eq!(check.ipfs_url, defaults.ipfs_url);
+        assert_eq!(check.timeout, defaults.timeout);
+    }
+
+    #[test]
+    fn a_request_chain_check_that_would_fail_every_request_is_rejected() {
+        let zero = RequestChainCheckConfig {
+            timeout: Duration::ZERO,
+            ..RequestChainCheckConfig::default()
+        };
+        let off = RequestChainCheckConfig {
+            enabled: false,
+            ..zero.clone()
+        };
+
+        assert!(zero.validate().is_err());
+        assert!(off.validate().is_ok(), "a check that is off never waits");
+        assert!(RequestChainCheckConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn the_ipfs_endpoint_is_logged_without_its_credentials() {
+        let config = RequestChainCheckConfig {
+            ipfs_url: Url::parse("https://project:secret@ipfs.example.com:5001/").unwrap(),
+            ..RequestChainCheckConfig::default()
+        };
+
+        assert_eq!(config.ipfs_host(), "ipfs.example.com:5001");
+        // Startup logs the whole config with Debug, which must leave the credentials out too.
+        let debugged = format!("{config:?}");
+        assert!(!debugged.contains("secret"), "{debugged}");
+        assert!(debugged.contains("ipfs.example.com:5001"), "{debugged}");
     }
 
     #[test]
