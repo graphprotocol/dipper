@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use sqlx::{
-    Pool, Postgres,
+    Connection as _, PgConnection, Pool, Postgres,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
 
@@ -27,35 +27,84 @@ pub async fn connect(conf: &DbConfig) -> anyhow::Result<Pool<Postgres>> {
         .username(&conf.username)
         .password(&conf.password);
 
-    // Connect, waiting out a database that is not reachable yet. The pool itself only retries a
-    // refused connection, and only for its acquire timeout.
-    let pool = crate::startup::retry_within(
+    // Wait for the database with 1 connection at a time, each cut off at the time left of the
+    // wait, then open the pool. Asking the pool instead would block every attempt for its whole
+    // acquire timeout and report only that it timed out, not why.
+    let probe = crate::startup::retry_within(
         "database connection",
         conf.connect_wait,
-        worth_retrying,
-        || {
-            PgPoolOptions::new()
-                .max_connections(conf.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS))
-                .acquire_timeout(ACQUIRE_TIMEOUT)
-                .connect_with(conn_options.clone())
+        ConnectFailure::worth_retrying,
+        |remaining| {
+            let options = conn_options.clone();
+            async move {
+                let limit = remaining.min(CONNECT_ATTEMPT_TIMEOUT);
+                match tokio::time::timeout(limit, PgConnection::connect_with(&options)).await {
+                    Ok(Ok(conn)) => {
+                        let _ = conn.close().await;
+                        Ok(())
+                    }
+                    Ok(Err(err)) => Err(ConnectFailure::Refused(err)),
+                    Err(_) => Err(ConnectFailure::TimedOut(limit)),
+                }
+            }
         },
     )
-    .await
-    .context("failed to connect to DB")?;
+    .await;
+    if let Err(gave_up) = probe {
+        anyhow::bail!(
+            "failed to connect to DB after {} tries over {}s: {}",
+            gave_up.tries,
+            gave_up.elapsed.as_secs(),
+            gave_up.error
+        );
+    }
+
+    let pool = PgPoolOptions::new()
+        .max_connections(conf.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS))
+        .acquire_timeout(ACQUIRE_TIMEOUT)
+        .connect_with(conn_options)
+        .await
+        .context("failed to connect to DB")?;
 
     Ok(pool)
 }
 
-/// Whether a failed connect may succeed if tried again. A server that answered with an error (a
-/// wrong password, a missing database) or a connection set up wrongly (its options, its TLS)
-/// will fail the same way each time, so those end the wait at once; a server that could not be
-/// reached, or dropped the connection, may be back soon.
-fn worth_retrying(err: &sqlx::Error) -> bool {
-    matches!(
-        err,
-        sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut | sqlx::Error::Protocol(_)
-    )
+/// The longest 1 connection attempt may take while waiting for the database at startup.
+const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Why 1 attempt to reach the database at startup failed.
+#[derive(Debug, thiserror::Error)]
+enum ConnectFailure {
+    #[error("{0}")]
+    Refused(sqlx::Error),
+    #[error("no answer within {}s", .0.as_secs())]
+    TimedOut(Duration),
 }
+
+impl ConnectFailure {
+    /// Whether the attempt may succeed if made again. A database that cannot be reached, drops
+    /// the connection, does not answer, is still starting up or has no connection to spare may
+    /// be back soon. Anything else fails the same way each time, and ends the wait at once: a
+    /// refused password or a missing database, a certificate the TLS check rejects (rustls
+    /// reports those as invalid data), something other than Postgres answering (a protocol
+    /// error), or the connection set up wrongly.
+    fn worth_retrying(&self) -> bool {
+        match self {
+            Self::TimedOut(_) => true,
+            Self::Refused(sqlx::Error::Io(err)) => err.kind() != std::io::ErrorKind::InvalidData,
+            Self::Refused(sqlx::Error::Database(err)) => err.code().is_some_and(|code| {
+                code == CANNOT_CONNECT_NOW || code == TOO_MANY_CONNECTIONS || code.starts_with("08")
+            }),
+            Self::Refused(_) => false,
+        }
+    }
+}
+
+/// Postgres's code for a server still starting up or shutting down (`cannot_connect_now`).
+const CANNOT_CONNECT_NOW: &str = "57P03";
+
+/// Postgres's code for a server with no connection slot to spare (`too_many_connections`).
+const TOO_MANY_CONNECTIONS: &str = "53300";
 
 #[cfg(test)]
 mod tests {
@@ -106,20 +155,54 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn connect_gives_up_on_a_silent_server_within_its_wait() {
+        // A server that accepts and then says nothing. Each attempt is cut off at the time left,
+        // so the wait ends on time instead of after an attempt's own timeout.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let result = connect(&db_config(&format!("postgres://{addr}/dipper"), 2)).await;
+        server.abort();
+
+        let err = format!("{:#}", result.expect_err("the server never answers"));
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert!(err.contains("no answer within"), "{err}");
+    }
+
+    fn io(kind: std::io::ErrorKind) -> ConnectFailure {
+        ConnectFailure::Refused(sqlx::Error::Io(std::io::Error::from(kind)))
+    }
+
     #[test]
     fn only_failures_that_may_clear_up_are_retried() {
-        // A connection set up wrongly fails the same way every time, so it ends the wait at once
-        // and dipper exits with the reason instead of retrying for minutes.
-        assert!(!worth_retrying(&sqlx::Error::Configuration(
-            "bad option".into()
-        )));
-        assert!(!worth_retrying(&sqlx::Error::Tls(
-            "untrusted certificate".into()
-        )));
-        // A server out of reach, or one that dropped the connection, may be back soon.
-        assert!(worth_retrying(&sqlx::Error::PoolTimedOut));
-        assert!(worth_retrying(&sqlx::Error::Io(std::io::Error::from(
-            std::io::ErrorKind::ConnectionReset
-        ))));
+        use std::io::ErrorKind;
+        // A database out of reach, dropping connections or not answering may be back soon.
+        assert!(io(ErrorKind::ConnectionRefused).worth_retrying());
+        assert!(io(ErrorKind::ConnectionReset).worth_retrying());
+        assert!(io(ErrorKind::UnexpectedEof).worth_retrying());
+        assert!(ConnectFailure::TimedOut(Duration::from_secs(1)).worth_retrying());
+        // rustls reports a rejected certificate as invalid data; it will be rejected every time.
+        assert!(!io(ErrorKind::InvalidData).worth_retrying());
+        // Something other than Postgres answering, or the connection set up wrongly.
+        assert!(
+            !ConnectFailure::Refused(sqlx::Error::Protocol("unexpected response".into()))
+                .worth_retrying()
+        );
+        assert!(
+            !ConnectFailure::Refused(sqlx::Error::Configuration("bad option".into()))
+                .worth_retrying()
+        );
     }
 }
