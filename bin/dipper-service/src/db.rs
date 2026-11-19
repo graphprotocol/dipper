@@ -22,6 +22,8 @@ const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
     reason = "predates this lint; fix when next touched"
 )]
 pub async fn connect(conf: &DbConfig) -> anyhow::Result<Pool<Postgres>> {
+    // sqlx checks a `verify-ca` certificate with rustls's process-wide provider.
+    crate::tls::install_crypto_provider();
     let mut conn_options: PgConnectOptions = conf.url.as_str().parse().expect("Invalid DB URL");
     conn_options = conn_options
         .username(&conf.username)
@@ -94,5 +96,123 @@ mod tests {
             next, TLS_HANDSHAKE_RECORD,
             "after the server agrees, dipper starts a TLS handshake"
         );
+    }
+
+    /// A throwaway CA, and a server certificate it signed for `localhost`.
+    struct TestCerts {
+        ca_pem: String,
+        server_chain: Vec<rustls::pki_types::CertificateDer<'static>>,
+        server_key: rustls::pki_types::PrivateKeyDer<'static>,
+    }
+
+    fn test_certs() -> TestCerts {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let ca_key = KeyPair::generate().unwrap();
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let server_key = KeyPair::generate().unwrap();
+        let server = CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .signed_by(&server_key, &ca, &ca_key)
+            .unwrap();
+        TestCerts {
+            ca_pem: ca.pem(),
+            server_chain: vec![server.der().clone()],
+            server_key: rustls::pki_types::PrivatePkcs8KeyDer::from(server_key.serialize_der())
+                .into(),
+        }
+    }
+
+    /// A server that agrees to TLS with `certs` and reports whether the client completed the
+    /// handshake, which it only does once it accepts the server's certificate. It then drops the
+    /// connection, so the connect fails either way; only the handshake matters.
+    async fn tls_server(
+        certs: &TestCerts,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<bool>) {
+        let config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(certs.server_chain.clone(), certs.server_key.clone_key())
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handshake = tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return false;
+            };
+            let mut request = [0u8; 8];
+            if socket.read_exact(&mut request).await.is_err() || request != SSL_REQUEST {
+                return false;
+            }
+            if socket.write_all(b"S").await.is_err() {
+                return false;
+            }
+            acceptor.accept(socket).await.is_ok()
+        });
+        (addr, handshake)
+    }
+
+    /// Connects to a TLS server for `localhost` through `host`, with `params` in the URL, and says
+    /// whether dipper completed the handshake, that is, accepted the certificate.
+    async fn accepts_certificate(host: &str, params: &str, trust_ca: bool) -> bool {
+        let certs = test_certs();
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("dipper-tls-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ca = dir.join("ca.pem");
+        std::fs::write(&ca, &certs.ca_pem).unwrap();
+        let (addr, handshake) = tls_server(&certs).await;
+        let root = if trust_ca {
+            format!("&sslrootcert={}", ca.display())
+        } else {
+            String::new()
+        };
+        let url = format!("postgres://{host}:{}/dipper?{params}{root}", addr.port());
+
+        let _ = tokio::time::timeout(Duration::from_secs(10), connect(&db_config(&url))).await;
+        let accepted = tokio::time::timeout(Duration::from_secs(10), handshake)
+            .await
+            .map(|joined| joined.unwrap_or(false))
+            .unwrap_or(false);
+        let _ = std::fs::remove_dir_all(&dir);
+        accepted
+    }
+
+    #[tokio::test]
+    async fn verify_full_accepts_a_certificate_from_the_given_ca_for_the_host() {
+        assert!(accepts_certificate("localhost", "sslmode=verify-full", true).await);
+    }
+
+    #[tokio::test]
+    async fn verify_full_refuses_a_certificate_for_another_host() {
+        // The certificate names `localhost`; dipper reaches the server as 127.0.0.1.
+        assert!(!accepts_certificate("127.0.0.1", "sslmode=verify-full", true).await);
+    }
+
+    #[tokio::test]
+    async fn verify_full_refuses_a_certificate_from_an_unknown_ca() {
+        assert!(!accepts_certificate("localhost", "sslmode=verify-full", false).await);
+    }
+
+    #[tokio::test]
+    async fn verify_ca_accepts_a_certificate_from_the_given_ca() {
+        // sqlx checks a `verify-ca` certificate through rustls's process-wide crypto provider;
+        // with 2 backends linked and none installed, that panicked.
+        assert!(accepts_certificate("localhost", "sslmode=verify-ca", true).await);
+    }
+
+    #[tokio::test]
+    async fn verify_ca_still_checks_the_hostname() {
+        // sqlx 0.8 skips the hostname check for `verify-ca` only on the error rustls used to
+        // return for a name mismatch; rustls 0.23 returns a newer one, so the check stays. Should
+        // a later sqlx skip it as libpq does, this fails, and the docs on `db.url` need updating.
+        assert!(!accepts_certificate("127.0.0.1", "sslmode=verify-ca", true).await);
     }
 }

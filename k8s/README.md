@@ -4,7 +4,7 @@ Kubernetes manifests for deploying the dipper service.
 
 ## Prerequisites
 
-- PostgreSQL database accessible from the cluster. Ask for an encrypted, verified connection in `db.url`, for example `postgres://<host>:5432/dipper?sslmode=verify-full&sslrootcert=/config/db-ca.pem` with the server's CA mounted next to `config.json`. Use `sslmode=verify-ca` when dipper reaches the server at an address its certificate does not name, such as a managed database's private IP
+- PostgreSQL database accessible from the cluster. Ask for an encrypted, verified connection in `db.url`, for example `postgres://<host>:5432/dipper?sslmode=verify-full&sslrootcert=/config/db-ca.pem` with the server's CA mounted next to `config.json`, where `<host>` is a name the server's certificate covers (a managed database may give one, such as Cloud SQL's instance DNS name with its shared CA). `sslmode=verify-ca` checks the name as well for now, so it is no way round a certificate that does not name the address dipper uses; reach such a database through a proxy that authenticates for dipper instead, such as the Cloud SQL Auth Proxy
 - Configuration secrets managed separately
 - IISA service reachable at startup (dipper health-checks IISA and exits if it is unreachable)
 

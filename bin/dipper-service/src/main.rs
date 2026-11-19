@@ -35,6 +35,7 @@ mod signing;
 mod supervisor;
 #[cfg(test)]
 mod test_support;
+mod tls;
 mod worker;
 
 #[global_allocator]
@@ -67,6 +68,9 @@ const STOP_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5)
     reason = "predates this lint; fix when next touched"
 )]
 pub async fn main() -> anyhow::Result<()> {
+    // Before anything opens a TLS connection: see `tls`.
+    tls::install_crypto_provider();
+
     // Load the configuration first, since logging needs it to know where to send alerts
     let conf_path = env::args()
         .nth(1)
