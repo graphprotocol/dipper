@@ -16,6 +16,7 @@ use thegraph_core::{DeploymentId, alloy::primitives::Address};
 use super::error_handling::{handle_list_result, handle_optional_result};
 use crate::{
     config::MAX_NUM_CANDIDATES,
+    network::service::indexing_request_consumer::SetAsideRequestRemoval,
     registry::{
         IndexingRequest as IndexingRequestRecord, IndexingRequestRegistry,
         IndexingRequestStatus as IndexingRequestRecordStatus, RequestOrderRegistry,
@@ -66,7 +67,13 @@ impl<R, W> RpcServerImpl<R, W> {
 #[async_trait]
 impl<R, W> IndexingRequestsRpcServer for RpcServerImpl<R, W>
 where
-    R: IndexingRequestRegistry + RequestOrderRegistry + Clone + Send + Sync + 'static,
+    R: IndexingRequestRegistry
+        + RequestOrderRegistry
+        + SetAsideRequestRemoval
+        + Clone
+        + Send
+        + Sync
+        + 'static,
     W: WorkerQueue + Clone + Send + Sync + 'static,
 {
     async fn get_all_indexing_requests(
@@ -263,6 +270,30 @@ where
             }
         }
 
+        // A Studio request for the same subgraph that still waits on its manifest is older
+        // than this one. It goes first, so that it is never applied over this one later.
+        match self
+            .registry
+            .forget_set_aside_request(requested_by, deployment_id, chain_id)
+            .await
+        {
+            Ok(true) => tracing::info!(
+                %requested_by,
+                %deployment_id,
+                %chain_id,
+                "Removed a Studio indexing request that was set aside: a newer request for the \
+                 same subgraph came over the admin RPC"
+            ),
+            Ok(false) => {}
+            Err(err) => {
+                tracing::error!(
+                    error=?err,
+                    "Failed to remove the Studio request set aside for the same subgraph"
+                );
+                return Err(ErrorObject::borrowed(503, "Service unavailable", None));
+            }
+        }
+
         apply_set_indexing_target(
             &self.registry,
             &self.worker,
@@ -372,6 +403,10 @@ mod tests {
         page: RequestsPage,
         /// What each listing asked for: where to start, which status, how many.
         pages_asked: Arc<std::sync::Mutex<Vec<PageAsked>>>,
+        /// Each removal of a Studio request set aside and each change applied, in order.
+        journal: Arc<std::sync::Mutex<Vec<String>>>,
+        /// Whether the database fails to remove a Studio request set aside.
+        forget_fails: Arc<std::sync::atomic::AtomicBool>,
     }
 
     type PageAsked = (
@@ -399,6 +434,23 @@ mod tests {
     }
 
     #[async_trait]
+    impl SetAsideRequestRemoval for MockRegistry {
+        async fn forget_set_aside_request(
+            &self,
+            requested_by: Address,
+            deployment_id: DeploymentId,
+            deployment_chain_id: ChainId,
+        ) -> RegistryResult<bool> {
+            if self.forget_fails.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(crate::registry::Error::NoRecordsUpdated);
+            }
+            let entry = format!("forget {requested_by} {deployment_id} {deployment_chain_id}");
+            self.journal.lock().unwrap().push(entry);
+            Ok(true)
+        }
+    }
+
+    #[async_trait]
     impl IndexingRequestRegistry for MockRegistry {
         async fn set_indexing_target_candidates(
             &self,
@@ -408,6 +460,8 @@ mod tests {
             num_candidates: usize,
         ) -> RegistryResult<SetTargetOutcome> {
             self.accepted_counts.lock().unwrap().push(num_candidates);
+            let entry = format!("apply {num_candidates}");
+            self.journal.lock().unwrap().push(entry);
             Ok(self.outcome.clone())
         }
 
@@ -631,6 +685,8 @@ mod tests {
                 newest_signed_at: Arc::default(),
                 page: RequestsPage::default(),
                 pages_asked: Arc::default(),
+                journal: Arc::default(),
+                forget_fails: Arc::default(),
             },
             worker: MockWorker::default(),
             max_candidates: 10,
@@ -1367,5 +1423,90 @@ mod tests {
         //* Assert
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(check.calls(), 0);
+    }
+
+    /// What the registry was asked to do for the requests that got past every check, in order.
+    fn journal(server: &RpcServerImpl<MockRegistry, MockWorker>) -> Vec<String> {
+        server.registry.journal.lock().unwrap().clone()
+    }
+
+    /// A Studio request for the same subgraph may be set aside until IPFS returns its manifest.
+    /// The operator's request is newer, so that one goes first: left there, it would be
+    /// applied over the operator's change, a cancel included, once the manifest turned up.
+    #[tokio::test]
+    async fn a_request_removes_the_studio_request_set_aside_for_its_subgraph_before_it_applies() {
+        let deployment = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
+        let id = IndexingRequestId::new();
+        let cases = [
+            (3, SetTargetOutcome::Inserted { id }),
+            (0, SetTargetOutcome::Canceled { id }),
+            (0, SetTargetOutcome::NoOpAlreadyEmpty),
+        ];
+        for (count, outcome) in cases {
+            let (signer, req) = signed_request(deployment, DEPLOYMENT_CHAIN_ID, Some(count));
+            let (server, _events) = server(signer.address(), outcome);
+
+            let result = server.set_indexing_target_candidates(req).await;
+
+            assert!(result.is_ok(), "count {count}: {result:?}");
+            let operator = signer.address();
+            let forget = format!("forget {operator} {deployment} {DEPLOYMENT_CHAIN_ID}");
+            assert_eq!(journal(&server), [forget, format!("apply {count}")]);
+        }
+    }
+
+    /// A request that is refused changes nothing, so it does not remove the Studio request set
+    /// aside either: that one is still the newest word on its subgraph.
+    #[tokio::test]
+    async fn a_refused_request_leaves_the_studio_request_set_aside_in_place() {
+        let deployment = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
+        let inserted = || SetTargetOutcome::Inserted {
+            id: IndexingRequestId::new(),
+        };
+
+        // A count above the maximum.
+        let too_many = Some(MAX_NUM_CANDIDATES + 1);
+        let (signer, req) = signed_request(deployment, DEPLOYMENT_CHAIN_ID, too_many);
+        let (strict, _events) = server(signer.address(), inserted());
+        let refused = strict.set_indexing_target_candidates(req).await;
+        assert_eq!(refused.expect_err("too many").code(), 400);
+        assert_eq!(journal(&strict), Vec::<String>::new());
+
+        // A chain the subgraph's manifest rules out.
+        let (signer, req) = signed_request(deployment, DEPLOYMENT_CHAIN_ID, Some(3));
+        let check = Arc::new(RefusingChainCheck::wrong_chain());
+        let (checking, _events) = server_with_check(signer.address(), inserted(), check);
+        let refused = checking.set_indexing_target_candidates(req).await;
+        assert_eq!(refused.expect_err("wrong chain").code(), 400);
+        assert_eq!(journal(&checking), Vec::<String>::new());
+
+        // The same request a 2nd time: only the 1st removes and applies.
+        let (signer, req) = signed_request(deployment, DEPLOYMENT_CHAIN_ID, Some(3));
+        let (replayed, _events) = server(signer.address(), inserted());
+        let again = with_count(&req, Some(3));
+        let accepted = replayed.set_indexing_target_candidates(req).await;
+        assert!(accepted.is_ok(), "{accepted:?}");
+        let refused = replayed.set_indexing_target_candidates(again).await;
+        assert_eq!(refused.expect_err("sent twice").code(), 409);
+        assert_eq!(journal(&replayed).len(), 2, "{:?}", journal(&replayed));
+    }
+
+    /// If the Studio request set aside can't be removed, the operator's request is not applied
+    /// and they are told to try again: applied, it could be overwritten later without a word.
+    #[tokio::test]
+    async fn a_request_is_not_applied_if_the_studio_request_set_aside_cannot_be_removed() {
+        let deployment = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
+        let (signer, req) = signed_request(deployment, DEPLOYMENT_CHAIN_ID, Some(3));
+        let id = IndexingRequestId::new();
+        let (server, events) = server(signer.address(), SetTargetOutcome::Inserted { id });
+        let fails = &server.registry.forget_fails;
+        fails.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let result = server.set_indexing_target_candidates(req).await;
+
+        let err = result.expect_err("the request must not be applied");
+        assert_eq!(err.code(), 503, "{err:?}");
+        assert_eq!(accepted_counts(&server), Vec::<usize>::new());
+        assert!(events.events().is_empty());
     }
 }

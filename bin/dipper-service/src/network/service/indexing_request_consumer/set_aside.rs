@@ -74,18 +74,10 @@ pub struct SetAsideRequest {
     pub waited: Duration,
 }
 
-/// Registry for the Studio requests set aside until their manifest can be read.
+/// Removes the Studio request set aside for a subgraph. The admin RPC needs this much of the
+/// registry below: a request it accepts is newer than one still waiting on its manifest.
 #[async_trait]
-pub trait SetAsideRequestRegistry {
-    /// Keep `request`, its manifest to be read again in `retry_in`, in place of any request kept
-    /// for the same requester, deployment and chain. `false`, changing nothing, when that same
-    /// record is already kept, as when Kafka delivers it twice.
-    async fn set_aside_request(
-        &self,
-        request: &SetAsideRequest,
-        retry_in: Duration,
-    ) -> Result<bool, crate::registry::Error>;
-
+pub trait SetAsideRequestRemoval {
     /// Remove the request kept for a requester, deployment and chain, whichever record it came
     /// from. Returns whether there was one.
     async fn forget_set_aside_request(
@@ -93,6 +85,19 @@ pub trait SetAsideRequestRegistry {
         requested_by: Address,
         deployment_id: DeploymentId,
         deployment_chain_id: ChainId,
+    ) -> Result<bool, crate::registry::Error>;
+}
+
+/// Registry for the Studio requests set aside until their manifest can be read.
+#[async_trait]
+pub trait SetAsideRequestRegistry: SetAsideRequestRemoval {
+    /// Keep `request`, its manifest to be read again in `retry_in`, in place of any request kept
+    /// for the same requester, deployment and chain. `false`, changing nothing, when that same
+    /// record is already kept, as when Kafka delivers it twice.
+    async fn set_aside_request(
+        &self,
+        request: &SetAsideRequest,
+        retry_in: Duration,
     ) -> Result<bool, crate::registry::Error>;
 
     /// Remove `request` now that it is applied or refused. `false`, changing nothing, if it was

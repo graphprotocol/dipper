@@ -1176,6 +1176,23 @@ fn whole_seconds(wait: std::time::Duration) -> i64 {
 }
 
 #[async_trait]
+impl crate::network::service::indexing_request_consumer::SetAsideRequestRemoval
+    for RegistryProvider
+{
+    async fn forget_set_aside_request(
+        &self,
+        requested_by: Address,
+        deployment_id: DeploymentId,
+        deployment_chain_id: ChainId,
+    ) -> RegistryResult<bool> {
+        self.inner
+            .forget_set_aside_studio_request(requested_by, deployment_id, deployment_chain_id)
+            .await
+            .map_err(Into::into)
+    }
+}
+
+#[async_trait]
 impl crate::network::service::indexing_request_consumer::SetAsideRequestRegistry
     for RegistryProvider
 {
@@ -1186,18 +1203,6 @@ impl crate::network::service::indexing_request_consumer::SetAsideRequestRegistry
     ) -> RegistryResult<bool> {
         self.inner
             .set_aside_studio_request(&stored_set_aside_request(request)?, whole_seconds(retry_in))
-            .await
-            .map_err(Into::into)
-    }
-
-    async fn forget_set_aside_request(
-        &self,
-        requested_by: Address,
-        deployment_id: DeploymentId,
-        deployment_chain_id: ChainId,
-    ) -> RegistryResult<bool> {
-        self.inner
-            .forget_set_aside_studio_request(requested_by, deployment_id, deployment_chain_id)
             .await
             .map_err(Into::into)
     }

@@ -28,7 +28,7 @@ use tokio::{
 };
 
 use self::set_aside::{SET_ASIDE_AFTER, apply_ready_requests, check_set_aside_requests, set_aside};
-pub use self::set_aside::{SetAsideRequest, SetAsideRequestRegistry};
+pub use self::set_aside::{SetAsideRequest, SetAsideRequestRegistry, SetAsideRequestRemoval};
 use crate::{
     config::{IndexingRequestConsumerConfig, MAX_NUM_CANDIDATES},
     log_text::with_causes,
@@ -2059,6 +2059,24 @@ mod tests {
     }
 
     #[async_trait]
+    impl SetAsideRequestRemoval for MockRegistry {
+        async fn forget_set_aside_request(
+            &self,
+            requested_by: Address,
+            deployment_id: DeploymentId,
+            deployment_chain_id: ChainId,
+        ) -> RegistryResult<bool> {
+            self.set_aside_write()?;
+            let mut rows = self.set_aside.lock().expect("poisoned");
+            let before = rows.len();
+            let key = (requested_by, deployment_id, deployment_chain_id);
+            rows.retain(|stored| key_of(&stored.request) != key);
+            self.note("forget".to_string());
+            Ok(rows.len() < before)
+        }
+    }
+
+    #[async_trait]
     impl SetAsideRequestRegistry for MockRegistry {
         async fn set_aside_request(
             &self,
@@ -2084,21 +2102,6 @@ mod tests {
             });
             self.note(format!("set aside {}", request.offset));
             Ok(true)
-        }
-
-        async fn forget_set_aside_request(
-            &self,
-            requested_by: Address,
-            deployment_id: DeploymentId,
-            deployment_chain_id: ChainId,
-        ) -> RegistryResult<bool> {
-            self.set_aside_write()?;
-            let mut rows = self.set_aside.lock().expect("poisoned");
-            let before = rows.len();
-            let key = (requested_by, deployment_id, deployment_chain_id);
-            rows.retain(|stored| key_of(&stored.request) != key);
-            self.note("forget".to_string());
-            Ok(rows.len() < before)
         }
 
         async fn forget_set_aside_record(&self, request: &SetAsideRequest) -> RegistryResult<bool> {
