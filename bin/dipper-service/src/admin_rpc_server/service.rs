@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 
 use super::handlers::{IndexingAgreementsCtx, IndexingRequestsCtx, rpc_handlers};
 use crate::{
+    network::service::indexing_request_consumer::SetAsideRequestRemoval,
     registry::{AgreementRegistry, IndexingRequestRegistry, RequestOrderRegistry},
     worker::service::WorkerQueue,
 };
@@ -44,6 +45,7 @@ pub fn new<S, R, W>(conf: Config, ctx: S) -> (Handle, impl Future<Output = anyho
 where
     R: IndexingRequestRegistry
         + RequestOrderRegistry
+        + SetAsideRequestRemoval
         + AgreementRegistry
         + Clone
         + Send

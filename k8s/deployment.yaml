@@ -5,6 +5,18 @@ metadata:
   labels:
     app: dipper
 spec:
+  # A rollout stops the old pod before starting the new one. With the default RollingUpdate
+  # both would run for a while: each keeps its own nonce for the one signer and its own
+  # in-process locks (the global reassess lock among them) while both pull jobs from the same
+  # queue, so they could send transactions on the same nonce and offer or cancel the same
+  # agreement twice. The price is a gap while the new pod starts. This covers rollouts only:
+  # when a pod is evicted, deleted or its node drained, Kubernetes starts the replacement while
+  # the old pod is still terminating, which only a lock in dipper itself can rule out.
+  # `rollingUpdate: null` drops the defaulted settings a client-side apply would otherwise keep,
+  # which the API refuses next to `Recreate`.
+  strategy:
+    type: Recreate
+    rollingUpdate: null
   replicas: 1
   selector:
     matchLabels:
@@ -25,7 +37,7 @@ spec:
         fsGroup: 1000
       containers:
         - name: dipper
-          image: ghcr.io/graphprotocol/dipper-service:v0.3.1 # x-release-please-version
+          image: ghcr.io/graphprotocol/dipper-service:v0.3.3 # x-release-please-version
           args:
             - /config/config.json
           # Dipper logs at info unless RUST_LOG is set, for example to `dipper_service=debug,info`.

@@ -9,13 +9,17 @@ use std::{
 };
 
 use dipper_core::config::{Hidden, HiddenSecretKeyAsHexStr};
-use dipper_producer::kafka::KafkaConfig;
+use dipper_producer::kafka::{KafkaConfig, KafkaConsumerConfig};
 use serde_with::serde_as;
 use thegraph_core::alloy::{
     primitives::{Address, ChainId, U256},
     signers::k256::SecretKey,
 };
 use url::Url;
+
+use crate::price_ceilings::{
+    BasePriceCeilings, Minimums, default_ceiling, default_fallback_ceiling,
+};
 
 /// How many indexers a request gets when it doesn't say. Despite the name, it is a default,
 /// not a limit; [`MAX_NUM_CANDIDATES`] is the limit.
@@ -140,6 +144,10 @@ pub struct Config {
     /// Events configuration for sending dipper events on the configured topic for streaming
     #[serde(default)]
     pub event_streaming_config: Option<EventStreamingConfig>,
+    /// The Studio indexing request consumer configuration (reads subgraph
+    /// indexing requests from a Redpanda topic; absent means off)
+    #[serde(default)]
+    pub indexing_request_consumer: Option<IndexingRequestConsumerConfig>,
     /// Number of concurrent worker loops draining the job queue (default: 8).
     /// Each loop can hold up to three pooled DB connections at once and shares
     /// the pool with the registry and background services; size accordingly.
@@ -155,6 +163,66 @@ pub struct Config {
     /// none are sent.
     #[serde(default)]
     pub alerts: AlertsConfig,
+    /// Refusing indexing requests whose chain is not the one their subgraph manifest
+    /// indexes. On by default, so omitting the section keeps the check.
+    #[serde(default)]
+    pub request_chain_check: RequestChainCheckConfig,
+    /// Where dipper reads the minimum prices indexer-rs suggests, which its default price
+    /// ceilings follow. Left out, it reads them from indexer-rs's DIPs branch every 6 hours.
+    #[serde(default)]
+    pub suggested_minimums: SuggestedMinimumsConfig,
+}
+
+/// How indexing requests are checked against their subgraph manifest's chain. A check that
+/// can't read the manifest never waves a request through: the admin RPC refuses it, and one
+/// from Studio is set aside and applied once the manifest can be read.
+#[serde_as]
+#[derive(custom_debug::CustomDebug, Clone, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RequestChainCheckConfig {
+    /// Whether to check at all. Turn it off only where manifests can't be read, or for a
+    /// chain neither the networks registry nor `additional_networks` names.
+    pub enabled: bool,
+
+    /// The IPFS API subgraph manifests are read from.
+    #[serde_as(as = "serde_with::DisplayFromStr")]
+    #[debug(with = debug_endpoint)]
+    pub ipfs_url: Url,
+
+    /// How long to wait on IPFS for 1 manifest, in seconds. IPFS takes about 30 seconds
+    /// to say it has no such manifest, so a shorter wait turns that into a retry.
+    #[serde_as(as = "serde_with::DurationSeconds")]
+    pub timeout: Duration,
+}
+
+impl RequestChainCheckConfig {
+    /// Rejects a check that would fail every request.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.enabled && self.timeout.is_zero() {
+            return Err("request_chain_check.timeout must be greater than 0".to_string());
+        }
+        Ok(())
+    }
+
+    /// The IPFS endpoint named by host, for logs: an IPFS URL can carry credentials.
+    pub fn ipfs_host(&self) -> String {
+        endpoint_name(&self.ipfs_url)
+    }
+}
+
+impl Default for RequestChainCheckConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ipfs_url: default_ipfs_url(),
+            timeout: Duration::from_secs(45),
+        }
+    }
+}
+
+#[expect(clippy::expect_used, reason = "a fixed URL that always parses")]
+fn default_ipfs_url() -> Url {
+    Url::parse("https://ipfs.thegraph.com").expect("a valid URL")
 }
 
 /// How loudly startup reports a background service that will not run.
@@ -232,6 +300,59 @@ impl Config {
         Ok(())
     }
 
+    /// Refuses a worker concurrency the database pool cannot serve. Each worker loop can hold up
+    /// to [`DB_CONNECTIONS_PER_WORKER_LOOP`] pooled connections at once (its listener, an open job
+    /// transaction and a registry query) and shares the pool with the registry and background
+    /// services, which [`DB_CONNECTIONS_RESERVED`] leaves room for. Starting with fewer would
+    /// deadlock the loops under load instead of failing here.
+    pub fn validate_db_pool(&self) -> Result<(), String> {
+        if self.worker_concurrency == 0 {
+            return Err("worker_concurrency must be at least 1".to_string());
+        }
+        let max_conns = self
+            .db
+            .max_connections
+            .unwrap_or(crate::db::DEFAULT_MAX_CONNECTIONS) as usize;
+        // Saturating so an absurd configured value can't overflow and slip past the check below
+        // (the very check meant to catch oversized sizing).
+        let required_conns = self
+            .worker_concurrency
+            .saturating_mul(DB_CONNECTIONS_PER_WORKER_LOOP)
+            .saturating_add(DB_CONNECTIONS_RESERVED);
+        if required_conns > max_conns {
+            return Err(format!(
+                "worker_concurrency ({}) needs at least {required_conns} db connections (each loop \
+                 may hold {DB_CONNECTIONS_PER_WORKER_LOOP} for its listener, open job transaction \
+                 and a registry query, plus {DB_CONNECTIONS_RESERVED} reserved for the registry \
+                 and background services), but db.max_connections is {max_conns}; raise \
+                 db.max_connections to at least {required_conns} or lower worker_concurrency",
+                self.worker_concurrency,
+            ));
+        }
+        Ok(())
+    }
+
+    /// A warning for startup to log when the Kafka consumer records requests under an identity
+    /// the admin RPC would not accept. Requests are keyed by who asked, so the 2 doors would
+    /// keep separate requests for the same deployment.
+    pub fn consumer_requester_warning(&self) -> Option<String> {
+        let requested_by = self.indexing_request_consumer.as_ref()?.requested_by;
+        if self
+            .admin_rpc
+            .gateway_operator_allowlist
+            .contains(&requested_by)
+        {
+            return None;
+        }
+        Some(format!(
+            "indexing_request_consumer.requested_by ({requested_by}) is not in \
+             admin_rpc.gateway_operator_allowlist. Requests are stored under who asked, so a \
+             cancel from Kafka will not close a request opened over the admin RPC, and a request \
+             from Kafka will open a 2nd one for the same deployment. Set requested_by to the \
+             allowlisted address that opens requests over the admin RPC"
+        ))
+    }
+
     /// The background services that will not run, for startup to report.
     pub fn background_services_off(&self) -> Vec<ServiceOff> {
         let mut off = Vec::new();
@@ -291,7 +412,28 @@ impl Config {
                 message,
             });
         }
+        off.extend(self.ceilings_not_following());
         off
+    }
+
+    /// The notice for default price ceilings that will not follow indexer-rs, if they will not.
+    fn ceilings_not_following(&self) -> Option<ServiceOff> {
+        let all_set = self.dips.max_grt_per_30_days.is_some()
+            && self.dips.fallback_max_grt_per_30_days.is_some();
+        let message = if !self.suggested_minimums.enabled {
+            "suggested_minimums is turned off in its config section: the default price ceilings \
+             stay on the minimum prices built into this release, and do not follow indexer-rs"
+        } else if all_set {
+            "suggested_minimums has nothing to keep in step: dips.max_grt_per_30_days and \
+             dips.fallback_max_grt_per_30_days are both set in the config, and stay as set"
+        } else {
+            return None;
+        };
+        Some(ServiceOff {
+            section: "suggested_minimums",
+            level: OffNoticeLevel::Info,
+            message: message.to_string(),
+        })
     }
 
     /// Each background service besides the listener: its section, what the config says about
@@ -379,6 +521,65 @@ const RUN_CHAIN_LISTENER: &str = r#""chain_listener": {"subgraph_endpoint": "<UR
 /// What to add to the config to run without the chain listener.
 const SKIP_CHAIN_LISTENER: &str = r#""chain_listener": {"enabled": false}"#;
 
+/// Keeps the default price ceilings in step with the minimum base price indexer-rs suggests
+/// for each chain. Only a ceiling the `dips` section leaves out follows: `max_grt_per_30_days`
+/// and `fallback_max_grt_per_30_days` stay exactly as set there.
+#[serde_as]
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SuggestedMinimumsConfig {
+    /// Whether to fetch the minimums at all. On by default; off, the default ceilings stay
+    /// on the minimums built into this release.
+    pub enabled: bool,
+    /// The file indexer-rs publishes them in. By default the one on its DIPs branch.
+    pub url: Url,
+    /// Seconds between fetches (default: 21,600, which is 6 hours). At least 60.
+    #[serde_as(as = "serde_with::DurationSeconds<u64>")]
+    pub interval: Duration,
+}
+
+/// The minimums as indexer-rs publishes them, on `main-dips-rebased`: the branch that holds its
+/// DIPs work and that indexers testing DIPs run. Move this to `main` once that branch merges.
+const SUGGESTED_MINIMUMS_URL: &str = "https://raw.githubusercontent.com/graphprotocol/indexer-rs/main-dips-rebased/crates/config/suggested-min-grt-per-30-days.json";
+
+impl Default for SuggestedMinimumsConfig {
+    #[expect(
+        clippy::expect_used,
+        reason = "a constant address, parsed by the test of the defaults"
+    )]
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            url: SUGGESTED_MINIMUMS_URL
+                .parse()
+                .expect("the default address is a URL"),
+            interval: Duration::from_secs(6 * 3_600),
+        }
+    }
+}
+
+impl SuggestedMinimumsConfig {
+    /// Refuses settings the fetch could not run with. Nothing is checked when it is off.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.interval < Duration::from_secs(60) {
+            return Err(format!(
+                "suggested_minimums.interval ({}) must be at least 60 seconds",
+                self.interval.as_secs()
+            ));
+        }
+        if !matches!(self.url.scheme(), "http" | "https") || self.url.host_str().is_none() {
+            return Err(format!(
+                "suggested_minimums.url ({}) must be an http or https address",
+                self.url
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Alerts for the log lines an operator has to act on, picked out by their `event` tag and
 /// posted to Slack, at most once per event in each throttle window.
 #[serde_as]
@@ -419,6 +620,13 @@ impl Default for AlertsConfig {
                 "chain_listener_fetch_failing",
                 "stale_agreement_uncancellable",
                 "liveness_abandonment_paused",
+                "studio_request_chain_refused",
+                "studio_request_consumer_stalled",
+                "studio_request_offset_jumped",
+                "studio_request_dropped",
+                "studio_request_consumer_not_connected",
+                "studio_request_set_aside",
+                "studio_request_still_waiting",
                 "iisa_request_rejected",
                 "dips_info_missing",
                 "dips_info_checks_paused",
@@ -429,6 +637,9 @@ impl Default for AlertsConfig {
                 "reassignment_off",
                 "liveness_checker_off",
                 "dips_info_watcher_off",
+                "price_ceilings_changed",
+                "suggested_minimums_refused",
+                "suggested_minimums_fetch_failed",
             ]
             .map(str::to_owned)
             .to_vec(),
@@ -747,6 +958,13 @@ fn default_expiration_grace() -> Duration {
 fn default_worker_concurrency() -> usize {
     8
 }
+
+/// Pooled connections one worker loop may hold at once: its listener, an open job transaction
+/// and a registry query.
+pub const DB_CONNECTIONS_PER_WORKER_LOOP: usize = 3;
+
+/// Pooled connections kept free of the worker loops for the registry and background services.
+pub const DB_CONNECTIONS_RESERVED: usize = 2;
 
 impl Default for ExpirationConfig {
     fn default() -> Self {
@@ -1357,14 +1575,15 @@ pub struct DipsAgreementConfig {
     ///
     /// Used as a ceiling when requesting indexers from IISA. Indexers asking
     /// more than the ceiling for their chain are excluded from selection.
-    /// Keys are chain names (e.g. "arbitrum-one", "mainnet").
-    #[serde(default = "default_max_grt_per_30_days")]
-    pub max_grt_per_30_days: BTreeMap<String, f64>,
+    /// Left out, each chain's ceiling follows indexer-rs (see `suggested_minimums`).
+    #[serde(default)]
+    pub max_grt_per_30_days: Option<BTreeMap<String, f64>>,
 
     /// Maximum GRT per 30 days Dipper will pay on a chain with no entry in
-    /// `max_grt_per_30_days`, so every chain has a base-price ceiling.
-    #[serde(default = "default_fallback_max_grt_per_30_days")]
-    pub fallback_max_grt_per_30_days: f64,
+    /// `max_grt_per_30_days`, so every chain has a base-price ceiling. Left out,
+    /// it is the highest default chain ceiling, and follows indexer-rs with them.
+    #[serde(default)]
+    pub fallback_max_grt_per_30_days: Option<f64>,
 
     /// Maximum GRT per billion entities per 30 days Dipper will pay, on every chain.
     ///
@@ -1479,15 +1698,16 @@ impl DipsAgreementConfig {
         }
         // A chain's cap of 0 excludes every priced indexer there, and IISA refuses a negative
         // one, which dipper takes for an outage and retries forever; refuse to start instead.
-        for (chain, cap) in &self.max_grt_per_30_days {
+        for (chain, cap) in self.max_grt_per_30_days.iter().flatten() {
             if !(cap.is_finite() && *cap > 0.0) {
                 return Err(format!(
                     "max_grt_per_30_days for chain {chain} ({cap}) must be a positive number"
                 ));
             }
         }
-        let fallback = self.fallback_max_grt_per_30_days;
-        if !(fallback.is_finite() && fallback > 0.0) {
+        if let Some(fallback) = self.fallback_max_grt_per_30_days
+            && !(fallback.is_finite() && fallback > 0.0)
+        {
             return Err(format!(
                 "fallback_max_grt_per_30_days ({fallback}) must be a positive number"
             ));
@@ -1554,13 +1774,16 @@ impl DipsAgreementConfig {
     fn validate_prices_within_agreement_cap(&self) -> Result<(), String> {
         let cap_grt = self.max_agreement_grt_per_30_days;
         let cap = crate::worker::grt_per_30_days_to_wei_per_second(cap_grt);
-        let ceilings = self
-            .max_grt_per_30_days
-            .iter()
-            .map(|(chain, ceiling)| (format!("max_grt_per_30_days for chain {chain}"), *ceiling))
+        // A setting left out is checked at the default dipper starts with.
+        let chains = self.max_grt_per_30_days.clone();
+        let fallback = self.fallback_max_grt_per_30_days;
+        let ceilings = chains
+            .unwrap_or_else(default_max_grt_per_30_days)
+            .into_iter()
+            .map(|(chain, ceiling)| (format!("max_grt_per_30_days for chain {chain}"), ceiling))
             .chain(std::iter::once((
                 "fallback_max_grt_per_30_days".to_string(),
-                self.fallback_max_grt_per_30_days,
+                fallback.unwrap_or_else(default_fallback_max_grt_per_30_days),
             )));
         for (name, ceiling) in ceilings {
             if crate::worker::grt_per_30_days_to_wei_per_second(ceiling) > cap {
@@ -1588,30 +1811,9 @@ fn default_deadline_seconds() -> u64 {
     600
 }
 
-/// Indexer-rs minimum GRT/30-days, per chain. Used by
-/// `default_max_grt_per_30_days` to derive a per-chain
-/// **selection-filter** ceiling.
-///
-/// The default `max_grt_per_30_days` map multiplies each value by 10:
-/// an indexer is dropped from selection if its advertised base price
-/// exceeds that ceiling on the relevant chain. This is a filter, not
-/// a payment rate — actual payment per indexer is set by IISA's
-/// reported price (or the fallback `pricing_table`), bounded above
-/// by `max_agreement_grt_per_30_days`. Operators do not pay 10x by
-/// default; they simply tolerate indexers asking up to 10x the
-/// indexer-rs published minimum on a given chain.
-///
-/// **Scope**: only the chains in the initial DIPs rollout set are
-/// listed here. Other chains get `fallback_max_grt_per_30_days`;
-/// operators can give one its own ceiling with an explicit entry in
-/// `max_grt_per_30_days`.
-///
-/// Synced from <https://github.com/graphprotocol/indexer-rs/blob/mb9/dips-signalling-endpoint/crates/config/maximal-config-example.toml#L201-L210>
-/// (the rollout-trimmed `[dips.min_grt_per_30_days]` section).
-///
-/// To refresh: re-read the linked section and copy the value pairs.
-/// Update the `mb9/dips-signalling-endpoint` ref to the merged commit
-/// hash on `main` (or `main-dips`) once the PR lands.
+/// The minimum GRT per 30 days indexer-rs suggests for each chain of the initial DIPs rollout.
+/// Only the starting value: dipper fetches the table indexer-rs publishes and follows it. This
+/// copy stands in until a fetched table is taken, and that first one is not held to it.
 const INDEXER_RS_MIN_GRT_PER_30_DAYS: &[(&str, f64)] = &[
     ("arbitrum-one", 450.0),
     ("matic", 300.0),
@@ -1624,28 +1826,39 @@ const INDEXER_RS_MIN_GRT_PER_30_DAYS: &[(&str, f64)] = &[
     ("sepolia", 5.0),
 ];
 
-/// Multiplier applied to indexer-rs minimums to derive dipper's max ceilings.
-const PAYMENT_CEILING_MULTIPLIER: f64 = 10.0;
+/// How many times a chain's suggested minimum an indexer may ask before it is left out of
+/// selection. It sets no payment: an agreement pays the price IISA reports for its indexer,
+/// or the `pricing_table` one, which `max_agreement_grt_per_30_days` bounds.
+pub const PAYMENT_CEILING_MULTIPLIER: f64 = 4.0;
 
-/// Default selection ceiling: 10x the indexer-rs minimum per chain.
-fn default_max_grt_per_30_days() -> BTreeMap<String, f64> {
+/// The suggested minimums built into this release, by chain name.
+pub fn built_in_minimums() -> Minimums {
     INDEXER_RS_MIN_GRT_PER_30_DAYS
         .iter()
-        .map(|(name, min)| ((*name).to_string(), min * PAYMENT_CEILING_MULTIPLIER))
+        .map(|(name, min)| ((*name).to_string(), *min))
+        .collect()
+}
+
+/// Default selection ceiling: 4 times the indexer-rs minimum per chain.
+fn default_max_grt_per_30_days() -> BTreeMap<String, f64> {
+    built_in_minimums()
+        .into_iter()
+        .map(|(name, min)| (name, default_ceiling(min)))
         .collect()
 }
 
 /// Default ceiling for chains outside the rollout set: the highest of the default chain
 /// ceilings, whatever `max_grt_per_30_days` an operator configures.
 fn default_fallback_max_grt_per_30_days() -> f64 {
-    INDEXER_RS_MIN_GRT_PER_30_DAYS
-        .iter()
-        .map(|(_, min)| min * PAYMENT_CEILING_MULTIPLIER)
-        .fold(0.0, f64::max)
+    default_fallback_ceiling(&built_in_minimums())
 }
 
+/// The minimum GRT per billion entities per 30 days that indexer-rs suggests, on every chain.
+const INDEXER_RS_MIN_GRT_PER_BILLION_ENTITIES_PER_30_DAYS: f64 = 200.0;
+
+/// Default per-entity ceiling: the same multiple of the indexer-rs minimum as the base ceilings.
 fn default_max_grt_per_billion_entities_per_30_days() -> f64 {
-    2000.0
+    INDEXER_RS_MIN_GRT_PER_BILLION_ENTITIES_PER_30_DAYS * PAYMENT_CEILING_MULTIPLIER
 }
 
 /// Default per-agreement payment ceiling (GRT per 30 days).
@@ -1762,8 +1975,13 @@ pub struct DbConfig {
     /// The database auth username
     pub username: String,
 
-    /// The database auth password
-    pub password: Hidden<String>,
+    /// The database auth password. Leave it out for a database that asks for none, such as one
+    /// reached through the Cloud SQL Auth Proxy with automatic IAM database authentication, where
+    /// the proxy's identity stands in for a password. Without it, dipper sets no password of its
+    /// own: the Postgres driver may still find one in `PGPASSWORD` or `~/.pgpass`, and answers a
+    /// server that asks for one with an empty password.
+    #[serde(default)]
+    pub password: Option<Hidden<String>>,
 
     /// The maximum number of connections to the database
     #[serde(default)]
@@ -1838,10 +2056,8 @@ pub struct IndexingAgreementConfig {
     pub duration_seconds: u64,
     /// Deadline duration in seconds.
     pub deadline_seconds: u64,
-    /// Payment ceiling per chain (GRT per 30 days).
-    pub max_grt_per_30_days: BTreeMap<String, f64>,
-    /// Payment ceiling (GRT per 30 days) for a chain with no entry in `max_grt_per_30_days`.
-    pub fallback_max_grt_per_30_days: f64,
+    /// Base-price ceiling per chain (GRT per 30 days), and for a chain with none of its own.
+    pub base_price_ceilings: Arc<BasePriceCeilings>,
     /// Payment ceiling for entity pricing (GRT per billion entities per 30 days).
     pub max_grt_per_billion_entities_per_30_days: f64,
     /// Number of days to look back for declined indexers (standard exclusion).
@@ -1887,8 +2103,11 @@ impl IndexingAgreementConfig {
             min_seconds_per_collection: 0,
             duration_seconds: 0,
             deadline_seconds: 0,
-            max_grt_per_30_days: BTreeMap::new(),
-            fallback_max_grt_per_30_days: default_fallback_max_grt_per_30_days(),
+            base_price_ceilings: Arc::new(BasePriceCeilings::new(
+                Some(BTreeMap::new()),
+                None,
+                built_in_minimums(),
+            )),
             max_grt_per_billion_entities_per_30_days:
                 default_max_grt_per_billion_entities_per_30_days(),
             declined_indexer_lookback_days: 0,
@@ -1951,10 +2170,7 @@ impl IndexingAgreementConfig {
 
     /// The base-price ceiling for a chain: its own entry, or the fallback when it has none.
     pub fn max_grt_per_30_days_for(&self, chain: &str) -> f64 {
-        self.max_grt_per_30_days
-            .get(chain)
-            .copied()
-            .unwrap_or(self.fallback_max_grt_per_30_days)
+        self.base_price_ceilings.for_chain(chain)
     }
 
     pub fn max_grt_per_billion_entities_per_30_days(&self) -> f64 {
@@ -2026,8 +2242,11 @@ impl From<DipsAgreementConfig>
             min_seconds_per_collection: value.min_seconds_per_collection,
             duration_seconds: value.duration_seconds.unwrap_or(u64::MAX),
             deadline_seconds: value.deadline_seconds,
-            max_grt_per_30_days: value.max_grt_per_30_days,
-            fallback_max_grt_per_30_days: value.fallback_max_grt_per_30_days,
+            base_price_ceilings: Arc::new(BasePriceCeilings::new(
+                value.max_grt_per_30_days,
+                value.fallback_max_grt_per_30_days,
+                built_in_minimums(),
+            )),
             max_grt_per_billion_entities_per_30_days: value
                 .max_grt_per_billion_entities_per_30_days,
             declined_indexer_lookback_days: value.declined_indexer_lookback_days,
@@ -2098,6 +2317,16 @@ impl EventStreamingConfig {
                     .to_string(),
             );
         }
+        // 0 makes every connect time out at once, and the retries that follow blame the brokers.
+        if self
+            .kafka
+            .as_ref()
+            .is_some_and(|kafka| kafka.connect_timeout_secs == 0)
+        {
+            return Err(
+                "event_streaming_config.kafka.connect_timeout_secs must be at least 1".to_string(),
+            );
+        }
         Ok(())
     }
 }
@@ -2110,9 +2339,199 @@ pub fn default_event_queue_capacity() -> NonZeroUsize {
     NonZeroUsize::new(1024).expect("default event queue capacity is non-zero")
 }
 
+/// Configuration for the Studio indexing request consumer, which reads
+/// subgraph indexing request events from a Redpanda topic and applies them
+/// through the same path as the admin RPC.
+#[serde_as]
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndexingRequestConsumerConfig {
+    /// Whether the consumer runs (default: false). Until Studio sends `indexed_network_caip2id`
+    /// every request is skipped for good. The first switch-on applies every record the topic
+    /// still holds, oldest first, so switch on when Studio starts sending the field, not later.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Kafka connection settings and the topic Studio produces on. The topic has no default.
+    /// A wrong name, like brokers that are down, is alerted on while dipper runs on without
+    /// the consumer, which keeps trying; settings that can never connect are refused at start.
+    pub kafka: KafkaConsumerConfig,
+
+    /// The identity recorded as the requester on consumed requests, since
+    /// Kafka messages carry no signature to recover one from. Use the address
+    /// that opens requests over the admin RPC, so both doors share request rows.
+    pub requested_by: Address,
+
+    /// How long a fetch waits server-side for new records before returning
+    /// empty, in seconds (default: 5).
+    #[serde_as(as = "serde_with::DurationSeconds<u64>")]
+    #[serde(default = "default_indexing_request_consumer_max_wait")]
+    pub max_wait: Duration,
+
+    /// Maximum bytes per fetch (default: 1,048,576).
+    #[serde(default = "default_indexing_request_consumer_fetch_max_bytes")]
+    pub fetch_max_bytes: i32,
+}
+
+fn default_indexing_request_consumer_max_wait() -> Duration {
+    Duration::from_secs(5)
+}
+
+fn default_indexing_request_consumer_fetch_max_bytes() -> i32 {
+    1_048_576
+}
+
+impl IndexingRequestConsumerConfig {
+    /// Reject a configuration the consumer cannot run with. Checked even when
+    /// disabled, so a broken value cannot lie dormant until the flag flips.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.kafka.brokers.is_empty() {
+            return Err(
+                "indexing_request_consumer.kafka.brokers must list at least 1 broker".to_string(),
+            );
+        }
+        if let Err(err) = self.kafka.validate() {
+            return Err(format!(
+                "indexing_request_consumer.kafka: {}",
+                crate::log_text::with_causes(&err)
+            ));
+        }
+        // 0 makes every connect time out instantly, so startup would fail with
+        // a message blaming the broker instead of the config typo.
+        if self.kafka.connect_timeout_secs == 0 {
+            return Err(
+                "indexing_request_consumer.kafka.connect_timeout_secs must be at least 1"
+                    .to_string(),
+            );
+        }
+        // A zero requester is almost certainly an unset value, and it would
+        // silently key every consumed request under the zero address.
+        if self.requested_by == Address::ZERO {
+            return Err(
+                "indexing_request_consumer.requested_by must be a non-zero address".to_string(),
+            );
+        }
+        // Below ~1 KB a fetch cannot hold a whole record, so the consumer
+        // would poll forever without ever making progress.
+        if self.fetch_max_bytes < 1_024 {
+            return Err(format!(
+                "indexing_request_consumer.fetch_max_bytes ({}) must be at least 1024",
+                self.fetch_max_bytes
+            ));
+        }
+        if self.max_wait.is_zero() || self.max_wait.as_millis() > i32::MAX as u128 {
+            return Err(format!(
+                "indexing_request_consumer.max_wait ({}s) must be between 1 second and {} seconds",
+                self.max_wait.as_secs(),
+                i32::MAX / 1_000
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn consumer_config(json: serde_json::Value) -> IndexingRequestConsumerConfig {
+        serde_json::from_value(json).expect("deserializes")
+    }
+
+    #[test]
+    fn indexing_request_consumer_config_defaults_and_validation() {
+        let config = consumer_config(serde_json::json!({
+            "kafka": { "brokers": ["localhost:9092"], "topic": "t" },
+            "requested_by": "0x8f8c426f956876325b1e037c6eae9b189952994c",
+        }));
+        assert!(
+            !config.enabled,
+            "the consumer must be off unless opted into"
+        );
+        assert_eq!(config.max_wait, Duration::from_secs(5));
+        assert_eq!(config.fetch_max_bytes, 1_048_576);
+        assert!(config.validate().is_ok());
+
+        // Validation runs even for a disabled section, so broken values are
+        // caught at startup rather than the day the flag flips.
+        let broken = consumer_config(serde_json::json!({
+            "enabled": false,
+            "kafka": { "brokers": ["localhost:9092"], "topic": "t" },
+            "requested_by": "0x0000000000000000000000000000000000000000",
+        }));
+        assert!(broken.validate().unwrap_err().contains("requested_by"));
+
+        let no_brokers = consumer_config(serde_json::json!({
+            "kafka": { "brokers": [], "topic": "t" },
+            "requested_by": "0x8f8c426f956876325b1e037c6eae9b189952994c",
+        }));
+        assert!(no_brokers.validate().unwrap_err().contains("brokers"));
+
+        let zero_connect_timeout = consumer_config(serde_json::json!({
+            "kafka": { "brokers": ["localhost:9092"], "topic": "t", "connect_timeout_secs": 0 },
+            "requested_by": "0x8f8c426f956876325b1e037c6eae9b189952994c",
+        }));
+        assert!(
+            zero_connect_timeout
+                .validate()
+                .unwrap_err()
+                .contains("connect_timeout_secs")
+        );
+
+        let tiny_fetch = consumer_config(serde_json::json!({
+            "kafka": { "brokers": ["localhost:9092"], "topic": "t" },
+            "requested_by": "0x8f8c426f956876325b1e037c6eae9b189952994c",
+            "fetch_max_bytes": 512,
+        }));
+        assert!(
+            tiny_fetch
+                .validate()
+                .unwrap_err()
+                .contains("fetch_max_bytes")
+        );
+    }
+
+    /// A Kafka setting no connect would accept fails at start, even while the consumer is off.
+    /// Found only on the day it is switched on, it would be retried like a broker outage.
+    #[test]
+    fn consumer_kafka_settings_that_can_never_connect_are_refused_while_off() {
+        let refusal = |kafka: serde_json::Value| {
+            consumer_config(serde_json::json!({
+                "enabled": false,
+                "kafka": kafka,
+                "requested_by": "0x8f8c426f956876325b1e037c6eae9b189952994c",
+            }))
+            .validate()
+            .expect_err("a config that can never connect is refused")
+        };
+
+        let mechanism = refusal(serde_json::json!({
+            "brokers": ["localhost:9092"], "topic": "t", "sasl_mechanism": "SCRAM",
+        }));
+        let password = refusal(serde_json::json!({
+            "brokers": ["localhost:9092"], "topic": "t",
+            "sasl_mechanism": "PLAIN", "sasl_username": "dipper",
+        }));
+        let ca_file = refusal(serde_json::json!({
+            "brokers": ["localhost:9092"], "topic": "t",
+            "tls_enabled": true, "tls_ca_cert_path": "/no/such/folder/ca.pem",
+        }));
+        let topic = refusal(serde_json::json!({ "brokers": ["localhost:9092"], "topic": "" }));
+
+        assert!(
+            mechanism.contains("unsupported SASL mechanism 'SCRAM'"),
+            "{mechanism}"
+        );
+        assert!(password.contains("sasl_password is required"), "{password}");
+        assert!(ca_file.contains("/no/such/folder/ca.pem"), "{ca_file}");
+        assert!(topic.contains("topic must not be empty"), "{topic}");
+        for refused in [mechanism, password, ca_file, topic] {
+            assert!(
+                refused.starts_with("indexing_request_consumer.kafka: "),
+                "{refused}"
+            );
+        }
+    }
 
     #[test]
     fn test_dips_agreement_config_deserialization() {
@@ -2278,8 +2697,8 @@ mod tests {
             assert!(err.contains("max_agreement_grt_per_30_days"), "{err}");
         }
         // The price ceilings may not exceed the cap, so a tiny cap needs ceilings as small.
-        conf.max_grt_per_30_days.clear();
-        conf.fallback_max_grt_per_30_days = 0.01;
+        conf.max_grt_per_30_days = Some(BTreeMap::new());
+        conf.fallback_max_grt_per_30_days = Some(0.01);
         for cap in [0.01, 20_000.0] {
             conf.max_agreement_grt_per_30_days = cap;
             assert!(conf.validate().is_ok(), "{cap}");
@@ -2322,16 +2741,15 @@ mod tests {
             }"#,
         )
         .expect("deserialization");
+        let arbitrum_at = |ceiling| Some(BTreeMap::from([("arbitrum-one".to_string(), ceiling)]));
         for ceiling in [0.0, -1.0, f64::NAN, f64::INFINITY] {
-            conf.max_grt_per_30_days
-                .insert("arbitrum-one".to_string(), ceiling);
+            conf.max_grt_per_30_days = arbitrum_at(ceiling);
             let err = conf.validate().expect_err(&format!("{ceiling}"));
             assert!(err.contains("arbitrum-one"), "{err}");
             assert!(err.contains(&format!("({ceiling})")), "{err}");
         }
         for ceiling in [0.01, 4500.0] {
-            conf.max_grt_per_30_days
-                .insert("arbitrum-one".to_string(), ceiling);
+            conf.max_grt_per_30_days = arbitrum_at(ceiling);
             assert!(conf.validate().is_ok(), "{ceiling}");
         }
     }
@@ -2358,24 +2776,23 @@ mod tests {
         let mut conf = dips_conf_with_default_prices();
         conf.max_agreement_grt_per_30_days = 20_000.0;
 
-        conf.max_grt_per_30_days
-            .insert("arbitrum-one".to_string(), 20_001.0);
+        let arbitrum_at = |ceiling| Some(BTreeMap::from([("arbitrum-one".to_string(), ceiling)]));
+        conf.max_grt_per_30_days = arbitrum_at(20_001.0);
         let err = conf
             .validate()
             .expect_err("a chain ceiling above the cap must be refused");
         assert!(err.contains("arbitrum-one"), "{err}");
         assert!(err.contains("max_agreement_grt_per_30_days"), "{err}");
 
-        conf.max_grt_per_30_days
-            .insert("arbitrum-one".to_string(), 20_000.0);
-        conf.fallback_max_grt_per_30_days = 20_001.0;
+        conf.max_grt_per_30_days = arbitrum_at(20_000.0);
+        conf.fallback_max_grt_per_30_days = Some(20_001.0);
         let err = conf
             .validate()
             .expect_err("a fallback ceiling above the cap must be refused");
         assert!(err.contains("fallback_max_grt_per_30_days"), "{err}");
 
         // A ceiling at the cap is fine: the highest price it allows is exactly the cap.
-        conf.fallback_max_grt_per_30_days = 20_000.0;
+        conf.fallback_max_grt_per_30_days = Some(20_000.0);
         assert_eq!(conf.validate(), Ok(()));
     }
 
@@ -2438,11 +2855,11 @@ mod tests {
         )
         .expect("deserialization");
         // Unset, the fallback is the highest default chain ceiling (arbitrum-one's).
-        assert_eq!(conf.fallback_max_grt_per_30_days, 4500.0);
+        assert_eq!(conf.fallback_max_grt_per_30_days, None);
         let (agreement_conf, _) =
             <(Arc<IndexingAgreementConfig>, Arc<BTreeMap<ChainId, _>>)>::from(conf);
         assert_eq!(agreement_conf.max_grt_per_30_days_for("mainnet"), 450.0);
-        assert_eq!(agreement_conf.max_grt_per_30_days_for("gnosis"), 4500.0);
+        assert_eq!(agreement_conf.max_grt_per_30_days_for("gnosis"), 1800.0);
     }
 
     #[test]
@@ -2459,12 +2876,12 @@ mod tests {
         )
         .expect("deserialization");
         for ceiling in [0.0, -1.0, f64::NAN, f64::INFINITY] {
-            conf.fallback_max_grt_per_30_days = ceiling;
+            conf.fallback_max_grt_per_30_days = Some(ceiling);
             let err = conf.validate().expect_err(&format!("{ceiling}"));
             assert!(err.contains("fallback_max_grt_per_30_days"), "{err}");
         }
         for ceiling in [0.01, 4500.0] {
-            conf.fallback_max_grt_per_30_days = ceiling;
+            conf.fallback_max_grt_per_30_days = Some(ceiling);
             assert!(conf.validate().is_ok(), "{ceiling}");
         }
     }
@@ -2775,7 +3192,7 @@ mod tests {
     /// Guards against silent typos and accidental duplicates in the
     /// indexer-rs mirror. Failure modes the test catches:
     ///   * a chain name is mistyped on either side of the multiplier
-    ///   * the multiplier itself drifts away from 10x
+    ///   * the multiplier itself drifts away from 4 times
     ///   * two rows accidentally share a chain name (BTreeMap would mask the
     ///     duplicate by silently dropping the earlier value)
     #[test]
@@ -2784,9 +3201,9 @@ mod tests {
 
         // Spot-check three values: high-traffic mainnet chains and a small
         // testnet, picked to cover both ends of the value range.
-        assert_eq!(map.get("arbitrum-one"), Some(&4500.0), "arbitrum-one");
-        assert_eq!(map.get("mainnet"), Some(&450.0), "mainnet");
-        assert_eq!(map.get("sepolia"), Some(&50.0), "sepolia");
+        assert_eq!(map.get("arbitrum-one"), Some(&1800.0), "arbitrum-one");
+        assert_eq!(map.get("mainnet"), Some(&180.0), "mainnet");
+        assert_eq!(map.get("sepolia"), Some(&20.0), "sepolia");
 
         // The const should mirror indexer-rs's published minimum table.
         // Updates that change the row count are intentional — refresh
@@ -2809,11 +3226,108 @@ mod tests {
             "duplicate chain name in INDEXER_RS_MIN_GRT_PER_30_DAYS"
         );
 
-        // Every output entry is 10x its source entry — confirms the
-        // multiplier wired through without rounding surprises.
+        // Every output entry is 4 times its source entry, which confirms
+        // the multiplier wired through without rounding surprises.
         for (name, min) in INDEXER_RS_MIN_GRT_PER_30_DAYS {
             let want = *min * PAYMENT_CEILING_MULTIPLIER;
             assert_eq!(map.get(*name), Some(&want), "ceiling for {name}");
+        }
+    }
+
+    /// A value written in the config stays as written. So the example leaves out the ceilings,
+    /// which would stop following indexer-rs, and the address, whose default is due to move to
+    /// indexer-rs's `main` branch: a deployment copied from it then moves with the default.
+    #[test]
+    fn the_example_configmap_leaves_the_ceilings_to_follow_indexer_rs() {
+        let example = example_config();
+        let dips = example["dips"].as_object().expect("a dips section");
+        let written = example["suggested_minimums"]
+            .as_object()
+            .expect("a suggested_minimums section");
+        let fetch: SuggestedMinimumsConfig =
+            serde_json::from_value(example["suggested_minimums"].clone())
+                .expect("the example's suggested_minimums section parses");
+        let defaults = SuggestedMinimumsConfig::default();
+
+        assert!(!dips.contains_key("max_grt_per_30_days"));
+        assert!(!dips.contains_key("fallback_max_grt_per_30_days"));
+        assert!(fetch.enabled, "the example shows the fetch switched on");
+        assert!(
+            !written.contains_key("url"),
+            "the address is left to the default"
+        );
+        assert_eq!(fetch.interval, defaults.interval);
+        assert_eq!(
+            dips["max_grt_per_billion_entities_per_30_days"].as_f64(),
+            Some(default_max_grt_per_billion_entities_per_30_days())
+        );
+    }
+
+    /// For a subgraph with many entities the per-entity part is most of what an agreement
+    /// pays, so its ceiling is the same multiple of the published minimum as the base one.
+    #[test]
+    fn the_default_per_entity_ceiling_is_4_times_the_published_minimum() {
+        let conf = dips_conf_with_default_prices();
+
+        assert_eq!(conf.max_grt_per_billion_entities_per_30_days, 800.0);
+        assert_eq!(
+            conf.max_grt_per_billion_entities_per_30_days,
+            INDEXER_RS_MIN_GRT_PER_BILLION_ENTITIES_PER_30_DAYS * PAYMENT_CEILING_MULTIPLIER
+        );
+        assert_eq!(conf.validate(), Ok(()));
+    }
+
+    /// The README tells indexers how far above the published minimums they may price before
+    /// dipper stops selecting them, so it has to state the rule dipper applies: the multiplier,
+    /// the chains it holds for, and the flat ceiling every other chain gets.
+    #[test]
+    fn the_readme_tells_indexers_the_multiplier_dipper_uses() {
+        let readme = include_str!("../../../README.md");
+        let rules = [
+            format!("the base ceiling is {PAYMENT_CEILING_MULTIPLIER} times that minimum"),
+            "every other chain shares 1 flat ceiling of 1,800 GRT per 30 days".to_string(),
+            format!(
+                "The per-entity ceiling is {PAYMENT_CEILING_MULTIPLIER} times the published \
+                 per-entity minimum"
+            ),
+            "800 GRT per billion entities per 30 days".to_string(),
+        ];
+
+        for rule in rules {
+            assert!(readme.contains(&rule), "the README does not say: {rule}");
+        }
+        // The 2 figures spelt out above are the defaults.
+        assert_eq!(default_fallback_max_grt_per_30_days(), 1_800.0);
+        assert_eq!(default_max_grt_per_billion_entities_per_30_days(), 800.0);
+        assert!(
+            !readme.contains("the published minimum for a chain"),
+            "only the chains indexer-rs lists are held to a multiple of their own minimum"
+        );
+        assert!(
+            !readme.contains("no suggested minimum"),
+            "a chain missing from the file may still have a minimum published elsewhere"
+        );
+        assert!(
+            readme.contains("The per-entity ceiling is not in that file"),
+            "the README does not tell operators which ceiling stays put"
+        );
+    }
+
+    /// Operators learn from the README what moves the ceilings and when, so it has to state
+    /// the parts of that which are easy to get wrong after a restart or a change upstream.
+    #[test]
+    fn the_readme_tells_operators_when_the_ceilings_move() {
+        let readme = include_str!("../../../README.md");
+        let rules = [
+            "each start begins on the minimums built into its release",
+            "A read that fails is tried again after 1 minute",
+            "adds a chain above the highest minimum in use or below a tenth of the lowest",
+            "these 3 rules do not protect the first read after a start",
+            "a chain it lists later leaves the fallback and gets 4 times its minimum",
+        ];
+
+        for rule in rules {
+            assert!(readme.contains(rule), "the README does not say: {rule}");
         }
     }
 
@@ -2933,6 +3447,26 @@ mod tests {
             "event_queue_capacity should default to 1024"
         );
         assert!(config.kafka.is_none(), "kafka should default to None");
+    }
+
+    /// A connect given no time fails every attempt, and the retries that follow blame the brokers.
+    #[test]
+    fn an_event_producer_with_no_time_to_connect_is_rejected() {
+        let config = |timeout: u64| -> EventStreamingConfig {
+            serde_json::from_value(serde_json::json!({
+                "enabled": true,
+                "kafka": { "brokers": ["localhost:9092"], "connect_timeout_secs": timeout },
+            }))
+            .expect("a valid event streaming section")
+        };
+
+        assert!(
+            config(0)
+                .validate()
+                .unwrap_err()
+                .contains("event_streaming_config.kafka.connect_timeout_secs")
+        );
+        assert!(config(1).validate().is_ok());
     }
 
     /// A fully specified section round-trips every field, including the nested Kafka block.
@@ -3127,6 +3661,99 @@ mod tests {
     }
 
     #[test]
+    fn suggested_minimums_are_fetched_from_indexer_rs_every_6_hours_by_default() {
+        let left_out = example_config_edited(|config| {
+            remove_sections(config, &["suggested_minimums"]);
+        });
+        let empty: SuggestedMinimumsConfig =
+            serde_json::from_str("{}").expect("an empty section parses");
+
+        for section in [&left_out.suggested_minimums, &empty] {
+            assert!(section.enabled);
+            assert_eq!(section.interval, Duration::from_secs(21_600));
+            assert_eq!(
+                section.url.as_str(),
+                "https://raw.githubusercontent.com/graphprotocol/indexer-rs/main-dips-rebased/crates/\
+                 config/suggested-min-grt-per-30-days.json"
+            );
+            assert_eq!(section.validate(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn suggested_minimums_settings_the_fetch_cannot_run_with_are_refused() {
+        let section = |json: &str| -> SuggestedMinimumsConfig {
+            serde_json::from_str(json).expect("the section parses")
+        };
+
+        // An interval of 0 would fetch without a pause, and a very short one buys nothing.
+        for interval in [0, 59] {
+            let err = section(&format!(r#"{{"interval": {interval}}}"#))
+                .validate()
+                .expect_err("an interval under a minute");
+            assert!(err.contains("suggested_minimums.interval"), "{err}");
+        }
+        assert_eq!(section(r#"{"interval": 60}"#).validate(), Ok(()));
+
+        for url in ["ftp://prices.example/table.json", "file:///etc/table.json"] {
+            let err = section(&format!(r#"{{"url": "{url}"}}"#))
+                .validate()
+                .expect_err("an address that is not http or https");
+            assert!(err.contains("suggested_minimums.url"), "{err}");
+        }
+        assert_eq!(
+            section(r#"{"url": "http://127.0.0.1:8686/table.json"}"#).validate(),
+            Ok(())
+        );
+
+        // Switched off, its other settings are not used, so they are not checked.
+        assert_eq!(
+            section(r#"{"enabled": false, "interval": 0}"#).validate(),
+            Ok(())
+        );
+        let misspelt = serde_json::from_str::<SuggestedMinimumsConfig>(r#"{"interval_secs": 60}"#);
+        assert!(misspelt.is_err(), "a setting it does not know is refused");
+    }
+
+    /// Startup says when the default ceilings will not follow indexer-rs, and why: the fetch
+    /// is switched off, or the operator set both ceilings and so left nothing to follow.
+    #[test]
+    fn startup_reports_ceilings_that_will_not_follow_indexer_rs() {
+        let following = example_config_edited(|_| {});
+        let switched_off = example_config_edited(|config| {
+            config["suggested_minimums"] = serde_json::json!({"enabled": false});
+        });
+        let set_in_full = example_config_edited(|config| {
+            config["dips"]["max_grt_per_30_days"] = serde_json::json!({"mainnet": 180});
+            config["dips"]["fallback_max_grt_per_30_days"] = serde_json::json!(1_800);
+        });
+        let only_chains_set = example_config_edited(|config| {
+            config["dips"]["max_grt_per_30_days"] = serde_json::json!({"mainnet": 180});
+        });
+        let notice = |config: &Config| {
+            config
+                .background_services_off()
+                .into_iter()
+                .find(|off| off.section == "suggested_minimums")
+        };
+
+        assert_eq!(notice(&following), None);
+        assert_eq!(notice(&only_chains_set), None, "the fallback still follows");
+        let off = notice(&switched_off).expect("a notice when switched off");
+        assert_eq!(off.level, OffNoticeLevel::Info);
+        assert!(off.message.contains("built into this release"), "{off:?}");
+        let nothing_to_follow = notice(&set_in_full).expect("a notice when both are set");
+        assert_eq!(nothing_to_follow.level, OffNoticeLevel::Info);
+        assert!(
+            nothing_to_follow.message.contains("max_grt_per_30_days")
+                && nothing_to_follow
+                    .message
+                    .contains("fallback_max_grt_per_30_days"),
+            "{nothing_to_follow:?}"
+        );
+    }
+
+    #[test]
     fn the_example_config_loads_and_warns_of_no_service_left_off() {
         let config = example_config_edited(|_| {});
 
@@ -3146,6 +3773,41 @@ mod tests {
             ],
             "a deployment copied from the example starts with no warning about a service left off"
         );
+    }
+
+    /// A request opened over the admin RPC is stored under its signer. A consumer set up with
+    /// any other address would not find it, so its cancel would do nothing and its request
+    /// would open a 2nd one beside it.
+    #[test]
+    fn a_consumer_identity_the_admin_rpc_does_not_allow_gets_a_startup_warning() {
+        const OPERATOR: &str = "0x8f8c426f956876325b1e037c6eae9b189952994c";
+        const OTHER: &str = "0x1111111111111111111111111111111111111111";
+        let warning = |requested_by: Option<&str>, allowed: &[&str]| {
+            example_config_edited(|config| {
+                config["admin_rpc"]["gateway_operator_allowlist"] = serde_json::json!(allowed);
+                if let Some(requested_by) = requested_by {
+                    config["indexing_request_consumer"] = serde_json::json!({
+                        "kafka": { "brokers": ["localhost:9092"], "topic": "t" },
+                        "requested_by": requested_by,
+                    });
+                }
+            })
+            .consumer_requester_warning()
+        };
+
+        let warned = warning(Some(OTHER), &[OPERATOR]).expect("a warning");
+        assert!(warned.contains("indexing_request_consumer.requested_by"));
+        assert!(warned.contains("admin_rpc.gateway_operator_allowlist"));
+        assert!(warned.to_lowercase().contains(OTHER), "{warned}");
+        // Studio only writes to the topic, so the warning must not send anyone looking for
+        // an address Studio signs with.
+        assert!(!warned.contains("Studio signs"), "{warned}");
+        assert!(
+            warning(Some(OTHER), &[]).is_some(),
+            "an empty allowlist does not hold it either"
+        );
+        assert_eq!(warning(Some(OPERATOR), &[OTHER, OPERATOR]), None);
+        assert_eq!(warning(None, &[OPERATOR]), None, "no consumer, no warning");
     }
 
     /// Without the listener dipper never learns an offer was accepted, so leaving the section out
@@ -3578,6 +4240,49 @@ mod tests {
     }
 
     #[test]
+    fn the_example_configmap_request_chain_check_section_parses() {
+        let check = serde_json::from_value::<RequestChainCheckConfig>(
+            example_config()["request_chain_check"].clone(),
+        )
+        .expect("the example's request_chain_check section is a valid config");
+        let defaults = RequestChainCheckConfig::default();
+
+        assert_eq!(check.enabled, defaults.enabled);
+        assert_eq!(check.ipfs_url, defaults.ipfs_url);
+        assert_eq!(check.timeout, defaults.timeout);
+    }
+
+    #[test]
+    fn a_request_chain_check_that_would_fail_every_request_is_rejected() {
+        let zero = RequestChainCheckConfig {
+            timeout: Duration::ZERO,
+            ..RequestChainCheckConfig::default()
+        };
+        let off = RequestChainCheckConfig {
+            enabled: false,
+            ..zero.clone()
+        };
+
+        assert!(zero.validate().is_err());
+        assert!(off.validate().is_ok(), "a check that is off never waits");
+        assert!(RequestChainCheckConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn the_ipfs_endpoint_is_logged_without_its_credentials() {
+        let config = RequestChainCheckConfig {
+            ipfs_url: Url::parse("https://project:secret@ipfs.example.com:5001/").unwrap(),
+            ..RequestChainCheckConfig::default()
+        };
+
+        assert_eq!(config.ipfs_host(), "ipfs.example.com:5001");
+        // Startup logs the whole config with Debug, which must leave the credentials out too.
+        let debugged = format!("{config:?}");
+        assert!(!debugged.contains("secret"), "{debugged}");
+        assert!(debugged.contains("ipfs.example.com:5001"), "{debugged}");
+    }
+
+    #[test]
     fn the_example_configmap_alerts_section_parses() {
         let config = example_config();
 
@@ -3755,6 +4460,68 @@ mod tests {
         assert!(
             HealthConfig::default().validate(admin_rpc).is_ok(),
             "distinct ports are fine"
+        );
+    }
+
+    #[test]
+    fn db_config_may_leave_the_password_out() {
+        // A database that asks for no password (one reached through the Cloud SQL Auth Proxy with
+        // automatic IAM authentication, or a local one trusting its clients) needs none here.
+        let db: Result<DbConfig, _> = serde_json::from_value(serde_json::json!({
+            "url": "postgres://127.0.0.1:5432/dipper",
+            "username": "dipper",
+        }));
+        let db = db.expect("a db section without a password is valid");
+        assert!(db.password.is_none(), "no password is set");
+    }
+
+    #[test]
+    fn example_config_has_db_connections_for_its_worker_loops() {
+        // The example is what operators copy: a pool it sizes too small for its own worker
+        // loops makes dipper refuse to start on an unedited copy.
+        let config = example_config_edited(|_| {});
+        assert_eq!(config.validate_db_pool(), Ok(()));
+    }
+
+    #[test]
+    fn db_pool_must_serve_every_worker_loop_and_the_reserve() {
+        let with = |workers: usize, max_connections: u32| {
+            example_config_edited(|config| {
+                config["worker_concurrency"] = workers.into();
+                config["db"]["max_connections"] = max_connections.into();
+            })
+            .validate_db_pool()
+        };
+        let needed = 8 * DB_CONNECTIONS_PER_WORKER_LOOP + DB_CONNECTIONS_RESERVED;
+        let needed = u32::try_from(needed).unwrap();
+        assert_eq!(
+            with(8, needed),
+            Ok(()),
+            "exactly enough connections is fine"
+        );
+        let err = with(8, needed - 1).expect_err("1 connection short must be refused");
+        assert!(
+            err.contains(&format!("at least {needed}")),
+            "the error names the size to raise db.max_connections to: {err}"
+        );
+    }
+
+    #[test]
+    fn default_db_pool_serves_the_default_worker_concurrency() {
+        let config = example_config_edited(|config| {
+            let db = config["db"].as_object_mut().unwrap();
+            db.remove("max_connections");
+            config.as_object_mut().unwrap().remove("worker_concurrency");
+        });
+        assert_eq!(config.validate_db_pool(), Ok(()));
+    }
+
+    #[test]
+    fn db_pool_check_refuses_zero_worker_loops() {
+        let config = example_config_edited(|config| config["worker_concurrency"] = 0.into());
+        assert_eq!(
+            config.validate_db_pool(),
+            Err("worker_concurrency must be at least 1".to_string())
         );
     }
 

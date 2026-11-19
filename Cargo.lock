@@ -2496,7 +2496,6 @@ dependencies = [
  "serde-envfile",
  "serde_json",
  "serde_with",
- "serde_yaml",
  "snmalloc-rs",
  "thegraph-core",
  "thiserror 2.0.18",
@@ -2513,13 +2512,20 @@ name = "dipper-core"
 version = "0.1.0"
 dependencies = [
  "fake",
+ "graph-networks-registry 0.7.0",
+ "indoc",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "serde_with",
+ "serde_yaml",
  "sqlx",
  "thegraph-core",
  "thiserror 2.0.18",
+ "tokio",
+ "url",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
@@ -2590,6 +2596,7 @@ dependencies = [
  "rustls",
  "rustls-pemfile 2.2.0",
  "serde",
+ "serde_json",
  "thegraph-core",
  "thiserror 2.0.18",
  "tokio",
@@ -2631,9 +2638,11 @@ dependencies = [
  "graph-networks-registry 0.7.0",
  "hyper-util",
  "jsonrpsee",
+ "pgtemp",
  "rand 0.9.5",
  "rcgen",
  "reqwest 0.12.28",
+ "rskafka",
  "rustls",
  "serde",
  "serde_json",
