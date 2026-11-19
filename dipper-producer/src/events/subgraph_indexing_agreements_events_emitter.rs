@@ -434,10 +434,11 @@ impl SubgraphIndexingAgreementsEventsEmitter {
         let event_type = event.payload.event_type();
         if let Err(err) = streaming.queue.try_send(event) {
             let total = streaming.dropped.fetch_add(1, Ordering::Relaxed) + 1;
-            let reason = match err {
-                mpsc::error::TrySendError::Full(_) => "event queue full",
-                mpsc::error::TrySendError::Closed(_) => "event queue closed",
+            let (reason, label) = match err {
+                mpsc::error::TrySendError::Full(_) => ("event queue full", "queue_full"),
+                mpsc::error::TrySendError::Closed(_) => ("event queue closed", "queue_closed"),
             };
+            metrics::counter!(crate::METRIC_KAFKA_EVENTS_DROPPED, "reason" => label).increment(1);
             tracing::warn!(
                 event_type = %event_type,
                 dropped_total = total,
@@ -618,6 +619,12 @@ fn report<T: Send + Sync + 'static>(
     result: &Result<(), kafka::Error>,
 ) {
     conn.report(client, result);
+    let outcome = match result {
+        Ok(()) => "ok",
+        Err(e) if e.is_unreachable() => "unreachable",
+        Err(_) => "error",
+    };
+    metrics::counter!(crate::METRIC_KAFKA_SENDS, "outcome" => outcome).increment(1);
 }
 
 /// A queued event: shared routing metadata plus its type-specific payload.

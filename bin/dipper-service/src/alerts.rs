@@ -96,7 +96,16 @@ impl<S: Subscriber> Layer<S> for AlertLayer {
 
 /// Only a log line's `event` tag, read first so a line no alert is set up for costs no more.
 #[derive(Default)]
-struct EventTag(Option<String>);
+pub(crate) struct EventTag(Option<String>);
+
+impl EventTag {
+    /// The `event` tag of a log line, if it has one.
+    pub(crate) fn of(event: &Event<'_>) -> Option<String> {
+        let mut tag = Self(None);
+        event.record(&mut tag);
+        tag.0
+    }
+}
 
 impl Visit for EventTag {
     fn record_str(&mut self, field: &Field, value: &str) {

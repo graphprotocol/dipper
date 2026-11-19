@@ -315,6 +315,29 @@ impl tracing::Subscriber for Askable {
     fn exit(&self, _: &tracing::span::Id) {}
 }
 
+/// The value of the series `name` with all of `labels` in rendered Prometheus text, if present.
+/// Matches labels in any order, so a test does not depend on how the exporter orders them.
+pub fn metric_value(rendered: &str, name: &str, labels: &[(&str, &str)]) -> Option<f64> {
+    rendered.lines().find_map(|line| {
+        let rest = line.strip_prefix(name)?;
+        let (series_labels, value) = match rest.strip_prefix('{') {
+            Some(rest) => rest.split_once("} ")?,
+            None => ("", rest.strip_prefix(' ')?),
+        };
+        let has_all = labels.iter().all(|(key, val)| {
+            series_labels
+                .split(',')
+                .any(|pair| pair == format!(r#"{key}="{val}""#))
+        });
+        let count = if series_labels.is_empty() {
+            0
+        } else {
+            series_labels.split(',').count()
+        };
+        (has_all && count == labels.len()).then(|| value.trim().parse().ok())?
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::logged;

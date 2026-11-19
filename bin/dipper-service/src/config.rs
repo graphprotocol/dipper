@@ -102,6 +102,9 @@ pub struct Config {
     pub admin_rpc: AdminRpcConfig,
     /// The database configuration
     pub db: DbConfig,
+    /// The log output configuration
+    #[serde(default)]
+    pub logging: LoggingConfig,
     /// The indexer URLs service configuration
     pub indexer_urls: IndexerUrlsConfig,
     /// The signer configuration
@@ -710,6 +713,26 @@ impl Default for HealthConfig {
 
 fn default_health_listen_addr() -> std::net::SocketAddr {
     std::net::SocketAddr::from(([0, 0, 0, 0], 8546))
+}
+
+/// The log output configuration
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LoggingConfig {
+    /// How log lines are written to standard output: `text` (the default) or `json`, one JSON
+    /// object per line for log stores that index fields.
+    pub format: LogFormat,
+}
+
+/// How log lines are written.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    /// Plain text lines.
+    #[default]
+    Text,
+    /// 1 JSON object per line.
+    Json,
 }
 
 /// The IISA (Indexing Indexer Selection Algorithm) service configuration
@@ -4484,6 +4507,23 @@ mod tests {
             HealthConfig::default().validate(admin_rpc).is_ok(),
             "distinct ports are fine"
         );
+    }
+
+    #[test]
+    fn logging_defaults_to_text_and_takes_json() {
+        let config = example_config_edited(|_| {});
+        assert_eq!(
+            config.logging.format,
+            LogFormat::Text,
+            "no section means text"
+        );
+        let config = example_config_edited(|config| {
+            config["logging"] = serde_json::json!({"format": "json"});
+        });
+        assert_eq!(config.logging.format, LogFormat::Json);
+        let err = serde_json::from_value::<LoggingConfig>(serde_json::json!({"format": "xml"}))
+            .expect_err("an unknown format is refused");
+        assert!(err.to_string().contains("xml"), "{err}");
     }
 
     #[test]

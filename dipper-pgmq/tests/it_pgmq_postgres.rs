@@ -996,3 +996,58 @@ async fn future_interactive_does_not_preempt_eligible_background() {
         "the future interactive job must stay gated until its scheduled_for"
     );
 }
+
+#[tokio::test]
+async fn depth_counts_ready_scheduled_and_failed_jobs() {
+    //* Given
+    let (db, _temp_db) = temp_pgmq_db().await;
+    let queue = PgQueue::new(db.clone());
+    for _ in 0..2 {
+        queue
+            .push(Faker.fake::<TestMsg>())
+            .await
+            .expect("Failed to push a ready job");
+    }
+    let later = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
+    queue
+        .push(JobBuilder::new(Faker.fake::<TestMsg>()).schedule_at(later))
+        .await
+        .expect("Failed to push a scheduled job");
+    let failed = queue
+        .push(Faker.fake::<TestMsg>())
+        .await
+        .expect("Failed to push the job to fail");
+    sqlx::query("UPDATE pgmq_queue SET status = 1 WHERE id = $1")
+        .bind(failed)
+        .execute(&db)
+        .await
+        .expect("Failed to mark the job failed");
+
+    //* When
+    let depth = queue.depth().await.expect("Failed to read the queue depth");
+
+    //* Then
+    assert_eq!((depth.ready, depth.scheduled, depth.failed), (2, 1, 1));
+    assert!(
+        depth.oldest_ready_age_secs.is_some_and(|age| age >= 0.0),
+        "the ready jobs have an age: {depth:?}"
+    );
+}
+
+#[tokio::test]
+async fn depth_of_an_empty_queue_has_no_oldest_job() {
+    let (db, _temp_db) = temp_pgmq_db().await;
+    let depth = PgQueue::new(db)
+        .depth()
+        .await
+        .expect("Failed to read the queue depth");
+    assert_eq!(
+        depth,
+        dipper_pgmq::QueueDepth {
+            ready: 0,
+            scheduled: 0,
+            failed: 0,
+            oldest_ready_age_secs: None,
+        }
+    );
+}
