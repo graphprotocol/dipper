@@ -1754,7 +1754,9 @@ pub struct DbConfig {
 
     /// The database auth password. Leave it out for a database that asks for none, such as one
     /// reached through the Cloud SQL Auth Proxy with automatic IAM database authentication, where
-    /// the proxy's identity stands in for a password.
+    /// the proxy's identity stands in for a password. Without it, dipper sets no password of its
+    /// own: the Postgres driver may still find one in `PGPASSWORD` or `~/.pgpass`, and answers a
+    /// server that asks for one with an empty password.
     #[serde(default)]
     pub password: Option<Hidden<String>>,
 
