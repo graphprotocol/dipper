@@ -1957,7 +1957,17 @@ pub struct AdminRpcConfig {
 pub struct DbConfig {
     /// The PostgreSQL database URL
     ///
-    /// The URL should be in the format `postgres://<host>:<port>/<database>`.
+    /// The URL should be in the format `postgres://<host>:<port>/<database>`. Its query string
+    /// sets the connection's TLS. `sslmode=verify-full` encrypts and checks that the server's
+    /// certificate is signed by a trusted CA and names the host in the URL; use it with a name the
+    /// certificate covers. `verify-ca` is meant to skip the name check, but the Postgres driver
+    /// dipper uses keeps it with the current TLS library, so it behaves as `verify-full` and
+    /// can't reach a server at an address its certificate does not name. `require` encrypts
+    /// without checking the certificate. `sslrootcert=<path>` adds a CA to trust, such as a
+    /// managed database's server CA, to the public roots dipper trusts anyway, and only takes
+    /// effect with a `verify-*` mode; a replaced file applies to connections opened after it.
+    /// Without `sslmode`, dipper uses TLS when the server offers it and plain text otherwise
+    /// (`prefer`), but if the TLS handshake then fails, it does not fall back to plain text.
     #[debug(with = debug_database)]
     #[serde_as(as = "serde_with::DisplayFromStr")]
     pub url: Url,
