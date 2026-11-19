@@ -592,6 +592,7 @@ impl Default for AlertsConfig {
                 "studio_request_offset_jumped",
                 "studio_request_dropped",
                 "studio_request_consumer_not_connected",
+                "studio_request_set_aside",
                 "iisa_request_rejected",
                 "dips_info_missing",
                 "dips_info_checks_paused",

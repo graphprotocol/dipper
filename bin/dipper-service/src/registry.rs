@@ -1126,6 +1126,58 @@ impl crate::network::service::indexing_request_consumer::KafkaConsumerOffsetRegi
     }
 }
 
+/// A request set aside by the Studio consumer, as the database stores it.
+fn stored_set_aside_request(
+    request: &crate::network::service::indexing_request_consumer::SetAsideRequest,
+) -> RegistryResult<dipper_pgregistry::SetAsideRequest> {
+    let num_candidates = i32::try_from(request.num_candidates).map_err(|_| Error::TooLarge {
+        field: "num_candidates",
+        value: request.num_candidates,
+    })?;
+    Ok(dipper_pgregistry::SetAsideRequest {
+        requested_by: request.requested_by,
+        deployment_id: request.deployment_id,
+        deployment_chain_id: request.deployment_chain_id,
+        num_candidates,
+        topic: request.topic.clone(),
+        partition_id: request.partition,
+        record_offset: request.offset,
+        event_id: request.event_id.clone(),
+        reason: request.reason.clone(),
+        attempts: i32::try_from(request.attempts).unwrap_or(i32::MAX),
+        waited_secs: i64::try_from(request.waited.as_secs()).unwrap_or(i64::MAX),
+    })
+}
+
+#[async_trait]
+impl crate::network::service::indexing_request_consumer::SetAsideRequestRegistry
+    for RegistryProvider
+{
+    async fn set_aside_request(
+        &self,
+        request: &crate::network::service::indexing_request_consumer::SetAsideRequest,
+        retry_in: std::time::Duration,
+    ) -> RegistryResult<bool> {
+        let retry_in_secs = i64::try_from(retry_in.as_secs()).unwrap_or(i64::MAX);
+        self.inner
+            .set_aside_studio_request(&stored_set_aside_request(request)?, retry_in_secs)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn forget_set_aside_request(
+        &self,
+        requested_by: Address,
+        deployment_id: DeploymentId,
+        deployment_chain_id: ChainId,
+    ) -> RegistryResult<bool> {
+        self.inner
+            .forget_set_aside_studio_request(requested_by, deployment_id, deployment_chain_id)
+            .await
+            .map_err(Into::into)
+    }
+}
+
 #[async_trait]
 impl crate::network::service::indexing_request_consumer::ConsumerLock for RegistryProvider {
     async fn consumer_lock_connection(
