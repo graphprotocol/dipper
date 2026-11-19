@@ -6,7 +6,7 @@ use dipper_core::ids::{IndexingAgreementId, IndexingRequestId};
 use dipper_pgregistry::{
     CancelKind, EndCorrection, Error, IndexingAgreementStatus, IndexingAgreementTerms,
     IndexingRequestStatus, NewAgreementParams, PgRegistry, ReconciliationAudit, ReconciliationItem,
-    RecordedEnd, SetAsideChange, WithheldIndexers,
+    RecordedEnd, SetAsideChange, SetAsideRequest, WithheldIndexers,
 };
 use fake::{Fake, Faker};
 use pgtemp::PgTempDB;
@@ -4642,6 +4642,331 @@ async fn kafka_consumer_offsets_roundtrip_and_upsert() {
             .await
             .expect("get offset"),
         Some(9)
+    );
+}
+
+/// The topic the set-aside tests read requests from.
+const STUDIO_TOPIC: &str = "studio.subgraph.indexing.requests";
+
+/// A Studio request for 3 indexers on chain 1, read from partition 2 of [`STUDIO_TOPIC`] at
+/// `record_offset`, whose manifest IPFS could not find.
+fn studio_request_at(record_offset: i64) -> SetAsideRequest {
+    SetAsideRequest {
+        requested_by: address!("8f8c426f956876325b1e037c6eae9b189952994c"),
+        deployment_id: deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv"),
+        deployment_chain_id: 1,
+        num_candidates: 3,
+        topic: STUDIO_TOPIC.to_string(),
+        partition_id: 2,
+        record_offset,
+        event_id: format!("event-{record_offset}"),
+        reason: "IPFS has no subgraph manifest for this deployment (HTTP 404)".to_string(),
+        attempts: 0,
+        waited_secs: 0,
+    }
+}
+
+/// Every set-aside request of [`STUDIO_TOPIC`] due a manifest read, without how long each waited.
+async fn due_studio_requests(registry: &PgRegistry) -> Vec<SetAsideRequest> {
+    let due = registry
+        .get_due_set_aside_studio_requests(STUDIO_TOPIC)
+        .await
+        .unwrap_or_else(|err| panic!("Failed to list the requests due a manifest read: {err}"));
+    due.into_iter().map(without_wait).collect()
+}
+
+/// The set-aside requests of partition 2 of [`STUDIO_TOPIC`] whose manifest could be read.
+async fn ready_studio_requests(registry: &PgRegistry) -> Vec<SetAsideRequest> {
+    let ready = registry
+        .get_ready_set_aside_studio_requests(STUDIO_TOPIC, 2)
+        .await
+        .unwrap_or_else(|err| panic!("Failed to list the ready requests: {err}"));
+    ready.into_iter().map(without_wait).collect()
+}
+
+/// `request` with its wait cleared, as the wait depends on how long the test took.
+fn without_wait(request: SetAsideRequest) -> SetAsideRequest {
+    SetAsideRequest {
+        waited_secs: 0,
+        ..request
+    }
+}
+
+#[tokio::test]
+async fn a_studio_request_set_aside_is_kept_whole_and_due_after_its_wait() {
+    //* Given
+    let (db, _temp_db) = temp_registry_db().await;
+    let registry = PgRegistry::new(db);
+    let waiting = studio_request_at(10);
+    let due_now = SetAsideRequest {
+        deployment_chain_id: 42161,
+        ..studio_request_at(11)
+    };
+
+    //* When
+    let stored = registry
+        .set_aside_studio_request(&waiting, 300)
+        .await
+        .expect("Failed to set the request aside");
+    registry
+        .set_aside_studio_request(&due_now, 0)
+        .await
+        .expect("Failed to set the 2nd request aside");
+
+    //* Then
+    assert!(stored, "a record not set aside before is reported as new");
+    assert_eq!(
+        due_studio_requests(&registry).await,
+        vec![due_now],
+        "every field comes back, and a request is not due before its wait is over"
+    );
+    assert!(ready_studio_requests(&registry).await.is_empty());
+    let other_topic = registry
+        .get_due_set_aside_studio_requests("another.topic")
+        .await
+        .expect("Failed to list another topic's requests");
+    assert!(other_topic.is_empty(), "requests are listed by topic");
+}
+
+#[tokio::test]
+async fn a_newer_record_replaces_a_set_aside_request_and_the_same_record_changes_nothing() {
+    //* Given - a request that was read again once and alerted on as still waiting
+    let (db, _temp_db) = temp_registry_db().await;
+    let registry = PgRegistry::new(db.clone());
+    let older = studio_request_at(10);
+    registry
+        .set_aside_studio_request(&older, 0)
+        .await
+        .expect("Failed to set the request aside");
+    registry
+        .retry_set_aside_studio_request_later(&older, "IPFS is down", 0)
+        .await
+        .expect("Failed to count the attempt");
+    sqlx::query(
+        "UPDATE dipper_studio_set_aside_requests SET set_aside_at = now() - interval '25 hours'",
+    )
+    .execute(&db)
+    .await
+    .expect("Failed to age the request");
+    let claimed = registry
+        .claim_still_waiting_studio_requests(STUDIO_TOPIC, 24 * 3_600)
+        .await
+        .expect("Failed to claim the alert");
+    assert_eq!(claimed.len(), 1);
+
+    //* When - the same record is read again, then a newer one for the same deployment and chain
+    let again = registry
+        .set_aside_studio_request(&older, 0)
+        .await
+        .expect("Failed to set the same record aside again");
+    let after_same = due_studio_requests(&registry).await;
+    let newer = SetAsideRequest {
+        num_candidates: 5,
+        ..studio_request_at(11)
+    };
+    let replaced = registry
+        .set_aside_studio_request(&newer, 0)
+        .await
+        .expect("Failed to set the newer record aside");
+    let after_newer = registry
+        .get_due_set_aside_studio_requests(STUDIO_TOPIC)
+        .await
+        .expect("Failed to list the requests due a manifest read");
+    let claimed_again = registry
+        .claim_still_waiting_studio_requests(STUDIO_TOPIC, 24 * 3_600)
+        .await
+        .expect("Failed to claim the alert");
+
+    //* Then
+    assert!(!again, "the same record is not a new set-aside request");
+    assert_eq!(
+        after_same,
+        vec![SetAsideRequest {
+            reason: "IPFS is down".to_string(),
+            attempts: 1,
+            ..older
+        }],
+        "it keeps its attempts and its last reason"
+    );
+    assert!(replaced, "a newer record is a new set-aside request");
+    assert_eq!(
+        after_newer.len(),
+        1,
+        "1 row for each requester, deployment and chain"
+    );
+    assert!(
+        after_newer[0].waited_secs < 3_600,
+        "the newer request's wait starts when it is set aside: {after_newer:?}"
+    );
+    assert_eq!(without_wait(after_newer[0].clone()), newer);
+    assert!(
+        claimed_again.is_empty(),
+        "and it is not yet due the alert the older one had"
+    );
+}
+
+#[tokio::test]
+async fn a_set_aside_studio_request_is_forgotten_by_requester_deployment_and_chain() {
+    //* Given
+    let (db, _temp_db) = temp_registry_db().await;
+    let registry = PgRegistry::new(db);
+    let request = studio_request_at(10);
+    let on_another_chain = SetAsideRequest {
+        deployment_chain_id: 42161,
+        ..studio_request_at(11)
+    };
+    for request in [&request, &on_another_chain] {
+        registry
+            .set_aside_studio_request(request, 0)
+            .await
+            .expect("Failed to set the request aside");
+    }
+
+    //* When
+    let forget = || {
+        registry.forget_set_aside_studio_request(
+            request.requested_by,
+            request.deployment_id,
+            request.deployment_chain_id,
+        )
+    };
+    let forgotten = forget().await.expect("Failed to forget the request");
+    let forgotten_again = forget().await.expect("Failed to forget the request again");
+
+    //* Then
+    assert!(forgotten);
+    assert!(!forgotten_again, "there was nothing left to forget");
+    assert_eq!(due_studio_requests(&registry).await, vec![on_another_chain]);
+}
+
+#[tokio::test]
+async fn a_studio_request_marked_ready_is_listed_for_its_partition_until_it_must_wait_again() {
+    //* Given
+    let (db, _temp_db) = temp_registry_db().await;
+    let registry = PgRegistry::new(db);
+    let request = studio_request_at(10);
+    registry
+        .set_aside_studio_request(&request, 0)
+        .await
+        .expect("Failed to set the request aside");
+
+    //* When
+    registry
+        .mark_set_aside_studio_request_ready(&request)
+        .await
+        .expect("Failed to mark the request ready");
+    let ready = ready_studio_requests(&registry).await;
+    let due_while_ready = due_studio_requests(&registry).await;
+    let ready_on_another_partition = registry
+        .get_ready_set_aside_studio_requests(STUDIO_TOPIC, 3)
+        .await
+        .expect("Failed to list another partition's ready requests");
+    registry
+        .retry_set_aside_studio_request_later(&request, "IPFS is down", 3_600)
+        .await
+        .expect("Failed to put the request back to waiting");
+    let ready_after = ready_studio_requests(&registry).await;
+    let due_after = due_studio_requests(&registry).await;
+    registry
+        .retry_set_aside_studio_request_later(&request, "IPFS is still down", 0)
+        .await
+        .expect("Failed to count the 2nd attempt");
+    let due_at_last = due_studio_requests(&registry).await;
+
+    //* Then
+    assert_eq!(ready, vec![request.clone()]);
+    assert!(
+        due_while_ready.is_empty(),
+        "a ready request is read no more"
+    );
+    assert!(ready_on_another_partition.is_empty());
+    assert!(ready_after.is_empty(), "back to waiting, it is not ready");
+    assert!(due_after.is_empty(), "nor due before its wait is over");
+    assert_eq!(
+        due_at_last,
+        vec![SetAsideRequest {
+            reason: "IPFS is still down".to_string(),
+            attempts: 2,
+            ..request
+        }]
+    );
+}
+
+#[tokio::test]
+async fn a_manifest_read_for_a_replaced_record_leaves_the_newer_request_alone() {
+    //* Given - the read was for the record at 10, replaced by the one at 11 in the meantime
+    let (db, _temp_db) = temp_registry_db().await;
+    let registry = PgRegistry::new(db);
+    let replaced = studio_request_at(10);
+    let newer = studio_request_at(11);
+    for request in [&replaced, &newer] {
+        registry
+            .set_aside_studio_request(request, 0)
+            .await
+            .expect("Failed to set the request aside");
+    }
+
+    //* When
+    registry
+        .retry_set_aside_studio_request_later(&replaced, "IPFS is down", 3_600)
+        .await
+        .expect("Failed to count the attempt");
+    let after_a_failed_read = due_studio_requests(&registry).await;
+    registry
+        .mark_set_aside_studio_request_ready(&replaced)
+        .await
+        .expect("Failed to mark the request ready");
+
+    //* Then
+    assert_eq!(after_a_failed_read, vec![newer.clone()]);
+    assert_eq!(due_studio_requests(&registry).await, vec![newer]);
+    assert!(ready_studio_requests(&registry).await.is_empty());
+}
+
+#[tokio::test]
+async fn the_still_waiting_alert_is_claimed_once_for_each_set_aside_request() {
+    //* Given - 1 request set aside 25 hours ago and 1 just now
+    let (db, _temp_db) = temp_registry_db().await;
+    let registry = PgRegistry::new(db.clone());
+    let old = studio_request_at(10);
+    let fresh = SetAsideRequest {
+        deployment_chain_id: 42161,
+        ..studio_request_at(11)
+    };
+    for request in [&old, &fresh] {
+        registry
+            .set_aside_studio_request(request, 300)
+            .await
+            .expect("Failed to set the request aside");
+    }
+    sqlx::query(
+        "UPDATE dipper_studio_set_aside_requests SET set_aside_at = now() - interval '25 hours' \
+         WHERE record_offset = 10",
+    )
+    .execute(&db)
+    .await
+    .expect("Failed to age the request");
+
+    //* When
+    let claim = || registry.claim_still_waiting_studio_requests(STUDIO_TOPIC, 24 * 3_600);
+    let other_topic = registry
+        .claim_still_waiting_studio_requests("another.topic", 24 * 3_600)
+        .await
+        .expect("Failed to claim another topic's alerts");
+    let first = claim().await.expect("Failed to claim the alerts");
+    let second = claim().await.expect("Failed to claim the alerts again");
+
+    //* Then
+    assert!(other_topic.is_empty());
+    assert_eq!(first.len(), 1, "only the request waiting over 24 hours");
+    assert!(
+        first[0].waited_secs >= 25 * 3_600,
+        "the claim says how long it has waited: {first:?}"
+    );
+    assert_eq!(without_wait(first[0].clone()), old);
+    assert!(
+        second.is_empty(),
+        "claimed once, it is not handed out again"
     );
 }
 

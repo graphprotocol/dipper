@@ -23,7 +23,7 @@ pub use postgres::{
     AdvisoryLockConnection, CancelKind, CancellingAgreement, ChainListenerStateRow, DipsInfoChecks,
     EndCorrection, NewAgreementParams, PendingAcceptedEvent, PendingExpiredEvent,
     PendingTerminatedEvent, PgRegistry, ReconciliationAudit, ReconciliationItem,
-    ReconciliationOutcome, RecordedEnd, SetAsideChange, WithheldIndexers,
+    ReconciliationOutcome, RecordedEnd, SetAsideChange, SetAsideRequest, WithheldIndexers,
 };
 pub use result::{Error, Result};
 

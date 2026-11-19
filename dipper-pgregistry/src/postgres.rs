@@ -36,8 +36,9 @@ mod advisory_lock;
 pub(crate) mod common;
 mod indexing_agreement;
 mod indexing_request;
+mod set_aside_request;
 
-pub use self::advisory_lock::AdvisoryLockConnection;
+pub use self::{advisory_lock::AdvisoryLockConnection, set_aside_request::SetAsideRequest};
 
 /// Chain listener state row from the database.
 #[derive(Debug, Clone)]
