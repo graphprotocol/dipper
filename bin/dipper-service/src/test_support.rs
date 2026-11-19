@@ -165,12 +165,25 @@ impl SubgraphIndexingAgreementEventsProducer for CapturingEventsProducer {
     }
 }
 
-/// A chain check that refuses every request, as a wrong chain or (when
-/// `transient`) as if IPFS were down, and counts how often it was asked.
+/// A chain check that turns every request away for 1 reason, and counts how often it was asked.
 #[derive(Default)]
 pub struct RefusingChainCheck {
-    transient: bool,
+    why: Refusal,
     calls: AtomicUsize,
+}
+
+/// Why a [`RefusingChainCheck`] turns requests away.
+#[derive(Default, Clone, Copy)]
+enum Refusal {
+    /// The manifest indexes another chain.
+    #[default]
+    WrongChain,
+    /// The manifest names several networks.
+    SeveralNetworks,
+    /// IPFS answers that it can't find the manifest.
+    NotFound,
+    /// IPFS is down.
+    Unavailable,
 }
 
 impl RefusingChainCheck {
@@ -178,9 +191,21 @@ impl RefusingChainCheck {
         Self::default()
     }
 
+    pub fn several_networks() -> Self {
+        Self::refusing(Refusal::SeveralNetworks)
+    }
+
+    pub fn not_found() -> Self {
+        Self::refusing(Refusal::NotFound)
+    }
+
     pub fn unavailable() -> Self {
+        Self::refusing(Refusal::Unavailable)
+    }
+
+    fn refusing(why: Refusal) -> Self {
         Self {
-            transient: true,
+            why,
             ..Self::default()
         }
     }
@@ -198,14 +223,20 @@ impl RequestChainCheck for RefusingChainCheck {
         requested_chain_id: ChainId,
     ) -> Result<(), ChainCheckError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Err(if self.transient {
-            ChainCheckError::Unavailable("IPFS is down".to_string())
-        } else {
-            ChainCheckError::Mismatch {
+        Err(match self.why {
+            Refusal::WrongChain => ChainCheckError::Mismatch {
                 network: "arbitrum-sepolia".to_string(),
                 manifest_chain_id: 421614,
                 requested_chain_id,
-            }
+            },
+            Refusal::SeveralNetworks => ChainCheckError::Unresolvable(
+                "the subgraph manifest's data sources name more than 1 network: gnosis, mainnet"
+                    .to_string(),
+            ),
+            Refusal::NotFound => ChainCheckError::NotFound(
+                "IPFS has no subgraph manifest for this deployment (HTTP 404)".to_string(),
+            ),
+            Refusal::Unavailable => ChainCheckError::Unavailable("IPFS is down".to_string()),
         })
     }
 }

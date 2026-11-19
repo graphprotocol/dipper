@@ -48,6 +48,11 @@ pub enum ApplyError {
     #[error("indexing request refused: {0}")]
     WrongChain(#[source] ChainCheckError),
 
+    /// IPFS could not find the manifest to check the chain against; nothing was changed. The
+    /// same request passes if the manifest reaches IPFS later, and never if it does not exist.
+    #[error("IPFS could not find the indexing request's subgraph manifest")]
+    ManifestNotFound(#[source] ChainCheckError),
+
     /// The manifest could not be read to check the chain; nothing was changed,
     /// and the same request may pass once IPFS answers.
     #[error("could not check the indexing request's chain")]
@@ -88,23 +93,37 @@ pub async fn check_chain(
     let Err(err) = chain_check.check(&deployment_id, deployment_chain_id).await else {
         return Ok(ChainChecked(request));
     };
-    if err.is_transient() {
-        tracing::error!(
-            %deployment_id,
-            chain_id = %deployment_chain_id,
-            error = %err,
-            "Could not check the indexing request's chain against its subgraph manifest"
-        );
-        return Err(ApplyError::ChainCheckUnavailable(err));
+    match err {
+        ChainCheckError::Unavailable(_) => {
+            tracing::error!(
+                %deployment_id,
+                chain_id = %deployment_chain_id,
+                error = %err,
+                "Could not check the indexing request's chain against its subgraph manifest"
+            );
+            Err(ApplyError::ChainCheckUnavailable(err))
+        }
+        ChainCheckError::NotFound(_) => {
+            tracing::warn!(
+                %requested_by,
+                %deployment_id,
+                chain_id = %deployment_chain_id,
+                error = %err,
+                "IPFS could not find the subgraph manifest to check an indexing request against"
+            );
+            Err(ApplyError::ManifestNotFound(err))
+        }
+        ChainCheckError::Mismatch { .. } | ChainCheckError::Unresolvable(_) => {
+            tracing::warn!(
+                %requested_by,
+                %deployment_id,
+                chain_id = %deployment_chain_id,
+                error = %err,
+                "Refused an indexing request that its subgraph manifest rules out"
+            );
+            Err(ApplyError::WrongChain(err))
+        }
     }
-    tracing::warn!(
-        %requested_by,
-        %deployment_id,
-        chain_id = %deployment_chain_id,
-        error = %err,
-        "Refused an indexing request whose chain does not match its subgraph manifest"
-    );
-    Err(ApplyError::WrongChain(err))
 }
 
 /// Upserts the indexing request, emits the request-received lifecycle event on a genuinely

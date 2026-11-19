@@ -34,19 +34,16 @@ pub enum ChainCheckError {
         manifest_chain_id: ChainId,
         requested_chain_id: ChainId,
     },
-    /// There is no manifest, or it can't be tied to a single chain ID; a retry won't change that.
+    /// The manifest can't be tied to a single chain ID; a retry won't change that.
     #[error("{0}")]
     Unresolvable(String),
+    /// IPFS searched for the manifest and did not find it in time. That is no verdict on the
+    /// request: IPFS gives up after about 30 seconds, and the manifest may yet reach it.
+    #[error("{0}")]
+    NotFound(String),
     /// IPFS did not return the manifest; the same request may pass later.
     #[error("could not read the subgraph manifest from IPFS: {0}")]
     Unavailable(String),
-}
-
-impl ChainCheckError {
-    /// Whether the same request could pass once IPFS answers.
-    pub fn is_transient(&self) -> bool {
-        matches!(self, Self::Unavailable(_))
-    }
 }
 
 #[async_trait]
@@ -111,7 +108,7 @@ impl ManifestChainCheck {
                 Ok(manifest) => network_from_manifest(&manifest).map_err(|err| error_chain(&err)),
                 // A manifest IPFS doesn't have may yet be added, so only its contents are remembered.
                 Err(err @ ManifestFetchError::NotFound(_)) => {
-                    return Err(ChainCheckError::Unresolvable(err.to_string()));
+                    return Err(ChainCheckError::NotFound(err.to_string()));
                 }
                 Err(err) if err.is_transient() => {
                     return Err(ChainCheckError::Unavailable(error_chain(&err)));
@@ -284,7 +281,6 @@ mod tests {
             ),
             "{err:?}"
         );
-        assert!(!err.is_transient());
     }
 
     #[tokio::test]
@@ -301,8 +297,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_missing_manifest_is_final_but_read_again_next_time() {
-        //* Arrange - IPFS answers 404 once it has searched for the manifest
+    async fn a_manifest_ipfs_cannot_find_is_no_refusal_and_is_read_again_next_time() {
+        //* Arrange - IPFS answers 404 once it has searched for the manifest for 30 seconds
         let server = MockServer::start().await;
         serve_manifest(&server, ResponseTemplate::new(404), 2).await;
         let check = check_against(&server);
@@ -311,15 +307,12 @@ mod tests {
         let first = check.check(&deployment_id!(DEPLOYMENT), 1).await;
         let second = check.check(&deployment_id!(DEPLOYMENT), 1).await;
 
-        //* Assert - final, so the consumer moves on; not remembered, as it may yet be added
-        assert!(
-            matches!(first, Err(ChainCheckError::Unresolvable(_))),
-            "{first:?}"
-        );
-        assert!(
-            matches!(second, Err(ChainCheckError::Unresolvable(_))),
-            "{second:?}"
-        );
+        //* Assert - not found is not a refusal, and not remembered, as it may yet be added
+        for answer in [first, second] {
+            let err = answer.expect_err("a manifest that is not there passes no request");
+            assert!(matches!(err, ChainCheckError::NotFound(_)), "{err:?}");
+            assert!(err.to_string().contains("HTTP 404"), "{err}");
+        }
     }
 
     #[tokio::test]
@@ -332,7 +325,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(err.is_transient(), "{err:?}");
+        assert!(matches!(err, ChainCheckError::Unavailable(_)), "{err:?}");
     }
 
     #[tokio::test]
@@ -346,7 +339,10 @@ mod tests {
                 .await
                 .unwrap_err();
 
-            assert!(err.is_transient(), "HTTP {status}: {err:?}");
+            assert!(
+                matches!(err, ChainCheckError::Unavailable(_)),
+                "HTTP {status}: {err:?}"
+            );
         }
     }
 
@@ -363,7 +359,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(err.is_transient(), "{err:?}");
+        assert!(matches!(err, ChainCheckError::Unavailable(_)), "{err:?}");
     }
 
     #[tokio::test]

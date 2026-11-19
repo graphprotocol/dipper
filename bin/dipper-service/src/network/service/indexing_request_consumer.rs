@@ -1220,8 +1220,8 @@ async fn stop_requested(shutdown_rx: &mut watch::Receiver<bool>) {
 }
 
 /// Apply a decoded propose until it takes effect; `false` if shutdown came first. A registry
-/// failure or unreadable manifest retries the whole apply, and a wrong chain skips the record. A
-/// queue failure retries only the job push: a cancel applied again finds nothing and queues none.
+/// failure or a manifest IPFS can't return retries the whole apply; a manifest that rules the
+/// request out skips it. A queue failure retries only the job push, as a repeated cancel queues none.
 #[allow(clippy::too_many_arguments)]
 async fn apply_target_with_retries<R, W>(
     registry: &R,
@@ -1278,7 +1278,11 @@ where
                 alert_refused_record(partition, offset, target, &err);
                 return true;
             }
-            Err(err @ (ApplyError::Registry(_) | ApplyError::ChainCheckUnavailable(_))) => {
+            Err(
+                err @ (ApplyError::Registry(_)
+                | ApplyError::ManifestNotFound(_)
+                | ApplyError::ChainCheckUnavailable(_)),
+            ) => {
                 retries.failed("applying it", &err);
                 if sleep_or_shutdown(shutdown_rx, RETRY_BACKOFF).await {
                     return false;
@@ -1341,8 +1345,8 @@ where
     })
 }
 
-/// Raise an alert for a Studio request dropped because its chain is wrong: Studio
-/// gets no reply, so without this the developer's request vanishes unseen.
+/// Raise an alert for a Studio request dropped because its subgraph manifest rules it out:
+/// Studio gets no reply, so without this the developer's request vanishes unseen.
 fn alert_refused_record(
     partition: i32,
     offset: i64,
@@ -1356,8 +1360,7 @@ fn alert_refused_record(
         event_id = %target.event_id,
         deployment_id = %target.deployment_id,
         chain_id = target.deployment_chain_id,
-        error = %err,
-        "Dropped a Studio indexing request whose chain does not match its subgraph manifest"
+        "Dropped a Studio indexing request that its subgraph manifest rules out: {err}"
     );
 }
 
@@ -2370,6 +2373,47 @@ mod tests {
         assert!(registry.calls().is_empty());
         assert!(worker.reassessments().is_empty());
         assert!(events.is_empty());
+    }
+
+    /// Every reason a manifest can rule a request out is one the operator has to tell apart, so
+    /// the alert gives the manifest's own, not always that of a wrong chain.
+    #[tokio::test]
+    async fn the_alert_for_a_refused_record_gives_the_manifests_own_reason() {
+        let registry = MockRegistry::scripted(vec![]);
+        let worker = MockWorker::new();
+        let check = RefusingChainCheck::several_networks();
+
+        let logs = logged(async {
+            run_apply_checked(&registry, &worker, 3, &check).await;
+        })
+        .await;
+
+        let alert = logs
+            .lines()
+            .find(|line| line.contains("studio_request_chain_refused"))
+            .unwrap_or_else(|| panic!("the dropped request raises an alert: {logs}"));
+        assert!(alert.contains("name more than 1 network"), "{alert}");
+        assert!(!alert.contains("chain does not match"), "{alert}");
+    }
+
+    /// IPFS answers that it can't find a manifest after searching for 30 seconds, which a
+    /// manifest still on its way to IPFS gets too. Nobody sends a record again, so the request
+    /// must not be dropped as if its manifest had refused it.
+    #[tokio::test(start_paused = true)]
+    async fn a_manifest_ipfs_cannot_find_does_not_get_its_record_dropped() {
+        let registry = MockRegistry::scripted(vec![]);
+        let worker = MockWorker::new();
+        let check = RefusingChainCheck::not_found();
+
+        let logs =
+            logs_of_apply_stopped_after(&registry, &worker, &check, Duration::from_secs(1)).await;
+
+        assert_eq!(alerts(&logs, "studio_request_chain_refused"), 0, "{logs}");
+        assert!(
+            logs.contains("IPFS has no subgraph manifest"),
+            "the log says why the record waits: {logs}"
+        );
+        assert!(registry.calls().is_empty());
     }
 
     #[tokio::test(start_paused = true)]

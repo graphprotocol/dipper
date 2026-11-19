@@ -29,8 +29,8 @@ pub enum ManifestFetchError {
 }
 
 impl ManifestFetchError {
-    /// Whether the same read could succeed later. A missing manifest counts as final:
-    /// IPFS only says so after searching for it.
+    /// Whether IPFS failed to answer for the manifest. A missing one is an answer, given after
+    /// IPFS searched for about 30 seconds, though a manifest still on its way gets it too.
     pub fn is_transient(&self) -> bool {
         matches!(self, Self::Unreachable(_))
     }

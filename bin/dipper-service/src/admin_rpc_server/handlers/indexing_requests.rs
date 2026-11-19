@@ -279,7 +279,9 @@ where
 fn into_rpc_error(err: ApplyError) -> ErrorObject<'static> {
     match err {
         // The caller sees why, so it can resend with the manifest's chain.
-        ApplyError::WrongChain(err) => ErrorObject::owned(400, err.to_string(), None::<()>),
+        ApplyError::WrongChain(err) | ApplyError::ManifestNotFound(err) => {
+            ErrorObject::owned(400, err.to_string(), None::<()>)
+        }
         ApplyError::ChainCheckUnavailable(err) => {
             ErrorObject::owned(503, err.to_string(), None::<()>)
         }
@@ -1245,6 +1247,34 @@ mod tests {
             events.events().is_empty(),
             "a refused request emits nothing"
         );
+    }
+
+    /// The consumer sets such a request aside to try again; a caller of the RPC is there to
+    /// send it again, so it is still told at once, with the same answer as before.
+    #[tokio::test]
+    async fn a_manifest_ipfs_cannot_find_is_refused_with_the_reason() {
+        let deployment = deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv");
+        let (signer, req) = signed_request(deployment, DEPLOYMENT_CHAIN_ID, Some(3));
+        let (server, events) = server_with_check(
+            signer.address(),
+            SetTargetOutcome::Inserted {
+                id: IndexingRequestId::new(),
+            },
+            Arc::new(RefusingChainCheck::not_found()),
+        );
+
+        let err = server
+            .set_indexing_target_candidates(req)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), 400);
+        assert_eq!(
+            err.message(),
+            "IPFS has no subgraph manifest for this deployment (HTTP 404)"
+        );
+        assert!(accepted_counts(&server).is_empty(), "nothing is changed");
+        assert!(events.events().is_empty());
     }
 
     #[tokio::test]
