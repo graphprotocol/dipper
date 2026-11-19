@@ -20,10 +20,10 @@ pub use indexing_request::{
     Status as IndexingRequestStatus,
 };
 pub use postgres::{
-    CancelKind, CancellingAgreement, ChainListenerStateRow, DipsInfoChecks, EndCorrection,
-    NewAgreementParams, PendingAcceptedEvent, PendingExpiredEvent, PendingTerminatedEvent,
-    PgRegistry, ReconciliationAudit, ReconciliationItem, ReconciliationOutcome, RecordedEnd,
-    SetAsideChange, WithheldIndexers,
+    AdvisoryLockConnection, CancelKind, CancellingAgreement, ChainListenerStateRow, DipsInfoChecks,
+    EndCorrection, NewAgreementParams, PendingAcceptedEvent, PendingExpiredEvent,
+    PendingTerminatedEvent, PgRegistry, ReconciliationAudit, ReconciliationItem,
+    ReconciliationOutcome, RecordedEnd, SetAsideChange, SetAsideRequest, WithheldIndexers,
 };
 pub use result::{Error, Result};
 

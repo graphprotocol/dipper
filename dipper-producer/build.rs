@@ -7,7 +7,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.out_dir("src/proto");
         config.protoc_arg("--experimental_allow_proto3_optional");
 
-        config.compile_protos(&["proto/indexing-agreement-events.proto"], &["proto/"])?;
+        config.compile_protos(
+            &[
+                "proto/indexing-agreement-events.proto",
+                "proto/subgraph-indexing-request-events.proto",
+            ],
+            &["proto/"],
+        )?;
 
         // Instruct cargo to rerun this build script if any of the proto files change
         println!("cargo:rerun-if-changed=proto");
