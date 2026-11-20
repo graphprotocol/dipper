@@ -62,7 +62,9 @@ const TEARDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(75);
 
 /// How long the worker may take to finish the jobs it is running once it stops taking new ones.
 /// A job still running then is dropped, which rolls its queue transaction back so it runs again
-/// on the next start; the longest jobs (420s) cannot fit any pod grace period.
+/// on the next start. This only saves work: a job can be cut off at any point anyway (a crash, a
+/// kill, a job longer than any sensible grace period, up to 420s), so it must be safe to re-run
+/// whatever this allows.
 const WORKER_DRAIN: std::time::Duration = std::time::Duration::from_secs(45);
 
 /// The stop sequence's ceiling: the worker's drain, with the services that feed or call it
