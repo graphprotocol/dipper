@@ -31,6 +31,26 @@ pub use eip5267::{fetch_rca_eip712_domain, refresh_rca_eip712_domain};
 pub use manager_role::verify_signer_has_agreement_manager_role;
 use thegraph_core::alloy::primitives::{Address, B256, Bytes, U256};
 
+/// Asks, for each chain broadcast, whether this process may make it. Only dipper's writer may, so
+/// a process another one has taken over from can't send a transaction the new writer doesn't
+/// know of. See [`crate::writer::WriterGate`].
+#[async_trait]
+pub trait BroadcastGate: Send + Sync {
+    /// Starts 1 broadcast's turn, which lasts until it is dropped. A takeover waits for it.
+    async fn open(&self) -> anyhow::Result<Box<dyn BroadcastTurn>>;
+}
+
+/// 1 broadcast's turn, from [`BroadcastGate::open`].
+#[async_trait]
+pub trait BroadcastTurn: Send + Sync {
+    /// Whether this process may still broadcast: asked before each attempt, so a broadcast stops
+    /// at the first attempt after a takeover.
+    async fn still_writer(&self) -> anyhow::Result<bool>;
+
+    /// Ends the turn once the broadcast is over, so a takeover no longer waits for it.
+    async fn end(self: Box<Self>);
+}
+
 /// Error type for chain client operations
 #[derive(Debug, thiserror::Error)]
 pub enum ChainClientError {

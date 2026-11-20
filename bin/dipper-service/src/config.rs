@@ -326,8 +326,9 @@ impl Config {
             return Err(format!(
                 "worker_concurrency ({}) needs at least {required_conns} db connections (each loop \
                  may hold {DB_CONNECTIONS_PER_WORKER_LOOP} for its listener, open job transaction \
-                 and a registry query, plus {DB_CONNECTIONS_RESERVED} reserved for the registry \
-                 and background services), but db.max_connections is {max_conns}; raise \
+                 and a registry query, plus {DB_CONNECTIONS_RESERVED} reserved for the registry, \
+                 background services and a chain broadcast's writer check), but \
+                 db.max_connections is {max_conns}; raise \
                  db.max_connections to at least {required_conns} or lower worker_concurrency",
                 self.worker_concurrency,
             ));
@@ -643,6 +644,12 @@ impl Default for AlertsConfig {
                 "price_ceilings_changed",
                 "suggested_minimums_refused",
                 "suggested_minimums_fetch_failed",
+                "writer_waiting",
+                "writer_superseded",
+                "writer_drain_blocked",
+                "writer_refused_while_writer",
+                "writer_fence_off",
+                "writer_fence_attach_waiting",
             ]
             .map(str::to_owned)
             .to_vec(),
@@ -997,8 +1004,9 @@ fn default_worker_concurrency() -> usize {
 /// and a registry query.
 pub const DB_CONNECTIONS_PER_WORKER_LOOP: usize = 3;
 
-/// Pooled connections kept free of the worker loops for the registry and background services.
-pub const DB_CONNECTIONS_RESERVED: usize = 2;
+/// Pooled connections kept free of the worker loops for the registry and background services,
+/// and 1 for a chain broadcast's check that this process is the writer, held while it lasts.
+pub const DB_CONNECTIONS_RESERVED: usize = 3;
 
 impl Default for ExpirationConfig {
     fn default() -> Self {
