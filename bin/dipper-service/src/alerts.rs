@@ -50,7 +50,7 @@ type Dropped = Arc<Mutex<HashMap<String, u64>>>;
 /// The alert layer for dipper's logging, with its poster running in the background, or `None`
 /// when no Slack webhook is configured.
 pub fn layer(config: &AlertsConfig) -> Option<AlertLayer> {
-    let url = config.slack_webhook_url.as_ref()?.as_ref().clone();
+    let url = config.slack_webhook_url.as_ref()?.expose().clone();
     let (queue, alerts) = mpsc::channel(QUEUE);
     let dropped = Dropped::default();
     tokio::spawn(post_alerts(

@@ -6,6 +6,7 @@ edition = "2024"
 
 [dependencies]
 async-trait.workspace = true
+dipper-core = { version = "0.1.0", path = "../dipper-core", features = ["serde"] }
 chrono = "0.4.45"
 fs-err = "3.3.0"
 metrics.workspace = true

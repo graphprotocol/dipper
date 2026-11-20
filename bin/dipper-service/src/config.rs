@@ -3,7 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     num::NonZeroUsize,
-    path::Path,
+    path::PathBuf,
     sync::Arc,
     time::Duration,
 };
@@ -16,6 +16,9 @@ use thegraph_core::alloy::{
     signers::k256::SecretKey,
 };
 use url::Url;
+
+mod secret_url;
+pub use secret_url::SecretUrl;
 
 use crate::price_ceilings::{
     BasePriceCeilings, Minimums, default_ceiling, default_fallback_ceiling,
@@ -63,33 +66,95 @@ fn debug_optional_endpoint(url: &Option<Url>, f: &mut std::fmt::Formatter<'_>) -
     }
 }
 
-#[expect(
-    clippy::ptr_arg,
-    reason = "custom_debug passes the field itself, a &Vec"
-)]
-fn debug_endpoints(urls: &Vec<Url>, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.debug_list()
-        .entries(urls.iter().map(endpoint_name))
-        .finish()
+/// Load the configuration from 1 or more JSON files, merged in the order given: an object in a
+/// later file merges into the one before key by key, and anything else (a string, a number, a
+/// list, `null`) replaces what was there. The merged result is then read as one configuration,
+/// so an unknown field is refused wherever it came from.
+///
+/// This keeps secrets out of the main file without dipper being told where they are: production
+/// passes a `config.json` with no secrets, reviewable in git, then a `secrets.json` rendered from
+/// the secret store with only the secret fields, while a test passes 1 file with everything.
+pub fn load_from_files(paths: &[PathBuf]) -> Result<Config, Error> {
+    let read = |path: &PathBuf| {
+        std::fs::read_to_string(path).map_err(|source| Error::Io {
+            path: path.clone(),
+            source,
+        })
+    };
+    let files = paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    match paths {
+        [] => Err(Error::NoFiles),
+        // 1 file is read straight from its text, so an error keeps its line and column.
+        [path] => {
+            let text = read(path)?;
+            serde_path_to_error::deserialize(&mut serde_json::Deserializer::from_str(&text))
+                .map_err(|source| Error::Deserialize { files, source })
+        }
+        _ => {
+            let mut merged = serde_json::Value::Object(serde_json::Map::new());
+            for path in paths {
+                let layer: serde_json::Value =
+                    serde_json::from_str(&read(path)?).map_err(|source| Error::Parse {
+                        path: path.clone(),
+                        source,
+                    })?;
+                merge(&mut merged, layer);
+            }
+            serde_path_to_error::deserialize(merged)
+                .map_err(|source| Error::Deserialize { files, source })
+        }
+    }
 }
 
-/// Load the configuration from a JSON file.
-pub fn load_from_file(path: &Path) -> Result<Config, Error> {
-    let config_content = std::fs::read_to_string(path)?;
-    let config = serde_json::from_str(&config_content)?;
-    Ok(config)
+/// Merges `layer` into `base`: objects key by key, anything else replacing what was there.
+fn merge(base: &mut serde_json::Value, layer: serde_json::Value) {
+    match (base, layer) {
+        (serde_json::Value::Object(base), serde_json::Value::Object(layer)) => {
+            for (key, value) in layer {
+                match base.get_mut(&key) {
+                    Some(existing) => merge(existing, value),
+                    None => {
+                        base.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base, layer) => *base = layer,
+    }
 }
 
-/// An error that can occur when loading the configuration.
+/// An error that can occur when loading the configuration. None of them repeats a secret: secret
+/// fields leave their value out of a deserialisation error, and the rest name the field and file.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// An error occurred while reading the configuration file.
-    #[error("failed to read configuration file: {0}")]
-    Io(#[from] std::io::Error),
+    /// No configuration file was given.
+    #[error("no configuration file given")]
+    NoFiles,
 
-    /// An error occurred while deserializing the configuration.
-    #[error("failed to deserialize configuration: {0}")]
-    Deserialize(#[from] serde_json::Error),
+    /// A configuration file could not be read.
+    #[error("failed to read configuration file {}: {source}", path.display())]
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    /// A configuration file, 1 of several, is not JSON.
+    #[error("configuration file {} is not valid JSON: {source}", path.display())]
+    Parse {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+
+    /// The configuration, merged from `files`, is not a valid one; the error names the field.
+    #[error("invalid configuration in {files}: {source}")]
+    Deserialize {
+        files: String,
+        source: serde_path_to_error::Error<serde_json::Error>,
+    },
 }
 
 /// The configuration for the DIPs service
@@ -590,8 +655,7 @@ impl SuggestedMinimumsConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct AlertsConfig {
     /// The Slack incoming-webhook URL to post alerts to. Without one, none are sent.
-    #[serde_as(as = "Option<serde_with::DisplayFromStr>")]
-    pub slack_webhook_url: Option<Hidden<Url>>,
+    pub slack_webhook_url: Option<SecretUrl>,
     /// The `event` tags of the log lines to alert on. Leave it out to alert on the defaults,
     /// which grow as alerts are added; a list given here replaces them.
     pub events: Vec<String>,
@@ -1477,9 +1541,7 @@ pub struct ChainClientConfig {
     ///
     /// At least one provider is required when enabled. Providers are tried in order,
     /// rotating to the next on persistent failures.
-    #[debug(with = debug_endpoints)]
-    #[serde_as(as = "Vec<serde_with::DisplayFromStr>")]
-    pub providers: Vec<Url>,
+    pub providers: Vec<SecretUrl>,
 
     /// Request timeout per RPC call in seconds (default: 10s). Every call here is a small one,
     /// so this is headroom rather than a working limit, and it multiplies with `max_retries`.
@@ -1529,6 +1591,17 @@ pub struct ChainClientConfig {
     /// The gas limit is capped at estimate + this value.
     #[serde(default = "default_gas_max_addition")]
     pub gas_max_addition: u64,
+}
+
+impl ChainClientConfig {
+    /// The providers' URLs, keys and all, for connecting with. Never log them; log the
+    /// providers themselves, which mask their keys.
+    pub fn provider_urls(&self) -> Vec<Url> {
+        self.providers
+            .iter()
+            .map(|url| url.expose().clone())
+            .collect()
+    }
 }
 
 fn default_chain_client_enabled() -> bool {
@@ -3562,7 +3635,7 @@ mod tests {
             "sasl_username mismatch"
         );
         assert_eq!(
-            kafka.sasl_password.as_deref(),
+            kafka.sasl_password.as_ref().map(|p| p.as_str()),
             Some("pass"),
             "sasl_password mismatch"
         );
@@ -3663,6 +3736,156 @@ mod tests {
             crate::health::DEFAULT_HEALTH_THRESHOLD,
             "the remaining fields keep their defaults"
         );
+    }
+
+    /// Writes each of `files` to a fresh temporary directory, returning their paths.
+    fn write_config_files(files: &[serde_json::Value]) -> Vec<std::path::PathBuf> {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "dipper-config-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        files
+            .iter()
+            .enumerate()
+            .map(|(index, file)| {
+                let path = dir.join(format!("{index}.json"));
+                std::fs::write(&path, serde_json::to_string_pretty(file).unwrap()).unwrap();
+                path
+            })
+            .collect()
+    }
+
+    /// The example, made loadable, with its secrets split from the rest as production would.
+    fn example_split_from_its_secrets() -> (serde_json::Value, serde_json::Value) {
+        let mut config = example_config();
+        config["dips"]["recurring_collector"] = "0x2222222222222222222222222222222222222222".into();
+        config["dips"]["recurring_agreement_manager"] =
+            "0x3333333333333333333333333333333333333333".into();
+        let signer = config["signer"].as_object_mut().unwrap();
+        signer.remove("secret_key");
+        let secrets = serde_json::json!({
+            "signer": {
+                "secret_key": "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+            },
+            "db": { "password": "from-the-secrets-file" },
+            "alerts": { "slack_webhook_url": "https://hooks.slack.com/services/T0/B0/not-a-real-key" },
+        });
+        (config, secrets)
+    }
+
+    /// The secrets file fills in the secret fields and leaves everything else as the main file
+    /// has it.
+    #[test]
+    fn a_secrets_file_merges_into_the_config() {
+        let (config, secrets) = example_split_from_its_secrets();
+        let paths = write_config_files(&[config.clone(), secrets]);
+        let merged = load_from_files(&paths).expect("the 2 files make a valid config");
+        assert_eq!(
+            merged.db.password.as_ref().map(|p| p.as_str()),
+            Some("from-the-secrets-file")
+        );
+        assert!(merged.alerts.slack_webhook_url.is_some());
+        assert_eq!(
+            merged.db.url.as_str(),
+            config["db"]["url"].as_str().unwrap(),
+            "fields the secrets file leaves out keep the main file's value"
+        );
+    }
+
+    /// The same configuration loads the same whether it comes in 1 file or 2.
+    #[test]
+    fn one_file_or_two_load_the_same() {
+        let (config, secrets) = example_split_from_its_secrets();
+        let mut whole = config.clone();
+        merge(&mut whole, secrets.clone());
+        let from_1 = load_from_files(&write_config_files(&[whole])).unwrap();
+        let from_2 = load_from_files(&write_config_files(&[config, secrets])).unwrap();
+        assert_eq!(format!("{from_1:?}"), format!("{from_2:?}"));
+    }
+
+    #[test]
+    fn later_files_replace_lists_and_values_and_merge_objects() {
+        let mut base = serde_json::json!({"a": {"x": 1, "y": [1, 2]}, "b": "keep"});
+        merge(&mut base, serde_json::json!({"a": {"y": [3], "z": null}}));
+        assert_eq!(
+            base,
+            serde_json::json!({"a": {"x": 1, "y": [3], "z": null}, "b": "keep"})
+        );
+    }
+
+    /// A field misspelt in the secrets file is refused like one in the main file.
+    #[test]
+    fn an_unknown_field_in_a_later_file_is_refused() {
+        let (config, _) = example_split_from_its_secrets();
+        let paths = write_config_files(&[config, serde_json::json!({"db": {"pasword": "x"}})]);
+        let err = load_from_files(&paths)
+            .expect_err("an unknown field")
+            .to_string();
+        assert!(err.contains("db") && err.contains("pasword"), "{err}");
+    }
+
+    /// An error names the field it is about and never repeats a secret's value.
+    #[test]
+    fn errors_name_the_field_and_leave_secrets_out() {
+        let (config, mut secrets) = example_split_from_its_secrets();
+        secrets["db"]["password"] = serde_json::json!(424_242);
+        let paths = write_config_files(&[config.clone(), secrets.clone()]);
+        let err = load_from_files(&paths)
+            .expect_err("a bad password")
+            .to_string();
+        assert!(err.contains("db.password"), "{err}");
+        assert!(!err.contains("424242"), "{err}");
+
+        secrets["db"]["password"] = "fine".into();
+        secrets["alerts"]["slack_webhook_url"] = "not a url s3cret".into();
+        let paths = write_config_files(&[config, secrets]);
+        let err = load_from_files(&paths)
+            .expect_err("a bad webhook")
+            .to_string();
+        assert!(err.contains("alerts.slack_webhook_url"), "{err}");
+        assert!(!err.contains("s3cret"), "{err}");
+    }
+
+    /// A single file still reports where in it an error is.
+    #[test]
+    fn a_single_file_keeps_line_numbers_in_errors() {
+        let paths = write_config_files(&[serde_json::json!({"db": {"url": 5}})]);
+        let err = load_from_files(&paths)
+            .expect_err("not a config")
+            .to_string();
+        assert!(err.contains("line "), "{err}");
+    }
+
+    #[test]
+    fn no_file_or_a_missing_file_is_refused() {
+        assert!(matches!(load_from_files(&[]), Err(Error::NoFiles)));
+        let missing = std::path::PathBuf::from("/no/such/dipper/config.json");
+        let err = load_from_files(&[missing]).err().unwrap().to_string();
+        assert!(err.contains("/no/such/dipper/config.json"), "{err}");
+    }
+
+    /// The configuration as logged at startup shows the providers and webhook masked.
+    #[test]
+    fn the_logged_config_masks_url_keys() {
+        let config = example_config_edited(|config| {
+            config["chain_client"]["providers"] = serde_json::json!([
+                "https://mainnet.infura.io/v3/0123456789abcdef0123456789abcdef"
+            ]);
+            config["alerts"] = serde_json::json!({
+                "slack_webhook_url": "https://hooks.slack.com/services/T0/B0/not-a-real-key"
+            });
+        });
+        let logged = format!("{config:?}");
+        assert!(logged.contains("mainnet.infura.io/v3/***"), "{logged}");
+        assert!(
+            logged.contains("hooks.slack.com/***/***/***/***"),
+            "{logged}"
+        );
+        assert!(!logged.contains("0123456789abcdef"), "{logged}");
+        assert!(!logged.contains("not-a-real-key"), "{logged}");
     }
 
     /// The config.json in the example configmap.
@@ -4433,9 +4656,10 @@ mod tests {
         assert!(alerts.slack_webhook_url.is_some());
         assert_eq!(alerts.throttle, Duration::from_secs(60));
         assert_eq!(alerts.events, AlertsConfig::default().events);
+        let logged = format!("{alerts:?}");
         assert!(
-            !format!("{alerts:?}").contains("hooks.slack.com"),
-            "the webhook is a secret, kept out of logs"
+            logged.contains("https://hooks.slack.com/***/***/***/***"),
+            "the webhook shows its host, its path masked: {logged}"
         );
     }
 
