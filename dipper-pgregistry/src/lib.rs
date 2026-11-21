@@ -9,6 +9,7 @@ mod indexing_agreement;
 mod indexing_request;
 mod postgres;
 mod result;
+pub mod writer_fence;
 
 pub use indexing_agreement::{
     Indexer as IndexingAgreementIndexer, IndexingAgreement, Status as IndexingAgreementStatus,

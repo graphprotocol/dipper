@@ -25,7 +25,12 @@ impl From<dipper_pgregistry::Error> for Error {
     fn from(value: dipper_pgregistry::Error) -> Self {
         match value {
             dipper_pgregistry::Error::NoRecordsUpdated => Error::NoRecordsUpdated,
-            dipper_pgregistry::Error::DbError(_) => Error::BackendError(value),
+            dipper_pgregistry::Error::DbError(ref err) => {
+                // A write the writer fence refused: the heartbeat checks at once whether another
+                // process has taken over, and stops this one if so.
+                crate::writer::note_db_refusal(err);
+                Error::BackendError(value)
+            }
         }
     }
 }

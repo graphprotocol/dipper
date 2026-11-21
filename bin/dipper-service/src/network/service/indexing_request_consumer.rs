@@ -75,8 +75,9 @@ const LOCK_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long giving the lock up may take, within the 5 seconds dipper allows a service to stop.
 const LOCK_RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The application name of the lock's database session, to find it by in `pg_stat_activity`.
-const LOCK_SESSION_NAME: &str = "dipper-studio-request-consumer-lock";
+/// What the lock's database session is named, after the process's own name, to find it by in
+/// `pg_stat_activity`: `dipper/<token>/studio-request-lock`, which is 63 bytes, all Postgres keeps.
+const LOCK_SESSION_NAME: &str = "studio-request-lock";
 
 /// How long the lock's session may sit idle before the database ends it and frees the lock.
 /// It bounds how long a dipper that vanished without closing its connection keeps the lock,
@@ -487,7 +488,8 @@ async fn lock_taken<L: ConsumerLock>(
             Ok(false) => wait.goes_on(format_args!(
                 "another database session holds it, which is either a dipper that is still \
                  running or one that has gone and whose session the database has not ended yet \
-                 (in pg_stat_activity both have the application_name '{LOCK_SESSION_NAME}')"
+                 (in pg_stat_activity both have an application_name ending in \
+                 '/{LOCK_SESSION_NAME}')"
             )),
             Err(error) => wait.goes_on(format_args!("the database could not be asked ({error})")),
         }

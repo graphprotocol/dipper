@@ -42,6 +42,7 @@ mod telemetry;
 mod test_support;
 mod tls;
 mod worker;
+mod writer;
 
 #[global_allocator]
 static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
@@ -263,12 +264,26 @@ pub async fn main() -> anyhow::Result<()> {
         Arc::new(Eip712Signer::new(chain_id, domain))
     };
 
-    //- DB connect and run migrations
-    let db_conn = db::connect(&conf.db).await?;
-    tracing::info!(db = %config::database_name(&conf.db.url), "initialized DB connection pool");
+    //- DB connect and run migrations. Every session of the pool carries this process's token: the
+    //  database refuses their writes until this process becomes the writer, just before the
+    //  services start below, and again once another process has taken over (see `writer`).
+    let writer_token = writer::new_token();
+    let db_conn = db::connect(&conf.db, writer_token).await?;
+    tracing::info!(
+        db = %config::database_name(&conf.db.url),
+        writer_token = %writer_token,
+        "initialized DB connection pool"
+    );
 
-    dipper_pgmq::run_db_migrations(&db_conn).await?;
-    dipper_pgregistry::run_db_migrations(&db_conn).await?;
+    // The migrations, and fencing any table they added, are work on the database as a whole,
+    // done on a session of their own that the writer fence lets through.
+    {
+        let mut operator = db::connect_operator(&conf.db).await?;
+        dipper_pgmq::run_db_migrations(&mut operator).await?;
+        dipper_pgregistry::run_db_migrations(&mut operator).await?;
+        writer::fence_every_table(&mut operator).await?;
+        let _ = sqlx::Connection::close(operator).await;
+    }
     tracing::info!("applied DB migrations");
 
     //- The metrics sampler: the database's reachability and the queue's depth
@@ -467,6 +482,7 @@ pub async fn main() -> anyhow::Result<()> {
             recurring_collector,
             agreement_conf.recurring_agreement_manager(),
             &secret_bytes,
+            Arc::new(writer::WriterGate::new(db_conn.clone(), writer_token)),
         )
         .expect("Failed to create AlloyChainClient");
         tracing::info!(
@@ -776,6 +792,22 @@ pub async fn main() -> anyhow::Result<()> {
     // Construct the task tree
     let mut task_tree = JoinSet::new();
 
+    //- Become dipper's writer, as late as startup allows: everything above only reads. This waits
+    //  while another dipper process is the healthy writer, then takes over. The heartbeat starts
+    //  at once, so this process never looks silent while it waits for what the replaced one still
+    //  had in flight, and it runs until the last step of the stop below.
+    let taken = writer::Takeover::new(&db_conn, writer_token, writer::holder())
+        .take()
+        .await?;
+    let (writer_handle, heartbeat) = writer::heartbeat(
+        db_conn.connect_options().as_ref().clone(),
+        writer_token,
+        writer::refusals(),
+    );
+    let heartbeat_task_handle = task_tree.spawn(heartbeat);
+    tracing::debug!(task_id=%heartbeat_task_handle.id(), "Writer heartbeat started");
+    taken.settle().await?;
+
     // Spawn the entity count cache if enabled
     let entity_count_handle = if let Some((handle, service)) = entity_count_service {
         let task_handle = task_tree.spawn(service);
@@ -1012,12 +1044,20 @@ pub async fn main() -> anyhow::Result<()> {
         // on would hang it and then take a confusing `PoolClosed`. Skipping it, or giving up on
         // it, costs nothing: Postgres rolls back anything open once the sockets drop.
         if all_stopped {
-            stop_service("DB connection pool", db_conn.close()).await;
+            all_stopped &= stop_service("DB connection pool", db_conn.close()).await;
         } else {
             tracing::warn!(
                 "skipping the graceful DB pool close because a service did not stop in time"
             );
         }
+
+        // The last step. The heartbeat ran until now, so this process never looked silent while
+        // it stopped. It hands over only after a clean stop, so the next process can't take over
+        // while a service of this one may still be running: it then waits out the silence.
+        stop_service("Writer handover", async {
+            writer_handle.finish(all_stopped).await;
+        })
+        .await;
 
         // Everything is stopped, so surface the registration failure now.
         match registration_error {

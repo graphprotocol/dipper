@@ -1,10 +1,12 @@
 use std::time::Duration;
 
 use anyhow::Context;
+use dipper_pgregistry::writer_fence;
 use sqlx::{
     Connection as _, PgConnection, Pool, Postgres,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
+use uuid::Uuid;
 
 use crate::config::DbConfig;
 
@@ -16,23 +18,35 @@ pub const DEFAULT_MAX_CONNECTIONS: u32 = 32;
 /// instead of relying on the driver default.
 const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Connect to the database
-#[expect(
-    clippy::expect_used,
-    reason = "predates this lint; fix when next touched"
-)]
-pub async fn connect(conf: &DbConfig) -> anyhow::Result<Pool<Postgres>> {
+/// How to reach the database as configured, credentials included.
+fn connect_options(conf: &DbConfig) -> anyhow::Result<PgConnectOptions> {
     // sqlx checks a `verify-ca` certificate with rustls's process-wide provider.
     crate::tls::install_crypto_provider();
-    let mut conn_options: PgConnectOptions = conf.url.as_str().parse().expect("Invalid DB URL");
-    conn_options = conn_options.username(&conf.username);
+    let conn_options: PgConnectOptions = conf
+        .url
+        .as_str()
+        .parse()
+        .context("db.url is not a Postgres connection URL")?;
+    let conn_options = conn_options.username(&conf.username);
+    Ok(match &conf.password {
+        Some(password) => conn_options.password(password),
+        None => conn_options,
+    })
+}
+
+/// Connects the pool every database call of this process goes through, once the database
+/// answers. Each of its sessions belongs to the process with `writer` as its token: the writer
+/// fence lets its writes through only while that process is the writer, and a takeover by
+/// another process ends them (see [`crate::writer`]). The connections opened from the pool's
+/// options, such as the queue's listener and the Studio consumer's lock, belong to it too.
+pub async fn connect(conf: &DbConfig, writer: Uuid) -> anyhow::Result<Pool<Postgres>> {
+    let conn_options = connect_options(conf)?;
     // Without a password, dipper only gets in where the server asks for none.
-    match &conf.password {
-        Some(password) => conn_options = conn_options.password(password),
-        None => tracing::info!(
+    if conf.password.is_none() {
+        tracing::info!(
             "db.password is not set: connecting without a password of dipper's own, as through \
              the Cloud SQL Auth Proxy with automatic IAM authentication"
-        ),
+        );
     }
 
     // Wait for the database with 1 connection at a time, each cut off at the time left of the
@@ -74,12 +88,23 @@ pub async fn connect(conf: &DbConfig) -> anyhow::Result<Pool<Postgres>> {
     let pool = PgPoolOptions::new()
         .max_connections(conf.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS))
         .acquire_timeout(ACQUIRE_TIMEOUT)
-        .connect_with(conn_options)
+        .connect_with(writer_fence::writer_options(conn_options, writer))
         .await
         .map_err(|err| explain_refusal(err, conf.password.is_none()))
         .context("failed to connect to DB")?;
 
     Ok(pool)
+}
+
+/// Opens 1 session for work done on the database as a whole rather than as this process: the
+/// migrations, and fencing the tables they add. The writer fence lets its writes through, and no
+/// takeover ends it. Call it once [`connect`] has found the database answering.
+pub async fn connect_operator(conf: &DbConfig) -> anyhow::Result<PgConnection> {
+    let options = writer_fence::operator_options(connect_options(conf)?);
+    PgConnection::connect_with(&options)
+        .await
+        .map_err(|err| explain_refusal(err, conf.password.is_none()))
+        .context("failed to open the DB session for migrations")
 }
 
 /// The longest 1 connection attempt may take while waiting for the database at startup.
@@ -191,7 +216,7 @@ mod tests {
 
         let conf = db_config(&format!("postgres://{addr}/dipper?sslmode=require"));
         let (_, seen) = tokio::join!(
-            tokio::time::timeout(Duration::from_secs(5), connect(&conf)),
+            tokio::time::timeout(Duration::from_secs(5), connect(&conf, Uuid::now_v7())),
             tokio::time::timeout(Duration::from_secs(5), server),
         );
         let (request, next) = seen
@@ -293,7 +318,11 @@ mod tests {
         };
         let url = format!("postgres://{host}:{}/dipper?{params}{root}", addr.port());
 
-        let _ = tokio::time::timeout(Duration::from_secs(10), connect(&db_config(&url))).await;
+        let _ = tokio::time::timeout(
+            Duration::from_secs(10),
+            connect(&db_config(&url), Uuid::now_v7()),
+        )
+        .await;
         let accepted = tokio::time::timeout(Duration::from_secs(10), handshake)
             .await
             .map(|joined| joined.unwrap_or(false))
@@ -396,7 +425,7 @@ mod tests {
         // pgtemp's default server trusts local connections, as a database behind the Cloud SQL
         // Auth Proxy with automatic IAM authentication asks the client for no password either.
         let temp_db = pgtemp::PgTempDB::new();
-        let pool = connect(&pgtemp_db_config(&temp_db, None))
+        let pool = connect(&pgtemp_db_config(&temp_db, None), Uuid::now_v7())
             .await
             .expect("connects without a password");
         let one: i32 = sqlx::query_scalar("SELECT 1")
@@ -406,12 +435,41 @@ mod tests {
         assert_eq!(one, 1);
     }
 
+    /// The writer fence tells processes apart by what their sessions carry: a session of the pool
+    /// belongs to this process, and the migrations' session to no process at all.
+    #[tokio::test]
+    async fn it_marks_every_session_with_whose_it_is() {
+        let temp_db = pgtemp::PgTempDB::new();
+        let conf = pgtemp_db_config(&temp_db, None);
+        let token = Uuid::now_v7();
+        let carried =
+            "SELECT current_setting('dipper.writer'), current_setting('application_name')";
+
+        let pool = connect(&conf, token).await.expect("connect the pool");
+        let (setting, name): (String, String) = sqlx::query_as(carried)
+            .fetch_one(&pool)
+            .await
+            .expect("read the pool's session");
+        assert_eq!(setting, token.to_string());
+        assert_eq!(name, format!("dipper/{token}"));
+
+        let mut operator = connect_operator(&conf)
+            .await
+            .expect("connect as an operator");
+        let (setting, name): (String, String) = sqlx::query_as(carried)
+            .fetch_one(&mut operator)
+            .await
+            .expect("read the operator's session");
+        assert_eq!(setting, "operator");
+        assert_eq!(name, "dipper-operator");
+    }
+
     #[tokio::test]
     async fn it_says_so_when_a_server_wants_the_password_that_is_not_set() {
         let (temp_db, dir) = password_checking_db();
 
-        let without = connect(&pgtemp_db_config(&temp_db, None)).await;
-        let with = connect(&pgtemp_db_config(&temp_db, Some("s3cret"))).await;
+        let without = connect(&pgtemp_db_config(&temp_db, None), Uuid::now_v7()).await;
+        let with = connect(&pgtemp_db_config(&temp_db, Some("s3cret")), Uuid::now_v7()).await;
         drop(temp_db);
         let _ = std::fs::remove_dir_all(dir);
 
@@ -447,7 +505,11 @@ mod tests {
             })
         };
 
-        let result = connect(&waiting_db_config(&format!("postgres://{addr}/dipper"), 2)).await;
+        let result = connect(
+            &waiting_db_config(&format!("postgres://{addr}/dipper"), 2),
+            Uuid::now_v7(),
+        )
+        .await;
         server.abort();
 
         assert!(result.is_err(), "the server never lets dipper in");
@@ -472,7 +534,11 @@ mod tests {
         });
 
         let started = std::time::Instant::now();
-        let result = connect(&waiting_db_config(&format!("postgres://{addr}/dipper"), 2)).await;
+        let result = connect(
+            &waiting_db_config(&format!("postgres://{addr}/dipper"), 2),
+            Uuid::now_v7(),
+        )
+        .await;
         server.abort();
 
         let err = format!("{:#}", result.expect_err("the server never answers"));

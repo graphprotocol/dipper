@@ -1,16 +1,22 @@
 #![cfg(feature = "fake")]
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 
 use dipper_core::ids::{IndexingAgreementId, IndexingRequestId};
 use dipper_pgregistry::{
     CancelKind, EndCorrection, Error, IndexingAgreementStatus, IndexingAgreementTerms,
     IndexingRequestStatus, NewAgreementParams, PgRegistry, ReconciliationAudit, ReconciliationItem,
-    RecordedEnd, SetAsideChange, SetAsideRequest, WithheldIndexers,
+    RecordedEnd, SetAsideChange, SetAsideRequest, WithheldIndexers, writer_fence,
 };
 use fake::{Fake, Faker};
 use pgtemp::PgTempDB;
-use sqlx::{Executor as _, Pool, Postgres};
+use sqlx::{
+    ConnectOptions as _, Executor as _, Pool, Postgres,
+    postgres::{PgConnectOptions, PgPoolOptions},
+};
 use thegraph_core::{
     DeploymentId, IndexerId,
     alloy::primitives::{ChainId, address},
@@ -21,22 +27,46 @@ use thegraph_core::{
 use url::Url;
 use uuid::uuid;
 
-/// Initialize a temporary database for integration testing.
+/// Initialize a temporary database for integration testing, as dipper's start leaves it: the
+/// migrations run and every table fenced by an operator's session, and a pool whose sessions
+/// belong to the process that is the writer. Every test here so runs through the writer fence.
 ///
-/// This function creates a temporary database and runs the migrations.
 /// It returns the database connection pool and the temporary database guard.
 #[expect(
     clippy::expect_used,
-    reason = "predates this lint; fix when next touched"
+    reason = "test setup; a failure should stop the test"
 )]
 async fn temp_registry_db() -> (Pool<Postgres>, PgTempDB) {
     let temp_db = PgTempDB::new();
-    let db = Pool::connect(&temp_db.connection_uri())
+    let base: PgConnectOptions = temp_db
+        .connection_uri()
+        .parse()
+        .expect("pgtemp's URI is a Postgres URL");
+    let mut operator = writer_fence::operator_options(base.clone())
+        .connect()
         .await
         .expect("Failed to connect to temporary database");
-    dipper_pgregistry::run_db_migrations(&db)
+    dipper_pgregistry::run_db_migrations(&mut operator)
         .await
         .expect("Failed to run DB migrations");
+    for table in writer_fence::unfenced(&mut operator)
+        .await
+        .expect("Failed to list the unfenced tables")
+    {
+        let fenced = writer_fence::attach(&mut operator, &table, Duration::from_secs(5))
+            .await
+            .expect("Failed to fence a table");
+        assert!(fenced, "{table} is free to fence");
+    }
+    let writer = uuid::Uuid::now_v7();
+    let took_over = writer_fence::take(&mut operator, writer, "test", Duration::ZERO)
+        .await
+        .expect("Failed to take over as the writer");
+    assert!(took_over, "a new database has no writer to wait for");
+    let db = PgPoolOptions::new()
+        .connect_with(writer_fence::writer_options(base, writer))
+        .await
+        .expect("Failed to connect to temporary database");
     (db, temp_db)
 }
 
@@ -5178,17 +5208,24 @@ async fn a_database_that_refuses_the_idle_timeout_still_gives_a_connection_for_t
 }
 
 /// The lock's session has a name of its own, so that the session holding the lock can be
-/// told from the pool's in `pg_stat_activity` when someone has to end it by hand.
+/// told from the pool's in `pg_stat_activity` when someone has to end it by hand. It follows
+/// the pool's own name, so a takeover by another dipper process ends it with the rest of this
+/// process's sessions.
 #[tokio::test]
 async fn a_lock_connection_is_listed_by_the_database_under_its_name() {
     //* Given
     let (db, _temp_db) = temp_registry_db().await;
     let registry = PgRegistry::new(db.clone());
+    let pool_name = db
+        .connect_options()
+        .get_application_name()
+        .map(str::to_owned)
+        .expect("the pool's sessions are named for their process");
     let named = async || {
         sqlx::query_scalar::<_, i64>(
             "SELECT count(*) FROM pg_stat_activity WHERE application_name = $1",
         )
-        .bind("dipper-test-lock")
+        .bind(format!("{pool_name}/dipper-test-lock"))
         .fetch_one(&db)
         .await
         .expect("read pg_stat_activity")
