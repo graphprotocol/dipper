@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.3.4](https://github.com/graphprotocol/dipper/compare/v0.3.3...v0.3.4) (2026-11-21)
+
+
+### Added
+
+* **db:** connect to Postgres over TLS ([#847](https://github.com/graphprotocol/dipper/issues/847)) ([2673181](https://github.com/graphprotocol/dipper/commit/267318145e62b5ef29f9afdf0c1f9ad1ce77b02a))
+* **db:** make the database password optional ([#850](https://github.com/graphprotocol/dipper/issues/850)) ([cb5d3b1](https://github.com/graphprotocol/dipper/commit/cb5d3b11bd71847851006671586bd2edbea06445))
+* **metrics:** serve Prometheus metrics and optionally log as JSON ([#851](https://github.com/graphprotocol/dipper/issues/851)) ([523819e](https://github.com/graphprotocol/dipper/commit/523819eab8ac83fc2a299656d4272006bf1c9444))
+* **startup:** wait for Postgres and IISA instead of exiting ([#849](https://github.com/graphprotocol/dipper/issues/849)) ([d1406d4](https://github.com/graphprotocol/dipper/commit/d1406d4b06cf7a37f228755f803ffeb10d71183c))
+
+
+### Fixed
+
+* **db:** sslmode=verify-ca skips the hostname check, as libpq does ([#859](https://github.com/graphprotocol/dipper/issues/859)) ([5fec97d](https://github.com/graphprotocol/dipper/commit/5fec97d5eceb49e27638978e2aa006c8531347e0))
+* **k8s:** roll dipper out one pod at a time ([#846](https://github.com/graphprotocol/dipper/issues/846)) ([de57e46](https://github.com/graphprotocol/dipper/commit/de57e462cc418aca08ec20a70196553b377dbfae))
+
 ## [0.3.3](https://github.com/graphprotocol/dipper/compare/v0.3.2...v0.3.3) (2026-11-19)
 
 
