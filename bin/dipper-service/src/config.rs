@@ -1994,9 +1994,10 @@ pub struct DbConfig {
     /// The URL should be in the format `postgres://<host>:<port>/<database>`. Its query string
     /// sets the connection's TLS. `sslmode=verify-full` encrypts and checks that the server's
     /// certificate is signed by a trusted CA and names the host in the URL; use it with a name the
-    /// certificate covers. `verify-ca` is meant to skip the name check, but the Postgres driver
-    /// dipper uses keeps it with the current TLS library, so it behaves as `verify-full` and
-    /// can't reach a server at an address its certificate does not name. `require` encrypts
+    /// certificate covers. `verify-ca` checks the signature but not the name, as libpq does; use
+    /// it for a server whose certificate does not name the host in the URL, such as a Cloud SQL
+    /// private-IP instance, whose certificate names only its DNS name with a trailing dot, which
+    /// `verify-full` never accepts. `require` encrypts
     /// without checking the certificate. `sslrootcert=<path>` adds a CA to trust, such as a
     /// managed database's server CA, to the public roots dipper trusts anyway, and only takes
     /// effect with a `verify-*` mode; a replaced file applies to connections opened after it.

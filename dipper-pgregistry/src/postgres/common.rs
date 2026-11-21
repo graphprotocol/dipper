@@ -15,13 +15,13 @@ pub struct PgU64(pub u64);
 
 impl sqlx::Type<Postgres> for PgU64 {
     fn type_info() -> PgTypeInfo {
-        <[u8; 8]>::type_info()
+        <[u8; 8] as sqlx::Type<Postgres>>::type_info()
     }
 }
 
 impl sqlx::Encode<'_, Postgres> for PgU64 {
     fn encode_by_ref(&self, buf: &mut PgArgumentBuffer) -> Result<IsNull, BoxDynError> {
-        <[u8; 8]>::encode(self.0.to_be_bytes(), buf)
+        <[u8; 8] as sqlx::Encode<'_, Postgres>>::encode(self.0.to_be_bytes(), buf)
     }
 }
 
@@ -70,19 +70,19 @@ pub struct PgAddress(pub Address);
 
 impl sqlx::Type<Postgres> for PgAddress {
     fn type_info() -> PgTypeInfo {
-        <[u8; 20]>::type_info()
+        <[u8; 20] as sqlx::Type<Postgres>>::type_info()
     }
 }
 
 impl sqlx::Encode<'_, Postgres> for PgAddress {
     fn encode_by_ref(&self, buf: &mut PgArgumentBuffer) -> Result<IsNull, BoxDynError> {
-        <[u8; 20]>::encode(self.0.into(), buf)
+        <[u8; 20] as sqlx::Encode<'_, Postgres>>::encode(self.0.into(), buf)
     }
 }
 
 impl<'r> sqlx::Decode<'r, Postgres> for PgAddress {
     fn decode(value: PgValueRef<'r>) -> Result<Self, BoxDynError> {
-        let bytes = <[u8; 20]>::decode(value)?;
+        let bytes = <[u8; 20] as sqlx::Decode<'_, Postgres>>::decode(value)?;
         Ok(Self(Address::from(bytes)))
     }
 }

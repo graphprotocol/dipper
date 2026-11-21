@@ -127,7 +127,7 @@ impl ::sqlx::Type<::sqlx::Postgres> for IndexingAgreementId {
 impl<'q> ::sqlx::Encode<'q, ::sqlx::Postgres> for IndexingAgreementId {
     fn encode_by_ref(
         &self,
-        buf: &mut <::sqlx::Postgres as ::sqlx::Database>::ArgumentBuffer<'q>,
+        buf: &mut <::sqlx::Postgres as ::sqlx::Database>::ArgumentBuffer,
     ) -> Result<::sqlx::encode::IsNull, ::sqlx::error::BoxDynError> {
         <&[u8] as ::sqlx::Encode<'q, ::sqlx::Postgres>>::encode_by_ref(&&self.0[..], buf)
     }
@@ -270,7 +270,7 @@ macro_rules! uuid_new_type_impls {
         impl<'q> ::sqlx::Encode<'q, ::sqlx::Postgres> for $name {
             fn encode_by_ref(
                 &self,
-                buf: &mut <::sqlx::Postgres as ::sqlx::Database>::ArgumentBuffer<'q>,
+                buf: &mut <::sqlx::Postgres as ::sqlx::Database>::ArgumentBuffer,
             ) -> Result<::sqlx::encode::IsNull, ::sqlx::error::BoxDynError> {
                 self.0.encode_by_ref(buf)
             }
