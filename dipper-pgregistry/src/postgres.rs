@@ -3095,7 +3095,8 @@ async fn batch_set_status(
         RETURNING id
         "#
     );
-    let mut query = sqlx::query_as::<_, (IndexingAgreementId,)>(&sql);
+    // Only numbered placeholders are interpolated; the values are bound below.
+    let mut query = sqlx::query_as::<_, (IndexingAgreementId,)>(sqlx::AssertSqlSafe(sql));
     for status in new_statuses {
         query = query.bind(*status);
     }

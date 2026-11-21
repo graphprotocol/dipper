@@ -1,6 +1,6 @@
 ## Rust builder
 # Compile the Rust code
-FROM rust:1.91.0-slim-bookworm AS rust-builder
+FROM rust:1.94.0-slim-bookworm AS rust-builder
 
 RUN --mount=type=cache,id=apt-builder,target=/var/cache/apt,sharing=locked \
   apt-get update \
