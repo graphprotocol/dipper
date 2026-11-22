@@ -135,6 +135,7 @@ pub struct IndexingRequestsPage {
 }
 
 /// The _indexing request_ response entity
+#[serde_with::serde_as]
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct IndexingRequest {
     /// The unique identifier of the request.
@@ -161,6 +162,24 @@ pub struct IndexingRequest {
 
     /// The Subgraph deployment ID.
     pub deployment_id: DeploymentId,
+
+    /// Source chain indexed by this deployment, not the protocol network.
+    /// Decimal text avoids loss of precision in JavaScript clients.
+    /// Absent when decoding responses from servers predating target observations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde_as(as = "Option<serde_with::DisplayFromStr>")]
+    pub chain_id: Option<ChainId>,
+
+    /// Protocol network of the Dipper instance serving this observation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde_as(as = "Option<serde_with::DisplayFromStr>")]
+    pub protocol_chain_id: Option<ChainId>,
+
+    /// Effective saved target: the stored count for open requests, zero for canceled
+    /// requests (whose rows may retain their previous count). This is not
+    /// an agreement count or acknowledgement of a particular command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_candidates: Option<usize>,
 }
 
 /// The status of the [`IndexingRequest`].
