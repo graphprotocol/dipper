@@ -326,9 +326,8 @@ impl Config {
             return Err(format!(
                 "worker_concurrency ({}) needs at least {required_conns} db connections (each loop \
                  may hold {DB_CONNECTIONS_PER_WORKER_LOOP} for its listener, open job transaction \
-                 and a registry query, plus {DB_CONNECTIONS_RESERVED} reserved for the registry, \
-                 background services and a chain broadcast's writer check), but \
-                 db.max_connections is {max_conns}; raise \
+                 and a registry query, plus {DB_CONNECTIONS_RESERVED} reserved for the registry \
+                 and background services), but db.max_connections is {max_conns}; raise \
                  db.max_connections to at least {required_conns} or lower worker_concurrency",
                 self.worker_concurrency,
             ));
@@ -1004,9 +1003,8 @@ fn default_worker_concurrency() -> usize {
 /// and a registry query.
 pub const DB_CONNECTIONS_PER_WORKER_LOOP: usize = 3;
 
-/// Pooled connections kept free of the worker loops for the registry and background services,
-/// and 1 for a chain broadcast's check that this process is the writer, held while it lasts.
-pub const DB_CONNECTIONS_RESERVED: usize = 3;
+/// Pooled connections kept free of the worker loops for the registry and background services.
+pub const DB_CONNECTIONS_RESERVED: usize = 2;
 
 impl Default for ExpirationConfig {
     fn default() -> Self {
@@ -1489,8 +1487,10 @@ pub struct ChainClientConfig {
     #[serde_as(as = "Vec<serde_with::DisplayFromStr>")]
     pub providers: Vec<Url>,
 
-    /// Request timeout per RPC call in seconds (default: 10s). Every call here is a small one,
-    /// so this is headroom rather than a working limit, and it multiplies with `max_retries`.
+    /// Request timeout per RPC call in seconds (default: 10s, at most 12s). Every call here is a
+    /// small one, so this is headroom rather than a working limit, and it multiplies with
+    /// `max_retries`. It is held below the 15 seconds a dipper taking over waits for a broadcast
+    /// attempt of the one it replaces.
     #[serde(default = "default_chain_client_request_timeout")]
     #[serde_as(as = "serde_with::DurationSeconds")]
     pub request_timeout: Duration,
@@ -1545,6 +1545,30 @@ fn default_chain_client_enabled() -> bool {
 
 pub(crate) fn default_chain_client_request_timeout() -> Duration {
     Duration::from_secs(10)
+}
+
+/// How much shorter than a takeover's wait for the old writer a broadcast attempt must be.
+const REQUEST_TIMEOUT_MARGIN: Duration = Duration::from_secs(3);
+
+impl ChainClientConfig {
+    /// Refuses a request timeout a broadcast attempt could outlast a takeover by. A process that
+    /// another one takes over from may have 1 attempt in flight, which the new writer waits for
+    /// up to [`crate::writer::DRAIN_WAIT`] before it goes on; an attempt longer than that could
+    /// still land afterwards.
+    pub fn validate(&self) -> Result<(), String> {
+        let longest = crate::writer::DRAIN_WAIT.saturating_sub(REQUEST_TIMEOUT_MARGIN);
+        if self.request_timeout > longest {
+            return Err(format!(
+                "chain_client.request_timeout ({}s) must be at most {}s: a dipper taking over \
+                 waits {}s for a broadcast attempt of the one it replaces, and an attempt can \
+                 take as long as this timeout",
+                self.request_timeout.as_secs(),
+                longest.as_secs(),
+                crate::writer::DRAIN_WAIT.as_secs(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn default_domain_refresh_interval() -> Duration {
@@ -4595,6 +4619,24 @@ mod tests {
             config.validate_db_pool(),
             Err("worker_concurrency must be at least 1".to_string())
         );
+    }
+
+    /// A broadcast attempt must end well within the 15 seconds a dipper taking over waits for
+    /// one of the process it replaces.
+    #[test]
+    fn chain_client_request_timeout_stays_below_a_takeovers_wait() {
+        let with = |secs: u64| {
+            example_config_edited(|config| {
+                config["chain_client"]["request_timeout"] = secs.into();
+            })
+            .chain_client
+            .expect("the example has a chain_client section")
+            .validate()
+        };
+        assert_eq!(with(10), Ok(()), "the default");
+        assert_eq!(with(12), Ok(()));
+        let err = with(13).expect_err("too close to the takeover's wait");
+        assert!(err.contains("at most 12s"), "{err}");
     }
 
     #[test]

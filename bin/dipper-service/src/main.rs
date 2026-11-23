@@ -198,6 +198,9 @@ pub async fn main() -> anyhow::Result<()> {
              on-chain and cannot sign agreements without it"
         ),
     };
+    if let Err(err) = chain_client_conf.validate() {
+        anyhow::bail!("invalid chain client config: {err}");
+    }
     let rca_domain = {
         let cfg = &chain_client_conf;
         let mut attempt: u32 = 0;
@@ -482,7 +485,10 @@ pub async fn main() -> anyhow::Result<()> {
             recurring_collector,
             agreement_conf.recurring_agreement_manager(),
             &secret_bytes,
-            Arc::new(writer::WriterGate::new(db_conn.clone(), writer_token)),
+            Arc::new(writer::WriterGate::new(
+                db::broadcast_check_pool(&db_conn),
+                writer_token,
+            )),
         )
         .expect("Failed to create AlloyChainClient");
         tracing::info!(

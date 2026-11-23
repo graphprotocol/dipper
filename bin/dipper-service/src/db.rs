@@ -96,6 +96,18 @@ pub async fn connect(conf: &DbConfig, writer: Uuid) -> anyhow::Result<Pool<Postg
     Ok(pool)
 }
 
+/// The pool of 1 connection a chain broadcast's writer check runs on, beside `pool`: a check holds
+/// its connection for as long as its broadcast lasts, so it gets one of its own rather than 1 the
+/// worker loops are counted on. Broadcasts take turns, so 1 is enough. Its session belongs to the
+/// same process as `pool`'s, as `dipper/<token>/broadcast`, and it connects when first used.
+pub fn broadcast_check_pool(pool: &Pool<Postgres>) -> Pool<Postgres> {
+    let options = writer_fence::named(pool.connect_options().as_ref().clone(), "broadcast");
+    PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(ACQUIRE_TIMEOUT)
+        .connect_lazy_with(options)
+}
+
 /// Opens 1 session for work done on the database as a whole rather than as this process: the
 /// migrations, and fencing the tables they add. The writer fence lets its writes through, and no
 /// takeover ends it. Call it once [`connect`] has found the database answering.

@@ -391,3 +391,128 @@ async fn sessions_carry_their_token_and_name_for_the_whole_session() {
     assert_eq!(setting, token.to_string());
     assert_eq!(name, format!("dipper/{token}/heartbeat"));
 }
+
+/// Waits until the session `pid` is waiting for a lock.
+#[expect(
+    clippy::expect_used,
+    reason = "test setup; a failure should stop the test"
+)]
+async fn wait_until_waiting_on_a_lock(base: &PgConnectOptions, pid: i32) {
+    let mut watcher = operator(base).await;
+    for _ in 0..100 {
+        let waiting: Option<String> =
+            sqlx::query_scalar("SELECT wait_event_type FROM pg_stat_activity WHERE pid = $1")
+                .bind(pid)
+                .fetch_one(&mut watcher)
+                .await
+                .expect("read pg_stat_activity");
+        if waiting.as_deref() == Some("Lock") {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("session {pid} never waited for a lock");
+}
+
+fn sqlstate(err: &sqlx::Error) -> Option<String> {
+    err.as_database_error()
+        .and_then(|db| db.code())
+        .map(|code| code.into_owned())
+}
+
+/// The fence takes its lock before it reads the token. A write already waiting for a takeover's
+/// drain when the takeover commits so reads the new token, and is refused; read the other way
+/// round, it would have read the old token and landed after the takeover.
+#[tokio::test]
+async fn a_write_queued_behind_a_takeover_is_refused_once_the_takeover_commits() {
+    //* Given - the old writer, and a drain holding the fence's lock
+    let (_temp_db, base) = fenced_db().await;
+    let (old, new) = (Uuid::now_v7(), Uuid::now_v7());
+    take_over(&base, old).await;
+    let mut draining = operator(&base).await;
+    sqlx::query("BEGIN").execute(&mut draining).await.unwrap();
+    sqlx::query("SELECT dipper_writer_drain()")
+        .execute(&mut draining)
+        .await
+        .unwrap();
+
+    //* When - a write of the old writer queues behind it, and the takeover commits meanwhile
+    let mut old_session = session_of(&base, old).await;
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut old_session)
+        .await
+        .unwrap();
+    let queued = tokio::spawn(async move { write(&mut old_session).await });
+    wait_until_waiting_on_a_lock(&base, pid).await;
+    take_over(&base, new).await;
+    sqlx::query("COMMIT").execute(&mut draining).await.unwrap();
+
+    //* Then
+    assert!(
+        refused(queued.await.unwrap()),
+        "the queued write is refused"
+    );
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM dipper_kafka_consumer_offsets")
+        .fetch_one(&mut draining)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
+}
+
+/// Outside READ COMMITTED a statement would read the token as its transaction first saw it and
+/// miss a takeover, so the writer's writes and broadcast checks are refused there, with `DP002`.
+#[tokio::test]
+async fn the_writer_is_refused_outside_read_committed() {
+    //* Given
+    let (_temp_db, base) = fenced_db().await;
+    let token = Uuid::now_v7();
+    take_over(&base, token).await;
+    let mut conn = session_of(&base, token).await;
+
+    //* When
+    sqlx::query("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    let write = write(&mut conn)
+        .await
+        .expect_err("a write under REPEATABLE READ");
+    sqlx::query("ROLLBACK").execute(&mut conn).await.unwrap();
+    sqlx::query("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    let check = sqlx::query_scalar::<_, bool>("SELECT dipper_writer_guard($1)")
+        .bind(token)
+        .fetch_one(&mut conn)
+        .await
+        .expect_err("a broadcast check under REPEATABLE READ");
+
+    //* Then
+    assert_eq!(sqlstate(&write).as_deref(), Some("DP002"));
+    assert_eq!(sqlstate(&check).as_deref(), Some("DP002"));
+}
+
+/// The broadcast guard runs under READ COMMITTED even where the database's default is another
+/// level, so its checks still see a takeover.
+#[tokio::test]
+async fn a_broadcast_guard_sees_a_takeover_whatever_the_default_isolation() {
+    //* Given - sessions that default to REPEATABLE READ
+    let (_temp_db, base) = fenced_db().await;
+    let (old, new) = (Uuid::now_v7(), Uuid::now_v7());
+    take_over(&base, old).await;
+    let options = writer_fence::writer_options(base.clone(), old)
+        .options([("default_transaction_isolation", "repeatable read")]);
+    let pool = PgPool::connect_with(options).await.unwrap();
+    let mut guard = writer_fence::BroadcastGuard::begin(&pool, old)
+        .await
+        .unwrap();
+    assert!(guard.still_writer().await.unwrap());
+
+    //* When
+    take_over(&base, new).await;
+
+    //* Then
+    assert!(!guard.still_writer().await.unwrap());
+    guard.end().await.unwrap();
+}

@@ -54,9 +54,10 @@ const WAITING_LOG_EVERY: Duration = Duration::from_secs(30);
 const WAITING_TOO_LONG: Duration = Duration::from_secs(120);
 
 /// How long a takeover waits for the statements and broadcast attempts the old writer had in
-/// flight before it ends that writer's sessions. Above the chain client's 10-second request
-/// timeout, so a broadcast attempt in flight normally finishes first.
-const DRAIN_WAIT: Duration = Duration::from_secs(15);
+/// flight before it ends that writer's sessions. The chain client's request timeout is held below
+/// it (see `ChainClientConfig::validate`), so a broadcast attempt in flight ends first unless its
+/// process is frozen.
+pub const DRAIN_WAIT: Duration = Duration::from_secs(15);
 
 /// How long fencing 1 table may wait for a transaction that keeps it busy.
 const ATTACH_WAIT: Duration = Duration::from_secs(5);

@@ -195,10 +195,13 @@ pub struct BroadcastGuard {
 }
 
 impl BroadcastGuard {
-    /// Starts the guard's transaction, on a connection from `pool`.
+    /// Starts the guard's transaction, on a connection from `pool`, under READ COMMITTED whatever
+    /// the database's default: each check must read the token afresh to see a takeover.
     pub async fn begin(pool: &PgPool, token: Uuid) -> sqlx::Result<Self> {
         Ok(Self {
-            tx: pool.begin().await?,
+            tx: pool
+                .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
+                .await?,
             token,
         })
     }

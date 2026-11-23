@@ -225,13 +225,18 @@ $$;
 
 -- A chain broadcast's guard. Called at the start of the broadcast's transaction and again before
 -- each attempt: it holds off a new writer's drain, and says whether this process is still the
--- writer.
+-- writer. Under any isolation but READ COMMITTED each call would read the token as the first did,
+-- and miss a takeover, so it refuses as the write fence does.
 CREATE FUNCTION dipper_writer_guard(mine UUID) RETURNS BOOLEAN
     LANGUAGE plpgsql AS
 $$
 BEGIN
     IF (SELECT NOT enforced FROM dipper_writer) THEN
         RETURN TRUE;
+    END IF;
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION 'dipper: a broadcast is checked under READ COMMITTED only'
+            USING ERRCODE = 'DP002';
     END IF;
     PERFORM dipper_fence_lock_shared();
     RETURN EXISTS (SELECT 1 FROM dipper_writer WHERE token = mine);

@@ -1734,6 +1734,58 @@ mod tests {
         async fn end(self: Box<Self>) {}
     }
 
+    /// A gate whose check can't reach the database, as when a takeover has ended its session.
+    struct UnreachableGate;
+
+    #[async_trait]
+    impl BroadcastGate for UnreachableGate {
+        async fn open(&self) -> anyhow::Result<Box<dyn BroadcastTurn>> {
+            Ok(Box::new(UnreachableGate))
+        }
+    }
+
+    #[async_trait]
+    impl BroadcastTurn for UnreachableGate {
+        async fn still_writer(&self) -> anyhow::Result<bool> {
+            anyhow::bail!("the database connection was ended")
+        }
+
+        async fn end(self: Box<Self>) {}
+    }
+
+    /// A check that can't tell whether this process is still the writer stops the broadcast as a
+    /// refusal does: a takeover ends a replaced process's sessions, so a lost connection may be
+    /// one.
+    #[tokio::test]
+    async fn send_transaction_sends_nothing_when_its_check_fails() {
+        let endpoint = server_answering_with(B256::repeat_byte(0xab)).await;
+        let client = client_gated(
+            vec![endpoint.uri().parse().expect("provider URL")],
+            0,
+            Arc::new(UnreachableGate),
+        );
+        let tx = ready_to_send_tx(client.inner.signer.address());
+
+        let err = client
+            .send_transaction(&tx)
+            .await
+            .expect_err("an unchecked broadcast must not go out");
+
+        assert!(
+            matches!(&err, ChainClientError::SubmitFailed(cause)
+                if format!("{cause:#}").contains("could not confirm")),
+            "got {err}"
+        );
+        assert!(
+            endpoint
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "no endpoint is offered the transaction"
+        );
+    }
+
     fn client_gated(
         providers: Vec<Url>,
         max_retries: u32,
