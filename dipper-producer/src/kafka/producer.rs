@@ -31,7 +31,7 @@ pub struct KafkaConfig {
     pub sasl_username: Option<String>,
     /// SASL password.
     #[serde(default)]
-    pub sasl_password: Option<String>,
+    pub sasl_password: Option<dipper_core::config::Hidden<String>>,
     /// Enable TLS encryption.
     #[serde(default)]
     pub tls_enabled: bool,
@@ -112,7 +112,7 @@ impl KafkaProducer {
             brokers: &config.brokers,
             sasl_mechanism: config.sasl_mechanism.as_deref(),
             sasl_username: config.sasl_username.as_deref(),
-            sasl_password: config.sasl_password.as_deref(),
+            sasl_password: config.sasl_password.as_ref().map(|p| p.as_str()),
             tls_enabled: config.tls_enabled,
             tls_ca_cert_path: config.tls_ca_cert_path.as_deref(),
         })
@@ -294,7 +294,7 @@ mod tests {
             partitions: 1,
             sasl_mechanism: mechanism.map(String::from),
             sasl_username: sasl_user,
-            sasl_password: sasl_pass,
+            sasl_password: sasl_pass.map(dipper_core::config::Hidden),
             tls_enabled: false,
             tls_ca_cert_path: None,
             connect_timeout_secs: 60,

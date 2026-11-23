@@ -3,7 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     num::NonZeroUsize,
-    path::Path,
+    path::PathBuf,
     sync::Arc,
     time::Duration,
 };
@@ -16,6 +16,9 @@ use thegraph_core::alloy::{
     signers::k256::SecretKey,
 };
 use url::Url;
+
+mod secret_url;
+pub use secret_url::SecretUrl;
 
 use crate::price_ceilings::{
     BasePriceCeilings, Minimums, default_ceiling, default_fallback_ceiling,
@@ -63,33 +66,209 @@ fn debug_optional_endpoint(url: &Option<Url>, f: &mut std::fmt::Formatter<'_>) -
     }
 }
 
-#[expect(
-    clippy::ptr_arg,
-    reason = "custom_debug passes the field itself, a &Vec"
-)]
-fn debug_endpoints(urls: &Vec<Url>, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.debug_list()
-        .entries(urls.iter().map(endpoint_name))
-        .finish()
+/// Load the configuration from 1 or more JSON files, merged in the order given: an object in a
+/// later file merges into the one before key by key, and anything else (a string, a number, a
+/// list, `null`) replaces what was there. The merged result is then read as one configuration,
+/// so an unknown field is refused wherever it came from. Each file holds 1 JSON value and nothing
+/// after it, and a key given twice in 1 object of a file is refused, as it is with 1 file.
+///
+/// This keeps secrets out of the main file without dipper being told where they are: production
+/// passes a `config.json` with no secrets, reviewable in git, then a `secrets.json` rendered from
+/// the secret store with only the secret fields, while a test passes 1 file with everything.
+pub fn load_from_files(paths: &[PathBuf]) -> Result<Config, Error> {
+    let read = |path: &PathBuf| {
+        std::fs::read_to_string(path).map_err(|source| Error::Io {
+            path: path.clone(),
+            source,
+        })
+    };
+    let not_json = |path: &PathBuf| {
+        let path = path.clone();
+        move |source| Error::Parse { path, source }
+    };
+    let files = paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let invalid = |source: serde_path_to_error::Error<serde_json::Error>| Error::Deserialize {
+        files: files.clone(),
+        detail: without_string_values(&source.to_string()),
+    };
+    match paths {
+        [] => Err(Error::NoFiles),
+        // 1 file is read straight from its text, so an error keeps its line and column.
+        [path] => {
+            let text = read(path)?;
+            let mut json = serde_json::Deserializer::from_str(&text);
+            let config = serde_path_to_error::deserialize(&mut json).map_err(invalid)?;
+            // Anything after the configuration, such as a stray `}` that closed it early and
+            // left the rest of the file unread, is refused rather than ignored.
+            json.end().map_err(not_json(path))?;
+            Ok(config)
+        }
+        _ => {
+            let mut merged = serde_json::Value::Object(serde_json::Map::new());
+            for path in paths {
+                let Layer(layer) = serde_json::from_str(&read(path)?).map_err(not_json(path))?;
+                merge(&mut merged, layer);
+            }
+            serde_path_to_error::deserialize(merged).map_err(invalid)
+        }
+    }
 }
 
-/// Load the configuration from a JSON file.
-pub fn load_from_file(path: &Path) -> Result<Config, Error> {
-    let config_content = std::fs::read_to_string(path)?;
-    let config = serde_json::from_str(&config_content)?;
-    Ok(config)
+/// `message` with each string a deserialisation error quotes (serde writes one as
+/// `string "…"`) replaced by `a string`. An error about a field then never repeats what the field
+/// held, whatever the field, a secret given in the wrong shape among them: a provider URL with its
+/// key given where a list of them belongs, say.
+fn without_string_values(message: &str) -> String {
+    const QUOTED: &str = "string \"";
+    let mut out = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some(start) = rest.find(QUOTED) {
+        out.push_str(&rest[..start]);
+        out.push_str("a string");
+        let quoted = &rest[start + QUOTED.len()..];
+        // serde writes the string as `{:?}` does, so a quote inside it is escaped.
+        let mut end = quoted.len();
+        let mut chars = quoted.char_indices();
+        while let Some((at, c)) = chars.next() {
+            match c {
+                '\\' => {
+                    chars.next();
+                }
+                '"' => {
+                    end = at + 1;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        rest = &quoted[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
-/// An error that can occur when loading the configuration.
+/// 1 configuration file's JSON, read as a [`serde_json::Value`] is, but refusing a key given twice
+/// in 1 object, as reading the configuration straight from 1 file does. The value would otherwise
+/// keep the last of them and say nothing.
+struct Layer(serde_json::Value);
+
+impl<'de> serde::Deserialize<'de> for Layer {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(LayerVisitor).map(Layer)
+    }
+}
+
+struct LayerVisitor;
+
+impl<'de> serde::de::Visitor<'de> for LayerVisitor {
+    type Value = serde_json::Value;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
+        serde_json::Number::from_f64(value)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| E::custom("a number JSON can't hold"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut items = Vec::new();
+        while let Some(Layer(item)) = seq.next_element()? {
+            items.push(item);
+        }
+        Ok(serde_json::Value::Array(items))
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut object = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if object.contains_key(&key) {
+                return Err(serde::de::Error::custom(format_args!(
+                    "duplicate field `{key}`"
+                )));
+            }
+            let Layer(value) = map.next_value()?;
+            object.insert(key, value);
+        }
+        Ok(serde_json::Value::Object(object))
+    }
+}
+
+/// Merges `layer` into `base`: objects key by key, anything else replacing what was there.
+fn merge(base: &mut serde_json::Value, layer: serde_json::Value) {
+    match (base, layer) {
+        (serde_json::Value::Object(base), serde_json::Value::Object(layer)) => {
+            for (key, value) in layer {
+                match base.get_mut(&key) {
+                    Some(existing) => merge(existing, value),
+                    None => {
+                        base.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base, layer) => *base = layer,
+    }
+}
+
+/// An error that can occur when loading the configuration. None of them repeats a secret: they
+/// name the file and the field, secret fields leave their value out of their own errors, and a
+/// string a field held is left out of any error about it.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// An error occurred while reading the configuration file.
-    #[error("failed to read configuration file: {0}")]
-    Io(#[from] std::io::Error),
+    /// No configuration file was given.
+    #[error("no configuration file given")]
+    NoFiles,
 
-    /// An error occurred while deserializing the configuration.
-    #[error("failed to deserialize configuration: {0}")]
-    Deserialize(#[from] serde_json::Error),
+    /// A configuration file could not be read.
+    #[error("failed to read configuration file {}: {source}", path.display())]
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    /// A configuration file is not valid JSON, holds more than 1 value, or gives a key twice in
+    /// 1 object.
+    #[error("configuration file {} is not valid JSON: {source}", path.display())]
+    Parse {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+
+    /// The configuration, merged from `files`, is not a valid one; `detail` names the field, and
+    /// leaves out any string it held.
+    #[error("invalid configuration in {files}: {detail}")]
+    Deserialize { files: String, detail: String },
 }
 
 /// The configuration for the DIPs service
@@ -590,8 +769,7 @@ impl SuggestedMinimumsConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct AlertsConfig {
     /// The Slack incoming-webhook URL to post alerts to. Without one, none are sent.
-    #[serde_as(as = "Option<serde_with::DisplayFromStr>")]
-    pub slack_webhook_url: Option<Hidden<Url>>,
+    pub slack_webhook_url: Option<SecretUrl>,
     /// The `event` tags of the log lines to alert on. Leave it out to alert on the defaults,
     /// which grow as alerts are added; a list given here replaces them.
     pub events: Vec<String>,
@@ -1477,9 +1655,7 @@ pub struct ChainClientConfig {
     ///
     /// At least one provider is required when enabled. Providers are tried in order,
     /// rotating to the next on persistent failures.
-    #[debug(with = debug_endpoints)]
-    #[serde_as(as = "Vec<serde_with::DisplayFromStr>")]
-    pub providers: Vec<Url>,
+    pub providers: Vec<SecretUrl>,
 
     /// Request timeout per RPC call in seconds (default: 10s). Every call here is a small one,
     /// so this is headroom rather than a working limit, and it multiplies with `max_retries`.
@@ -1529,6 +1705,17 @@ pub struct ChainClientConfig {
     /// The gas limit is capped at estimate + this value.
     #[serde(default = "default_gas_max_addition")]
     pub gas_max_addition: u64,
+}
+
+impl ChainClientConfig {
+    /// The providers' URLs, keys and all, for connecting with. Never log them; log the
+    /// providers themselves, which mask their keys.
+    pub fn provider_urls(&self) -> Vec<Url> {
+        self.providers
+            .iter()
+            .map(|url| url.expose().clone())
+            .collect()
+    }
 }
 
 fn default_chain_client_enabled() -> bool {
@@ -3563,7 +3750,7 @@ mod tests {
             "sasl_username mismatch"
         );
         assert_eq!(
-            kafka.sasl_password.as_deref(),
+            kafka.sasl_password.as_ref().map(|p| p.as_str()),
             Some("pass"),
             "sasl_password mismatch"
         );
@@ -3664,6 +3851,249 @@ mod tests {
             crate::health::DEFAULT_HEALTH_THRESHOLD,
             "the remaining fields keep their defaults"
         );
+    }
+
+    /// Writes each of `files` to a fresh temporary directory, returning their paths.
+    fn write_config_files(files: &[serde_json::Value]) -> Vec<std::path::PathBuf> {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "dipper-config-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        files
+            .iter()
+            .enumerate()
+            .map(|(index, file)| {
+                let path = dir.join(format!("{index}.json"));
+                std::fs::write(&path, serde_json::to_string_pretty(file).unwrap()).unwrap();
+                path
+            })
+            .collect()
+    }
+
+    /// The example, made loadable, with its secrets split from the rest as production would.
+    fn example_split_from_its_secrets() -> (serde_json::Value, serde_json::Value) {
+        let mut config = example_config();
+        config["dips"]["recurring_collector"] = "0x2222222222222222222222222222222222222222".into();
+        config["dips"]["recurring_agreement_manager"] =
+            "0x3333333333333333333333333333333333333333".into();
+        let signer = config["signer"].as_object_mut().unwrap();
+        signer.remove("secret_key");
+        let secrets = serde_json::json!({
+            "signer": {
+                "secret_key": "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+            },
+            "db": { "password": "from-the-secrets-file" },
+            "alerts": { "slack_webhook_url": "https://hooks.slack.com/services/T0/B0/not-a-real-key" },
+        });
+        (config, secrets)
+    }
+
+    /// The secrets file fills in the secret fields and leaves everything else as the main file
+    /// has it.
+    #[test]
+    fn a_secrets_file_merges_into_the_config() {
+        let (config, secrets) = example_split_from_its_secrets();
+        let paths = write_config_files(&[config.clone(), secrets]);
+        let merged = load_from_files(&paths).expect("the 2 files make a valid config");
+        assert_eq!(
+            merged.db.password.as_ref().map(|p| p.as_str()),
+            Some("from-the-secrets-file")
+        );
+        assert!(merged.alerts.slack_webhook_url.is_some());
+        assert_eq!(
+            merged.db.url.as_str(),
+            config["db"]["url"].as_str().unwrap(),
+            "fields the secrets file leaves out keep the main file's value"
+        );
+    }
+
+    /// The same configuration loads the same whether it comes in 1 file or 2.
+    #[test]
+    fn one_file_or_two_load_the_same() {
+        let (config, secrets) = example_split_from_its_secrets();
+        let mut whole = config.clone();
+        merge(&mut whole, secrets.clone());
+        let from_1 = load_from_files(&write_config_files(&[whole])).unwrap();
+        let from_2 = load_from_files(&write_config_files(&[config, secrets])).unwrap();
+        assert_eq!(format!("{from_1:?}"), format!("{from_2:?}"));
+    }
+
+    #[test]
+    fn later_files_replace_lists_and_values_and_merge_objects() {
+        let mut base = serde_json::json!({"a": {"x": 1, "y": [1, 2]}, "b": "keep"});
+        merge(&mut base, serde_json::json!({"a": {"y": [3], "z": null}}));
+        assert_eq!(
+            base,
+            serde_json::json!({"a": {"x": 1, "y": [3], "z": null}, "b": "keep"})
+        );
+    }
+
+    /// A field misspelt in the secrets file is refused like one in the main file.
+    #[test]
+    fn an_unknown_field_in_a_later_file_is_refused() {
+        let (config, _) = example_split_from_its_secrets();
+        let paths = write_config_files(&[config, serde_json::json!({"db": {"pasword": "x"}})]);
+        let err = load_from_files(&paths)
+            .expect_err("an unknown field")
+            .to_string();
+        assert!(err.contains("db") && err.contains("pasword"), "{err}");
+    }
+
+    /// An error names the field it is about and never repeats a secret's value.
+    #[test]
+    fn errors_name_the_field_and_leave_secrets_out() {
+        let (config, mut secrets) = example_split_from_its_secrets();
+        secrets["db"]["password"] = serde_json::json!(424_242);
+        let paths = write_config_files(&[config.clone(), secrets.clone()]);
+        let err = load_from_files(&paths)
+            .expect_err("a bad password")
+            .to_string();
+        assert!(err.contains("db.password"), "{err}");
+        assert!(!err.contains("424242"), "{err}");
+
+        secrets["db"]["password"] = "fine".into();
+        secrets["alerts"]["slack_webhook_url"] = "not a url s3cret".into();
+        let paths = write_config_files(&[config, secrets]);
+        let err = load_from_files(&paths)
+            .expect_err("a bad webhook")
+            .to_string();
+        assert!(err.contains("alerts.slack_webhook_url"), "{err}");
+        assert!(!err.contains("s3cret"), "{err}");
+    }
+
+    /// Writes each text, as it is, to a fresh temporary directory, returning their paths.
+    fn write_config_texts(texts: &[&str]) -> Vec<std::path::PathBuf> {
+        let paths = write_config_files(&vec![serde_json::Value::Null; texts.len()]);
+        for (path, text) in paths.iter().zip(texts) {
+            std::fs::write(path, text).unwrap();
+        }
+        paths
+    }
+
+    /// The example as 1 whole, loadable config.
+    fn example_whole() -> serde_json::Value {
+        let (mut config, secrets) = example_split_from_its_secrets();
+        merge(&mut config, secrets);
+        config
+    }
+
+    /// Anything after the configuration in a file, such as a stray `}` that closed it early and
+    /// left the sections after it unread, is refused rather than ignored.
+    #[test]
+    fn a_file_with_anything_after_the_configuration_is_refused() {
+        let whole = serde_json::to_string_pretty(&example_whole()).unwrap();
+        assert!(load_from_files(&write_config_texts(&[&whole])).is_ok());
+
+        let trailing = format!("{whole}\n}}");
+        let err = load_from_files(&write_config_texts(&[&trailing]))
+            .expect_err("a stray brace after the configuration")
+            .to_string();
+        assert!(err.contains("trailing characters"), "{err}");
+    }
+
+    /// A string given where a secret's section or list belongs is left out of the error, so a
+    /// provider URL with its key, or a signing key, given in the wrong shape never reaches a log.
+    #[test]
+    fn a_secret_in_the_wrong_shape_is_left_out_of_the_error() {
+        let key = "https://rpc.example.com/v2/s3cret-provider-key";
+        let mut whole = example_whole();
+        whole["chain_client"]["providers"] = key.into();
+        let err = load_from_files(&write_config_files(&[whole]))
+            .expect_err("1 URL where a list belongs")
+            .to_string();
+        assert!(err.contains("chain_client.providers"), "{err}");
+        assert!(!err.contains("s3cret-provider-key"), "{err}");
+
+        let (config, mut secrets) = example_split_from_its_secrets();
+        secrets["signer"] =
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".into();
+        let err = load_from_files(&write_config_files(&[config, secrets]))
+            .expect_err("a signing key where the signer's section belongs")
+            .to_string();
+        assert!(err.contains("signer"), "{err}");
+        assert!(!err.contains("ac0974bec39a17e36ba4a6b4d"), "{err}");
+    }
+
+    /// A key given twice in 1 object of a file is refused with several files too, as it is with 1:
+    /// otherwise the last of them would be used without a word.
+    #[test]
+    fn a_key_given_twice_in_1_of_several_files_is_refused() {
+        let (config, _) = example_split_from_its_secrets();
+        let config = serde_json::to_string(&config).unwrap();
+        let secrets = r#"{"db": {"password": "first-s3cret", "password": "second-s3cret"}}"#;
+        let paths = write_config_texts(&[&config, secrets]);
+        let err = load_from_files(&paths)
+            .expect_err("a key given twice")
+            .to_string();
+        assert!(err.contains("duplicate field `password`"), "{err}");
+        assert!(err.contains(&paths[1].display().to_string()), "{err}");
+        assert!(!err.contains("s3cret"), "{err}");
+    }
+
+    /// A later file that isn't JSON is refused, naming that file and quoting none of it.
+    #[test]
+    fn a_later_file_that_is_not_json_is_refused_naming_it() {
+        let (config, _) = example_split_from_its_secrets();
+        let config = serde_json::to_string(&config).unwrap();
+        let paths = write_config_texts(&[&config, r#"{"db": {"password": s3cret}}"#]);
+        let err = load_from_files(&paths).expect_err("not JSON").to_string();
+        assert!(err.contains(&paths[1].display().to_string()), "{err}");
+        assert!(!err.contains("s3cret"), "{err}");
+    }
+
+    #[test]
+    fn strings_are_left_out_of_an_error_message() {
+        assert_eq!(
+            without_string_values(r#"a.b: invalid type: string "k\"e\\y", expected a sequence"#),
+            "a.b: invalid type: a string, expected a sequence"
+        );
+        assert_eq!(
+            without_string_values(r#"invalid value: string "x", expected y at line 1 column 2"#),
+            "invalid value: a string, expected y at line 1 column 2"
+        );
+        assert_eq!(without_string_values("no string here"), "no string here");
+    }
+
+    /// A single file still reports where in it an error is.
+    #[test]
+    fn a_single_file_keeps_line_numbers_in_errors() {
+        let paths = write_config_files(&[serde_json::json!({"db": {"url": 5}})]);
+        let err = load_from_files(&paths)
+            .expect_err("not a config")
+            .to_string();
+        assert!(err.contains("line "), "{err}");
+    }
+
+    #[test]
+    fn no_file_or_a_missing_file_is_refused() {
+        assert!(matches!(load_from_files(&[]), Err(Error::NoFiles)));
+        let missing = std::path::PathBuf::from("/no/such/dipper/config.json");
+        let err = load_from_files(&[missing]).err().unwrap().to_string();
+        assert!(err.contains("/no/such/dipper/config.json"), "{err}");
+    }
+
+    /// The configuration as logged at startup shows the providers and webhook masked.
+    #[test]
+    fn the_logged_config_masks_url_keys() {
+        let config = example_config_edited(|config| {
+            config["chain_client"]["providers"] = serde_json::json!([
+                "https://mainnet.infura.io/v3/0123456789abcdef0123456789abcdef"
+            ]);
+            config["alerts"] = serde_json::json!({
+                "slack_webhook_url": "https://hooks.slack.com/services/T0/B0/not-a-real-key"
+            });
+        });
+        let logged = format!("{config:?}");
+        assert!(logged.contains("mainnet.infura.io/v3/***"), "{logged}");
+        assert!(
+            logged.contains("hooks.slack.com/***/***/***/***"),
+            "{logged}"
+        );
+        assert!(!logged.contains("0123456789abcdef"), "{logged}");
+        assert!(!logged.contains("not-a-real-key"), "{logged}");
     }
 
     /// The config.json in the example configmap.
@@ -4434,9 +4864,10 @@ mod tests {
         assert!(alerts.slack_webhook_url.is_some());
         assert_eq!(alerts.throttle, Duration::from_secs(60));
         assert_eq!(alerts.events, AlertsConfig::default().events);
+        let logged = format!("{alerts:?}");
         assert!(
-            !format!("{alerts:?}").contains("hooks.slack.com"),
-            "the webhook is a secret, kept out of logs"
+            logged.contains("https://hooks.slack.com/***/***/***/***"),
+            "the webhook shows its host, its path masked: {logged}"
         );
     }
 

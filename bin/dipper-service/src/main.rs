@@ -95,13 +95,17 @@ pub async fn main() -> anyhow::Result<()> {
     // Before anything opens a TLS connection: see `tls`.
     tls::install_crypto_provider();
 
-    // Load the configuration first, since logging needs it to know where to send alerts
-    let conf_path = env::args()
-        .nth(1)
-        .expect("Missing argument for config path")
-        .parse::<PathBuf>()
-        .expect("Invalid path");
-    let conf = config::load_from_file(&conf_path).expect("Failed to load config");
+    // Load the configuration first, since logging needs it to know where to send alerts. Every
+    // argument is a config file, merged in order: see `config::load_from_files`.
+    let conf_paths: Vec<PathBuf> = env::args_os().skip(1).map(PathBuf::from).collect();
+    let conf = match config::load_from_files(&conf_paths) {
+        Ok(conf) => conf,
+        Err(err) => {
+            eprintln!("Failed to load config: {err}");
+            eprintln!("Usage: dipper-service <config.json> [more config files, merged in order]");
+            std::process::exit(2);
+        }
+    };
 
     // The metrics recorder goes in before logging, so the log layer counting tagged lines sees
     // every one of them. Without the health server nothing could read the metrics, so none are
