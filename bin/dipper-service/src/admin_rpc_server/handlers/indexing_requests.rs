@@ -113,7 +113,7 @@ where
                 requests: page
                     .requests
                     .into_iter()
-                    .map(into_indexing_request)
+                    .map(|request| into_indexing_request(request, self.signer.chain_id()))
                     .collect(),
                 next: page.next,
             }),
@@ -131,7 +131,7 @@ where
         handle_optional_result(
             self.registry.get_indexing_request_by_id(&id).await,
             "Failed to get indexing request by id",
-            into_indexing_request,
+            |request| into_indexing_request(request, self.signer.chain_id()),
         )
     }
 
@@ -144,7 +144,7 @@ where
                 .get_indexing_requests_by_deployment_id(&deployment_id)
                 .await,
             "Failed to get indexing requests by deployment id",
-            into_indexing_request,
+            |request| into_indexing_request(request, self.signer.chain_id()),
         )
     }
 
@@ -335,7 +335,10 @@ impl<R, W> std::ops::Deref for RpcServerImpl<R, W> {
     }
 }
 
-fn into_indexing_request(request: IndexingRequestRecord) -> IndexingRequest {
+fn into_indexing_request(
+    request: IndexingRequestRecord,
+    protocol_chain_id: u64,
+) -> IndexingRequest {
     IndexingRequest {
         id: request.id,
         created_at: request.created_at,
@@ -343,6 +346,14 @@ fn into_indexing_request(request: IndexingRequestRecord) -> IndexingRequest {
         status: into_indexing_request_status(request.status),
         requested_by: request.requested_by,
         deployment_id: request.deployment_id,
+        chain_id: Some(request.deployment_chain_id),
+        protocol_chain_id: Some(protocol_chain_id),
+        // Cancellation retires the target but preserves its historical count in the row.
+        // Match reassessment's effective target, not that historical column value.
+        num_candidates: Some(match request.status {
+            IndexingRequestRecordStatus::Open => request.num_candidates,
+            IndexingRequestRecordStatus::Canceled => 0,
+        }),
     }
 }
 
@@ -376,6 +387,46 @@ mod tests {
         test_support::{CapturedEvent, CapturingEventsProducer, RefusingChainCheck},
         worker::queue::JobId,
     };
+
+    #[test]
+    fn request_observation_exposes_saved_target_and_source_chain() {
+        for (count, status, expected) in [
+            (1, IndexingRequestRecordStatus::Open, 1),
+            (3, IndexingRequestRecordStatus::Open, 3),
+            (3, IndexingRequestRecordStatus::Canceled, 0),
+        ] {
+            let request = IndexingRequestRecord {
+                id: IndexingRequestId::new(),
+                created_at: time::OffsetDateTime::UNIX_EPOCH,
+                updated_at: time::OffsetDateTime::UNIX_EPOCH,
+                status,
+                requested_by: Address::ZERO,
+                deployment_id: deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv"),
+                deployment_chain_id: 8453,
+                num_candidates: count,
+            };
+            let value = serde_json::to_value(into_indexing_request(request, 42161)).unwrap();
+            assert_eq!(value["chain_id"], "8453");
+            assert_eq!(value["protocol_chain_id"], "42161");
+            assert_eq!(value["num_candidates"], expected);
+        }
+    }
+
+    #[test]
+    fn old_request_responses_keep_observation_fields_unknown() {
+        let old = serde_json::json!({
+            "id": IndexingRequestId::new(),
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "status": "OPEN",
+            "requested_by": Address::ZERO,
+            "deployment_id": deployment_id!("QmUzRg2HHMpbgf6Q4VHKNDbtBEJnyp5JWCh2gUX9AV6jXv"),
+        });
+        let request: IndexingRequest = serde_json::from_value(old).unwrap();
+        assert_eq!(request.chain_id, None);
+        assert_eq!(request.protocol_chain_id, None);
+        assert_eq!(request.num_candidates, None);
+    }
 
     /// The protocol (signer) chain id. Deliberately different from the
     /// request's deployment `chain_id` so the assertion that the emitted

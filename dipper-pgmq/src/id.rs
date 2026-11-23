@@ -49,7 +49,7 @@ impl sqlx::Type<Postgres> for JobId {
 impl sqlx::Encode<'_, Postgres> for JobId {
     fn encode_by_ref(
         &self,
-        buf: &mut <Postgres as sqlx::Database>::ArgumentBuffer<'_>,
+        buf: &mut <Postgres as sqlx::Database>::ArgumentBuffer,
     ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
         sqlx::Encode::<Postgres>::encode_by_ref(&self.0, buf)
     }

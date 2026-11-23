@@ -230,14 +230,14 @@ mod tests {
         );
     }
 
-    /// A throwaway CA, and a server certificate it signed for `localhost`.
+    /// A throwaway CA, and a server certificate it signed for one name.
     struct TestCerts {
         ca_pem: String,
         server_chain: Vec<rustls::pki_types::CertificateDer<'static>>,
         server_key: rustls::pki_types::PrivateKeyDer<'static>,
     }
 
-    fn test_certs() -> TestCerts {
+    fn test_certs(name: &str) -> TestCerts {
         use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
         let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -245,7 +245,7 @@ mod tests {
         let ca_key = KeyPair::generate().unwrap();
         let ca = ca_params.self_signed(&ca_key).unwrap();
         let server_key = KeyPair::generate().unwrap();
-        let server = CertificateParams::new(vec!["localhost".to_string()])
+        let server = CertificateParams::new(vec![name.to_string()])
             .unwrap()
             .signed_by(&server_key, &ca, &ca_key)
             .unwrap();
@@ -293,7 +293,17 @@ mod tests {
     /// Connects to a TLS server for `localhost` through `host`, with `params` in the URL, and says
     /// whether dipper completed the handshake, that is, accepted the certificate.
     async fn accepts_certificate(host: &str, params: &str, trust_ca: bool) -> bool {
-        let certs = test_certs();
+        accepts_certificate_for("localhost", host, params, trust_ca).await
+    }
+
+    /// As [`accepts_certificate`], for a server whose certificate names `cert_name` alone.
+    async fn accepts_certificate_for(
+        cert_name: &str,
+        host: &str,
+        params: &str,
+        trust_ca: bool,
+    ) -> bool {
+        let certs = test_certs(cert_name);
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("dipper-tls-{}-{n}", std::process::id()));
@@ -345,11 +355,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verify_ca_still_checks_the_hostname() {
-        // sqlx 0.8 skips the hostname check for `verify-ca` only on the error rustls used to
-        // return for a name mismatch; rustls 0.23 returns a newer one, so the check stays. Should
-        // a later sqlx skip it as libpq does, this fails, and the docs on `db.url` need updating.
-        assert!(!accepts_certificate("127.0.0.1", "sslmode=verify-ca", true).await);
+    async fn verify_ca_skips_the_hostname_check() {
+        // As libpq does. sqlx 0.8 skipped it only on the name error rustls used to return, so
+        // with rustls 0.23.24 and later `verify-ca` behaved as `verify-full`; sqlx 0.9 skips both.
+        assert!(accepts_certificate("127.0.0.1", "sslmode=verify-ca", true).await);
+    }
+
+    #[tokio::test]
+    async fn verify_ca_still_refuses_a_certificate_from_an_unknown_ca() {
+        assert!(!accepts_certificate("127.0.0.1", "sslmode=verify-ca", false).await);
+    }
+
+    /// The only name in a Cloud SQL private-IP instance's server certificate: its DNS name, with
+    /// a trailing dot.
+    const CLOUD_SQL_NAME: &str = "d0b150ab5022.76ws9odrdkfn.us-central1.sql-psa.goog.";
+
+    #[tokio::test]
+    async fn verify_ca_accepts_a_cloud_sql_certificate() {
+        assert!(
+            accepts_certificate_for(CLOUD_SQL_NAME, "127.0.0.1", "sslmode=verify-ca", true).await
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_full_refuses_a_cloud_sql_certificate_even_by_its_name() {
+        // rustls accepts no presented name with a trailing dot, so such a server is reachable
+        // with `verify-ca` only.
+        assert!(
+            !accepts_certificate_for(
+                CLOUD_SQL_NAME,
+                CLOUD_SQL_NAME.trim_end_matches('.'),
+                "sslmode=verify-full",
+                true
+            )
+            .await
+        );
     }
 
     /// A temporary Postgres that, unlike pgtemp's default, checks passwords on TCP connections.

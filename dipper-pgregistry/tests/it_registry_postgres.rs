@@ -73,7 +73,8 @@ async fn temp_registry_db() -> (Pool<Postgres>, PgTempDB) {
 /// Execute SQL fixture statements
 async fn run_fixture(db: &Pool<Postgres>, sql: &str) -> Result<(), sqlx::Error> {
     let mut conn = db.acquire().await?;
-    conn.execute(sql).await?;
+    // The fixtures are this repository's own SQL files.
+    conn.execute(sqlx::AssertSqlSafe(sql.to_owned())).await?;
     Ok(())
 }
 
