@@ -611,7 +611,7 @@ impl AlloyChainClient {
             .map_err(|e| ChainClientError::ConfigError(format!("Invalid signing key: {e}")))?;
 
         let rpc_pool = RpcProviderPool::new(
-            config.providers.clone(),
+            config.provider_urls(),
             config.request_timeout,
             config.max_retries,
         )?;
@@ -1793,7 +1793,7 @@ mod tests {
     ) -> AlloyChainClient {
         let config = ChainClientConfig {
             enabled: true,
-            providers,
+            providers: providers.into_iter().map(Into::into).collect(),
             request_timeout: Duration::from_secs(5),
             max_retries,
             domain_refresh_interval: Duration::from_secs(3600),

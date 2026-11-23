@@ -632,11 +632,8 @@ mod tests {
     /// A database as dipper's start leaves it before any takeover: both migrations run and every
     /// table fenced, on an operator's session.
     async fn started_db() -> (pgtemp::PgTempDB, PgConnectOptions) {
-        let temp_db = pgtemp::PgTempDB::new();
-        let base: PgConnectOptions = temp_db
-            .connection_uri()
-            .parse()
-            .expect("pgtemp's URI is a Postgres URL");
+        let temp_db = crate::test_support::temp_postgres();
+        let base = crate::test_support::temp_postgres_options(&temp_db);
         let mut operator = operator(&base).await;
         dipper_pgmq::run_db_migrations(&mut operator)
             .await

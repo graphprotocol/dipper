@@ -4,24 +4,29 @@
 use std::time::Duration;
 
 use dipper_pgregistry::writer_fence;
-use pgtemp::PgTempDB;
+use pgtemp::{PgTempDB, PgTempDBBuilder};
 use sqlx::{
     ConnectOptions as _, Connection as _, PgConnection, PgPool, postgres::PgConnectOptions,
 };
 use uuid::Uuid;
 
 /// A database with dipper's migrations, every table fenced, as dipper leaves it at start, and no
-/// writer yet. Returns the options sessions are opened from.
+/// writer yet. Returns the options sessions are opened from. The server listens on its Unix
+/// socket only, as in the registry's other tests, so a parallel run can't take its port.
 #[expect(
     clippy::expect_used,
     reason = "test setup; a failure should stop the test"
 )]
 async fn fenced_db() -> (PgTempDB, PgConnectOptions) {
-    let temp_db = PgTempDB::new();
-    let base: PgConnectOptions = temp_db
-        .connection_uri()
-        .parse()
-        .expect("pgtemp's URI is a Postgres URL");
+    let temp_db = PgTempDBBuilder::new()
+        .with_config_param("listen_addresses", "")
+        .start();
+    let base = PgConnectOptions::new()
+        .socket(temp_db.data_dir())
+        .port(temp_db.db_port())
+        .username(temp_db.db_user())
+        .password(temp_db.db_pass())
+        .database(temp_db.db_name());
     let mut operator = operator(&base).await;
     dipper_pgregistry::run_db_migrations(&mut operator)
         .await

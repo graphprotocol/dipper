@@ -56,7 +56,30 @@ The `configmap-example.yaml` shows the required config.json structure. Create a 
 kubectl create configmap dipper-config --from-file=config.json=your-config.json
 ```
 
-Or apply a ConfigMap manifest with the values injected from your secrets management system.
+Dipper reads every file named in its `args`, merged in order (see the main README), so secrets need not sit in the ConfigMap. Leave them out of `config.json` and put them in a `secrets.json` that holds only the secret fields, in the same shape:
+
+```json
+{
+  "signer": { "secret_key": "0x…" },
+  "event_streaming_config": { "kafka": { "sasl_password": "…" } },
+  "chain_client": { "providers": ["https://arb-mainnet.g.alchemy.com/v2/…"] },
+  "alerts": { "slack_webhook_url": "https://hooks.slack.com/services/…" }
+}
+```
+
+Keep that file in a Secret, for example one External Secrets renders from your secret store, mount it, and name it after `config.json`:
+
+```yaml
+args: [/config/config.json, /secrets/secrets.json]
+volumeMounts:
+  - { name: config, mountPath: /config, readOnly: true }
+  - { name: secrets, mountPath: /secrets, readOnly: true }
+volumes:
+  - { name: config, configMap: { name: dipper-config } }
+  - { name: secrets, secret: { secretName: dipper-secrets } }
+```
+
+A list in a later file replaces the earlier one whole, so `chain_client.providers` goes in 1 file or the other. Dipper reads the files once, at start: restart it to take a changed secret, for example with a checksum of the Secret in a pod annotation. Through the Cloud SQL Auth Proxy with automatic IAM database authentication, `db.password` is left out altogether.
 
 ## IISA Service Discovery
 

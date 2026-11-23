@@ -12,7 +12,7 @@ use dipper_pgregistry::{
     RecordedEnd, SetAsideChange, SetAsideRequest, WithheldIndexers, writer_fence,
 };
 use fake::{Fake, Faker};
-use pgtemp::PgTempDB;
+use pgtemp::{PgTempDB, PgTempDBBuilder};
 use sqlx::{
     ConnectOptions as _, Executor as _, Pool, Postgres,
     postgres::{PgConnectOptions, PgPoolOptions},
@@ -27,6 +27,23 @@ use thegraph_core::{
 use url::Url;
 use uuid::uuid;
 
+/// A temporary Postgres for a test, and how to connect to it: through its Unix socket only. pgtemp
+/// picks a free TCP port and starts Postgres on it a moment later, and in a parallel test run
+/// another process can take the port in between, which leaves the test waiting out its pool's
+/// timeout on a server that never started.
+fn temp_postgres() -> (PgTempDB, PgConnectOptions) {
+    let temp_db = PgTempDBBuilder::new()
+        .with_config_param("listen_addresses", "")
+        .start();
+    let options = PgConnectOptions::new()
+        .socket(temp_db.data_dir())
+        .port(temp_db.db_port())
+        .username(temp_db.db_user())
+        .password(temp_db.db_pass())
+        .database(temp_db.db_name());
+    (temp_db, options)
+}
+
 /// Initialize a temporary database for integration testing, as dipper's start leaves it: the
 /// migrations run and every table fenced by an operator's session, and a pool whose sessions
 /// belong to the process that is the writer. Every test here so runs through the writer fence.
@@ -37,11 +54,7 @@ use uuid::uuid;
     reason = "test setup; a failure should stop the test"
 )]
 async fn temp_registry_db() -> (Pool<Postgres>, PgTempDB) {
-    let temp_db = PgTempDB::new();
-    let base: PgConnectOptions = temp_db
-        .connection_uri()
-        .parse()
-        .expect("pgtemp's URI is a Postgres URL");
+    let (temp_db, base) = temp_postgres();
     let mut operator = writer_fence::operator_options(base.clone())
         .connect()
         .await

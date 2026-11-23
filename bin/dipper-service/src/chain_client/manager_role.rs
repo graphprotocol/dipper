@@ -32,7 +32,7 @@ pub async fn verify_signer_has_agreement_manager_role(
     signer: Address,
 ) -> Result<(), ChainClientError> {
     let pool = RpcProviderPool::new(
-        config.providers.clone(),
+        config.provider_urls(),
         config.request_timeout,
         config.max_retries,
     )?;
@@ -111,7 +111,7 @@ mod tests {
     fn config_for(rpc_url: Url) -> ChainClientConfig {
         ChainClientConfig {
             enabled: true,
-            providers: vec![rpc_url],
+            providers: vec![rpc_url.into()],
             request_timeout: Duration::from_secs(5),
             max_retries: 0,
             domain_refresh_interval: Duration::from_secs(3600),

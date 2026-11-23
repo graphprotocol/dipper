@@ -40,6 +40,9 @@ spec:
       containers:
         - name: dipper
           image: ghcr.io/graphprotocol/dipper-service:v0.3.3 # x-release-please-version
+          # Every argument is a config file, merged in order. To keep secrets out of the
+          # ConfigMap, mount a Secret holding a secrets.json with only the secret fields
+          # and add it after config.json: see the k8s README.
           args:
             - /config/config.json
           # Dipper logs at info unless RUST_LOG is set, for example to `dipper_service=debug,info`.

@@ -25,7 +25,7 @@ pub async fn fetch_rca_eip712_domain(
     recurring_collector: Address,
 ) -> Result<Eip712Domain, ChainClientError> {
     let pool = RpcProviderPool::new(
-        config.providers.clone(),
+        config.provider_urls(),
         config.request_timeout,
         config.max_retries,
     )?;
@@ -277,7 +277,7 @@ mod tests {
     fn test_chain_client_config(rpc_url: Url) -> ChainClientConfig {
         ChainClientConfig {
             enabled: true,
-            providers: vec![rpc_url],
+            providers: vec![rpc_url.into()],
             request_timeout: Duration::from_secs(5),
             max_retries: 0,
             domain_refresh_interval: Duration::from_secs(3600),

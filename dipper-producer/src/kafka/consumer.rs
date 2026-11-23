@@ -31,7 +31,7 @@ pub struct KafkaConsumerConfig {
     pub sasl_username: Option<String>,
     /// SASL password.
     #[serde(default)]
-    pub sasl_password: Option<String>,
+    pub sasl_password: Option<dipper_core::config::Hidden<String>>,
     /// Enable TLS encryption.
     #[serde(default)]
     pub tls_enabled: bool,
@@ -85,7 +85,7 @@ impl KafkaConsumerConfig {
             brokers: &self.brokers,
             sasl_mechanism: self.sasl_mechanism.as_deref(),
             sasl_username: self.sasl_username.as_deref(),
-            sasl_password: self.sasl_password.as_deref(),
+            sasl_password: self.sasl_password.as_ref().map(|p| p.as_str()),
             tls_enabled: self.tls_enabled,
             tls_ca_cert_path: self.tls_ca_cert_path.as_deref(),
         }
@@ -477,7 +477,7 @@ mod tests {
         assert_eq!(config.topic, "studio.subgraph.indexing.requests");
         assert_eq!(config.sasl_mechanism, None);
         assert_eq!(config.sasl_username, None);
-        assert_eq!(config.sasl_password, None);
+        assert!(config.sasl_password.is_none());
         assert!(!config.tls_enabled);
         assert_eq!(config.tls_ca_cert_path, None);
         assert_eq!(config.connect_timeout_secs, 60);
@@ -565,7 +565,7 @@ mod tests {
             topic: "test".to_string(),
             sasl_mechanism: Some("PLAIN".to_string()),
             sasl_username: Some("user".to_string()),
-            sasl_password: Some("hunter2".to_string()),
+            sasl_password: Some(dipper_core::config::Hidden("hunter2".to_string())),
             tls_enabled: false,
             tls_ca_cert_path: None,
             connect_timeout_secs: 60,
