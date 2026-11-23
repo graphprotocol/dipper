@@ -61,17 +61,21 @@ const INDEXER_URLS_FETCH_MAX_RETRIES: u32 = 5;
 const TEARDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(75);
 
 /// How long the worker may take to finish the jobs it is running once it stops taking new ones.
-/// A job still running then is dropped, which rolls its queue transaction back so it runs again
+/// A job still running then is cut off, which rolls its queue transaction back so it runs again
 /// on the next start. This only saves work: a job can be cut off at any point anyway (a crash, a
 /// kill, a job longer than any sensible grace period, up to 420s), so it must be safe to re-run
 /// whatever this allows.
 const WORKER_DRAIN: std::time::Duration = std::time::Duration::from_secs(45);
 
-/// The stop sequence's ceiling: the worker's drain, with the services that feed or call it
-/// stopping alongside, then 4 steps in turn, each capped at [`STOP_STEP_TIMEOUT`]: the services
-/// the jobs read from, the health endpoint, the event flush and the DB pool.
-const TEARDOWN_CEILING: std::time::Duration =
-    std::time::Duration::from_secs(WORKER_DRAIN.as_secs() + 4 * STOP_STEP_TIMEOUT.as_secs());
+/// The stop sequence's ceiling: the worker's drain and the cut-off of any job it left running,
+/// with the services that feed or call it stopping alongside, then 4 steps in turn, each capped
+/// at [`STOP_STEP_TIMEOUT`]: the services the jobs read from, the health endpoint, the event flush
+/// and the DB pool.
+const TEARDOWN_CEILING: std::time::Duration = std::time::Duration::from_secs(
+    WORKER_DRAIN.as_secs()
+        + worker::service::CUT_OFF_WAIT.as_secs()
+        + 4 * STOP_STEP_TIMEOUT.as_secs(),
+);
 
 // The sequence must end before the supervisor stops waiting for it.
 const _: () = assert!(TEARDOWN_CEILING.as_secs() < TEARDOWN_GRACE.as_secs());
@@ -973,7 +977,11 @@ pub async fn main() -> anyhow::Result<()> {
             ));
         }
         let (drained, feeders_stopped) = tokio::join!(
-            stop_service_within("Worker", WORKER_DRAIN, worker_handle.stop()),
+            stop_service_within(
+                "Worker",
+                WORKER_DRAIN + worker::service::CUT_OFF_WAIT,
+                worker_handle.stop_within(WORKER_DRAIN),
+            ),
             stop_services(feeders),
         );
         all_stopped &= drained && feeders_stopped;
@@ -995,7 +1003,8 @@ pub async fn main() -> anyhow::Result<()> {
 
         // Stop the health endpoint last: Kubernetes probes /health for as long as the pod runs,
         // so stopping it early makes every clean teardown look like a liveness failure. The
-        // worker watermark freezes here, but its staleness threshold dwarfs the teardown ceiling.
+        // worker watermark froze when the worker stopped, at the start of the sequence, but its
+        // staleness threshold dwarfs the teardown ceiling.
         // The metrics sampler stops in the same step, as it only exists with the endpoint and
         // drops a sample in progress at once, so it adds no step to the sequence.
         if let Some(handle) = health_stop_handle {
@@ -1128,15 +1137,33 @@ async fn stop_service_within(
 type Stopping = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
 /// Stops `services` all at once, each capped as [`stop_service`] caps 1, so together they take as
-/// long as the slowest of them. Returns whether every one stopped in time.
+/// long as the slowest of them. Returns whether every one stopped in time. A stop that panics is
+/// logged with its service's name, and its panic carried on once the others have stopped, so the
+/// teardown fails as it would have with the services stopped in turn.
 async fn stop_services(services: Vec<(&'static str, Stopping)>) -> bool {
     let mut stopping = tokio::task::JoinSet::new();
+    let mut names = std::collections::HashMap::new();
     for (name, stop) in services {
-        stopping.spawn(stop_service(name, stop));
+        let task = stopping.spawn(stop_service(name, stop));
+        names.insert(task.id(), name);
     }
     let mut all_stopped = true;
+    let mut panicked = None;
     while let Some(stopped) = stopping.join_next().await {
-        all_stopped &= stopped.unwrap_or(false);
+        match stopped {
+            Ok(in_time) => all_stopped &= in_time,
+            Err(err) => {
+                all_stopped = false;
+                let service = names.get(&err.id()).copied().unwrap_or("unknown");
+                tracing::error!(service, error = %err, "a service's stop failed");
+                if err.is_panic() && panicked.is_none() {
+                    panicked = Some(err.into_panic());
+                }
+            }
+        }
+    }
+    if let Some(panic) = panicked {
+        std::panic::resume_unwind(panic);
     }
     all_stopped
 }
@@ -1291,6 +1318,30 @@ mod tests {
             stop_services(vec![("a", wedged()), ("b", sleeping(1)), ("c", wedged())]).await;
         assert!(!stopped, "a wedged service is reported");
         assert_eq!(started.elapsed(), STOP_STEP_TIMEOUT);
+    }
+
+    /// A stop that panics among others lets the others finish, then fails the sequence, so the
+    /// process can't exit as if the teardown were clean.
+    #[tokio::test(start_paused = true)]
+    async fn a_panicking_stop_fails_the_sequence_once_the_others_have_stopped() {
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let others = std::sync::Arc::clone(&finished);
+        let panicking: Stopping = Box::pin(async { panic!("a stop that panics") });
+        let slow: Stopping = Box::pin(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            others.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let outcome = tokio::spawn(stop_services(vec![("a", panicking), ("b", slow)])).await;
+
+        assert!(
+            outcome.is_err_and(|err| err.is_panic()),
+            "the panic is carried on"
+        );
+        assert!(
+            finished.load(std::sync::atomic::Ordering::SeqCst),
+            "the other stop ran to its end first"
+        );
     }
 
     /// The worker is given its own, longer, limit to finish the jobs it is running.
