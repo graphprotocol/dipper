@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.3.4](https://github.com/graphprotocol/dipper/compare/v0.3.3...v0.3.4) (2026-11-23)
+
+
+### Added
+
+* **config:** type secrets as such and read config from several files ([#857](https://github.com/graphprotocol/dipper/issues/857)) ([fe92407](https://github.com/graphprotocol/dipper/commit/fe92407a7638a6432217b054f660b8a94c42b3d5))
+* **db:** connect to Postgres over TLS ([#847](https://github.com/graphprotocol/dipper/issues/847)) ([2673181](https://github.com/graphprotocol/dipper/commit/267318145e62b5ef29f9afdf0c1f9ad1ce77b02a))
+* **db:** let only 1 dipper process write, enforced by the database ([#858](https://github.com/graphprotocol/dipper/issues/858)) ([6f88900](https://github.com/graphprotocol/dipper/commit/6f88900abc77379c4f458f51ebe08c660de53480))
+* **db:** make the database password optional ([#850](https://github.com/graphprotocol/dipper/issues/850)) ([cb5d3b1](https://github.com/graphprotocol/dipper/commit/cb5d3b11bd71847851006671586bd2edbea06445))
+* **metrics:** serve Prometheus metrics and optionally log as JSON ([#851](https://github.com/graphprotocol/dipper/issues/851)) ([523819e](https://github.com/graphprotocol/dipper/commit/523819eab8ac83fc2a299656d4272006bf1c9444))
+* **rpc:** expose effective indexing targets and chain identity ([#860](https://github.com/graphprotocol/dipper/issues/860)) ([aafc0ce](https://github.com/graphprotocol/dipper/commit/aafc0ce0ca31080fb8ada21d7bc62ff15268dedf))
+* **startup:** wait for Postgres and IISA instead of exiting ([#849](https://github.com/graphprotocol/dipper/issues/849)) ([d1406d4](https://github.com/graphprotocol/dipper/commit/d1406d4b06cf7a37f228755f803ffeb10d71183c))
+
+
+### Fixed
+
+* **db:** sslmode=verify-ca skips the hostname check, as libpq does ([#859](https://github.com/graphprotocol/dipper/issues/859)) ([5fec97d](https://github.com/graphprotocol/dipper/commit/5fec97d5eceb49e27638978e2aa006c8531347e0))
+* **k8s:** roll dipper out one pod at a time ([#846](https://github.com/graphprotocol/dipper/issues/846)) ([de57e46](https://github.com/graphprotocol/dipper/commit/de57e462cc418aca08ec20a70196553b377dbfae))
+* **shutdown:** stop taking jobs first and fit the teardown in its budget ([#854](https://github.com/graphprotocol/dipper/issues/854)) ([a1bc47d](https://github.com/graphprotocol/dipper/commit/a1bc47db70a0b1d30296e6ed3631078846c32ad0))
+
+
+### Tests
+
+* run each test's Postgres on its Unix socket only ([#861](https://github.com/graphprotocol/dipper/issues/861)) ([bc9e2b2](https://github.com/graphprotocol/dipper/commit/bc9e2b23b9841972c2bf7bb6003a4c1dea5eb476))
+
 ## [0.3.3](https://github.com/graphprotocol/dipper/compare/v0.3.2...v0.3.3) (2026-11-19)
 
 
