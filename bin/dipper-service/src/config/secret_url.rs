@@ -85,7 +85,9 @@ impl SecretUrl {
     }
 
     /// The first 3 bytes of the URL's keccak-256 hash, in hex: the same for the same URL, so 2
-    /// logs can be told to use the same key or not, and too short to help guess the key.
+    /// logs can be told to use the same key or not, and too short to give a random key away. A
+    /// guessable password in a URL could still be checked against it, guess by guess, so such a
+    /// password belongs in a field of its own, such as `db.password`, not in a URL.
     pub fn fingerprint(&self) -> String {
         let hash = keccak256(self.0.as_str().as_bytes());
         hash[..3].iter().map(|byte| format!("{byte:02x}")).collect()

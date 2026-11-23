@@ -69,7 +69,8 @@ fn debug_optional_endpoint(url: &Option<Url>, f: &mut std::fmt::Formatter<'_>) -
 /// Load the configuration from 1 or more JSON files, merged in the order given: an object in a
 /// later file merges into the one before key by key, and anything else (a string, a number, a
 /// list, `null`) replaces what was there. The merged result is then read as one configuration,
-/// so an unknown field is refused wherever it came from.
+/// so an unknown field is refused wherever it came from. Each file holds 1 JSON value and nothing
+/// after it, and a key given twice in 1 object of a file is refused, as it is with 1 file.
 ///
 /// This keeps secrets out of the main file without dipper being told where they are: production
 /// passes a `config.json` with no secrets, reviewable in git, then a `secrets.json` rendered from
@@ -81,32 +82,145 @@ pub fn load_from_files(paths: &[PathBuf]) -> Result<Config, Error> {
             source,
         })
     };
+    let not_json = |path: &PathBuf| {
+        let path = path.clone();
+        move |source| Error::Parse { path, source }
+    };
     let files = paths
         .iter()
         .map(|path| path.display().to_string())
         .collect::<Vec<_>>()
         .join(", ");
+    let invalid = |source: serde_path_to_error::Error<serde_json::Error>| Error::Deserialize {
+        files: files.clone(),
+        detail: without_string_values(&source.to_string()),
+    };
     match paths {
         [] => Err(Error::NoFiles),
         // 1 file is read straight from its text, so an error keeps its line and column.
         [path] => {
             let text = read(path)?;
-            serde_path_to_error::deserialize(&mut serde_json::Deserializer::from_str(&text))
-                .map_err(|source| Error::Deserialize { files, source })
+            let mut json = serde_json::Deserializer::from_str(&text);
+            let config = serde_path_to_error::deserialize(&mut json).map_err(invalid)?;
+            // Anything after the configuration, such as a stray `}` that closed it early and
+            // left the rest of the file unread, is refused rather than ignored.
+            json.end().map_err(not_json(path))?;
+            Ok(config)
         }
         _ => {
             let mut merged = serde_json::Value::Object(serde_json::Map::new());
             for path in paths {
-                let layer: serde_json::Value =
-                    serde_json::from_str(&read(path)?).map_err(|source| Error::Parse {
-                        path: path.clone(),
-                        source,
-                    })?;
+                let Layer(layer) = serde_json::from_str(&read(path)?).map_err(not_json(path))?;
                 merge(&mut merged, layer);
             }
-            serde_path_to_error::deserialize(merged)
-                .map_err(|source| Error::Deserialize { files, source })
+            serde_path_to_error::deserialize(merged).map_err(invalid)
         }
+    }
+}
+
+/// `message` with each string a deserialisation error quotes (serde writes one as
+/// `string "…"`) replaced by `a string`. An error about a field then never repeats what the field
+/// held, whatever the field, a secret given in the wrong shape among them: a provider URL with its
+/// key given where a list of them belongs, say.
+fn without_string_values(message: &str) -> String {
+    const QUOTED: &str = "string \"";
+    let mut out = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some(start) = rest.find(QUOTED) {
+        out.push_str(&rest[..start]);
+        out.push_str("a string");
+        let quoted = &rest[start + QUOTED.len()..];
+        // serde writes the string as `{:?}` does, so a quote inside it is escaped.
+        let mut end = quoted.len();
+        let mut chars = quoted.char_indices();
+        while let Some((at, c)) = chars.next() {
+            match c {
+                '\\' => {
+                    chars.next();
+                }
+                '"' => {
+                    end = at + 1;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        rest = &quoted[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// 1 configuration file's JSON, read as a [`serde_json::Value`] is, but refusing a key given twice
+/// in 1 object, as reading the configuration straight from 1 file does. The value would otherwise
+/// keep the last of them and say nothing.
+struct Layer(serde_json::Value);
+
+impl<'de> serde::Deserialize<'de> for Layer {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(LayerVisitor).map(Layer)
+    }
+}
+
+struct LayerVisitor;
+
+impl<'de> serde::de::Visitor<'de> for LayerVisitor {
+    type Value = serde_json::Value;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
+        serde_json::Number::from_f64(value)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| E::custom("a number JSON can't hold"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut items = Vec::new();
+        while let Some(Layer(item)) = seq.next_element()? {
+            items.push(item);
+        }
+        Ok(serde_json::Value::Array(items))
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut object = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if object.contains_key(&key) {
+                return Err(serde::de::Error::custom(format_args!(
+                    "duplicate field `{key}`"
+                )));
+            }
+            let Layer(value) = map.next_value()?;
+            object.insert(key, value);
+        }
+        Ok(serde_json::Value::Object(object))
     }
 }
 
@@ -127,8 +241,9 @@ fn merge(base: &mut serde_json::Value, layer: serde_json::Value) {
     }
 }
 
-/// An error that can occur when loading the configuration. None of them repeats a secret: secret
-/// fields leave their value out of a deserialisation error, and the rest name the field and file.
+/// An error that can occur when loading the configuration. None of them repeats a secret: they
+/// name the file and the field, secret fields leave their value out of their own errors, and a
+/// string a field held is left out of any error about it.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// No configuration file was given.
@@ -142,19 +257,18 @@ pub enum Error {
         source: std::io::Error,
     },
 
-    /// A configuration file, 1 of several, is not JSON.
+    /// A configuration file is not valid JSON, holds more than 1 value, or gives a key twice in
+    /// 1 object.
     #[error("configuration file {} is not valid JSON: {source}", path.display())]
     Parse {
         path: PathBuf,
         source: serde_json::Error,
     },
 
-    /// The configuration, merged from `files`, is not a valid one; the error names the field.
-    #[error("invalid configuration in {files}: {source}")]
-    Deserialize {
-        files: String,
-        source: serde_path_to_error::Error<serde_json::Error>,
-    },
+    /// The configuration, merged from `files`, is not a valid one; `detail` names the field, and
+    /// leaves out any string it held.
+    #[error("invalid configuration in {files}: {detail}")]
+    Deserialize { files: String, detail: String },
 }
 
 /// The configuration for the DIPs service
@@ -3848,6 +3962,99 @@ mod tests {
             .to_string();
         assert!(err.contains("alerts.slack_webhook_url"), "{err}");
         assert!(!err.contains("s3cret"), "{err}");
+    }
+
+    /// Writes each text, as it is, to a fresh temporary directory, returning their paths.
+    fn write_config_texts(texts: &[&str]) -> Vec<std::path::PathBuf> {
+        let paths = write_config_files(&vec![serde_json::Value::Null; texts.len()]);
+        for (path, text) in paths.iter().zip(texts) {
+            std::fs::write(path, text).unwrap();
+        }
+        paths
+    }
+
+    /// The example as 1 whole, loadable config.
+    fn example_whole() -> serde_json::Value {
+        let (mut config, secrets) = example_split_from_its_secrets();
+        merge(&mut config, secrets);
+        config
+    }
+
+    /// Anything after the configuration in a file, such as a stray `}` that closed it early and
+    /// left the sections after it unread, is refused rather than ignored.
+    #[test]
+    fn a_file_with_anything_after_the_configuration_is_refused() {
+        let whole = serde_json::to_string_pretty(&example_whole()).unwrap();
+        assert!(load_from_files(&write_config_texts(&[&whole])).is_ok());
+
+        let trailing = format!("{whole}\n}}");
+        let err = load_from_files(&write_config_texts(&[&trailing]))
+            .expect_err("a stray brace after the configuration")
+            .to_string();
+        assert!(err.contains("trailing characters"), "{err}");
+    }
+
+    /// A string given where a secret's section or list belongs is left out of the error, so a
+    /// provider URL with its key, or a signing key, given in the wrong shape never reaches a log.
+    #[test]
+    fn a_secret_in_the_wrong_shape_is_left_out_of_the_error() {
+        let key = "https://rpc.example.com/v2/s3cret-provider-key";
+        let mut whole = example_whole();
+        whole["chain_client"]["providers"] = key.into();
+        let err = load_from_files(&write_config_files(&[whole]))
+            .expect_err("1 URL where a list belongs")
+            .to_string();
+        assert!(err.contains("chain_client.providers"), "{err}");
+        assert!(!err.contains("s3cret-provider-key"), "{err}");
+
+        let (config, mut secrets) = example_split_from_its_secrets();
+        secrets["signer"] =
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".into();
+        let err = load_from_files(&write_config_files(&[config, secrets]))
+            .expect_err("a signing key where the signer's section belongs")
+            .to_string();
+        assert!(err.contains("signer"), "{err}");
+        assert!(!err.contains("ac0974bec39a17e36ba4a6b4d"), "{err}");
+    }
+
+    /// A key given twice in 1 object of a file is refused with several files too, as it is with 1:
+    /// otherwise the last of them would be used without a word.
+    #[test]
+    fn a_key_given_twice_in_1_of_several_files_is_refused() {
+        let (config, _) = example_split_from_its_secrets();
+        let config = serde_json::to_string(&config).unwrap();
+        let secrets = r#"{"db": {"password": "first-s3cret", "password": "second-s3cret"}}"#;
+        let paths = write_config_texts(&[&config, secrets]);
+        let err = load_from_files(&paths)
+            .expect_err("a key given twice")
+            .to_string();
+        assert!(err.contains("duplicate field `password`"), "{err}");
+        assert!(err.contains(&paths[1].display().to_string()), "{err}");
+        assert!(!err.contains("s3cret"), "{err}");
+    }
+
+    /// A later file that isn't JSON is refused, naming that file and quoting none of it.
+    #[test]
+    fn a_later_file_that_is_not_json_is_refused_naming_it() {
+        let (config, _) = example_split_from_its_secrets();
+        let config = serde_json::to_string(&config).unwrap();
+        let paths = write_config_texts(&[&config, r#"{"db": {"password": s3cret}}"#]);
+        let err = load_from_files(&paths).expect_err("not JSON").to_string();
+        assert!(err.contains(&paths[1].display().to_string()), "{err}");
+        assert!(!err.contains("s3cret"), "{err}");
+    }
+
+    #[test]
+    fn strings_are_left_out_of_an_error_message() {
+        assert_eq!(
+            without_string_values(r#"a.b: invalid type: string "k\"e\\y", expected a sequence"#),
+            "a.b: invalid type: a string, expected a sequence"
+        );
+        assert_eq!(
+            without_string_values(r#"invalid value: string "x", expected y at line 1 column 2"#),
+            "invalid value: a string, expected y at line 1 column 2"
+        );
+        assert_eq!(without_string_values("no string here"), "no string here");
     }
 
     /// A single file still reports where in it an error is.
