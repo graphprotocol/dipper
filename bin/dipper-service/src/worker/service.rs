@@ -595,6 +595,7 @@ where
                 // An unexpected DB failure (the empty queue is Ok(None) above);
                 // surface it so a DB outage doesn't leave every loop spinning
                 // silently while the worker still looks healthy.
+                crate::writer::note_refusal(&err);
                 tracing::warn!(error=?err, "Failed to get next job from queue");
                 continue;
             }
@@ -702,6 +703,11 @@ impl FinishedJob for JobGuard<'_, Message> {
 
 /// Removes, retries or defers a job according to how its run went.
 async fn settle_job(job: impl FinishedJob, result: JobResult<()>) {
+    // A job of a process another one has taken over from fails at its first write, and its
+    // settling is refused too, which leaves it queued for the new writer.
+    if let Err(JobError::Retryable(err, _) | JobError::Fatal(err)) = &result {
+        crate::writer::note_refusal(err);
+    }
     let kind = job.message().kind();
     let outcome = match result {
         Ok(..) => recorded(remove_job(job).await, "success"),
@@ -729,6 +735,7 @@ async fn drop_job(job: impl FinishedJob, err: &anyhow::Error) -> bool {
             true
         }
         Err(remove_err) => {
+            crate::writer::note_refusal(&remove_err);
             tracing::error!(
             job_id = %failed.id,
             kind = failed.kind,
@@ -749,6 +756,7 @@ async fn remove_job(job: impl FinishedJob) -> bool {
     match job.remove().await {
         Ok(()) => true,
         Err(err) => {
+            crate::writer::note_refusal(&err);
             tracing::error!(job_id = %id, error = ?err, "Failed to remove job from queue");
             false
         }
@@ -769,6 +777,7 @@ async fn defer_job(job: impl FinishedJob, delay: Duration) -> bool {
     match job.defer_to(scheduled_for).await {
         Ok(()) => true,
         Err(err) => {
+            crate::writer::note_refusal(&err);
             tracing::error!(error=?err, "Failed to reschedule deferred job");
             false
         }
@@ -797,6 +806,7 @@ async fn retry_job(
             "gave_up"
         }
         Err(db_err) => {
+            crate::writer::note_refusal(&db_err);
             tracing::error!(
                 job_id = %failed.id,
                 kind = failed.kind,

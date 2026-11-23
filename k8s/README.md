@@ -23,9 +23,30 @@ Kubernetes manifests for deploying the dipper service.
 
 Dipper requires IISA at startup: it runs an IISA health check, retrying with growing pauses for up to `iisa.startup_wait` (180s by default, enough for IISA's own rollout), and exits if IISA is still not reachable. It waits for the database the same way, for up to `db.connect_wait` (120s by default), but exits at once if the database refuses it, as with a wrong password. Deploy and verify IISA before starting dipper.
 
-Run exactly 1 replica. The signer's nonce and the locks that keep 2 jobs from acting on the same agreement live in the process, so 2 pods side by side could send transactions on the same nonce or act on an agreement twice. `deployment.yaml` sets `strategy: Recreate` for that reason: a rollout stops the old pod before the new one starts, at the cost of a gap while the new pod starts up. Keep it if you deploy with other manifests.
+Run 1 replica. Dipper's flows assume a single process acts: the signer's nonce and the locks that keep 2 jobs from acting on the same agreement live in the process. The database enforces that with the [writer fence](#the-writer-fence), so a pod started while another is still running waits for it, and nothing acts twice. When a pod is evicted, deleted or its node drained, Kubernetes starts the replacement while the old pod is still shutting down; the replacement takes over once the old pod hands over at the end of its stop, or once it has been silent for 20 seconds. No maintenance window is needed for that.
 
-`Recreate` only covers rollouts. When a pod is evicted, deleted or its node drained, Kubernetes starts the replacement while the old pod is still shutting down, and the old pod's worker, though it takes no new job once its stop begins, finishes the ones it is running for up to 45 seconds. Until dipper holds a lock of its own for as long as it runs, keep such disruptions to planned windows: set a maintenance window on the cluster, and drain a node only after scaling dipper to 0.
+`deployment.yaml` sets `strategy: Recreate`, so a rollout stops the old pod before the new one starts. Keep it if you deploy with other manifests: with a rolling update the new pod would wait for a writer that Kubernetes only stops once the new pod is ready, which it isn't while it waits.
+
+## The writer fence
+
+Every database session of a dipper process carries a token of that process, as the session setting `dipper.writer` and in its name, `dipper/<token>` in `pg_stat_activity`. The table `dipper_writer` names the process allowed to write, and a trigger on every table refuses a write from any other session, with the error code `DP001`. A process another one has taken over from is refused however late it finds out, stops, and has its sessions ended by the new writer.
+
+| Task | How |
+| --- | --- |
+| Manual SQL that writes, a `pg_restore`, or a script such as `scripts/dedupe-open-indexing-requests.sql` | Mark the session as an operator's first: `SET dipper.writer = 'operator';`, or connect with `PGOPTIONS='-c dipper.writer=operator'` |
+| See who the writer is, and whether the fence is on | `SELECT holder, taken_at, enforced FROM dipper_writer;` (`holder` is the pod's name) |
+| See whether the writer is healthy | `SELECT seen_at, released FROM dipper_writer_heartbeat;` |
+| See every dipper session and whose it is | `SELECT pid, application_name, state FROM pg_stat_activity WHERE application_name LIKE 'dipper/%';` |
+| Hand over now, from a writer that won't stop | `UPDATE dipper_writer_heartbeat SET released = true;` The next pod takes over within 2 seconds; the old one is refused from then on, and stops |
+| Turn the fence off in an emergency, or before going back to a release without it | `SELECT dipper_fence_set(false);` It stays off, across restarts, until `SELECT dipper_fence_set(true);` |
+
+It needs:
+
+- Postgres 14 or later, and dipper's sessions on 1 database role: a takeover ends only the sessions of its own role.
+- Sessions that keep their settings, so a direct connection or the Cloud SQL Auth Proxy, not a pooler in transaction mode.
+- No prepared transactions (Postgres disables them by default). One left behind holds a takeover back until an operator rolls it back; the start logs `writer_drain_blocked` naming it.
+
+What it logs, by `event`: `writer_taken` at each start, `writer_waiting` while a start waits for the writer (as a warning past 2 minutes, which means another dipper is running that shouldn't be), `writer_superseded` when a process finds it has been replaced, `writer_drain_blocked` when a takeover can't finish, and `writer_fence_off` at each start while the fence is off. All but `writer_taken` are alerted on by default.
 
 ## Configuration
 

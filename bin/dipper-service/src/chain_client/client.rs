@@ -32,8 +32,8 @@ use super::{
 };
 use crate::{
     chain_client::{
-        AgreementOnChain, ChainClient, ChainClientError, EscrowAccount, ManagerEscrowReader,
-        TrackedProviders,
+        AgreementOnChain, BroadcastGate, ChainClient, ChainClientError, EscrowAccount,
+        ManagerEscrowReader, TrackedProviders,
     },
     config::ChainClientConfig,
     worker::service::PROCESS_JOB_TIMEOUT,
@@ -525,6 +525,17 @@ fn classify_fill_nonce_gap_outcome(
     }
 }
 
+/// Why a broadcast stopped once this process was found no longer to be dipper's writer.
+const NOT_THE_WRITER: &str = "this process is no longer dipper's writer, so it may not broadcast";
+
+/// Whether an attempt of the broadcast has already found it may not go on.
+fn has_stopped(stopped: &std::sync::Mutex<Option<anyhow::Error>>) -> bool {
+    stopped
+        .lock()
+        .map(|stopped| stopped.is_some())
+        .unwrap_or(true)
+}
+
 /// Production implementation of `ChainClient` using alloy. `Clone` via internal `Arc`
 /// wrapping, so it can be shared across async task contexts.
 #[derive(Clone)]
@@ -580,17 +591,21 @@ struct AlloyChainClientInner {
     seen_block: std::sync::Mutex<SeenBlock>,
     /// Each endpoint's latest block, so a run of reads asks for it once a second, not every read.
     endpoint_heads: EndpointHeads,
+    /// Lets a broadcast through only while this process is dipper's writer.
+    broadcast_gate: Arc<dyn BroadcastGate>,
 }
 
 impl AlloyChainClient {
     /// Create a new AlloyChainClient from configuration. Errors if no RPC providers are
-    /// configured or the signer cannot be constructed.
+    /// configured or the signer cannot be constructed. Every broadcast asks `broadcast_gate`
+    /// first, and again before each attempt.
     pub fn new(
         config: &ChainClientConfig,
         chain_id: u64,
         recurring_collector: Address,
         recurring_agreement_manager: Address,
         secret_key: &[u8; 32],
+        broadcast_gate: Arc<dyn BroadcastGate>,
     ) -> Result<Self, ChainClientError> {
         let signer = PrivateKeySigner::from_bytes(&FixedBytes::from(*secret_key))
             .map_err(|e| ChainClientError::ConfigError(format!("Invalid signing key: {e}")))?;
@@ -633,6 +648,7 @@ impl AlloyChainClient {
                 submit_deadline,
                 seen_block: std::sync::Mutex::new(SeenBlock::new()),
                 endpoint_heads,
+                broadcast_gate,
             }),
         })
     }
@@ -882,11 +898,44 @@ impl AlloyChainClient {
         let signed_hash = *signed.tx_hash();
         let raw = signed.encoded_2718();
 
-        self.inner
+        // Only dipper's writer may broadcast, and a takeover waits for this turn to end. Each
+        // attempt asks again, so a broadcast stops at its first attempt after a takeover, however
+        // long its walk through the endpoints is.
+        let turn = self
+            .inner
+            .broadcast_gate
+            .open()
+            .await
+            .map_err(ChainClientError::SubmitFailed)?;
+        // Why the broadcast stopped, once an attempt found it may not go on.
+        let stopped: std::sync::Mutex<Option<anyhow::Error>> = std::sync::Mutex::new(None);
+
+        let sent = self
+            .inner
             .rpc_pool
             .execute("send_transaction", |provider| {
                 let raw = raw.clone();
+                let (turn, stopped) = (&turn, &stopped);
                 async move {
+                    // Not worth retrying, so the pool moves on through the remaining endpoints
+                    // at once, each attempt stopping here as well.
+                    let not_the_writer = || Err(TransportErrorKind::custom_str(NOT_THE_WRITER));
+                    if has_stopped(stopped) {
+                        return not_the_writer();
+                    }
+                    let refusal = match turn.still_writer().await {
+                        Ok(true) => None,
+                        Ok(false) => Some(anyhow::anyhow!(NOT_THE_WRITER)),
+                        Err(err) => Some(err.context(
+                            "could not confirm that this process is still dipper's writer",
+                        )),
+                    };
+                    if let Some(refusal) = refusal {
+                        if let Ok(mut stopped) = stopped.lock() {
+                            *stopped = Some(refusal);
+                        }
+                        return not_the_writer();
+                    }
                     match provider.send_raw_transaction(&raw).await {
                         // The hash follows from the bytes, so report the one we signed
                         // instead of what this endpoint echoed back. A wrong hash sends the
@@ -900,14 +949,18 @@ impl AlloyChainClient {
                     }
                 }
             })
-            .await
-            .map_err(|e| match e {
-                // A submission that got nowhere is a failed submission, whatever the
-                // endpoints happened to say. Anything the pool could name precisely, such
-                // as a rejection from the contract, keeps the name it already has.
-                ChainClientError::RpcError(cause) => ChainClientError::SubmitFailed(cause),
-                other => other,
-            })
+            .await;
+        turn.end().await;
+        if let Ok(Some(reason)) = stopped.into_inner() {
+            return Err(ChainClientError::SubmitFailed(reason));
+        }
+        sent.map_err(|e| match e {
+            // A submission that got nowhere is a failed submission, whatever the
+            // endpoints happened to say. Anything the pool could name precisely, such
+            // as a rejection from the contract, keeps the name it already has.
+            ChainClientError::RpcError(cause) => ChainClientError::SubmitFailed(cause),
+            other => other,
+        })
     }
 
     /// Send a reconcile call to the manager and wait for its receipt, as offers and
@@ -1511,6 +1564,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::chain_client::BroadcastTurn;
 
     /// A cancel must leave nothing the indexer can still be paid through: neither
     /// an accepted agreement without a cancellation notice, nor an offer still
@@ -1619,6 +1673,124 @@ mod tests {
     }
 
     fn client_over_retrying(providers: Vec<Url>, max_retries: u32) -> AlloyChainClient {
+        client_gated(providers, max_retries, Arc::new(AlwaysWriter))
+    }
+
+    /// Lets every broadcast through, as for a process that stays the writer.
+    struct AlwaysWriter;
+
+    #[async_trait]
+    impl BroadcastGate for AlwaysWriter {
+        async fn open(&self) -> anyhow::Result<Box<dyn BroadcastTurn>> {
+            Ok(Box::new(AlwaysWriter))
+        }
+    }
+
+    #[async_trait]
+    impl BroadcastTurn for AlwaysWriter {
+        async fn still_writer(&self) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+
+        async fn end(self: Box<Self>) {}
+    }
+
+    /// Answers each check of a broadcast's turn from a script, then that the process is no
+    /// longer the writer, and counts the checks.
+    #[derive(Clone)]
+    struct ScriptedGate {
+        answers: Arc<std::sync::Mutex<std::collections::VecDeque<bool>>>,
+        asked: Arc<AtomicU64>,
+    }
+
+    impl ScriptedGate {
+        fn answering(answers: &[bool]) -> Self {
+            Self {
+                answers: Arc::new(std::sync::Mutex::new(answers.iter().copied().collect())),
+                asked: Arc::new(AtomicU64::new(0)),
+            }
+        }
+
+        fn asked(&self) -> u64 {
+            self.asked.load(Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait]
+    impl BroadcastGate for ScriptedGate {
+        async fn open(&self) -> anyhow::Result<Box<dyn BroadcastTurn>> {
+            Ok(Box::new(self.clone()))
+        }
+    }
+
+    #[async_trait]
+    impl BroadcastTurn for ScriptedGate {
+        async fn still_writer(&self) -> anyhow::Result<bool> {
+            self.asked.fetch_add(1, Ordering::Relaxed);
+            let next = self.answers.lock().expect("script").pop_front();
+            Ok(next.unwrap_or(false))
+        }
+
+        async fn end(self: Box<Self>) {}
+    }
+
+    /// A gate whose check can't reach the database, as when a takeover has ended its session.
+    struct UnreachableGate;
+
+    #[async_trait]
+    impl BroadcastGate for UnreachableGate {
+        async fn open(&self) -> anyhow::Result<Box<dyn BroadcastTurn>> {
+            Ok(Box::new(UnreachableGate))
+        }
+    }
+
+    #[async_trait]
+    impl BroadcastTurn for UnreachableGate {
+        async fn still_writer(&self) -> anyhow::Result<bool> {
+            anyhow::bail!("the database connection was ended")
+        }
+
+        async fn end(self: Box<Self>) {}
+    }
+
+    /// A check that can't tell whether this process is still the writer stops the broadcast as a
+    /// refusal does: a takeover ends a replaced process's sessions, so a lost connection may be
+    /// one.
+    #[tokio::test]
+    async fn send_transaction_sends_nothing_when_its_check_fails() {
+        let endpoint = server_answering_with(B256::repeat_byte(0xab)).await;
+        let client = client_gated(
+            vec![endpoint.uri().parse().expect("provider URL")],
+            0,
+            Arc::new(UnreachableGate),
+        );
+        let tx = ready_to_send_tx(client.inner.signer.address());
+
+        let err = client
+            .send_transaction(&tx)
+            .await
+            .expect_err("an unchecked broadcast must not go out");
+
+        assert!(
+            matches!(&err, ChainClientError::SubmitFailed(cause)
+                if format!("{cause:#}").contains("could not confirm")),
+            "got {err}"
+        );
+        assert!(
+            endpoint
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "no endpoint is offered the transaction"
+        );
+    }
+
+    fn client_gated(
+        providers: Vec<Url>,
+        max_retries: u32,
+        gate: Arc<dyn BroadcastGate>,
+    ) -> AlloyChainClient {
         let config = ChainClientConfig {
             enabled: true,
             providers: providers.into_iter().map(Into::into).collect(),
@@ -1638,6 +1810,7 @@ mod tests {
             Address::repeat_byte(0x11),
             Address::repeat_byte(0x22),
             &[0x42; 32],
+            gate,
         )
         .expect("chain client")
     }
@@ -1706,6 +1879,91 @@ mod tests {
                 .is_empty(),
             "the healthy provider should have been tried after rotation"
         );
+    }
+
+    /// A process another one has taken over from sends nothing: the new writer may already be
+    /// using the nonce, or have cancelled what this transaction offers.
+    #[tokio::test]
+    async fn send_transaction_sends_nothing_once_the_process_is_not_the_writer() {
+        let endpoint = server_answering_with(B256::repeat_byte(0xab)).await;
+        let other = server_answering_with(B256::repeat_byte(0xab)).await;
+        let gate = ScriptedGate::answering(&[]);
+        let client = client_gated(
+            vec![
+                endpoint.uri().parse().expect("provider URL"),
+                other.uri().parse().expect("other provider URL"),
+            ],
+            0,
+            Arc::new(gate.clone()),
+        );
+        let tx = ready_to_send_tx(client.inner.signer.address());
+
+        let err = client
+            .send_transaction(&tx)
+            .await
+            .expect_err("a replaced process must not broadcast");
+
+        assert!(
+            matches!(&err, ChainClientError::SubmitFailed(cause) if cause.to_string() == NOT_THE_WRITER),
+            "got {err}"
+        );
+        for server in [&endpoint, &other] {
+            assert!(
+                server
+                    .received_requests()
+                    .await
+                    .unwrap_or_default()
+                    .is_empty(),
+                "no endpoint is offered the transaction"
+            );
+        }
+        assert_eq!(
+            gate.asked(),
+            1,
+            "the other endpoints aren't asked about again"
+        );
+    }
+
+    /// A broadcast already walking the endpoints when another process takes over stops at its
+    /// next attempt, rather than offering the transaction to the endpoints left.
+    #[tokio::test]
+    async fn send_transaction_stops_at_the_first_attempt_after_a_takeover() {
+        let sick = server_answering_500().await;
+        let healthy = server_answering_with(B256::repeat_byte(0xab)).await;
+        let gate = ScriptedGate::answering(&[true]);
+        let client = client_gated(
+            vec![
+                sick.uri().parse().expect("sick provider URL"),
+                healthy.uri().parse().expect("healthy provider URL"),
+            ],
+            0,
+            Arc::new(gate.clone()),
+        );
+        let tx = ready_to_send_tx(client.inner.signer.address());
+
+        let err = client
+            .send_transaction(&tx)
+            .await
+            .expect_err("the takeover stops the broadcast");
+
+        assert!(
+            matches!(err, ChainClientError::SubmitFailed(_)),
+            "got {err}"
+        );
+        assert_eq!(
+            sick.received_requests().await.unwrap_or_default().len(),
+            1,
+            "the 1st attempt, made while still the writer, went out"
+        );
+        assert!(
+            healthy
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "the attempt after the takeover never went out"
+        );
+        assert_eq!(gate.asked(), 2, "each attempt asked before going out");
     }
 
     /// With a single provider there is nowhere to rotate to, so the fault must surface rather
@@ -2144,6 +2402,7 @@ mod tests {
             Address::repeat_byte(0x11),
             Address::repeat_byte(0x22),
             &[0x42; 32],
+            Arc::new(AlwaysWriter),
         )
         .expect("chain client");
 

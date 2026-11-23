@@ -18,8 +18,10 @@ pub struct AdvisoryLockConnection {
 
 impl PgRegistry {
     /// Opens a connection of its own, to the pool's database, to take the lock `key` on. It is
-    /// listed in `pg_stat_activity` under the application name `name`, and the database is told
-    /// to end it once nothing has been asked on it for `idle_timeout`, which frees the lock.
+    /// listed in `pg_stat_activity` under the application name `name`, after the pool's own name
+    /// when the pool has one (`dipper/<token>/<name>`), so a takeover by another dipper process
+    /// ends it with the rest of this one's sessions. The database is told to end it once nothing
+    /// has been asked on it for `idle_timeout`, which frees the lock.
     pub async fn advisory_lock_connection(
         &self,
         key: i64,
@@ -27,7 +29,7 @@ impl PgRegistry {
         idle_timeout: Duration,
     ) -> Result<AdvisoryLockConnection> {
         let options = self.pool.connect_options().as_ref().clone();
-        let mut conn = options.application_name(name).connect().await?;
+        let mut conn = crate::writer_fence::named(options, name).connect().await?;
         // Set once connected and not as a startup option, which a database that lacks the
         // setting would refuse the whole connection over. Without a unit the value is in ms.
         let set = sqlx::query("SELECT set_config('idle_session_timeout', $1, false)")
