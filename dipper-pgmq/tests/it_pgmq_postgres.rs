@@ -2,19 +2,31 @@ use std::time::Duration;
 
 use dipper_pgmq::{JobBuilder, JobGuard, JobPriority, PgQueue, RetryOutcome};
 use fake::{Dummy, Fake, Faker};
-use pgtemp::PgTempDB;
-use sqlx::{Pool, Postgres};
+use pgtemp::{PgTempDB, PgTempDBBuilder};
+use sqlx::{Pool, Postgres, postgres::PgConnectOptions};
 
 /// Initialize a temporary database for integration testing: spins up a temp
 /// Postgres, runs the migrations, and returns the connection pool and the
 /// temporary database guard.
+///
+/// The server listens on its Unix socket only. pgtemp picks a free TCP port and starts Postgres on
+/// it a moment later, and in a parallel test run another process can take the port in between,
+/// which leaves the test waiting out its pool's timeout on a server that never started.
 #[expect(
     clippy::expect_used,
-    reason = "predates this lint; fix when next touched"
+    reason = "test setup; a failure should stop the test"
 )]
 async fn temp_pgmq_db() -> (Pool<Postgres>, PgTempDB) {
-    let temp_db = PgTempDB::new();
-    let db = Pool::connect(&temp_db.connection_uri())
+    let temp_db = PgTempDBBuilder::new()
+        .with_config_param("listen_addresses", "")
+        .start();
+    let options = PgConnectOptions::new()
+        .socket(temp_db.data_dir())
+        .port(temp_db.db_port())
+        .username(temp_db.db_user())
+        .password(temp_db.db_pass())
+        .database(temp_db.db_name());
+    let db = Pool::connect_with(options)
         .await
         .expect("Failed to connect to temporary database");
     dipper_pgmq::run_db_migrations(&db)

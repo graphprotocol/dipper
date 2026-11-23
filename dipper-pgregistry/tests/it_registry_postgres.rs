@@ -9,8 +9,8 @@ use dipper_pgregistry::{
     RecordedEnd, SetAsideChange, SetAsideRequest, WithheldIndexers,
 };
 use fake::{Fake, Faker};
-use pgtemp::PgTempDB;
-use sqlx::{Executor as _, Pool, Postgres};
+use pgtemp::{PgTempDB, PgTempDBBuilder};
+use sqlx::{Executor as _, Pool, Postgres, postgres::PgConnectOptions};
 use thegraph_core::{
     DeploymentId, IndexerId,
     alloy::primitives::{ChainId, address},
@@ -21,17 +21,34 @@ use thegraph_core::{
 use url::Url;
 use uuid::uuid;
 
+/// A temporary Postgres for a test, and how to connect to it: through its Unix socket only. pgtemp
+/// picks a free TCP port and starts Postgres on it a moment later, and in a parallel test run
+/// another process can take the port in between, which leaves the test waiting out its pool's
+/// timeout on a server that never started.
+fn temp_postgres() -> (PgTempDB, PgConnectOptions) {
+    let temp_db = PgTempDBBuilder::new()
+        .with_config_param("listen_addresses", "")
+        .start();
+    let options = PgConnectOptions::new()
+        .socket(temp_db.data_dir())
+        .port(temp_db.db_port())
+        .username(temp_db.db_user())
+        .password(temp_db.db_pass())
+        .database(temp_db.db_name());
+    (temp_db, options)
+}
+
 /// Initialize a temporary database for integration testing.
 ///
 /// This function creates a temporary database and runs the migrations.
 /// It returns the database connection pool and the temporary database guard.
 #[expect(
     clippy::expect_used,
-    reason = "predates this lint; fix when next touched"
+    reason = "test setup; a failure should stop the test"
 )]
 async fn temp_registry_db() -> (Pool<Postgres>, PgTempDB) {
-    let temp_db = PgTempDB::new();
-    let db = Pool::connect(&temp_db.connection_uri())
+    let (temp_db, options) = temp_postgres();
+    let db = Pool::connect_with(options)
         .await
         .expect("Failed to connect to temporary database");
     dipper_pgregistry::run_db_migrations(&db)
