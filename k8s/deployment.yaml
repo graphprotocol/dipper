@@ -27,8 +27,10 @@ spec:
         app: dipper
     spec:
       # Above the service's own teardown budget: once shutdown starts it has 75s in
-      # total to stop its 11 services, flush events and close the DB pool, after which
-      # it exits by itself. A SIGKILL part-way through the teardown stays out of reach.
+      # total to stop taking jobs, finish the running ones (45s at most), stop its
+      # other services, flush events, close the DB pool and hand over to the next
+      # dipper, after which it exits by itself. A SIGKILL part-way through the teardown
+      # stays out of reach.
       terminationGracePeriodSeconds: 90
       securityContext:
         runAsNonRoot: true

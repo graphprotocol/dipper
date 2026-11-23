@@ -57,10 +57,29 @@ const RCA_DOMAIN_FETCH_MAX_RETRIES: u32 = 5;
 /// stalled subgraph would leave the pod hanging unready with no restart; exit visibly instead.
 const INDEXER_URLS_FETCH_MAX_RETRIES: u32 = 5;
 
-/// Total budget for the teardown, from shutdown being requested to the last task draining. The
-/// stop sequence's own ceiling is 65s (11 stop steps and the event flush and the DB pool close,
-/// each capped locally at `STOP_STEP_TIMEOUT`), so this sits above it and below the pod's 90s grace.
+/// Total budget for the teardown, from shutdown being requested to the last task draining. It sits
+/// above the stop sequence's own ceiling, [`TEARDOWN_CEILING`], and below the pod's 90s grace.
 const TEARDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(75);
+
+/// How long the worker may take to finish the jobs it is running once it stops taking new ones.
+/// A job still running then is cut off, which rolls its queue transaction back so it runs again
+/// on the next start. This only saves work: a job can be cut off at any point anyway (a crash, a
+/// kill, a job longer than any sensible grace period, up to 420s), so it must be safe to re-run
+/// whatever this allows.
+const WORKER_DRAIN: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// The stop sequence's ceiling: the worker's drain and the cut-off of any job it left running,
+/// with the services that feed or call it stopping alongside, then 5 steps in turn, each capped
+/// at [`STOP_STEP_TIMEOUT`]: the services the jobs read from, the health endpoint, the event flush,
+/// the DB pool, and the writer's handover.
+const TEARDOWN_CEILING: std::time::Duration = std::time::Duration::from_secs(
+    WORKER_DRAIN.as_secs()
+        + worker::service::CUT_OFF_WAIT.as_secs()
+        + 5 * STOP_STEP_TIMEOUT.as_secs(),
+);
+
+// The sequence must end before the supervisor stops waiting for it.
+const _: () = assert!(TEARDOWN_CEILING.as_secs() < TEARDOWN_GRACE.as_secs());
 
 /// How long to wait for one stop step before moving on without it. Every step of the sequence is
 /// capped by this, giving the whole sequence a ceiling that holds however badly a single service
@@ -960,70 +979,70 @@ pub async fn main() -> anyhow::Result<()> {
         // treats the resulting service completions as a deliberate shutdown.
         shutdown_coordinator.request();
 
-        // Stop all services in reverse dependency order, so a service is stopped before the
-        // services it depends on. Every step is capped, so the whole sequence has a ceiling
-        // that holds however badly an individual service misbehaves.
+        // Stop in 2 waves, so the time it takes is that of the slowest service in each rather than
+        // the sum of all. First the worker stops taking jobs and finishes the ones it is running,
+        // while everything that feeds it work or calls it stops alongside: the queue is in the
+        // database, so a job queued meanwhile waits there for the next start. Then the services
+        // the running jobs read from, once no job is left to read them.
         let mut all_stopped = true;
 
-        all_stopped &= stop_service("Admin RPC", admin_rpc_handle.stop()).await;
-
-        // Stop reassignment service before worker (it depends on worker queue)
+        let mut feeders: Vec<(&'static str, Stopping)> = vec![
+            ("Admin RPC", Box::pin(async move { admin_rpc_handle.stop().await })),
+            ("Cancel retry", Box::pin(async move { cancel_retry_handle.stop().await })),
+        ];
         if let Some(handle) = reassignment_stop_handle {
-            all_stopped &= stop_service("Reassignment", handle.stop()).await;
+            feeders.push(("Reassignment", Box::pin(async move { handle.stop().await })));
         }
-
-        // Stop expiration service before worker (it depends on worker queue)
         if let Some(handle) = expiration_stop_handle {
-            all_stopped &= stop_service("Expiration", handle.stop()).await;
+            feeders.push(("Expiration", Box::pin(async move { handle.stop().await })));
         }
-
-        // Stop liveness checker service before worker (it depends on worker queue)
         if let Some(handle) = liveness_checker_stop_handle {
-            all_stopped &= stop_service("Liveness checker", handle.stop()).await;
+            feeders.push(("Liveness checker", Box::pin(async move { handle.stop().await })));
         }
-
         if let Some(handle) = dips_info_watcher_stop_handle {
-            all_stopped &= stop_service("DIPs info watcher", handle.stop()).await;
+            feeders.push(("DIPs info watcher", Box::pin(async move { handle.stop().await })));
         }
-
-        // Stop chain listener service before worker (it depends on worker queue)
         if let Some(handle) = chain_listener_stop_handle {
-            all_stopped &= stop_service("Chain listener", handle.stop()).await;
+            feeders.push(("Chain listener", Box::pin(async move { handle.stop().await })));
         }
-
-        // Stop the cancel retry before worker (it queues replacements)
-        all_stopped &= stop_service("Cancel retry", cancel_retry_handle.stop()).await;
-
-        // Stop escrow reconciler service before the DB pool closes
         if let Some(handle) = escrow_reconciler_stop_handle {
-            all_stopped &= stop_service("Escrow reconciler", handle.stop()).await;
+            feeders.push(("Escrow reconciler", Box::pin(async move { handle.stop().await })));
         }
-
-        // Stop the indexing request consumer before worker (it queues worker jobs)
         if let Some(handle) = indexing_request_consumer_stop_handle {
-            all_stopped &= stop_service("Indexing request consumer", handle.stop()).await;
+            feeders.push((
+                "Indexing request consumer",
+                Box::pin(async move { handle.stop().await }),
+            ));
         }
+        let (drained, feeders_stopped) = tokio::join!(
+            stop_service_within(
+                "Worker",
+                WORKER_DRAIN + worker::service::CUT_OFF_WAIT,
+                worker_handle.stop_within(WORKER_DRAIN),
+            ),
+            stop_services(feeders),
+        );
+        all_stopped &= drained && feeders_stopped;
 
-        // Stop entity count cache service
+        let mut sources: Vec<(&'static str, Stopping)> = vec![
+            ("indexer URLs", Box::pin(async move { indexer_urls_handle.stop().await })),
+            (
+                "RCA domain refresh",
+                Box::pin(async move { domain_refresh_handle.stop().await }),
+            ),
+        ];
         if let Some(handle) = entity_count_handle {
-            all_stopped &= stop_service("Entity count cache", handle.stop()).await;
+            sources.push(("Entity count cache", Box::pin(async move { handle.stop().await })));
         }
-
-        // Stop the RCA domain refresh. It drops any in-flight refresh rather
-        // than waiting for it, so a wedged RPC provider cannot stall shutdown.
-        all_stopped &= stop_service("RCA domain refresh", domain_refresh_handle.stop()).await;
-
-        // Stop the fetch of suggested minimum prices, which drops a fetch in flight.
         if let Some(handle) = suggested_minimums_handle {
-            all_stopped &= stop_service("Suggested minimums", handle.stop()).await;
+            sources.push(("Suggested minimums", Box::pin(async move { handle.stop().await })));
         }
-
-        all_stopped &= stop_service("Worker", worker_handle.stop()).await;
-        all_stopped &= stop_service("indexer URLs", indexer_urls_handle.stop()).await;
+        all_stopped &= stop_services(sources).await;
 
         // Stop the health endpoint last: Kubernetes probes /health for as long as the pod runs,
         // so stopping it early makes every clean teardown look like a liveness failure. The
-        // worker watermark freezes here, but its staleness threshold dwarfs the teardown ceiling.
+        // worker watermark froze when the worker stopped, at the start of the sequence, but its
+        // staleness threshold dwarfs the teardown ceiling.
         // The metrics sampler stops in the same step, as it only exists with the endpoint and
         // drops a sample in progress at once, so it adds no step to the sequence.
         if let Some(handle) = health_stop_handle {
@@ -1137,17 +1156,62 @@ fn log_filter(rust_log: Option<&str>) -> EnvFilter {
 /// Stop one service, giving up after [`STOP_STEP_TIMEOUT`]. Returns whether it stopped in time,
 /// naming the service when it did not so the errors it goes on to log are attributable.
 async fn stop_service(name: &str, stop: impl std::future::Future<Output = ()>) -> bool {
+    stop_service_within(name, STOP_STEP_TIMEOUT, stop).await
+}
+
+/// [`stop_service`] with its own time limit, for a service that is given longer to finish its
+/// work, as the worker is to finish the jobs it is running.
+async fn stop_service_within(
+    name: &str,
+    limit: std::time::Duration,
+    stop: impl std::future::Future<Output = ()>,
+) -> bool {
     tracing::trace!(service = name, "stopping service");
-    if tokio::time::timeout(STOP_STEP_TIMEOUT, stop).await.is_err() {
+    if tokio::time::timeout(limit, stop).await.is_err() {
         tracing::warn!(
             service = name,
-            timeout_secs = STOP_STEP_TIMEOUT.as_secs(),
+            timeout_secs = limit.as_secs(),
             "service did not stop in time; continuing teardown without it"
         );
         return false;
     }
     tracing::trace!(service = name, "stopped service");
     true
+}
+
+/// A service's stop, ready to run alongside others.
+type Stopping = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+/// Stops `services` all at once, each capped as [`stop_service`] caps 1, so together they take as
+/// long as the slowest of them. Returns whether every one stopped in time. A stop that panics is
+/// logged with its service's name, and its panic carried on once the others have stopped, so the
+/// teardown fails as it would have with the services stopped in turn.
+async fn stop_services(services: Vec<(&'static str, Stopping)>) -> bool {
+    let mut stopping = tokio::task::JoinSet::new();
+    let mut names = std::collections::HashMap::new();
+    for (name, stop) in services {
+        let task = stopping.spawn(stop_service(name, stop));
+        names.insert(task.id(), name);
+    }
+    let mut all_stopped = true;
+    let mut panicked = None;
+    while let Some(stopped) = stopping.join_next().await {
+        match stopped {
+            Ok(in_time) => all_stopped &= in_time,
+            Err(err) => {
+                all_stopped = false;
+                let service = names.get(&err.id()).copied().unwrap_or("unknown");
+                tracing::error!(service, error = %err, "a service's stop failed");
+                if err.is_panic() && panicked.is_none() {
+                    panicked = Some(err.into_panic());
+                }
+            }
+        }
+    }
+    if let Some(panic) = panicked {
+        std::panic::resume_unwind(panic);
+    }
+    all_stopped
 }
 
 /// Signal handler for the application
@@ -1267,7 +1331,74 @@ mod tests {
         );
     }
 
-    use super::{EnvFilter, config, log_filter, log_layer, stop_service};
+    use super::{
+        EnvFilter, STOP_STEP_TIMEOUT, Stopping, config, log_filter, log_layer, stop_service,
+        stop_service_within, stop_services,
+    };
+
+    fn sleeping(secs: u64) -> Stopping {
+        Box::pin(tokio::time::sleep(std::time::Duration::from_secs(secs)))
+    }
+
+    /// Services stopped together take as long as the slowest of them, not the sum.
+    #[tokio::test(start_paused = true)]
+    async fn services_stopped_together_take_as_long_as_the_slowest() {
+        let started = tokio::time::Instant::now();
+        let stopped = stop_services(vec![
+            ("a", sleeping(1)),
+            ("b", sleeping(3)),
+            ("c", sleeping(2)),
+        ])
+        .await;
+        assert!(stopped);
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(3));
+    }
+
+    /// A wedged service among others is given up on at its own cap, and only the time of 1 cap
+    /// passes however many are wedged.
+    #[tokio::test(start_paused = true)]
+    async fn wedged_services_stopped_together_cost_1_cap() {
+        let wedged = || -> Stopping { Box::pin(std::future::pending::<()>()) };
+        let started = tokio::time::Instant::now();
+        let stopped =
+            stop_services(vec![("a", wedged()), ("b", sleeping(1)), ("c", wedged())]).await;
+        assert!(!stopped, "a wedged service is reported");
+        assert_eq!(started.elapsed(), STOP_STEP_TIMEOUT);
+    }
+
+    /// A stop that panics among others lets the others finish, then fails the sequence, so the
+    /// process can't exit as if the teardown were clean.
+    #[tokio::test(start_paused = true)]
+    async fn a_panicking_stop_fails_the_sequence_once_the_others_have_stopped() {
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let others = std::sync::Arc::clone(&finished);
+        let panicking: Stopping = Box::pin(async { panic!("a stop that panics") });
+        let slow: Stopping = Box::pin(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            others.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let outcome = tokio::spawn(stop_services(vec![("a", panicking), ("b", slow)])).await;
+
+        assert!(
+            outcome.is_err_and(|err| err.is_panic()),
+            "the panic is carried on"
+        );
+        assert!(
+            finished.load(std::sync::atomic::Ordering::SeqCst),
+            "the other stop ran to its end first"
+        );
+    }
+
+    /// The worker is given its own, longer, limit to finish the jobs it is running.
+    #[tokio::test(start_paused = true)]
+    async fn the_worker_gets_its_own_limit() {
+        let limit = std::time::Duration::from_secs(45);
+        assert!(stop_service_within("worker", limit, sleeping(30)).await);
+        let started = tokio::time::Instant::now();
+        assert!(!stop_service_within("worker", limit, sleeping(50)).await);
+        assert_eq!(started.elapsed(), limit);
+    }
 
     /// The normal path: a service that stops promptly reports success, which is
     /// what lets the graceful DB pool close go ahead.

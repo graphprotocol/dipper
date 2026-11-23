@@ -459,8 +459,10 @@ where
     } = state.into();
 
     // A watch channel fans the stop signal out to every loop; a single mpsc
-    // receiver could only wake one of them.
+    // receiver could only wake one of them. The cut-off follows a stop whose
+    // jobs outlast their drain.
     let (stop_tx, stop_rx) = watch::channel(false);
+    let (cut_off_tx, cut_off_rx) = watch::channel(false);
 
     // An offer is worth resubmitting for as long as the indexer can still accept
     // it, so the budget comes from that window. Sized on the shorter of the two
@@ -472,6 +474,7 @@ where
 
     let handle = Handle {
         stop_tx: stop_tx.clone(),
+        cut_off_tx,
         worker_queue_handle: WorkerQueueHandle::new(queue.clone(), submit_offer_max_retries),
     };
     let fut = async move {
@@ -508,6 +511,7 @@ where
                 state.clone(),
                 queue.clone(),
                 stop_rx.clone(),
+                cut_off_rx.clone(),
                 liveness.register(),
             ));
         }
@@ -543,13 +547,15 @@ where
     (handle, fut)
 }
 
-/// One worker loop: drains jobs until the stop signal fires. Each loop owns its
-/// own queue notification listener because the underlying `LISTEN`/`NOTIFY` is
-/// per-connection and can't be shared across tasks.
+/// One worker loop: drains jobs until the stop signal fires, or the cut-off ends
+/// the job it is running. Each loop owns its own queue notification listener
+/// because the underlying `LISTEN`/`NOTIFY` is per-connection and can't be shared
+/// across tasks.
 async fn run_loop<Q, R, C, I, T>(
     state: InnerCtx<R, WorkerQueueHandle<Q>, C, I, T>,
     queue: Q,
     mut stop_rx: watch::Receiver<bool>,
+    mut cut_off_rx: watch::Receiver<bool>,
     liveness: crate::health::ProgressTicker,
 ) -> anyhow::Result<()>
 where
@@ -599,11 +605,35 @@ where
         let kind = job.desc().kind();
         let _in_flight = InFlight::start();
         let started = Instant::now();
-        let result =
-            run_job_with_timeout(PROCESS_JOB_TIMEOUT, process_job(&state, job.desc())).await;
+        let run = run_job_with_timeout(PROCESS_JOB_TIMEOUT, process_job(&state, job.desc()));
+        let Some(result) = unless_cut_off(&mut cut_off_rx, run).await else {
+            // Dropping the job rolls its queue transaction back, as a crash would.
+            tracing::warn!(
+                job = %job.id(),
+                kind,
+                "the stop cut off a job still running after its drain; it runs again on the next start"
+            );
+            return Ok(());
+        };
         metrics::histogram!(crate::telemetry::JOB_DURATION, "kind" => kind)
             .record(started.elapsed().as_secs_f64());
         settle_job(job, result).await;
+    }
+}
+
+/// Runs `job` to its end, or until the cut-off comes, which drops it there: `None`. Without a
+/// cut-off to come, as once the worker's handle is gone, it runs `job` to its end.
+async fn unless_cut_off<T>(
+    cut_off: &mut watch::Receiver<bool>,
+    job: impl Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        done = job => Some(done),
+        () = async {
+            if cut_off.wait_for(|cut| *cut).await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        } => None,
     }
 }
 
@@ -904,6 +934,9 @@ pub struct Handle<Q> {
     /// Broadcasts the stop signal to every worker loop
     stop_tx: watch::Sender<bool>,
 
+    /// Broadcasts the cut-off, which ends the jobs a stop's drain left running
+    cut_off_tx: watch::Sender<bool>,
+
     /// A handle to the worker's queue
     worker_queue_handle: WorkerQueueHandle<Q>,
 }
@@ -914,17 +947,34 @@ impl<Q> Handle<Q> {
         &self.worker_queue_handle
     }
 
-    /// Stop the worker and wait for every loop to drain.
-    pub async fn stop(self) {
+    /// Stops the worker: it takes no new job, and the loops finish the jobs they are running. A
+    /// job still running after `drain` is cut off, which rolls its queue transaction back so it
+    /// runs again on the next start; the loops then exit within [`CUT_OFF_WAIT`]. Returns once
+    /// every loop has exited.
+    pub async fn stop_within(self, drain: Duration) {
         if self.stop_tx.is_closed() {
             return;
         }
 
         // One send wakes all loops; closed() resolves once they've all exited.
         let _ = self.stop_tx.send(true);
-        self.stop_tx.closed().await;
+        if tokio::time::timeout(drain, self.stop_tx.closed())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                drain_secs = drain.as_secs(),
+                "the worker's jobs are still running at the end of its drain; cutting them off"
+            );
+            let _ = self.cut_off_tx.send(true);
+            self.stop_tx.closed().await;
+        }
     }
 }
+
+/// How long the worker's loops take at most to exit once a stop has cut their jobs off: dropping
+/// a job is all a loop has left to do.
+pub const CUT_OFF_WAIT: Duration = Duration::from_secs(2);
 
 #[cfg(test)]
 mod tests {
@@ -941,17 +991,83 @@ mod tests {
     use tokio::sync::watch;
 
     use super::{
-        AfterFailure, DEFAULT_QUEUE_POLL_PERIOD, FailedJob, FinishedJob, JOB_FAILED_EVENT,
+        AfterFailure, DEFAULT_QUEUE_POLL_PERIOD, FailedJob, FinishedJob, Handle, JOB_FAILED_EVENT,
         JobError, Message, RESUBSCRIBE_BASE_DELAY, RESUBSCRIBE_MAX_DELAY,
         RESUBSCRIBE_STABLE_PERIOD, ResubscribeBackoff, Subscription, Tick, WARN_COOLDOWN,
-        WarnPacer, await_next_tick, log_job_failure, run_job_with_timeout, settle_job,
-        should_resubscribe,
+        WarnPacer, WorkerQueueHandle, await_next_tick, log_job_failure, run_job_with_timeout,
+        settle_job, should_resubscribe, unless_cut_off,
     };
     use crate::{
         config::AlertsConfig,
         test_support::logged,
         worker::queue::{JobGuard, JobId, JobNotifications, JobPriority, Queue, RetryOutcome},
     };
+
+    /// A worker handle over `loops` loops the test plays itself. Each holds the stop and cut-off
+    /// receivers as a real loop does: it runs a job that takes `job_secs`, unless the cut-off ends
+    /// it first, then waits for the stop before it would take another. Counts the jobs cut off.
+    fn handle_over(loops: usize, job_secs: u64) -> (Handle<()>, Arc<AtomicUsize>) {
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let (cut_off_tx, cut_off_rx) = watch::channel(false);
+        let cut = Arc::new(AtomicUsize::new(0));
+        for _ in 0..loops {
+            let (mut stop_rx, mut cut_off_rx) = (stop_rx.clone(), cut_off_rx.clone());
+            let cut = Arc::clone(&cut);
+            tokio::spawn(async move {
+                let job = tokio::time::sleep(Duration::from_secs(job_secs));
+                if unless_cut_off(&mut cut_off_rx, job).await.is_none() {
+                    cut.fetch_add(1, Ordering::SeqCst);
+                }
+                let _ = stop_rx.wait_for(|stop| *stop).await;
+            });
+        }
+        let handle = Handle {
+            stop_tx,
+            cut_off_tx,
+            worker_queue_handle: WorkerQueueHandle::new((), 0),
+        };
+        (handle, cut)
+    }
+
+    /// A stop lets the jobs the loops are running finish, when they do within the drain.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_lets_running_jobs_finish_within_the_drain() {
+        let (handle, cut) = handle_over(2, 30);
+        let started = tokio::time::Instant::now();
+
+        handle.stop_within(Duration::from_secs(45)).await;
+
+        assert_eq!(started.elapsed(), Duration::from_secs(30));
+        assert_eq!(cut.load(Ordering::SeqCst), 0, "no job is cut off");
+    }
+
+    /// A job still running at the end of the drain is cut off there, so the stop ends on time
+    /// rather than waiting out a job that may run for up to 420 seconds.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_cuts_off_jobs_still_running_at_the_end_of_the_drain() {
+        let (handle, cut) = handle_over(2, 400);
+        let started = tokio::time::Instant::now();
+
+        handle.stop_within(Duration::from_secs(45)).await;
+
+        assert_eq!(started.elapsed(), Duration::from_secs(45));
+        assert_eq!(cut.load(Ordering::SeqCst), 2, "both jobs are cut off");
+    }
+
+    /// Without a cut-off to come, a job runs to its end; once one has come, a job ends at once.
+    #[tokio::test]
+    async fn a_job_runs_to_its_end_unless_cut_off() {
+        let (cut_off, mut never) = watch::channel(false);
+        drop(cut_off);
+        assert_eq!(unless_cut_off(&mut never, async { 7 }).await, Some(7));
+
+        let (cut_off, mut cutting) = watch::channel(false);
+        cut_off.send(true).unwrap();
+        assert_eq!(
+            unless_cut_off(&mut cutting, future::pending::<u32>()).await,
+            None
+        );
+    }
 
     /// A listener stub whose `wait_for_notification` always errors. Models a
     /// dropped/broken `LISTEN`/`NOTIFY` connection.
