@@ -438,10 +438,11 @@ mod tests {
     async fn it_the_sampler_reports_the_database_and_the_queue() {
         let (recorder, handle) = local_recorder();
         let _local = metrics::set_default_local_recorder(&recorder);
-        let temp_db = pgtemp::PgTempDB::new();
-        let db = Pool::<Postgres>::connect(&temp_db.connection_uri())
-            .await
-            .unwrap();
+        let temp_db = crate::test_support::temp_postgres();
+        let db =
+            Pool::<Postgres>::connect_with(crate::test_support::temp_postgres_options(&temp_db))
+                .await
+                .unwrap();
         dipper_pgmq::run_db_migrations(&db).await.unwrap();
         let queue = dipper_pgmq::PgQueue::new(db.clone());
         queue

@@ -338,9 +338,72 @@ pub fn metric_value(rendered: &str, name: &str, labels: &[(&str, &str)]) -> Opti
     })
 }
 
+/// A temporary Postgres for a test, reached through its Unix socket only: it opens no TCP port.
+/// pgtemp picks a free port and starts Postgres on it a moment later, and in a parallel test run
+/// another process (a test's mock server, say) can take the port in between. Postgres then fails
+/// to start, and the test waits out its pool's timeout on a server that never came up.
+pub fn temp_postgres() -> pgtemp::PgTempDB {
+    temp_postgres_from(pgtemp::PgTempDBBuilder::new())
+}
+
+/// [`temp_postgres`], started from `builder`, for a server set up some other way.
+pub fn temp_postgres_from(builder: pgtemp::PgTempDBBuilder) -> pgtemp::PgTempDB {
+    builder.with_config_param("listen_addresses", "").start()
+}
+
+/// How to connect to `db`, through its socket.
+pub fn temp_postgres_options(db: &pgtemp::PgTempDB) -> sqlx::postgres::PgConnectOptions {
+    sqlx::postgres::PgConnectOptions::new()
+        .socket(db.data_dir())
+        .port(db.db_port())
+        .username(db.db_user())
+        .password(db.db_pass())
+        .database(db.db_name())
+}
+
+/// `db`'s URL, through its socket, for code that takes 1: `postgres:///<db>?host=<dir>&port=<n>`.
+pub fn temp_postgres_url(db: &pgtemp::PgTempDB) -> String {
+    format!(
+        "postgres:///{}?host={}&port={}",
+        db.db_name(),
+        db.data_dir().display(),
+        db.db_port()
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::logged;
+    use super::{logged, temp_postgres_from, temp_postgres_options, temp_postgres_url};
+
+    /// A test's Postgres starts and answers even when another process holds the port pgtemp gave
+    /// it, as happens in a parallel test run: it needs no TCP port at all. Listening on the port,
+    /// as pgtemp's default server does, it would fail to start.
+    #[tokio::test]
+    async fn it_a_temp_postgres_answers_when_its_port_is_taken() {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a port");
+        let port = taken.local_addr().expect("the port held").port();
+        let _taken_too = std::net::TcpListener::bind(("::1", port));
+
+        let db = temp_postgres_from(pgtemp::PgTempDBBuilder::new().with_port(port));
+
+        let one: i32 = sqlx::query_scalar("SELECT 1")
+            .fetch_one(
+                &sqlx::PgPool::connect_with(temp_postgres_options(&db))
+                    .await
+                    .expect("connect through the socket"),
+            )
+            .await
+            .expect("the server answers");
+        assert_eq!(one, 1);
+        // As `db::connect` reads a URL: with the user given beside it.
+        let from_url: sqlx::postgres::PgConnectOptions = temp_postgres_url(&db)
+            .parse()
+            .expect("the URL is a Postgres URL");
+        let by_url = sqlx::PgPool::connect_with(from_url.username(db.db_user()))
+            .await
+            .expect("connect through the socket, by URL");
+        by_url.close().await;
+    }
 
     fn reach_a_shared_line() {
         tracing::info!("A line another thread reached first");

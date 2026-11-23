@@ -363,26 +363,23 @@ mod tests {
         );
     }
 
-    /// A temporary Postgres that, unlike pgtemp's default, checks passwords on TCP connections.
+    /// A temporary Postgres that, unlike pgtemp's default, checks passwords.
     fn password_checking_db() -> (pgtemp::PgTempDB, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("dipper-scram-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let hba = dir.join("pg_hba.conf");
-        std::fs::write(
-            &hba,
-            "local all all trust\nhost all all 127.0.0.1/32 scram-sha-256\nhost all all ::1/128 scram-sha-256\n",
-        )
-        .unwrap();
-        let db = pgtemp::PgTempDBBuilder::new()
-            .with_password("s3cret")
-            .with_config_param("hba_file", hba.to_str().unwrap())
-            .start();
+        std::fs::write(&hba, "local all all scram-sha-256\n").unwrap();
+        let db = crate::test_support::temp_postgres_from(
+            pgtemp::PgTempDBBuilder::new()
+                .with_password("s3cret")
+                .with_config_param("hba_file", hba.to_str().unwrap()),
+        );
         (db, dir)
     }
 
     fn pgtemp_db_config(temp_db: &pgtemp::PgTempDB, password: Option<&str>) -> DbConfig {
         let mut json = serde_json::json!({
-            "url": format!("postgres://127.0.0.1:{}/{}", temp_db.db_port(), temp_db.db_name()),
+            "url": crate::test_support::temp_postgres_url(temp_db),
             "username": temp_db.db_user(),
         });
         if let Some(password) = password {
@@ -395,7 +392,7 @@ mod tests {
     async fn it_connects_without_a_password_where_the_server_asks_for_none() {
         // pgtemp's default server trusts local connections, as a database behind the Cloud SQL
         // Auth Proxy with automatic IAM authentication asks the client for no password either.
-        let temp_db = pgtemp::PgTempDB::new();
+        let temp_db = crate::test_support::temp_postgres();
         let pool = connect(&pgtemp_db_config(&temp_db, None))
             .await
             .expect("connects without a password");

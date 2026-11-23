@@ -5425,8 +5425,8 @@ mod tests {
         let topic = unique_topic();
         create_topic(&brokers, &topic).await;
 
-        let temp_db = pgtemp::PgTempDB::new();
-        let db = sqlx::Pool::connect(&temp_db.connection_uri())
+        let temp_db = crate::test_support::temp_postgres();
+        let db = sqlx::Pool::connect_with(crate::test_support::temp_postgres_options(&temp_db))
             .await
             .expect("connect to temp db");
         dipper_pgregistry::run_db_migrations(&db)
